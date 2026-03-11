@@ -39,3 +39,6 @@ desktop.ini
 *.cbz
 *.cbr
 *.cb7
+
+# Progress tracking files
+*_progress.json
