@@ -1,24 +1,8 @@
-# cbz_sanitizer.py — Batch Sanitizer
+# cbz_sanitizer.py
 
-The canonical script for batch sanitizing an existing library. Walks all subdirectories and applies the full filename-cleaning and ComicInfo.xml tagging pipeline **in place** — nothing is moved or transferred.
+Batch sanitizer. Recursively scans a library folder for `.cbz` files and applies the full cleaning and tagging pipeline in-place: filename normalisation, directory renaming, and `ComicInfo.xml` creation/repair. Does **not** move files — use `cbz_watcher.py` for that.
 
-This is also the **canonical reference implementation** for all shared functions. Other tools sync their shared logic from this script.
-
----
-
-## Running
-
-From the repo root:
-
-```powershell
-python scripts\cbz_sanitizer.py [path] [flags]
-```
-
-Or from inside `scripts\`:
-
-```powershell
-python cbz_sanitizer.py [path] [flags]
-```
+`cbz_sanitizer.py` is also the **canonical reference** for all shared functions. Other scripts in the suite sync from it.
 
 ---
 
@@ -27,18 +11,9 @@ python cbz_sanitizer.py [path] [flags]
 Edit the constants at the top of `scripts\cbz_sanitizer.py`:
 
 ```python
-# Default folder(s) to scan when no path is given on the command line.
-# Can be a single string or a list.
-SCAN_FOLDERS: list = [
-    r"\\tower\media\comics\Comix",
-    r"\\tower\media\comics\Manga",
-]
-
+SCAN_FOLDER   = r"\\tower\media\comics\Comix"       # folder to scan
 LOG_FILE      = r"C:\ComicAutomation\cbz_sanitizer.log"
 PROGRESS_FILE = r"C:\ComicAutomation\cbz_sanitizer_progress.json"
-
-# Default sort order: newest | oldest | alpha
-DEFAULT_SORT  = "newest"
 ```
 
 ---
@@ -46,65 +21,74 @@ DEFAULT_SORT  = "newest"
 ## CLI Usage
 
 ```powershell
-# Scan all configured SCAN_FOLDERS, newest-modified dirs first
-python scripts\cbz_sanitizer.py
+# Run from the repo root:
+cd C:\Users\David.Johnson\ComicAutomation
 
-# Scan a specific path (overrides SCAN_FOLDERS)
-python scripts\cbz_sanitizer.py "L:\Comix"
-python scripts\cbz_sanitizer.py "\\tower\media\comics\Comix"
+python scripts\cbz_sanitizer.py                  # scan SCAN_FOLDER, newest-modified dirs first
+python scripts\cbz_sanitizer.py --sort=oldest    # oldest-modified dirs first
+python scripts\cbz_sanitizer.py --sort=alpha     # alphabetical order
+python scripts\cbz_sanitizer.py --resume         # resume an interrupted run
+python scripts\cbz_sanitizer.py --restart        # ignore saved progress, start fresh
+python scripts\cbz_sanitizer.py --dry-run        # log all planned changes, write nothing
+```
 
-# Sort order
-python scripts\cbz_sanitizer.py --sort=newest   # most recently modified first (default)
-python scripts\cbz_sanitizer.py --sort=oldest   # oldest modified first
-python scripts\cbz_sanitizer.py --sort=alpha    # alphabetical
+All flags can be combined:
 
-# Resume / restart
-python scripts\cbz_sanitizer.py --resume        # resume from saved progress
-python scripts\cbz_sanitizer.py --restart       # ignore saved progress, start fresh
-
-# Dry run
-python scripts\cbz_sanitizer.py --dry-run       # preview all changes without writing
-
-# Combine freely
-python scripts\cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
+```powershell
+python scripts\cbz_sanitizer.py --sort=oldest --dry-run
+python scripts\cbz_sanitizer.py --resume --sort=alpha
 ```
 
 ---
 
 ## Sort Modes
 
-| Mode | Order | Use case |
-|------|-------|---------|
-| `newest` | Most recently modified dirs first | Catch up after a batch import |
-| `oldest` | Oldest modified dirs first | Work through the archive chronologically |
-| `alpha` | Alphabetical by directory name | Deterministic; easy to audit |
+| Mode | Behaviour |
+|------|-----------|
+| *(default)* | Subdirectories sorted by modification time, **newest first** |
+| `--sort=oldest` | Subdirectories sorted by modification time, oldest first |
+| `--sort=alpha` | Subdirectories sorted alphabetically |
+
+Sorting applies at the subdirectory level. Files within each subdirectory are always processed in alphabetical order.
 
 ---
 
-## Progress Tracking
+## Progress & Resume
 
-Progress is stored in an append-only JSONL file — one line per completed file path.
+The progress file (`cbz_sanitizer_progress.json`) uses **append-only JSONL** — one JSON line is written per completed file immediately after processing. This means:
 
-- **O(1) write cost** — no full rewrite as the processed set grows.
-- **Crash-safe** — every file is persisted immediately after processing.
-- **Resumable** — `--resume` loads the file and skips already-processed paths.
-- The progress file is excluded from git via `.gitignore` (it's machine-local).
+- Interrupting a run (Ctrl-C, power loss, network drop) costs nothing to recover from.
+- Resuming skips all already-processed files in O(1) per lookup regardless of library size.
+- The progress file is excluded from git.
+
+On the next run, if a progress file exists and no flag is passed, the script interactively prompts:
+
+```
+  A progress file was found from a previous run.
+  [R] Resume from where it left off
+  [S] Start over from the beginning
+  Choice (R/S):
+```
+
+Pass `--resume` or `--restart` to skip the prompt.
 
 ---
 
 ## Processing Pipeline
 
-For each subdirectory under the scan target:
+For each `.cbz` file found:
 
-1. Clean the directory name via `clean_directory_name()`
-2. If the cleaned name collides with an existing directory, merge via `_merge_directories()`
-3. Pre-compute fallback names for any files whose cleaned stem would be empty
-4. For each `.cbz` file:
-   - `clean_filename()` — strip junk from the filename
-   - `normalize_stem()` — strip series-name prefix, fix generic stems
-   - `normalise_number_tokens()` — deduplicate chapter number tokens
-   - Rename the file on disk
-5. `process_comicinfo()` — read or create `ComicInfo.xml`; set `<Title>`, `<Series>`, `<Number>`, `<Volume>`
-6. `detect_and_fix_compilations()` — detect and fix compilation-range chapters within the directory
+1. **Filename cleaning** — applies `sanitize()` + `normalize_stem()` to the file's stem.
+2. **Rename** — renames the `.cbz` file if the cleaned name differs (pre-checks for `FileExistsError` before calling `Path.rename()`).
+3. **ComicInfo.xml** — creates one from the built-in template if absent, or reads the existing one.
+4. **Tag update** — sets `<Title>`, `<Series>`, `<Number>`, and `<Volume>` from the cleaned filename and directory name.
+5. **Archive rewrite** — if any tag or the XML itself changed, rewrites the archive, preserving the original compression type of every image member.
+6. **Directory rename** — after all files in a subdirectory are processed, renames the directory itself if its cleaned name differs.
 
-See [shared_pipeline.md](shared_pipeline.md) for details on the cleaning and ComicInfo logic.
+See [shared_pipeline.md](shared_pipeline.md) for the full `sanitize()` step breakdown and `ComicInfo.xml` tag logic.
+
+---
+
+## Logging
+
+Rotating log file at `LOG_FILE` (5 MB max, 3 backups). Also streams to stdout. Log entries include every rename, tag update, skip, and error with timestamps.

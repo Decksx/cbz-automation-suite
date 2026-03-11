@@ -22,7 +22,7 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ## Larger file wins on conflict
 
-**Decision:** When two files collide during a merge, the larger file is always kept.
+**Decision:** When two files collide during a merge or move, the larger file is always kept.
 
 **Why:** File size is a reliable proxy for scan quality — higher-resolution scans are almost always larger. This heuristic produces the right result without requiring human input on every conflict, which would make large-library merges impractical.
 
@@ -54,7 +54,7 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ## Four sanitizer variants collapsed into one script
 
-**Decision:** `Newest1st_cbz_sanitizer.py`, `Oldest_firstcbz_sanitizer.py`, and `Localcbz_sanitizer.py` were merged into `cbz_sanitizer.py` with `--sort` and path CLI flags.
+**Decision:** `Newest1st_cbz_sanitizer.py`, `Oldest_firstcbz_sanitizer.py`, and `Localcbz_sanitizer.py` were merged into `cbz_sanitizer.py` with `--sort` and `--resume`/`--restart` CLI flags.
 
 **Why:** The three variants were identical except for one line (the `sorted()` key/direction) and the `SCAN_FOLDER` value. Maintaining them separately meant any shared-function fix had to be applied four times. The merged script is strictly better: same capabilities, one place to maintain.
 
@@ -81,3 +81,19 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 **Decision:** The number tagger is a standalone script rather than a watcher feature.
 
 **Why:** The watcher already tags `<Number>` and `<Volume>` on ingest via `process_comicinfo()`. The tagger exists solely for retroactive tagging of files that predate the pipeline. Merging it into the watcher would conflate two different use cases.
+
+---
+
+## Regex patterns normalised between sanitizer and watcher
+
+**Decision:** All 20 shared compiled regex patterns between `cbz_sanitizer.py` and `cbz_watcher.py` are byte-for-byte identical. The dead `_CJK_RE` pattern (superseded by `_NON_LATIN_RE`) and the redundant raw-string `TITLE_OVERWRITE_PATTERNS` list (superseded by `_TITLE_OVERWRITE_RES`) were removed from both files.
+
+**Why:** Divergent patterns between the two main scripts is a maintenance hazard — a fix applied to one is silently absent from the other. Normalising them ensures the watcher and sanitizer produce identical output for the same input. The `_CJK_RE` removal also corrects behaviour: the old pattern stripped only CJK/full-width characters, while `_NON_LATIN_RE` correctly strips all non-Latin/non-Greek/non-emoji scripts (Arabic, Cyrillic, Thai, etc.) in a single pass.
+
+---
+
+## Non-Latin removal scope (step 5 of sanitize())
+
+**Decision:** Step 5 uses `_NON_LATIN_RE`, which preserves Basic Latin, Extended Latin (accented characters), Greek, general punctuation, and emoji — stripping everything else.
+
+**Why:** The original `_CJK_RE` only covered CJK unified ideographs and full-width forms. Comic filenames sourced from aggregator sites contain characters from many scripts (Arabic, Cyrillic, Thai, Devanagari, etc.), not just CJK. A single broad allowlist is simpler, more maintainable, and handles all cases correctly. Emoji and Greek are preserved because they appear legitimately in series titles and special characters.

@@ -7,10 +7,11 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 ## Design Principles
 
 - **Hands-off pipeline** — files dropped into a watch folder are processed and routed automatically.
-- **Resumable** — batch operations track progress in an append-only JSONL file; interrupting and restarting costs nothing.
-- **Non-destructive** — files are renamed in place, never silently deleted; conflicts keep the larger file.
-- **Windows-aware** — explicit handling for `FileExistsError` on rename, UNC paths, and watchdog event filtering.
+- **Resumable** — batch operations track progress in an append-only JSONL file; interrupting a long run costs nothing to recover from.
+- **Non-destructive** — files are renamed in place, never silently deleted; on any collision the larger file wins.
+- **Windows-aware** — explicit handling for `FileExistsError` on rename, UNC paths, and watchdog destination-folder event filtering.
 - **Dry-run everywhere** — all batch tools support `--dry-run` for safe previewing on large libraries.
+- **One canonical reference** — `scripts/cbz_sanitizer.py` owns all shared functions; other scripts sync from it rather than maintaining independent copies.
 
 ---
 
@@ -26,7 +27,7 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 - Python 3.8+
 - [`watchdog`](https://pypi.org/project/watchdog/) >= 3.0.0 — required by `cbz_watcher.py` **only**
 
-All other scripts use the Python standard library exclusively.
+All other scripts use the Python standard library exclusively (`zipfile`, `re`, `pathlib`, `logging`, `difflib`, `csv`, `json`, etc.).
 
 ```powershell
 pip install watchdog
@@ -36,36 +37,30 @@ pip install watchdog
 
 ## Tools at a Glance
 
-| Script | Purpose |
-|--------|---------|
-| [`scripts/cbz_watcher.py`](cbz_watcher.md) | Live watcher — monitors Incoming folder, cleans, tags, and routes files |
-| [`scripts/cbz_sanitizer.py`](cbz_sanitizer.md) | Batch sanitizer — in-place clean/tag with `--sort`, `--dry-run`, and multi-target CLI |
-| [`scripts/cbz_folder_merger.py`](other_tools.md#cbz_folder_mergerpy) | Merges colliding directories; keeps larger file on any conflict |
-| [`scripts/cbz_compilation_resolver.py`](other_tools.md#cbz_compilation_resolverpy) | Resolves compilation vs individual overlaps; rewrites with best pages |
-| [`scripts/cbz_number_tagger.py`](other_tools.md#cbz_number_taggerpy) | Sets `<Number>` and `<Volume>` ComicInfo tags from filenames — retroactive tool |
-| [`scripts/cbz_series_matcher.py`](other_tools.md#cbz_series_matcherpy) | Near-duplicate series name detector; auto-merges above threshold |
-| [`scripts/cbz_gap_checker.py`](other_tools.md#cbz_gap_checkerpy) | Scans library, outputs timestamped CSV of missing chapter numbers |
-| [`scripts/strip_duplicates.py`](other_tools.md#strip_duplicatespy) | Removes duplicate number tokens and fixes spaced punctuation; importable as a library |
-| `config/run_watcher.bat` | Double-click launcher — installs watchdog and starts the watcher |
-| `config/CBZWatcher_Task.xml` | Windows Task Scheduler import — auto-starts watcher on login |
+| Script | Purpose | Doc |
+|--------|---------|-----|
+| `scripts/cbz_watcher.py` | Live watcher — monitors Incoming folder, cleans, tags, and routes files | [cbz_watcher.md](cbz_watcher.md) |
+| `scripts/cbz_sanitizer.py` | Batch sanitizer — in-place clean/tag with `--sort`, `--resume`, `--dry-run` | [cbz_sanitizer.md](cbz_sanitizer.md) |
+| `scripts/cbz_folder_merger.py` | Merges colliding series directories; keeps larger file on conflict | [other_tools.md](other_tools.md#cbz_folder_mergerpy) |
+| `scripts/cbz_folder_merger_LDrive.py` | Local-drive variant of folder merger | [other_tools.md](other_tools.md#cbz_folder_merger_ldrivepy) |
+| `scripts/cbz_compilation_resolver.py` | Resolves compilation vs individual overlaps; rewrites with best pages | [other_tools.md](other_tools.md#cbz_compilation_resolverpy) |
+| `scripts/cbz_number_tagger.py` | Retroactively sets `<Number>` and `<Volume>` ComicInfo tags from filenames | [other_tools.md](other_tools.md#cbz_number_taggerpy) |
+| `scripts/cbz_series_matcher.py` | Near-duplicate series name detector; auto-merges above threshold | [other_tools.md](other_tools.md#cbz_series_matcherpy) |
+| `scripts/cbz_gap_checker.py` | Scans library, outputs timestamped CSV of missing chapter numbers | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
+| `scripts/strip_duplicates.py` | Removes duplicate number tokens and fixes spaced punctuation; importable as library | [other_tools.md](other_tools.md#strip_duplicatespy) |
+| `config/run_watcher.bat` | Double-click launcher — installs watchdog and starts the watcher | — |
+| `config/CBZWatcher_Task.xml` | Windows Task Scheduler import — auto-starts watcher on login | — |
 
 ---
 
 ## Running Scripts
 
-All scripts live in `scripts/`. Run them from the **repo root**:
+All scripts live in `scripts/`. Run from the **repo root**:
 
 ```powershell
 cd C:\Users\David.Johnson\ComicAutomation
 python scripts\cbz_sanitizer.py --dry-run
 python scripts\cbz_watcher.py
-```
-
-Or `cd scripts` and run them directly if you prefer:
-
-```powershell
-cd C:\Users\David.Johnson\ComicAutomation\scripts
-python cbz_sanitizer.py --dry-run
 ```
 
 ---
@@ -109,6 +104,7 @@ All tools write rotating logs (max 5 MB, 3 backups). Configure `LOG_FILE` at the
 |----------|--------|
 | `C:\ComicAutomation\cbz_watcher.log` | cbz_watcher.py |
 | `C:\ComicAutomation\cbz_sanitizer.log` | cbz_sanitizer.py |
+| `C:\ComicAutomation\cbz_folder_merger.log` | cbz_folder_merger.py |
 | `C:\ComicAutomation\cbz_compilation_resolver.log` | cbz_compilation_resolver.py |
 | `C:\ComicAutomation\cbz_series_matcher.log` | cbz_series_matcher.py |
 | `C:\ComicAutomation\cbz_number_tagger.log` | cbz_number_tagger.py |

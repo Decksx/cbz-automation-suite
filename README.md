@@ -10,19 +10,19 @@ A collection of Python scripts for monitoring, cleaning, tagging, and routing `.
 
 ```
 cbz-automation-suite/
-├── scripts/                        # All Python scripts — run from here
-│   ├── cbz_watcher.py
-│   ├── cbz_sanitizer.py
-│   ├── cbz_folder_merger.py
-│   ├── cbz_folder_merger_LDrive.py
-│   ├── cbz_compilation_resolver.py
-│   ├── cbz_number_tagger.py
-│   ├── cbz_series_matcher.py
-│   ├── cbz_gap_checker.py
-│   └── strip_duplicates.py
+├── scripts/
+│   ├── cbz_watcher.py              # Live watcher — main day-to-day tool
+│   ├── cbz_sanitizer.py            # Batch sanitizer — canonical shared-function reference
+│   ├── cbz_folder_merger.py        # Merge colliding series folders
+│   ├── cbz_folder_merger_LDrive.py # Local-drive variant of folder merger
+│   ├── cbz_compilation_resolver.py # Resolve compilation vs individual chapter overlaps
+│   ├── cbz_number_tagger.py        # Retroactively set <Number>/<Volume> tags
+│   ├── cbz_series_matcher.py       # Detect and merge near-duplicate series folders
+│   ├── cbz_gap_checker.py          # Report missing chapter numbers per series
+│   └── strip_duplicates.py         # Remove duplicate number tokens from filenames
 ├── config/
 │   ├── run_watcher.bat             # Double-click launcher
-│   └── CBZWatcher_Task.xml        # Windows Task Scheduler import
+│   └── CBZWatcher_Task.xml         # Windows Task Scheduler import
 ├── docs/
 │   ├── overview.md
 │   ├── cbz_sanitizer.md
@@ -41,32 +41,32 @@ cbz-automation-suite/
 
 | Script | Purpose |
 |--------|---------|
-| `cbz_watcher.py` | Live watcher — monitors an Incoming folder, cleans filenames, injects ComicInfo.xml metadata, and routes files to the correct destination |
-| `cbz_sanitizer.py` | Batch sanitizer — walks a library folder and applies the full cleaning/tagging pipeline in-place; supports sort order, multiple scan targets, resume, and dry-run via CLI flags |
-| `cbz_folder_merger.py` | Merges directories whose cleaned names collide; keeps the larger file on any conflict |
+| `cbz_watcher.py` | Live watcher — monitors an Incoming folder, cleans filenames, injects `ComicInfo.xml` metadata, and routes files to the correct destination |
+| `cbz_sanitizer.py` | Batch sanitizer — walks a library folder and applies the full cleaning/tagging pipeline in-place; supports `--sort`, `--resume`, `--restart`, and `--dry-run` |
+| `cbz_folder_merger.py` | Merges sibling directories whose cleaned names collide; keeps the larger file on any conflict |
 | `cbz_compilation_resolver.py` | Detects compilation/individual chapter overlaps; performs page-by-page quality comparison and rewrites compilations with the best pages |
-| `cbz_number_tagger.py` | Sets `<Number>` (chapter) and `<Volume>` tags in ComicInfo.xml based on the filename |
+| `cbz_number_tagger.py` | Sets `<Number>` and `<Volume>` tags in `ComicInfo.xml` from the filename — retroactive library tool |
 | `cbz_series_matcher.py` | Finds near-duplicate series folder names and auto-merges above a configurable similarity threshold |
-| `cbz_gap_checker.py` | Scans library folders and writes a CSV report of missing chapter numbers per series |
-| `strip_duplicates.py` | Removes duplicate number tokens and fixes oddly spaced punctuation in filenames |
+| `cbz_gap_checker.py` | Scans library folders and writes a timestamped CSV report of missing chapter numbers per series |
+| `strip_duplicates.py` | Removes duplicate number tokens and fixes oddly spaced punctuation in filenames; also importable as a library |
 
 ---
 
 ## Requirements
 
 - Python 3.8+
-- [`watchdog`](https://pypi.org/project/watchdog/) — required by `cbz_watcher.py` only; all other scripts use the standard library
+- [`watchdog`](https://pypi.org/project/watchdog/) >= 3.0.0 — required by `cbz_watcher.py` **only**; all other scripts use the standard library exclusively
 
-```bash
+```powershell
 pip install watchdog
-# or just double-click config\run_watcher.bat — it handles this automatically
+# or double-click config\run_watcher.bat — it installs watchdog and starts the watcher automatically
 ```
 
 ---
 
 ## Quick Start
 
-All scripts live in `scripts/`. Run them from the **repo root**:
+All scripts live in `scripts/`. Run them from the repo root:
 
 ```powershell
 cd C:\Users\David.Johnson\ComicAutomation
@@ -77,10 +77,11 @@ cd C:\Users\David.Johnson\ComicAutomation
 Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
-WATCH_FOLDER = r"C:\Comics\Incoming"
-LOG_FILE     = r"C:\ComicAutomation\cbz_watcher.log"
-DEFAULT_DEST = r"\\tower\media\comics\Comix"
+WATCH_FOLDER  = r"C:\Comics\Incoming"
+LOG_FILE      = r"C:\ComicAutomation\cbz_watcher.log"
+DEFAULT_DEST  = r"\\tower\media\comics\Comix"
 
+# Only list sources that need a NON-default destination
 SOURCE_ROUTING = {
     "manga-source": r"\\tower\media\comics\Manga",
 }
@@ -95,13 +96,12 @@ python scripts\cbz_watcher.py
 ### Batch Sanitize
 
 ```powershell
-python scripts\cbz_sanitizer.py                               # scan configured folders, newest first
-python scripts\cbz_sanitizer.py "L:\Comix"                    # specific path
+python scripts\cbz_sanitizer.py                               # scan SCAN_FOLDER, newest dirs first
 python scripts\cbz_sanitizer.py --sort=oldest                 # oldest-modified dirs first
 python scripts\cbz_sanitizer.py --sort=alpha                  # alphabetical
-python scripts\cbz_sanitizer.py --resume                      # resume interrupted run
-python scripts\cbz_sanitizer.py --dry-run                     # preview only
-python scripts\cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
+python scripts\cbz_sanitizer.py --resume                      # resume an interrupted run
+python scripts\cbz_sanitizer.py --restart                     # ignore saved progress, start fresh
+python scripts\cbz_sanitizer.py --dry-run                     # preview only, no changes written
 ```
 
 ### Other Tools
@@ -111,6 +111,7 @@ python scripts\cbz_number_tagger.py --dry-run
 python scripts\cbz_series_matcher.py --dry-run
 python scripts\cbz_gap_checker.py
 python scripts\cbz_compilation_resolver.py --dry-run
+python scripts\cbz_folder_merger.py --dry-run
 python scripts\strip_duplicates.py "C:\Comics" --recursive --dry-run
 ```
 
@@ -120,30 +121,32 @@ See [docs/other_tools.md](docs/other_tools.md) for full details on each.
 
 ## How It Works
 
-All tools share a common `sanitize()` pipeline that strips bracketed group tags, CJK characters, website patterns, scanner credits, and normalises whitespace. `ComicInfo.xml` is created or updated with `<Series>`, `<Title>`, `<Number>`, and `<Volume>` tags derived from the directory and filename.
+### Filename & Metadata Cleaning
 
-See [docs/shared_pipeline.md](docs/shared_pipeline.md) for the full pipeline breakdown.
+All tools share a common `sanitize()` pipeline (defined in `cbz_sanitizer.py`) that strips non-Latin/non-Greek/non-emoji characters (covering CJK, Arabic, Cyrillic, full-width forms, etc.), bracketed group and publisher tags, website patterns, scanner/scanlation credits, trailing G-code suffixes, and normalises whitespace. See [docs/shared_pipeline.md](docs/shared_pipeline.md) for the full step-by-step breakdown.
+
+`ComicInfo.xml` is created or updated with `<Title>`, `<Series>`, `<Number>`, and `<Volume>` tags derived from the filename and directory name.
 
 ### Routing (watcher only)
 
 ```
 WATCH_FOLDER/
-├── manga-source/     →  \\tower\media\comics\Manga
-└── anything-else/    →  \\tower\media\comics\Comix  (default)
+├── manga-source/     →  \\tower\media\comics\Manga   (SOURCE_ROUTING match)
+└── anything-else/    →  \\tower\media\comics\Comix   (DEFAULT_DEST fallback)
 ```
 
 ### Conflict Resolution
 
-On any filename collision during a merge, **the larger file is kept**.
+On any filename collision during a merge or move, **the larger file is always kept**.
 
 ---
 
 ## Notes
 
-- **Windows only** — path handling, network shares, and rename behaviour are Windows-specific.
+- **Windows only** — path handling, UNC share access, and rename behaviour are Windows-specific throughout.
 - `scripts\cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync from it.
-- `scripts\strip_duplicates.py` can also be used as an importable library: `from scripts.strip_duplicates import clean` (or `cd scripts` first).
-- Progress files (`*_progress.json`) are machine-local and excluded from git.
+- `scripts\strip_duplicates.py` is also importable as a library: `from strip_duplicates import clean`.
+- Progress files (`*_progress.json`) are machine-local and excluded from git via `.gitignore`.
 
 ---
 
@@ -151,9 +154,9 @@ On any filename collision during a merge, **the larger file is kept**.
 
 | Doc | Contents |
 |-----|---------|
-| [docs/overview.md](docs/overview.md) | Design principles, tools at a glance, repo structure, logs |
-| [docs/cbz_sanitizer.md](docs/cbz_sanitizer.md) | Full CLI reference, sort modes, progress tracking, processing pipeline |
-| [docs/cbz_watcher.md](docs/cbz_watcher.md) | Configuration, routing logic, processing pipeline, Windows notes |
-| [docs/other_tools.md](docs/other_tools.md) | merger, compilation resolver, number tagger, series matcher, gap checker, strip_duplicates |
-| [docs/shared_pipeline.md](docs/shared_pipeline.md) | sanitize() steps, ComicInfo tag logic, conflict resolution |
+| [docs/overview.md](docs/overview.md) | Design principles, all tools at a glance, repo structure, log paths |
+| [docs/cbz_sanitizer.md](docs/cbz_sanitizer.md) | Full CLI reference, sort modes, progress/resume system |
+| [docs/cbz_watcher.md](docs/cbz_watcher.md) | Configuration, routing logic, settle/age timers, Task Scheduler setup |
+| [docs/other_tools.md](docs/other_tools.md) | folder merger, compilation resolver, number tagger, series matcher, gap checker, strip_duplicates |
+| [docs/shared_pipeline.md](docs/shared_pipeline.md) | sanitize() steps, ComicInfo tag logic, archive rewriting, conflict resolution |
 | [docs/engineering_decisions.md](docs/engineering_decisions.md) | Rationale for non-obvious design choices |
