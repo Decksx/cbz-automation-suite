@@ -2,6 +2,8 @@
 
 A collection of Python scripts for monitoring, cleaning, tagging, and routing `.cbz` comic book archives on Windows. Designed to work against a network share (e.g. `\\tower\media\comics\`) or a local drive.
 
+📖 **[Full documentation in /docs](docs/overview.md)**
+
 ---
 
 ## Tools
@@ -23,18 +25,11 @@ A collection of Python scripts for monitoring, cleaning, tagging, and routing `.
 ## Requirements
 
 - Python 3.8+
-- [watchdog](https://pypi.org/project/watchdog/) — required by `cbz_watcher.py` only
-
-All other scripts use the Python standard library exclusively (`zipfile`, `re`, `pathlib`, `logging`, `difflib`, `csv`, `json`, etc.).
+- [`watchdog`](https://pypi.org/project/watchdog/) — required by `cbz_watcher.py` only; all other scripts use the standard library
 
 ```bash
 pip install watchdog
-```
-
-Or use the provided launcher which handles this automatically:
-
-```bat
-run_watcher.bat
+# or just double-click run_watcher.bat — it handles this automatically
 ```
 
 ---
@@ -50,91 +45,42 @@ WATCH_FOLDER = r"C:\Comics\Incoming"
 LOG_FILE     = r"C:\ComicAutomation\cbz_watcher.log"
 DEFAULT_DEST = r"\\tower\media\comics\Comix"
 
-# Only list sources that should route somewhere OTHER than DEFAULT_DEST
 SOURCE_ROUTING = {
     "manga-source": r"\\tower\media\comics\Manga",
 }
 ```
 
-Then run:
-
-```bash
+```
 python cbz_watcher.py
-# or double-click run_watcher.bat
 ```
 
-### Batch Sanitize a Library
+See [cbz_watcher.md](docs/cbz_watcher.md) for full details.
 
-Edit `SCAN_FOLDERS` in `cbz_sanitizer.py`, then:
+### Batch Sanitize
 
-```bash
-# Scan all configured folders, newest-modified directories first (default)
-python cbz_sanitizer.py
-
-# Scan a specific folder
-python cbz_sanitizer.py "\\tower\media\comics\Comix"
-
-# Scan a local drive path
-python cbz_sanitizer.py "L:\Comix"
-
-# Sort order variants
-python cbz_sanitizer.py --sort=newest     # most recently modified first (default)
-python cbz_sanitizer.py --sort=oldest     # oldest modified first
-python cbz_sanitizer.py --sort=alpha      # alphabetical
-
-# Resume an interrupted run
-python cbz_sanitizer.py --resume
-
-# Start over, ignoring saved progress
-python cbz_sanitizer.py --restart
-
-# Preview changes without writing anything
-python cbz_sanitizer.py --dry-run
-
-# Combine flags freely
+```
+python cbz_sanitizer.py                               # scan configured folders, newest first
+python cbz_sanitizer.py "L:\Comix"                    # specific path
+python cbz_sanitizer.py --sort=oldest                 # oldest-modified dirs first
+python cbz_sanitizer.py --sort=alpha                  # alphabetical
+python cbz_sanitizer.py --resume                      # resume interrupted run
+python cbz_sanitizer.py --dry-run                     # preview only
 python cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
 ```
 
-### Tag Chapter / Volume Numbers
+See [cbz_sanitizer.md](docs/cbz_sanitizer.md) for full details.
 
-```bash
-python cbz_number_tagger.py                                      # all configured folders
-python cbz_number_tagger.py "\\tower\media\comics\Comix\Batman"  # single series
-python cbz_number_tagger.py --dry-run                            # preview only
+### Other Tools
+
+```
+python cbz_number_tagger.py --dry-run
+python cbz_series_matcher.py --dry-run
+python cbz_gap_checker.py
+python cbz_compilation_resolver.py --dry-run
+python strip_duplicates.py "C:\Comics" --recursive --dry-run
 ```
 
-### Find Near-Duplicate Series Names
-
-```bash
-python cbz_series_matcher.py           # scan all configured folders
-python cbz_series_matcher.py --dry-run # preview merges without writing
-```
-
-### Check for Missing Chapters
-
-```bash
-python cbz_gap_checker.py                                        # all configured folders
-python cbz_gap_checker.py "\\tower\media\comics\Comix\Batman"    # single series
-```
-
-Outputs a timestamped CSV to `C:\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`.
-
-### Resolve Compilation / Individual Overlaps
-
-```bash
-python cbz_compilation_resolver.py                        # prompts for directory
-python cbz_compilation_resolver.py "C:\Comics\Batman"     # single series
-python cbz_compilation_resolver.py --dry-run              # preview only
-```
-
-### Clean Duplicate Number Tokens in Filenames
-
-```bash
-python strip_duplicates.py "C:\Comics\Batman"             # rename in place
-python strip_duplicates.py "C:\Comics\Batman" --dry-run   # preview
-python strip_duplicates.py "C:\Comics" --recursive        # walk subdirs
-python strip_duplicates.py --test                         # run self-tests
-```
+See [other_tools.md](docs/other_tools.md) for full details on each.
 
 ---
 
@@ -142,90 +88,40 @@ python strip_duplicates.py --test                         # run self-tests
 
 ### Filename & Metadata Cleaning
 
-All tools share a common `sanitize()` pipeline that removes:
-- Bracketed group/publisher tags: `[GroupName]`, `(Publisher)`
-- CJK / full-width characters
-- Website patterns: `www.site.com`, `site.net`
-- Scanner/group credits: words containing `scans` or `scanners` (e.g. `TheGuildScans`)
-- Redundant series-name prefixes in filenames
+All tools share a common `sanitize()` pipeline that strips bracketed group tags, CJK characters, website patterns, scanner credits, and normalises whitespace. `ComicInfo.xml` is created or updated with `<Series>`, `<Title>`, `<Number>`, and `<Volume>` tags derived from the directory and filename.
 
-### ComicInfo.xml Handling
-
-- If a `.cbz` has no `ComicInfo.xml`, one is created from a built-in template.
-- `<Title>` is replaced if it is missing, generic (e.g. `Chapter 12`), or matches a configurable overwrite pattern.
-- `<Series>`, `<Number>`, and `<Volume>` are set automatically from the folder name and filename.
-- Archive rewrites preserve the original compression type of every member — images are never re-compressed.
+See [shared_pipeline.md](docs/shared_pipeline.md) for the full pipeline breakdown.
 
 ### Routing (watcher only)
 
-The watcher reads the name of the immediate subfolder inside `WATCH_FOLDER` and looks it up in `SOURCE_ROUTING`. Anything not listed routes to `DEFAULT_DEST`.
-
 ```
-Incoming/
-├── manga-source/          →  \\tower\media\comics\Manga
-│   └── Some Series/
-│       └── ch01.cbz
-└── any-other-source/      →  \\tower\media\comics\Comix  (default)
-    └── Another Series/
-        └── ch01.cbz
+WATCH_FOLDER/
+├── manga-source/     →  \\tower\media\comics\Manga
+└── anything-else/    →  \\tower\media\comics\Comix  (default)
 ```
 
 ### Conflict Resolution
 
-When a destination folder already exists, `_merge_directories()` merges the incoming folder into it. On any file conflict, the **larger** file is kept.
-
-### Compilation Quality Resolution
-
-`cbz_compilation_resolver.py` compares pages between a compilation (e.g. `Batman Ch. 1-5.cbz`) and the matching individual chapter files. For each page position:
-- **PNG beats JPEG** regardless of file size
-- Otherwise **larger file size wins**
-
-If all individual chapters are present and at least one page is an upgrade, the compilation is rewritten with the best pages and the individual archives are moved to `C:\ComicAutomation\Processed\`.
-
-### Series Deduplication
-
-`cbz_series_matcher.py` normalises folder names (strips punctuation, lowercases) before comparing, so `Batman: Year One` and `Batman Year One` score as identical. Pairs at or above `AUTO_RENAME_THRESHOLD` (default `0.90`) are auto-merged; pairs between `0.80` and `0.90` are flagged in the log for manual review.
-
----
-
-## Logs
-
-All tools write rotating logs (max 5 MB, 3 backups). Configure `LOG_FILE` in each script.
-
-```
-C:\ComicAutomation\cbz_watcher.log
-C:\ComicAutomation\cbz_sanitizer.log
-C:\ComicAutomation\cbz_compilation_resolver.log
-C:\ComicAutomation\cbz_series_matcher.log
-C:\ComicAutomation\cbz_number_tagger.log
-C:\ComicAutomation\cbz_gap_checker.log
-C:\ComicAutomation\strip_duplicates.log
-```
-
----
-
-## File Structure
-
-```
-cbz-automation-suite/
-├── cbz_watcher.py                  # Live watcher (main tool)
-├── cbz_sanitizer.py                # Batch sanitizer — canonical shared-function reference
-├── cbz_folder_merger.py            # Folder merge utility
-├── cbz_compilation_resolver.py     # Compilation page-quality optimizer
-├── cbz_number_tagger.py            # Chapter/volume number tagger
-├── cbz_series_matcher.py           # Near-duplicate series name detector
-├── cbz_gap_checker.py              # Missing chapter gap reporter
-├── strip_duplicates.py             # Duplicate number / spacing cleaner
-├── run_watcher.bat                 # Windows convenience launcher
-├── requirements.txt                # watchdog only
-└── README.md
-```
+On any filename collision during a merge, **the larger file is kept**.
 
 ---
 
 ## Notes
 
 - **Windows only** — path handling, network shares, and rename behaviour are Windows-specific.
-- `cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync their shared functions from it.
+- `cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync from it.
 - `strip_duplicates.py` can also be used as an importable library: `from strip_duplicates import clean`.
-- The progress file used by `cbz_sanitizer.py` is append-only — one JSON line per completed file — so interrupting a 10,000-file run and resuming with `--resume` costs almost nothing.
+- Progress files (`*_progress.json`) are machine-local and excluded from git.
+
+---
+
+## Documentation
+
+| Doc | Contents |
+|-----|---------|
+| [docs/overview.md](docs/overview.md) | Design principles, tools at a glance, repo structure, logs |
+| [docs/cbz_sanitizer.md](docs/cbz_sanitizer.md) | Full CLI reference, sort modes, progress tracking, processing pipeline |
+| [docs/cbz_watcher.md](docs/cbz_watcher.md) | Configuration, routing logic, processing pipeline, Windows notes |
+| [docs/other_tools.md](docs/other_tools.md) | merger, compilation resolver, number tagger, series matcher, gap checker, strip_duplicates |
+| [docs/shared_pipeline.md](docs/shared_pipeline.md) | sanitize() steps, ComicInfo tag logic, conflict resolution |
+| [docs/engineering_decisions.md](docs/engineering_decisions.md) | Rationale for non-obvious design choices |
