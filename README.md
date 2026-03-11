@@ -9,10 +9,7 @@ A collection of Python scripts for monitoring, cleaning, tagging, and routing `.
 | Script | Purpose |
 |--------|---------|
 | `cbz_watcher.py` | Live watcher — monitors an Incoming folder, cleans filenames, injects ComicInfo.xml metadata, and routes files to the correct destination |
-| `cbz_sanitizer.py` | Batch sanitizer — walks an existing network share library and applies the same cleaning/tagging pipeline in-place |
-| `Localcbz_sanitizer.py` | Resumable sanitizer — same as above but for local drives; tracks progress to a JSON file so large runs can be interrupted and resumed |
-| `Newest1st_cbz_sanitizer.py` | Sanitizer variant — processes files newest-first within each directory |
-| `Oldest_firstcbz_sanitizer.py` | Sanitizer variant — processes files oldest-first within each directory |
+| `cbz_sanitizer.py` | Batch sanitizer — walks a library folder and applies the full cleaning/tagging pipeline in-place; supports sort order, multiple scan targets, resume, and dry-run via CLI flags |
 | `cbz_folder_merger.py` | Merges directories whose cleaned names collide; keeps the larger file on any conflict |
 | `cbz_compilation_resolver.py` | Detects compilation/individual chapter overlaps; performs page-by-page quality comparison and rewrites compilations with the best pages |
 | `cbz_number_tagger.py` | Sets `<Number>` (chapter) and `<Volume>` tags in ComicInfo.xml based on the filename |
@@ -66,21 +63,36 @@ python cbz_watcher.py
 # or double-click run_watcher.bat
 ```
 
-### Batch Sanitize a Network Share
+### Batch Sanitize a Library
 
-Edit `SCAN_FOLDER` in `cbz_sanitizer.py`, then:
+Edit `SCAN_FOLDERS` in `cbz_sanitizer.py`, then:
 
 ```bash
+# Scan all configured folders, newest-modified directories first (default)
 python cbz_sanitizer.py
-```
 
-### Batch Sanitize a Local Drive (Resumable)
+# Scan a specific folder
+python cbz_sanitizer.py "\\tower\media\comics\Comix"
 
-Edit `SCAN_FOLDER` in `Localcbz_sanitizer.py` to point at a local path (e.g. `L:\Comix`), then:
+# Scan a local drive path
+python cbz_sanitizer.py "L:\Comix"
 
-```bash
-python Localcbz_sanitizer.py           # start or resume
-python Localcbz_sanitizer.py --restart # ignore saved progress, start fresh
+# Sort order variants
+python cbz_sanitizer.py --sort=newest     # most recently modified first (default)
+python cbz_sanitizer.py --sort=oldest     # oldest modified first
+python cbz_sanitizer.py --sort=alpha      # alphabetical
+
+# Resume an interrupted run
+python cbz_sanitizer.py --resume
+
+# Start over, ignoring saved progress
+python cbz_sanitizer.py --restart
+
+# Preview changes without writing anything
+python cbz_sanitizer.py --dry-run
+
+# Combine flags freely
+python cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
 ```
 
 ### Tag Chapter / Volume Numbers
@@ -198,9 +210,6 @@ C:\ComicAutomation\strip_duplicates.log
 cbz-automation-suite/
 ├── cbz_watcher.py                  # Live watcher (main tool)
 ├── cbz_sanitizer.py                # Batch sanitizer — canonical shared-function reference
-├── Localcbz_sanitizer.py           # Resumable local-drive sanitizer
-├── Newest1st_cbz_sanitizer.py      # Sanitizer — newest files first
-├── Oldest_firstcbz_sanitizer.py    # Sanitizer — oldest files first
 ├── cbz_folder_merger.py            # Folder merge utility
 ├── cbz_compilation_resolver.py     # Compilation page-quality optimizer
 ├── cbz_number_tagger.py            # Chapter/volume number tagger
@@ -218,5 +227,5 @@ cbz-automation-suite/
 
 - **Windows only** — path handling, network shares, and rename behaviour are Windows-specific.
 - `cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync their shared functions from it.
-- The progress file used by `Localcbz_sanitizer.py` is append-only — one JSON line per completed file — so interrupting a 10,000-file run costs almost nothing to resume.
 - `strip_duplicates.py` can also be used as an importable library: `from strip_duplicates import clean`.
+- The progress file used by `cbz_sanitizer.py` is append-only — one JSON line per completed file — so interrupting a 10,000-file run and resuming with `--resume` costs almost nothing.

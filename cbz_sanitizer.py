@@ -5,6 +5,21 @@ Recursively scans a folder for .cbz files, processes each one
 but does NOT move or transfer anything when done.
 
 Use this to sanitize a batch of files already in their target location.
+
+Usage:
+    python cbz_sanitizer.py                        # scan SCAN_FOLDER, newest dirs first (default)
+    python cbz_sanitizer.py "C:/path/to/folder"    # scan a specific folder
+    python cbz_sanitizer.py --sort=oldest          # oldest-modified dirs first
+    python cbz_sanitizer.py --sort=alpha           # alphabetical order
+    python cbz_sanitizer.py --restart              # ignore saved progress, start fresh
+    python cbz_sanitizer.py --resume               # resume from saved progress
+    python cbz_sanitizer.py --dry-run              # preview changes without writing
+
+Sort modes:
+    newest  — subdirectories sorted by mtime descending (default, same as old cbz_sanitizer.py
+              and Newest1st_cbz_sanitizer.py)
+    oldest  — subdirectories sorted by mtime ascending (same as Oldest_firstcbz_sanitizer.py)
+    alpha   — subdirectories sorted alphabetically (same as Localcbz_sanitizer.py)
 """
 
 import os
@@ -25,9 +40,22 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 # CONFIGURATION — edit these as needed
 # ─────────────────────────────────────────────
-SCAN_FOLDER    = r"\\tower\media\comics\Comix"   # Folder to sanitize
+# Default folder(s) to scan when no path is given on the command line.
+# Can be a single path string or a list of path strings.
+SCAN_FOLDERS: list = [
+    r"\\tower\media\comics\Comix",
+    r"\\tower\media\comics\Manga",
+]
+
 LOG_FILE       = r"C:\ComicAutomation\cbz_sanitizer.log"
 PROGRESS_FILE  = r"C:\ComicAutomation\cbz_sanitizer_progress.json"
+
+# Default sort order for subdirectories.
+# Overridable via --sort=newest / --sort=oldest / --sort=alpha on the command line.
+#   newest — most recently modified first (default)
+#   oldest — oldest modified first
+#   alpha  — alphabetical
+DEFAULT_SORT   = "newest"
 # ─────────────────────────────────────────────
 
 COMICINFO_TEMPLATE = """<ComicInfo
@@ -1028,7 +1056,7 @@ def _patch_comicinfo_for_range(cbz_path: Path, start: float, end: float) -> None
 # ─────────────────────────────────────────────
 # DIRECTORY SANITIZING (no move)
 # ─────────────────────────────────────────────
-def sanitize_directory(dir_path: Path, processed: set, started: str) -> None:
+def sanitize_directory(dir_path: Path, processed: set, started: str, dry_run: bool = False) -> None:
     """
     Recursively find all immediate directories containing .cbz files,
     clean directory names, process all .cbz files inside each one.
@@ -1113,10 +1141,14 @@ def sanitize_directory(dir_path: Path, processed: set, started: str) -> None:
             override = fallback_names.get(cbz)
             if override:
                 log.info(f"    Empty stem fallback: '{cbz.name}' -> '{override}'")
-            result_path = process_cbz_file(cbz, override_name=override)
-            # Mark as done immediately — survives crashes mid-batch
-            processed.add(str(result_path))
-            save_progress(str(result_path))  # O(1) append, not full rewrite
+            if dry_run:
+                log.info(f"    [DRY RUN] Would process: {cbz.name}")
+                result_path = cbz
+            else:
+                result_path = process_cbz_file(cbz, override_name=override)
+                # Mark as done immediately — survives crashes mid-batch
+                processed.add(str(result_path))
+                save_progress(str(result_path))  # O(1) append, not full rewrite
             total_processed += 1
             if result_path.name != original_name:
                 total_renamed += 1
@@ -1147,20 +1179,55 @@ def sanitize_directory(dir_path: Path, processed: set, started: str) -> None:
 # ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
-def main():
-    scan_path = Path(SCAN_FOLDER)
+def _sort_subdirs(subdirs: list, sort_mode: str) -> list:
+    """Sort a list of directories according to sort_mode."""
+    if sort_mode == "oldest":
+        return sorted(subdirs, key=lambda d: d.stat().st_mtime)
+    elif sort_mode == "alpha":
+        return sorted(subdirs, key=lambda d: d.name.lower())
+    else:  # "newest" (default)
+        return sorted(subdirs, key=lambda d: d.stat().st_mtime, reverse=True)
 
-    if not scan_path.exists():
-        print(f"ERROR: Scan folder not found: {SCAN_FOLDER}")
-        return
+
+def main():
+    # ── Parse CLI arguments ───────────────────────────────────────
+    args     = sys.argv[1:]
+    restart  = "--restart" in args
+    resume   = "--resume"  in args
+    dry_run  = "--dry-run" in args
+
+    # --sort=newest / --sort=oldest / --sort=alpha
+    sort_mode = DEFAULT_SORT
+    for a in args:
+        if a.startswith("--sort="):
+            sort_mode = a.split("=", 1)[1].lower()
+            if sort_mode not in ("newest", "oldest", "alpha"):
+                print(f"ERROR: Unknown sort mode '{sort_mode}'. Use: newest, oldest, alpha")
+                return
+
+    # Positional args are target paths; everything else is a flag
+    path_args = [a for a in args if not a.startswith("--")]
+
+    # Resolve target folders: CLI paths > SCAN_FOLDERS config
+    if path_args:
+        scan_targets = [Path(p) for p in path_args]
+    else:
+        folders = SCAN_FOLDERS if isinstance(SCAN_FOLDERS, list) else [SCAN_FOLDERS]
+        scan_targets = [Path(f) for f in folders]
+
+    # Validate all targets exist before starting
+    for scan_path in scan_targets:
+        if not scan_path.exists():
+            print(f"ERROR: Scan folder not found: {scan_path}")
+            return
 
     # ── Determine resume / restart mode ──────────────────────────
-    args    = sys.argv[1:]
-    restart = "--restart" in args
-    resume  = "--resume"  in args
     progress_exists = Path(PROGRESS_FILE).exists()
 
-    if restart:
+    if dry_run:
+        processed = set()
+        log.info("  --dry-run flag: no files will be written.")
+    elif restart:
         processed = set()
         log.info("  --restart flag: ignoring any saved progress.")
     elif resume:
@@ -1181,28 +1248,33 @@ def main():
         processed = set()
 
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Always write a fresh header so the file exists from the start
-    init_progress_file(started)
+    if not dry_run:
+        init_progress_file(started)
 
     log.info("=" * 60)
-    log.info("CBZ Sanitizer started")
-    log.info(f"  Scanning : {SCAN_FOLDER}")
+    log.info("CBZ Sanitizer started" + (" [DRY RUN]" if dry_run else ""))
+    log.info(f"  Targets  : {[str(p) for p in scan_targets]}")
+    log.info(f"  Sort     : {sort_mode}")
     log.info(f"  Log      : {LOG_FILE}")
-    log.info(f"  Progress : {PROGRESS_FILE}")
+    if not dry_run:
+        log.info(f"  Progress : {PROGRESS_FILE}")
     log.info("=" * 60)
 
-    subdirs = sorted((d for d in scan_path.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
+    for scan_path in scan_targets:
+        subdirs = [d for d in scan_path.iterdir() if d.is_dir()]
+        subdirs = _sort_subdirs(subdirs, sort_mode)
 
-    if not subdirs:
-        sanitize_directory(scan_path, processed, started)
-    else:
-        for subdir in subdirs:
-            sanitize_directory(subdir, processed, started)
+        if not subdirs:
+            sanitize_directory(scan_path, processed, started, dry_run=dry_run)
+        else:
+            for subdir in subdirs:
+                sanitize_directory(subdir, processed, started, dry_run=dry_run)
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer complete.")
     log.info("=" * 60)
-    clear_progress()
+    if not dry_run:
+        clear_progress()
 
 
 if __name__ == "__main__":
