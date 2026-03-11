@@ -9,9 +9,12 @@ with the correct Series, Title, Number, and Volume tags derived from the
 filename.
 
 Usage:
-    python cbz_folder_merger.py                   # scans all SCAN_FOLDERS
-    python cbz_folder_merger.py "C:/path/Comix"   # scan one library root
-    python cbz_folder_merger.py --dry-run         # preview without writing
+    python cbz_folder_merger.py                              # interactive prompt to choose a path, or scan all SCAN_FOLDERS
+    python cbz_folder_merger.py "\\\\tower\\media\\Comix"    # UNC network path
+    python cbz_folder_merger.py "L:\\Comix"                  # local drive path
+    python cbz_folder_merger.py "C:\\Comics\\Batman"         # single series directory
+    python cbz_folder_merger.py --dry-run                    # preview without writing
+    python cbz_folder_merger.py "L:\\Comix" --dry-run        # local drive, preview only
 """
 
 import os
@@ -79,7 +82,6 @@ _CHAPTER_RE = re.compile(
     r')',
     re.IGNORECASE
 )
-_CHAPTER_NUMBER_RE = _CHAPTER_RE   # alias used by synced extract_chapter()
 
 # Matches volume number inside a filename stem
 _VOLUME_RE = re.compile(
@@ -133,49 +135,36 @@ _DIR_TRAILING_STUB_RE = re.compile(
     r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
 )
 
-# Matches 1 or 2 trailing punctuation characters that may distinguish otherwise
-# identical directory/file names (e.g. "Batman!" vs "Batman", "Title~" vs "Title")
-_TRAILING_PUNCT_RE = re.compile(r'[!\-~]{1,2}$')
-_LEADING_NUM_DASH_RE = re.compile(r'^\d+\s*-\s*')  # "1 - Title" / "001 - Title" leading index
-
 
 def sanitize(text: str) -> str:
-    """
-    Shared sanitization pipeline applied to filenames, directory names,
-    and XML fields (Title, Series). Steps in order:
+    """Sanitize pipeline: entities, URLs, scan-groups, trailing-slash, G-code,
+    non-Latin, brackets, stray brackets, underscores, collapse whitespace."""
+    text = html.unescape(text)
+    text = _URL_RE.sub("", text)
+    text = _SCAN_GROUP_RE.sub("", text)
+    text = _TRAILING_SLASH_RE.sub("", text)
+    text = _GCODE_RE.sub("", text)
+    text = _NON_LATIN_RE.sub("", text)
+    text = _BRACKET_RE.sub("", text)
+    text = _STRAY_RE.sub("", text)
+    text = text.replace("_", " ")
+    return _SPACES_RE.sub(" ", text).strip()
 
-      1. Decode XML/HTML entities (e.g. &amp; -> &, &apos; -> ', &lt; -> <)
-      2. Remove website URLs (http://, www., bare domain.tld)
-      3. Remove scanlator group names (words containing scan/scans/scanners/scanlation)
-      4. Strip trailing G-code suffix (e.g. "Batman G1234" -> "Batman")
-      5. Remove CJK (Asian language) characters  [regex, ~11x faster than char loop]
-      6. Remove [bracketed] and (parenthesised) groups in one pass
-      7. Strip any lone stray bracket/parenthesis characters left behind
-      8. Replace underscores with spaces
-      9. Collapse multiple spaces and strip leading/trailing whitespace
-    """
-    text = html.unescape(text)                    # 1. decode entities
-    text = _URL_RE.sub("", text)                  # 2. strip URLs/websites
-    text = _SCAN_GROUP_RE.sub("", text)           # 3. strip scan-group names
-    text = _TRAILING_SLASH_RE.sub("", text)        # 4. strip trailing slash(es)
-    text = _GCODE_RE.sub("", text)                 # 5. strip trailing G-code suffix
-    text = _NON_LATIN_RE.sub("", text)             # 6. strip non-Latin/non-Greek/non-emoji
-    text = _BRACKET_RE.sub("", text)              # 7. strip bracketed groups
-    text = _STRAY_RE.sub("", text)                # 8. strip stray brackets
-    text = text.replace("_", " ")                 # 9. underscores -> spaces
-    return _SPACES_RE.sub(" ", text).strip()      # 10. collapse whitespace
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
 def _fmt_num(n: float) -> str:
-    """Format a float chapter number as a clean string (1.0 -> '1', 1.5 -> '1.5')."""
     return str(int(n)) if n == int(n) else str(n)
+
+
 def get_base(dir_name: str) -> str | None:
     """
     Strip the trailing chapter/number token from a directory name.
-    Also strips a leading "# - " index prefix (e.g. "1 - Batman ch. 1" -> "batman")
-    so indexed dirs group correctly with non-indexed ones.
     Returns the normalised (lowercase, collapsed-spaces) base, or None if the
     name has no trailing number token (i.e. it's not an enumerated folder).
     """
-    dir_name = _LEADING_NUM_DASH_RE.sub('', dir_name).strip()
     m = _TRAILING_TOKEN_RE.search(dir_name)
     if not m:
         return None
@@ -213,25 +202,14 @@ def canonical_name(dir_names: list[str]) -> str:
     return best or dir_names[0]
 
 
-def extract_chapter(name: str) -> float | None:
-    """Extract chapter number from a filename stem (alias for detection logic)."""
-    m = _CHAPTER_NUMBER_RE.search(name)
+def extract_chapter(stem: str) -> float | None:
+    m = _CHAPTER_RE.search(stem)
     if m:
         val = next(g for g in m.groups() if g is not None)
         return float(val)
     return None
 
-# ─────────────────────────────────────────────
-# COMPILATION DETECTION
-# Detects chapter numbers that are likely concatenations of two
-# earlier chapter numbers (e.g. ch.12 in a series with ch.1 and ch.2)
-# and renames the file to use a hyphenated range (ch.1-2).
-# ─────────────────────────────────────────────
 
-_CHAPTER_TOKEN_RE = re.compile(
-    r'(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)',
-    re.IGNORECASE
-)
 def extract_volume(stem: str) -> str | None:
     m = _VOLUME_RE.search(stem)
     if m:
@@ -579,6 +557,8 @@ def _detect_compilation_candidates(
             results.append((suspect, found_start, found_end))
 
     return results
+
+
 def _rename_stem_for_compilation(stem: str, start: float, end: float) -> str:
     """
     Replace the chapter number in a filename stem with a hyphenated range.
@@ -592,6 +572,8 @@ def _rename_stem_for_compilation(stem: str, start: float, end: float) -> str:
 
     new_stem, n = _CHAPTER_TOKEN_RE.subn(_replacer, stem, count=1)
     return new_stem if n else f"{stem} {range_str}"
+
+
 def _update_comicinfo_range(xml: str, start: float, end: float) -> tuple[str, bool]:
     """
     Update the <Number> tag in xml to "start-end" format and add/update
@@ -614,32 +596,29 @@ def _update_comicinfo_range(xml: str, start: float, end: float) -> tuple[str, bo
         changed = True
 
     return xml, changed
+
+
 def detect_and_fix_compilations(
     series_dir: Path,
     dry_run: bool = False,
-    num_to_path: dict[float, Path] | None = None,
 ) -> int:
     """
-    Detect chapter numbers that appear to be compilations (e.g. ch.12 in a
-    series that has ch.1 and ch.2) and rename them to a hyphenated range
-    (ch.1-2), updating ComicInfo.xml to match.
-
-    num_to_path: optional pre-built {chapter_float: Path} mapping collected
-    during the main processing loop — avoids a second glob + regex scan of
-    the directory.  When None the map is built here from a fresh glob.
+    Scan all .cbz files in series_dir, detect any whose chapter number
+    appears to be a concatenation of two earlier chapter numbers, rename
+    those files to use a hyphenated range, and update their ComicInfo.xml.
 
     Returns the number of files renamed.
     """
-    if num_to_path is None:
-        # Build from scratch — used when called standalone (e.g. dry-run)
-        cbz_files = sorted(series_dir.glob("*.cbz"))
-        if len(cbz_files) < 2:
-            return 0
-        num_to_path = {}
-        for cbz in cbz_files:
-            ch = extract_chapter(cbz.stem)
-            if ch is not None:
-                num_to_path[ch] = cbz
+    cbz_files = sorted(series_dir.glob("*.cbz"))
+    if len(cbz_files) < 2:
+        return 0
+
+    # Build chapter-number → path map
+    num_to_path: dict[float, Path] = {}
+    for cbz in cbz_files:
+        ch = extract_chapter(cbz.stem)
+        if ch is not None:
+            num_to_path[ch] = cbz
 
     if len(num_to_path) < 2:
         return 0
@@ -691,51 +670,32 @@ def detect_and_fix_compilations(
         renamed += 1
 
     return renamed
-def _rewrite_comicinfo(cbz_path: Path, xml_entry_name: str, new_xml: str) -> None:
-    """
-    Atomically rewrite one ComicInfo.xml entry inside a CBZ with new_xml content.
-    All other entries are preserved with their original compression.
-    """
-    tmp_path = cbz_path.with_suffix(".tmp.cbz")
-    bak_path = cbz_path.with_suffix(".bak.cbz")
-    try:
-        with zipfile.ZipFile(cbz_path, "r") as zin,              zipfile.ZipFile(tmp_path, "w") as zout:
-            for item in zin.infolist():
-                if item.filename == xml_entry_name:
-                    zout.writestr(item, new_xml.encode("utf-8"))
-                else:
-                    zout.writestr(item, zin.read(item.filename),
-                                  compress_type=item.compress_type)
-        cbz_path.rename(bak_path)
-        tmp_path.rename(cbz_path)
-        if bak_path.exists():
-            bak_path.unlink()
-    except Exception as e:
-        log.error(f"    Failed to rewrite ComicInfo in {cbz_path.name}: {e}")
-        if tmp_path.exists():
-            tmp_path.unlink()
 
 
 def _patch_comicinfo_for_range(cbz_path: Path, start: float, end: float) -> None:
-    """
-    Update <Number> to "start-end" in a CBZ's ComicInfo.xml.
-    Reads the existing XML, applies _update_comicinfo_range, then delegates
-    the atomic zip rewrite to _write_cbz_with_comicinfo — no duplicated write logic.
-    """
+    """Read the zip, update <Number> to 'start-end', rewrite atomically."""
+    zip_entries: list[tuple] = []
+    real_name = None
+    xml       = None
+
     try:
         with zipfile.ZipFile(cbz_path, "r") as zin:
-            nl      = {n.lower(): n for n in zin.namelist()}
-            key     = next(
+            nl = {n.lower(): n for n in zin.namelist()}
+            key = next(
                 (k for k in nl if os.path.basename(k).lower() == "comicinfo.xml"),
                 None
             )
-            if not key:
-                log.info(f"    No ComicInfo.xml in {cbz_path.name} — skipping range patch.")
-                return
-            real_name = nl[key]
-            xml       = zin.read(real_name).decode("utf-8", errors="replace")
+            if key:
+                real_name = nl[key]
+                xml = zin.read(real_name).decode("utf-8", errors="replace")
+            for item in zin.infolist():
+                zip_entries.append((item, zin.read(item.filename)))
     except (zipfile.BadZipFile, OSError) as e:
         log.error(f"    Cannot read {cbz_path.name} for ComicInfo patch: {e}")
+        return
+
+    if xml is None:
+        log.info(f"    No ComicInfo.xml in {cbz_path.name} — skipping range patch.")
         return
 
     xml, changed = _update_comicinfo_range(xml, start, end)
@@ -743,40 +703,38 @@ def _patch_comicinfo_for_range(cbz_path: Path, start: float, end: float) -> None
         log.info(f"    ComicInfo already correct for range {_fmt_num(start)}-{_fmt_num(end)}.")
         return
 
-    log.info(
-        f"    ComicInfo updated: Number={_fmt_num(start)}-{_fmt_num(end)}"
-        f" in '{cbz_path.name}'"
-    )
-    _rewrite_comicinfo(cbz_path, real_name, xml)
+    tmp_path = cbz_path.with_suffix(".tmp.cbz")
+    bak_path = cbz_path.with_suffix(".bak.cbz")
+    try:
+        with zipfile.ZipFile(tmp_path, "w") as zout:
+            for item, data in zip_entries:
+                if item.filename == real_name:
+                    zout.writestr(item, xml.encode("utf-8"))
+                else:
+                    zout.writestr(item, data, compress_type=item.compress_type)
+        cbz_path.rename(bak_path)
+        tmp_path.rename(cbz_path)
+        bak_path.unlink(missing_ok=True)
+        log.info(
+            f"    ComicInfo updated: Number={_fmt_num(start)}-{_fmt_num(end)}"
+            f" in '{cbz_path.name}'"
+        )
+    except Exception as e:
+        log.error(f"    Failed to patch ComicInfo in {cbz_path.name}: {e}")
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 
 # ─────────────────────────────────────────────
-# DIRECTORY SANITIZING (no move)
+# SCAN AND GROUP
 # ─────────────────────────────────────────────
-def _punct_normalise(name: str) -> str:
-    """
-    Return a lowercase, punctuation-stripped key for fuzzy matching.
-    Strips a leading "# - " index prefix and up to 2 trailing punctuation
-    characters (!, -, ~, etc.) so that "1 - Batman!", "Batman!" and "Batman"
-    all map to the same key.
-    """
-    key = _LEADING_NUM_DASH_RE.sub('', name).strip()
-    key = re.sub(r'\s+', ' ', key).strip().lower()
-    key = _TRAILING_PUNCT_RE.sub('', key).rstrip()
-    return key
-
 
 def find_groups(library_root: Path) -> dict[str, list[Path]]:
     """
     Scan immediate subdirectories of library_root.
     Return a dict of {normalised_base: [Path, ...]} for groups of 2+ dirs
-    that share the same base name after:
-      1. Stripping the trailing chapter/number token (primary grouping), OR
-      2. Differing only by 1-2 trailing punctuation characters such as
-         !, -, or ~ (punctuation-near-duplicate grouping).
-         This also catches a punctuated dir that belongs to an existing
-         chapter-number group (e.g. "Naruto!" folds into "Naruto ch. 1/2").
+    that share the same base name after stripping the trailing number.
     """
     groups: dict[str, list[Path]] = defaultdict(list)
 
@@ -786,27 +744,6 @@ def find_groups(library_root: Path) -> dict[str, list[Path]]:
         base = get_base(d.name)
         if base:
             groups[base].append(d)
-
-    # ── Punctuation-near-duplicate pass ──────────────────────────────────
-    # Two sub-cases:
-    #   A) Two or more standalone dirs differ only by trailing punct
-    #      ("Batman" and "Batman!" both have no chapter token) — group them.
-    #   B) A standalone dir's punct-normalised name matches an existing
-    #      chapter-number group key ("Naruto!" -> key "naruto" matches the
-    #      "naruto" group from "Naruto ch. 1/2") — fold it in.
-    for d in sorted(library_root.iterdir()):
-        if not d.is_dir():
-            continue
-        # Only consider dirs that don't already belong to a chapter-number group
-        if get_base(d.name) is not None:
-            continue
-        key = _punct_normalise(d.name)
-        # Case B: punct key matches an existing group — fold this dir in
-        if key in groups and d not in groups[key]:
-            groups[key].append(d)
-            continue
-        # Case A: accumulate into a punct-keyed bucket for later grouping
-        groups[key].append(d)
 
     # Only return groups with 2+ members
     return {b: dirs for b, dirs in groups.items() if len(dirs) >= 2}
@@ -904,7 +841,36 @@ def main() -> None:
     args    = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry_run = "--dry-run" in sys.argv
 
-    targets = args if args else SCAN_FOLDERS
+    if args:
+        # Path(s) supplied on the command line — use them directly.
+        # Works for UNC shares (\\tower\...), local drives (L:\...), or any path.
+        targets = args
+    elif SCAN_FOLDERS:
+        # No CLI args: prompt the user so they can override without editing the script.
+        print()
+        print("  No path given. Choose an option:")
+        for i, folder in enumerate(SCAN_FOLDERS, start=1):
+            print(f"  [{i}] {folder}")
+        print(f"  [A] All of the above ({len(SCAN_FOLDERS)} folder(s))")
+        print("  [C] Enter a custom path (local drive or UNC share)")
+        choice = input("  Choice: ").strip().upper()
+
+        if choice == "A":
+            targets = SCAN_FOLDERS
+        elif choice == "C":
+            custom = input("  Path: ").strip().strip('"').strip("'")
+            if not custom:
+                print("  No path entered, exiting.")
+                return
+            targets = [custom]
+        elif choice.isdigit() and 1 <= int(choice) <= len(SCAN_FOLDERS):
+            targets = [SCAN_FOLDERS[int(choice) - 1]]
+        else:
+            print(f"  Unrecognised choice '{choice}', exiting.")
+            return
+    else:
+        print("  No SCAN_FOLDERS configured and no path given, exiting.")
+        return
 
     log.info("=" * 60)
     log.info("CBZ Folder Merger" + (" [DRY RUN]" if dry_run else ""))

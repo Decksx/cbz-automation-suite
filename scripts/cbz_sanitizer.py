@@ -27,7 +27,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 SCAN_FOLDER    = r"\\tower\media\comics\Comix"   # Folder to sanitize
 LOG_FILE       = r"C:\ComicAutomation\cbz_sanitizer.log"
-PROGRESS_FILE  = r"C:\ComicAutomation\cbz_sanitizer_progress.json"
+PROGRESS_FILE  = r"C:\Users\David.Johnson\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
 # ─────────────────────────────────────────────
 
 COMICINFO_TEMPLATE = """<ComicInfo
@@ -124,6 +124,17 @@ log = logging.getLogger(__name__)
 # CLEANING HELPERS
 # ─────────────────────────────────────────────
 # Compiled regex patterns for the sanitize() hot path
+_CJK_RE     = re.compile(
+    r'[\u4E00-\u9FFF'        # CJK Unified Ideographs
+    r'\u3400-\u4DBF'         # CJK Extension A
+    r'\u3000-\u303F'         # CJK Symbols & Punctuation
+    r'\u3040-\u309F'         # Hiragana
+    r'\u30A0-\u30FF'         # Katakana
+    r'\uFF00-\uFFEF'         # Halfwidth/Fullwidth Forms
+    r'\U00020000-\U0002A6DF' # CJK Extension B
+    r'\U0002A700-\U0002CEAF' # CJK Extensions C-F
+    r']'
+)
 _BRACKET_RE    = re.compile(r'\[[^\]]*\]|\([^)]*\)')  # [..] and (..) groups in one pass
 _STRAY_RE      = re.compile(r'[\[\]()]')                  # lone stray bracket/paren chars
 _SPACES_RE     = re.compile(r' {2,}')                       # multiple consecutive spaces
@@ -182,7 +193,7 @@ def sanitize(text: str) -> str:
       2. Remove website URLs (http://, www., bare domain.tld)
       3. Remove scanlator group names (words containing scan/scans/scanners/scanlation)
       4. Strip trailing G-code suffix (e.g. "Batman G1234" -> "Batman")
-      5. Strip non-Latin/non-Greek/non-emoji characters
+      5. Remove CJK (Asian language) characters  [regex, ~11x faster than char loop]
       6. Remove [bracketed] and (parenthesised) groups in one pass
       7. Strip any lone stray bracket/parenthesis characters left behind
       8. Replace underscores with spaces
@@ -1143,10 +1154,26 @@ def main():
         print(f"ERROR: Scan folder not found: {SCAN_FOLDER}")
         return
 
-    # ── Determine resume / restart mode ──────────────────────────
+    # ── Parse CLI flags ───────────────────────────────────────────
     args    = sys.argv[1:]
     restart = "--restart" in args
     resume  = "--resume"  in args
+    dry_run = "--dry-run" in args
+
+    # --sort=<mode>  (default: newest)
+    # Supported modes: newest | oldest | alpha | alpha-reverse
+    sort_mode = "newest"
+    for arg in args:
+        if arg.startswith("--sort="):
+            sort_mode = arg.split("=", 1)[1].strip().lower()
+            break
+
+    _VALID_SORTS = {"newest", "oldest", "alpha", "alpha-reverse"}
+    if sort_mode not in _VALID_SORTS:
+        print(f"ERROR: Unknown --sort mode '{sort_mode}'. "
+              f"Valid options: {', '.join(sorted(_VALID_SORTS))}")
+        return
+
     progress_exists = Path(PROGRESS_FILE).exists()
 
     if restart:
@@ -1173,14 +1200,41 @@ def main():
     # Always write a fresh header so the file exists from the start
     init_progress_file(started)
 
+    # ── Sort subdirectories ───────────────────────────────────────
+    _sort_labels = {
+        "newest":       "modification time, newest first",
+        "oldest":       "modification time, oldest first",
+        "alpha":        "alphabetical A→Z",
+        "alpha-reverse": "alphabetical Z→A",
+    }
+    if sort_mode == "newest":
+        subdirs = sorted(
+            (d for d in scan_path.iterdir() if d.is_dir()),
+            key=lambda d: d.stat().st_mtime, reverse=True
+        )
+    elif sort_mode == "oldest":
+        subdirs = sorted(
+            (d for d in scan_path.iterdir() if d.is_dir()),
+            key=lambda d: d.stat().st_mtime
+        )
+    elif sort_mode == "alpha":
+        subdirs = sorted(
+            (d for d in scan_path.iterdir() if d.is_dir()),
+            key=lambda d: d.name.lower()
+        )
+    else:  # alpha-reverse
+        subdirs = sorted(
+            (d for d in scan_path.iterdir() if d.is_dir()),
+            key=lambda d: d.name.lower(), reverse=True
+        )
+
     log.info("=" * 60)
     log.info("CBZ Sanitizer started")
     log.info(f"  Scanning : {SCAN_FOLDER}")
+    log.info(f"  Sort     : {_sort_labels[sort_mode]}")
     log.info(f"  Log      : {LOG_FILE}")
     log.info(f"  Progress : {PROGRESS_FILE}")
     log.info("=" * 60)
-
-    subdirs = sorted((d for d in scan_path.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
 
     if not subdirs:
         sanitize_directory(scan_path, processed, started)
