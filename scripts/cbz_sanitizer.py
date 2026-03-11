@@ -64,6 +64,8 @@ COMICINFO_TEMPLATE = """<ComicInfo
   <Title></Title>
   <Series></Series>
   <Number></Number>
+  <Volume></Volume>
+  <Publisher></Publisher>
   <Summary></Summary>
   <Writer></Writer>
   <Penciller></Penciller>
