@@ -4,7 +4,24 @@ Monitors a watch folder for new `.cbz` directories using [watchdog](https://pypi
 
 ---
 
+## Running
+
+```powershell
+# From the repo root
+python scripts\cbz_watcher.py
+
+# Or double-click the launcher (installs watchdog automatically)
+config\run_watcher.bat
+
+# Or import into Windows Task Scheduler for auto-start on login
+# Import: config\CBZWatcher_Task.xml
+```
+
+---
+
 ## Configuration
+
+Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER = r"C:\Temp\Mega\Mega Uploads\book2"   # Folder to monitor
@@ -21,18 +38,6 @@ SOURCE_ROUTING = {
     # ... 40+ manga sources pre-configured
 }
 ```
-
----
-
-## Running
-
-```
-python cbz_watcher.py
-# or double-click:
-run_watcher.bat
-```
-
-`run_watcher.bat` installs `watchdog` if missing and starts the watcher.
 
 ---
 
@@ -60,18 +65,29 @@ For each incoming directory, `process_and_move_directory()` runs:
 2. Group `.cbz` files by immediate parent directory
 3. For each subdirectory: clean name → rename on disk
 4. Pre-compute fallback names for files with empty cleaned stems
-5. For each `.cbz`:
-   - `clean_filename()` → `normalize_stem()` → `normalise_number_tokens()` → rename
+5. For each `.cbz`: `clean_filename()` → `normalize_stem()` → `normalise_number_tokens()` → rename
 6. `process_comicinfo()` — read or create `ComicInfo.xml`; set `<Title>`, `<Series>`, `<Number>`, `<Volume>`
 7. `_move_cbz_dir()` → `_merge_directories()` on destination conflict (larger file wins)
 
-See [Shared Pipeline](shared_pipeline.md) for details on the cleaning and ComicInfo logic.
+See [shared_pipeline.md](shared_pipeline.md) for details on the cleaning and ComicInfo logic.
 
 ---
 
 ## Number Tagging Note
 
 The watcher already performs `<Number>` and `<Volume>` tagging inside `process_comicinfo()` as part of its normal pipeline. [`cbz_number_tagger.py`](other_tools.md#cbz_number_taggerpy) is a **separate retroactive tool** for files that were added before the watcher was running — it is not a duplicate.
+
+---
+
+## Windows Task Scheduler
+
+To auto-start the watcher on login, import `config\CBZWatcher_Task.xml` into Task Scheduler:
+
+```powershell
+schtasks /create /xml "config\CBZWatcher_Task.xml" /tn "CBZWatcher"
+```
+
+The task runs `python scripts\cbz_watcher.py` with `C:\Users\David.Johnson\ComicAutomation` as the working directory.
 
 ---
 

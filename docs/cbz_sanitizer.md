@@ -6,9 +6,25 @@ This is also the **canonical reference implementation** for all shared functions
 
 ---
 
+## Running
+
+From the repo root:
+
+```powershell
+python scripts\cbz_sanitizer.py [path] [flags]
+```
+
+Or from inside `scripts\`:
+
+```powershell
+python cbz_sanitizer.py [path] [flags]
+```
+
+---
+
 ## Configuration
 
-Edit the constants at the top of the file:
+Edit the constants at the top of `scripts\cbz_sanitizer.py`:
 
 ```python
 # Default folder(s) to scan when no path is given on the command line.
@@ -29,26 +45,29 @@ DEFAULT_SORT  = "newest"
 
 ## CLI Usage
 
+```powershell
+# Scan all configured SCAN_FOLDERS, newest-modified dirs first
+python scripts\cbz_sanitizer.py
+
+# Scan a specific path (overrides SCAN_FOLDERS)
+python scripts\cbz_sanitizer.py "L:\Comix"
+python scripts\cbz_sanitizer.py "\\tower\media\comics\Comix"
+
+# Sort order
+python scripts\cbz_sanitizer.py --sort=newest   # most recently modified first (default)
+python scripts\cbz_sanitizer.py --sort=oldest   # oldest modified first
+python scripts\cbz_sanitizer.py --sort=alpha    # alphabetical
+
+# Resume / restart
+python scripts\cbz_sanitizer.py --resume        # resume from saved progress
+python scripts\cbz_sanitizer.py --restart       # ignore saved progress, start fresh
+
+# Dry run
+python scripts\cbz_sanitizer.py --dry-run       # preview all changes without writing
+
+# Combine freely
+python scripts\cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
 ```
-python cbz_sanitizer.py                              # scan SCAN_FOLDERS, newest dirs first
-python cbz_sanitizer.py "L:\Comix"                   # scan a specific path
-python cbz_sanitizer.py "\\tower\media\comics\Comix"  # scan a UNC path
-
-python cbz_sanitizer.py --sort=newest                # most recently modified first (default)
-python cbz_sanitizer.py --sort=oldest                # oldest modified first
-python cbz_sanitizer.py --sort=alpha                 # alphabetical
-
-python cbz_sanitizer.py --resume                     # resume from saved progress
-python cbz_sanitizer.py --restart                    # ignore saved progress, start fresh
-python cbz_sanitizer.py --dry-run                    # preview changes without writing
-
-# Flags combine freely
-python cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
-```
-
-### Positional path argument
-
-Passing a path overrides `SCAN_FOLDERS` entirely for that run. Useful for targeting a single series or a local drive without editing the config.
 
 ---
 
@@ -56,9 +75,9 @@ Passing a path overrides `SCAN_FOLDERS` entirely for that run. Useful for target
 
 | Mode | Order | Use case |
 |------|-------|---------|
-| `newest` | Most recently modified dirs first | Catch up after a batch import — processes new additions before the backlog |
+| `newest` | Most recently modified dirs first | Catch up after a batch import |
 | `oldest` | Oldest modified dirs first | Work through the archive chronologically |
-| `alpha` | Alphabetical by directory name | Deterministic; easy to audit or compare runs |
+| `alpha` | Alphabetical by directory name | Deterministic; easy to audit |
 
 ---
 
@@ -88,4 +107,4 @@ For each subdirectory under the scan target:
 5. `process_comicinfo()` — read or create `ComicInfo.xml`; set `<Title>`, `<Series>`, `<Number>`, `<Volume>`
 6. `detect_and_fix_compilations()` — detect and fix compilation-range chapters within the directory
 
-See [Shared Pipeline](shared_pipeline.md) for details on the cleaning and ComicInfo logic.
+See [shared_pipeline.md](shared_pipeline.md) for details on the cleaning and ComicInfo logic.

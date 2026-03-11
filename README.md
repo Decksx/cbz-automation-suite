@@ -6,6 +6,37 @@ A collection of Python scripts for monitoring, cleaning, tagging, and routing `.
 
 ---
 
+## Repository Structure
+
+```
+cbz-automation-suite/
+├── scripts/                        # All Python scripts — run from here
+│   ├── cbz_watcher.py
+│   ├── cbz_sanitizer.py
+│   ├── cbz_folder_merger.py
+│   ├── cbz_folder_merger_LDrive.py
+│   ├── cbz_compilation_resolver.py
+│   ├── cbz_number_tagger.py
+│   ├── cbz_series_matcher.py
+│   ├── cbz_gap_checker.py
+│   └── strip_duplicates.py
+├── config/
+│   ├── run_watcher.bat             # Double-click launcher
+│   └── CBZWatcher_Task.xml        # Windows Task Scheduler import
+├── docs/
+│   ├── overview.md
+│   ├── cbz_sanitizer.md
+│   ├── cbz_watcher.md
+│   ├── other_tools.md
+│   ├── shared_pipeline.md
+│   ├── engineering_decisions.md
+│   └── CBZ_Automation_Suite_Documentation.docx
+├── README.md
+└── requirements.txt
+```
+
+---
+
 ## Tools
 
 | Script | Purpose |
@@ -18,7 +49,6 @@ A collection of Python scripts for monitoring, cleaning, tagging, and routing `.
 | `cbz_series_matcher.py` | Finds near-duplicate series folder names and auto-merges above a configurable similarity threshold |
 | `cbz_gap_checker.py` | Scans library folders and writes a CSV report of missing chapter numbers per series |
 | `strip_duplicates.py` | Removes duplicate number tokens and fixes oddly spaced punctuation in filenames |
-| `run_watcher.bat` | Windows launcher — installs `watchdog` and starts `cbz_watcher.py` |
 
 ---
 
@@ -29,16 +59,22 @@ A collection of Python scripts for monitoring, cleaning, tagging, and routing `.
 
 ```bash
 pip install watchdog
-# or just double-click run_watcher.bat — it handles this automatically
+# or just double-click config\run_watcher.bat — it handles this automatically
 ```
 
 ---
 
 ## Quick Start
 
+All scripts live in `scripts/`. Run them from the **repo root**:
+
+```powershell
+cd C:\Users\David.Johnson\ComicAutomation
+```
+
 ### Live Watcher
 
-Edit the constants at the top of `cbz_watcher.py`:
+Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER = r"C:\Comics\Incoming"
@@ -50,47 +86,43 @@ SOURCE_ROUTING = {
 }
 ```
 
+```powershell
+python scripts\cbz_watcher.py
+# or double-click config\run_watcher.bat
+# or import config\CBZWatcher_Task.xml into Task Scheduler for auto-start on login
 ```
-python cbz_watcher.py
-```
-
-See [cbz_watcher.md](docs/cbz_watcher.md) for full details.
 
 ### Batch Sanitize
 
+```powershell
+python scripts\cbz_sanitizer.py                               # scan configured folders, newest first
+python scripts\cbz_sanitizer.py "L:\Comix"                    # specific path
+python scripts\cbz_sanitizer.py --sort=oldest                 # oldest-modified dirs first
+python scripts\cbz_sanitizer.py --sort=alpha                  # alphabetical
+python scripts\cbz_sanitizer.py --resume                      # resume interrupted run
+python scripts\cbz_sanitizer.py --dry-run                     # preview only
+python scripts\cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
 ```
-python cbz_sanitizer.py                               # scan configured folders, newest first
-python cbz_sanitizer.py "L:\Comix"                    # specific path
-python cbz_sanitizer.py --sort=oldest                 # oldest-modified dirs first
-python cbz_sanitizer.py --sort=alpha                  # alphabetical
-python cbz_sanitizer.py --resume                      # resume interrupted run
-python cbz_sanitizer.py --dry-run                     # preview only
-python cbz_sanitizer.py "L:\Comix" --sort=oldest --dry-run
-```
-
-See [cbz_sanitizer.md](docs/cbz_sanitizer.md) for full details.
 
 ### Other Tools
 
-```
-python cbz_number_tagger.py --dry-run
-python cbz_series_matcher.py --dry-run
-python cbz_gap_checker.py
-python cbz_compilation_resolver.py --dry-run
-python strip_duplicates.py "C:\Comics" --recursive --dry-run
+```powershell
+python scripts\cbz_number_tagger.py --dry-run
+python scripts\cbz_series_matcher.py --dry-run
+python scripts\cbz_gap_checker.py
+python scripts\cbz_compilation_resolver.py --dry-run
+python scripts\strip_duplicates.py "C:\Comics" --recursive --dry-run
 ```
 
-See [other_tools.md](docs/other_tools.md) for full details on each.
+See [docs/other_tools.md](docs/other_tools.md) for full details on each.
 
 ---
 
 ## How It Works
 
-### Filename & Metadata Cleaning
-
 All tools share a common `sanitize()` pipeline that strips bracketed group tags, CJK characters, website patterns, scanner credits, and normalises whitespace. `ComicInfo.xml` is created or updated with `<Series>`, `<Title>`, `<Number>`, and `<Volume>` tags derived from the directory and filename.
 
-See [shared_pipeline.md](docs/shared_pipeline.md) for the full pipeline breakdown.
+See [docs/shared_pipeline.md](docs/shared_pipeline.md) for the full pipeline breakdown.
 
 ### Routing (watcher only)
 
@@ -109,8 +141,8 @@ On any filename collision during a merge, **the larger file is kept**.
 ## Notes
 
 - **Windows only** — path handling, network shares, and rename behaviour are Windows-specific.
-- `cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync from it.
-- `strip_duplicates.py` can also be used as an importable library: `from strip_duplicates import clean`.
+- `scripts\cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync from it.
+- `scripts\strip_duplicates.py` can also be used as an importable library: `from scripts.strip_duplicates import clean` (or `cd scripts` first).
 - Progress files (`*_progress.json`) are machine-local and excluded from git.
 
 ---

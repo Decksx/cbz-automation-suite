@@ -26,9 +26,9 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 - Python 3.8+
 - [`watchdog`](https://pypi.org/project/watchdog/) >= 3.0.0 — required by `cbz_watcher.py` **only**
 
-All other scripts use the Python standard library exclusively (`zipfile`, `re`, `pathlib`, `logging`, `difflib`, `csv`, `json`, etc.).
+All other scripts use the Python standard library exclusively.
 
-```
+```powershell
 pip install watchdog
 ```
 
@@ -38,15 +38,35 @@ pip install watchdog
 
 | Script | Purpose |
 |--------|---------|
-| [`cbz_watcher.py`](cbz_watcher.md) | Live watcher — monitors Incoming folder, cleans, tags, and routes files |
-| [`cbz_sanitizer.py`](cbz_sanitizer.md) | Batch sanitizer — in-place clean/tag with `--sort`, `--dry-run`, and multi-target CLI |
-| [`cbz_folder_merger.py`](other_tools.md#cbz_folder_mergerpy) | Merges colliding directories; keeps larger file on any conflict |
-| [`cbz_compilation_resolver.py`](other_tools.md#cbz_compilation_resolverpy) | Resolves compilation vs individual overlaps; rewrites with best pages |
-| [`cbz_number_tagger.py`](other_tools.md#cbz_number_taggerpy) | Sets `<Number>` and `<Volume>` ComicInfo tags from filenames — retroactive tool |
-| [`cbz_series_matcher.py`](other_tools.md#cbz_series_matcherpy) | Near-duplicate series name detector; auto-merges above threshold |
-| [`cbz_gap_checker.py`](other_tools.md#cbz_gap_checkerpy) | Scans library, outputs timestamped CSV of missing chapter numbers |
-| [`strip_duplicates.py`](other_tools.md#strip_duplicatespy) | Removes duplicate number tokens and fixes spaced punctuation; importable as a library |
-| `run_watcher.bat` | Windows launcher — installs watchdog and starts `cbz_watcher.py` |
+| [`scripts/cbz_watcher.py`](cbz_watcher.md) | Live watcher — monitors Incoming folder, cleans, tags, and routes files |
+| [`scripts/cbz_sanitizer.py`](cbz_sanitizer.md) | Batch sanitizer — in-place clean/tag with `--sort`, `--dry-run`, and multi-target CLI |
+| [`scripts/cbz_folder_merger.py`](other_tools.md#cbz_folder_mergerpy) | Merges colliding directories; keeps larger file on any conflict |
+| [`scripts/cbz_compilation_resolver.py`](other_tools.md#cbz_compilation_resolverpy) | Resolves compilation vs individual overlaps; rewrites with best pages |
+| [`scripts/cbz_number_tagger.py`](other_tools.md#cbz_number_taggerpy) | Sets `<Number>` and `<Volume>` ComicInfo tags from filenames — retroactive tool |
+| [`scripts/cbz_series_matcher.py`](other_tools.md#cbz_series_matcherpy) | Near-duplicate series name detector; auto-merges above threshold |
+| [`scripts/cbz_gap_checker.py`](other_tools.md#cbz_gap_checkerpy) | Scans library, outputs timestamped CSV of missing chapter numbers |
+| [`scripts/strip_duplicates.py`](other_tools.md#strip_duplicatespy) | Removes duplicate number tokens and fixes spaced punctuation; importable as a library |
+| `config/run_watcher.bat` | Double-click launcher — installs watchdog and starts the watcher |
+| `config/CBZWatcher_Task.xml` | Windows Task Scheduler import — auto-starts watcher on login |
+
+---
+
+## Running Scripts
+
+All scripts live in `scripts/`. Run them from the **repo root**:
+
+```powershell
+cd C:\Users\David.Johnson\ComicAutomation
+python scripts\cbz_sanitizer.py --dry-run
+python scripts\cbz_watcher.py
+```
+
+Or `cd scripts` and run them directly if you prefer:
+
+```powershell
+cd C:\Users\David.Johnson\ComicAutomation\scripts
+python cbz_sanitizer.py --dry-run
+```
 
 ---
 
@@ -54,26 +74,29 @@ pip install watchdog
 
 ```
 cbz-automation-suite/
-├── cbz_watcher.py
-├── cbz_sanitizer.py                # Canonical shared-function reference
-├── cbz_folder_merger.py
-├── cbz_folder_merger_LDrive.py
-├── cbz_compilation_resolver.py
-├── cbz_number_tagger.py
-├── cbz_series_matcher.py
-├── cbz_gap_checker.py
-├── strip_duplicates.py
-├── run_watcher.bat
-├── requirements.txt
+├── scripts/
+│   ├── cbz_watcher.py
+│   ├── cbz_sanitizer.py            # Canonical shared-function reference
+│   ├── cbz_folder_merger.py
+│   ├── cbz_folder_merger_LDrive.py
+│   ├── cbz_compilation_resolver.py
+│   ├── cbz_number_tagger.py
+│   ├── cbz_series_matcher.py
+│   ├── cbz_gap_checker.py
+│   └── strip_duplicates.py
+├── config/
+│   ├── run_watcher.bat
+│   └── CBZWatcher_Task.xml
+├── docs/
+│   ├── overview.md                 ← this file
+│   ├── cbz_sanitizer.md
+│   ├── cbz_watcher.md
+│   ├── other_tools.md
+│   ├── shared_pipeline.md
+│   ├── engineering_decisions.md
+│   └── CBZ_Automation_Suite_Documentation.docx
 ├── README.md
-├── CBZ_Automation_Suite_Documentation.docx
-└── docs/
-    ├── overview.md                 # This file
-    ├── cbz_sanitizer.md
-    ├── cbz_watcher.md
-    ├── other_tools.md
-    ├── shared_pipeline.md
-    └── engineering_decisions.md
+└── requirements.txt
 ```
 
 ---
