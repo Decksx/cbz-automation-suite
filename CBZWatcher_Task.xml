@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Import this into Windows Task Scheduler to auto-run the CBZ watcher on login.
+  Steps:
+    1. Open Task Scheduler
+    2. Click "Import Task..." in the right panel
+    3. Select this file
+    4. Update the <WorkingDirectory> and <Command> paths to match where you saved cbz_watcher.py
+    5. Click OK
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>python</Command>
+      <Arguments>cbz_watcher.py</Arguments>
+      <!-- UPDATE THIS PATH to wherever you saved cbz_watcher.py -->
+      <WorkingDirectory>C:\Comics</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
