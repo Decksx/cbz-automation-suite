@@ -110,13 +110,6 @@ COMICINFO_TEMPLATE = """<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
 # ─────────────────────────────────────────────
 # Titles/filenames matching these patterns are treated as generic
 # and may be overwritten by the title logic.
-TITLE_OVERWRITE_PATTERNS = [
-    r"manga_chapter",
-    r"#\s*english",
-    r"^chapter",
-    r"^part\s+\d+",
-    r"doujinshi_chapter",
-]
 _TITLE_OVERWRITE_RES = [
     re.compile(r"manga_chapter",          re.IGNORECASE),
     re.compile(r"^#\s*english",           re.IGNORECASE),
@@ -162,30 +155,46 @@ log = logging.getLogger(__name__)
 _BRACKET_RE       = re.compile(r'\[[^\]]*\]|\([^)]*\)')
 _STRAY_RE         = re.compile(r'[\[\]()]')
 _SPACES_RE        = re.compile(r' {2,}')
-_URL_RE           = re.compile(
-    r'(?:https?://\S+)|(?:www\.\S+)' +
-    r'|(?:\b[\w-]+\.(?:com|net|org|io|co|info|biz|tv|me|cc|us|uk|ca|au)(?:/\S*)?)'
-    , re.IGNORECASE)
-_SCAN_GROUP_RE    = re.compile(
-    r'\b[\w-]*scans?\b|\b[\w-]*scanners?\b|\b[\w-]*scanlations?\b', re.IGNORECASE)
+_URL_RE           = re.compile(                                 # website URLs to strip from filenames/titles
+    r'(?:https?://\S+)'
+    r'|(?:www\.\S+)'
+    r'|(?:\b[\w-]+\.(?:com|net|org|io|co|info|biz|tv|me|cc|us|uk|ca|au)(?:/\S*)?)',
+    re.IGNORECASE
+)
+_SCAN_GROUP_RE    = re.compile(                                 # scanlator/scan-group names to strip
+    r'\b[\w-]*scans?\b|\b[\w-]*scanners?\b|\b[\w-]*scanlations?\b',
+    re.IGNORECASE
+)
 _GCODE_RE         = re.compile(r'[\s\-]*\bG\d{3,5}$')
 _TRAILING_SLASH_RE = re.compile(r'[\s/]+$')
 _NON_LATIN_RE     = re.compile(
-    r'[^\u0000-\u024F'
-    r'\u0370-\u03FF'
-    r'\u2000-\u206F'
-    r'\u2600-\u27BF'
-    r'\uFE00-\uFE0F'
-    r'\U0001F300-\U0001FAFF'
+    r'[^\u0000-\u024F'        # Basic + Extended Latin
+    r'\u0370-\u03FF'          # Greek
+    r'\u2000-\u206F'          # General Punctuation (en/em dash, ellipsis, curly quotes)
+    r'\u2600-\u27BF'          # Misc Symbols + Dingbats
+    r'\uFE00-\uFE0F'          # Variation Selectors (emoji presentation)
+    r'\U0001F300-\U0001FAFF'  # Emoji / Supplemental Symbols and Pictographs
     r']+'
-)
-_NUM_TOKEN_RE     = re.compile(
-    r'((?:ch(?:ap(?:ter)?)?p?|issue|ep(?:isode)?|vol(?:ume)?|v(?=\d))\.?\s*)(\d[\d.]*)',
-    re.IGNORECASE
+)                              # non-Latin / non-Greek / non-emoji characters to strip
+_NUM_TOKEN_RE     = re.compile(                              # leading-zero / .0 number normalisation
+    r'''
+    (                                           # group 1: keyword + separator
+        (?:
+            ch(?:ap(?:ter)?)?p?                 # ch / chap / chapter / chp
+          | issue
+          | ep(?:isode)?                        # ep / episode
+          | vol(?:ume)?                         # vol / volume
+          | v(?=\d)                             # bare 'v' immediately before digits
+        )
+        \.?\s*
+    )
+    (\d[\d.]*)                                  # group 2: the raw number
+    ''',
+    re.IGNORECASE | re.VERBOSE
 )
 _DIR_LEADING_HASH_RE  = re.compile(r'^#+\s*')
 _DIR_TRAILING_HASH_RE = re.compile(r'\s*#+$')
-_DIR_TRAILING_STUB_RE = re.compile(
+_DIR_TRAILING_STUB_RE = re.compile(                         # dangling trailing tokens with no number
     r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE)
 
 
@@ -198,7 +207,7 @@ def sanitize(text: str) -> str:
       2. Remove website URLs (http://, www., bare domain.tld)
       3. Remove scanlator group names (words containing scan/scans/scanners/scanlation)
       4. Strip trailing G-code suffix (e.g. "Batman G1234" -> "Batman")
-      5. Remove CJK (Asian language) characters  [regex, ~11x faster than char loop]
+      5. Strip non-Latin/non-Greek/non-emoji characters
       6. Remove [bracketed] and (parenthesised) groups in one pass
       7. Strip any lone stray bracket/parenthesis characters left behind
       8. Replace underscores with spaces
