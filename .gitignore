@@ -40,5 +40,8 @@ desktop.ini
 *.cbr
 *.cb7
 
-# Progress tracking files
+# ── Runtime state — lives at C:\ComicAutomation\ ───────
+# Progress tracking files (auto-generated, machine-specific)
 *_progress.json
+# Live routing config (copy config\routing.example.json and edit)
+routing.json

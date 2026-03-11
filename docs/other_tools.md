@@ -8,31 +8,38 @@ Secondary scripts for library maintenance. All support `--dry-run` unless noted.
 
 Scans a library root for sibling directories representing the same series split across chapter-numbered folders (e.g. `Batman ch. 1`, `batman ch2`, `Batman Chapter 7`). Renames generically-named files inside each source folder to use the directory name before merging, then consolidates everything into a single clean folder and updates `ComicInfo.xml` tags post-merge.
 
+Works with UNC network shares, local drives, or any valid Windows path — pass the path on the command line or select it interactively at runtime.
+
 **Configuration** (`scripts\cbz_folder_merger.py`):
 ```python
 SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
+    r"\\tower\media\comics\Manga",
 ]
 LOG_FILE = r"C:\ComicAutomation\cbz_folder_merger.log"
 ```
 
 **Usage:**
 ```powershell
-python scripts\cbz_folder_merger.py                        # scan all SCAN_FOLDERS
-python scripts\cbz_folder_merger.py "\\tower\media\comics\Comix"  # one library root
+python scripts\cbz_folder_merger.py                        # interactive prompt (choose from SCAN_FOLDERS or enter custom path)
+python scripts\cbz_folder_merger.py "\\tower\media\Comix"  # UNC network path
+python scripts\cbz_folder_merger.py "L:\Comix"             # local drive path
+python scripts\cbz_folder_merger.py "C:\Comics\Batman"     # single series directory
 python scripts\cbz_folder_merger.py --dry-run              # preview, no changes
-python scripts\cbz_folder_merger.py "L:\Comix" --dry-run
+python scripts\cbz_folder_merger.py "L:\Comix" --dry-run   # local drive, preview only
+```
+
+**Interactive prompt** (when run with no path argument):
+```
+  No path given. Choose an option:
+  [1] \\tower\media\comics\Comix
+  [2] \\tower\media\comics\Manga
+  [A] All of the above (2 folder(s))
+  [C] Enter a custom path (local drive or UNC share)
+  Choice:
 ```
 
 **Conflict resolution:** On any filename collision, the larger file is kept. Applies to both file merges and directory renames.
-
----
-
-## cbz_folder_merger_LDrive.py
-
-Local-drive variant of `cbz_folder_merger.py`. Identical behaviour — use this when operating against a local path (e.g. `L:\Comix`) rather than a UNC share.
-
-**Usage:** same flags as `cbz_folder_merger.py`.
 
 ---
 

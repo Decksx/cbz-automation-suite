@@ -13,7 +13,7 @@ Edit the constants at the top of `scripts\cbz_sanitizer.py`:
 ```python
 SCAN_FOLDER   = r"\\tower\media\comics\Comix"       # folder to scan
 LOG_FILE      = r"C:\ComicAutomation\cbz_sanitizer.log"
-PROGRESS_FILE = r"C:\ComicAutomation\cbz_sanitizer_progress.json"
+PROGRESS_FILE = r"C:\Users\David.Johnson\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
 ```
 
 ---

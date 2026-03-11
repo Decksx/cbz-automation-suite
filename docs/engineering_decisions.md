@@ -28,11 +28,27 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ---
 
-## Path guard in watchdog handler
+## External routing config (routing.json)
 
-**Decision:** The watchdog event handler checks whether an incoming path is inside `WATCH_FOLDER` before queuing it.
+**Decision:** Destination routing is driven by `routing.json` — an external JSON file at `C:\ComicAutomation\routing.json` — rather than a hardcoded `SOURCE_ROUTING` dict inside the script.
 
-**Why:** When the watcher moves a processed directory to `DEFAULT_DEST`, watchdog fires a `moved` event for the destination path. Without the guard, the watcher would re-queue the file it just processed, causing an infinite loop.
+**Why:** The old dict had 55 entries, all mapping to the same destination. Adding a new source required editing Python. The JSON config separates concern cleanly: `destinations` defines named paths once, `rules` reference those names, and wildcard patterns (e.g. `Toonily*`) eliminate the need for one entry per site variant. A `routing.example.json` template in `config/` gives new users the structure without committing real network paths to the repo.
+
+---
+
+## routing.json excluded from git
+
+**Decision:** `routing.json` is listed in `.gitignore`. Only `routing.example.json` (with placeholder paths) is committed.
+
+**Why:** The live `routing.json` contains real UNC paths specific to the host machine. Committing it would expose network share structure and break for anyone cloning the repo on a different machine. The example template gives new users everything they need to create their own.
+
+---
+
+## _processing_dirs loop prevention
+
+**Decision:** A module-level `_processing_dirs` set (protected by a threading lock) tracks directories currently being processed. The watchdog event handler silently drops any event whose path falls inside a currently-processing directory.
+
+**Why:** The watcher renames `.cbz` files as part of cleaning. Each rename fires a watchdog `on_moved` event. Without suppression, that event re-triggers the settle timer, which re-triggers processing — an infinite loop. The set-based guard is O(1) per event and adds no meaningful overhead.
 
 ---
 
@@ -40,7 +56,23 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 **Decision:** All rename operations check whether the target path exists before calling `Path.rename()`.
 
-**Why:** On POSIX, `rename()` silently overwrites the target. On Windows, it raises `FileExistsError`. The pre-check enables clean skip/merge behaviour instead of a crash, and keeps the code explicit about what happens on collision.
+**Why:** On POSIX, `rename()` silently overwrites the target. On Windows, it raises `FileExistsError`. This commonly occurs when a 2-way cloud sync delivers both a cleaned and an uncleaned copy of the same file. The pre-check produces a clean skip/warn instead of a crash, and keeps the code explicit about what happens on collision.
+
+---
+
+## Top-level directory name cleaned before file loop
+
+**Decision:** The watcher cleans the top-level incoming directory name at the start of `_process_and_move_directory_inner()`, before iterating over any `.cbz` files.
+
+**Why:** When the file structure is two levels deep (e.g. `Source Dir / Comic Dir / Chapter.cbz`), the inner loop only iterates over `Comic Dir` — `Source Dir` never enters the per-comic cleaning step. Without the top-level pre-clean, source directories with Japanese text and G-codes would land at the destination with those artefacts intact.
+
+---
+
+## Path guard in watchdog handler
+
+**Decision:** The watchdog event handler checks whether an incoming path is inside `WATCH_FOLDER` before queuing it.
+
+**Why:** When the watcher moves a processed directory to a destination, watchdog fires a `moved` event for the destination path. Without the guard, the watcher would re-queue the file it just processed, causing an infinite loop.
 
 ---
 
@@ -68,6 +100,14 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ---
 
+## Runtime files kept off the repo (partially)
+
+**Decision:** `routing.json` and `*.log` live at `C:\ComicAutomation\` on the host machine and are fully excluded via `.gitignore`. Progress JSONs live inside `progress_tracking/` in the repo directory — the folder itself is committed (so it always exists on a fresh clone), but the JSON contents are gitignored.
+
+**Why:** Logs and `routing.json` are machine-specific and change-noisy — no value in tracking them. Progress JSONs are also machine-specific runtime state, but keeping them in a dedicated subfolder rather than the repo root or a separate system path makes it easy to find and clear them without hunting through `C:\ComicAutomation\`. The committed empty folder means `os.makedirs` calls are never needed for the progress path on a fresh clone.
+
+---
+
 ## Dry-run on all batch tools
 
 **Decision:** Every tool that modifies files supports `--dry-run`, which logs all planned operations without writing anything.
@@ -86,9 +126,9 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ## Regex patterns normalised between sanitizer and watcher
 
-**Decision:** All 20 shared compiled regex patterns between `cbz_sanitizer.py` and `cbz_watcher.py` are byte-for-byte identical. The dead `_CJK_RE` pattern (superseded by `_NON_LATIN_RE`) and the redundant raw-string `TITLE_OVERWRITE_PATTERNS` list (superseded by `_TITLE_OVERWRITE_RES`) were removed from both files.
+**Decision:** All shared compiled regex patterns between `cbz_sanitizer.py` and `cbz_watcher.py` are byte-for-byte identical. The dead `_CJK_RE` pattern (superseded by `_NON_LATIN_RE`) and the redundant raw-string `TITLE_OVERWRITE_PATTERNS` list (superseded by `_TITLE_OVERWRITE_RES`) were removed from both files.
 
-**Why:** Divergent patterns between the two main scripts is a maintenance hazard — a fix applied to one is silently absent from the other. Normalising them ensures the watcher and sanitizer produce identical output for the same input. The `_CJK_RE` removal also corrects behaviour: the old pattern stripped only CJK/full-width characters, while `_NON_LATIN_RE` correctly strips all non-Latin/non-Greek/non-emoji scripts (Arabic, Cyrillic, Thai, etc.) in a single pass.
+**Why:** Divergent patterns between the two main scripts is a maintenance hazard — a fix applied to one is silently absent from the other. Normalising them ensures the watcher and sanitizer produce identical output for the same input.
 
 ---
 
