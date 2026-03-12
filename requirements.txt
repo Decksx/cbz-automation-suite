@@ -1,0 +1,5 @@
+# CBZ Automation Suite — Python dependencies
+# All other imports are Python standard library (zipfile, re, pathlib, logging, etc.)
+
+# Required by cbz_watcher.py only
+watchdog>=3.0.0
