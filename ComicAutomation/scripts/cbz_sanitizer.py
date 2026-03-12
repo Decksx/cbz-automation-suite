@@ -27,7 +27,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 SCAN_FOLDER    = r"\\tower\media\comics\Comix"   # Folder to sanitize
 LOG_FILE       = r"C:\ComicAutomation\cbz_sanitizer.log"
-PROGRESS_FILE  = r"C:\Users\David.Johnson\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
+PROGRESS_FILE  = r"C:\\git\\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
 # ─────────────────────────────────────────────
 
 COMICINFO_TEMPLATE = """<ComicInfo

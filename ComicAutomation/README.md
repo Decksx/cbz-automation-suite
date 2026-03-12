@@ -69,7 +69,7 @@ pip install watchdog
 All scripts live in `scripts/`. Run them from the repo root:
 
 ```powershell
-cd C:\Users\David.Johnson\ComicAutomation
+cd C:\\git\\ComicAutomation
 ```
 
 ### Live Watcher
