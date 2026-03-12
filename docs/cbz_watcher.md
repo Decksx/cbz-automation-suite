@@ -130,7 +130,7 @@ See [shared_pipeline.md](shared_pipeline.md) for the full `sanitize()` step brea
 3. Update the **Action** paths if your Python or repo location differs:
    - **Program:** path to your `python.exe`
    - **Arguments:** `scripts\cbz_watcher.py`
-   - **Start in:** `C:\Users\David.Johnson\ComicAutomation`
+   - **Start in:** `C:\git\ComicAutomation`
 4. Under **Triggers**, confirm the trigger is set to **At log on**.
 
 Alternatively, just double-click `config\run_watcher.bat` for a manual session — it handles `watchdog` installation automatically.

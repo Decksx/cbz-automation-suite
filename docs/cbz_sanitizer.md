@@ -13,7 +13,7 @@ Edit the constants at the top of `scripts\cbz_sanitizer.py`:
 ```python
 SCAN_FOLDER   = r"\\tower\media\comics\Comix"       # folder to scan
 LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_sanitizer.log"
-PROGRESS_FILE = r"C:\Users\David.Johnson\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
+PROGRESS_FILE = r"C:\git\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
 ```
 
 ---
@@ -22,7 +22,7 @@ PROGRESS_FILE = r"C:\Users\David.Johnson\ComicAutomation\progress_tracking\cbz_s
 
 ```powershell
 # Run from the repo root:
-cd C:\Users\David.Johnson\ComicAutomation
+cd C:\git\ComicAutomation
 
 python scripts\cbz_sanitizer.py                  # scan SCAN_FOLDER, newest-modified dirs first
 python scripts\cbz_sanitizer.py --sort=oldest    # oldest-modified dirs first

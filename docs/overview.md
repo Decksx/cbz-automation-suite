@@ -19,7 +19,7 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 ## Repository
 
 - **GitHub:** https://github.com/Decksx/cbz-automation-suite
-- **Local path:** `C:\Users\David.Johnson\ComicAutomation`
+- **Local path:** `C:\git\ComicAutomation`
 
 ---
 
@@ -59,7 +59,7 @@ pip install watchdog
 All scripts live in `scripts/`. Run from the **repo root**:
 
 ```powershell
-cd C:\Users\David.Johnson\ComicAutomation
+cd C:\git\ComicAutomation
 python scripts\cbz_sanitizer.py --dry-run
 python scripts\cbz_watcher.py
 ```
@@ -68,7 +68,7 @@ python scripts\cbz_watcher.py
 
 ## First-time Setup
 
-1. Clone the repo to `C:\Users\David.Johnson\ComicAutomation`
+1. Clone the repo to `C:\git\ComicAutomation`
 2. Copy `config\routing.example.json` to `C:\\git\\ComicAutomation\routing.json`
 3. Edit `routing.json` to set your actual destination paths and source rules
 4. Edit the `WATCH_FOLDER`, `LOG_FILE`, and `ROUTING_FILE` constants at the top of `scripts\cbz_watcher.py`

@@ -37,7 +37,7 @@ SCAN_FOLDERS: list[str] = [
     r"\\tower\media\comics\Manga",
 ]
 
-LOG_FILE = r"C:\\git\\ComicAutomation\cbz_series_matcher.log"
+LOG_FILE = r"C:\git\ComicAutomation\cbz_series_matcher.log"
 
 # Pairs at or above this ratio are auto-renamed/merged
 AUTO_RENAME_THRESHOLD  = 0.90

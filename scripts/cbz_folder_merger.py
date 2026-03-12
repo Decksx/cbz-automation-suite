@@ -37,7 +37,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\\git\\ComicAutomation\cbz_folder_merger.log"
+LOG_FILE = r"C:\git\ComicAutomation\cbz_folder_merger.log"
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
