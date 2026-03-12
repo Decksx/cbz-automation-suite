@@ -11,7 +11,7 @@
   "rules": [
     { "_comment": "--- Manga / manhwa sources ---" },
     { "match": "source", "pattern": "MangaDex (EN)",         "dest": "manga" },
-    { "match": "source", "pattern": "Toonily*",              "dest": "manga" },
+    { "match": "source", "pattern": "Atsumaru*",              "dest": "manga" },
     { "match": "source", "pattern": "Webtoons*",             "dest": "manga" },
     { "match": "source", "pattern": "MangaFire (EN)",        "dest": "manga" },
     { "match": "source", "pattern": "ManyToon (EN)",         "dest": "manga" },
