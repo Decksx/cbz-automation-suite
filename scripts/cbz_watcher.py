@@ -23,12 +23,12 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 # CONFIGURATION — edit these as needed
 # ─────────────────────────────────────────────
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"
-LOG_FILE      = r"C:\ComicAutomation\cbz_watcher.log"
+LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_watcher.log"
 POLL_INTERVAL = 2    # seconds between stability checks
 SETTLE_DELAY  = 5    # seconds of inactivity before processing a directory
 MIN_AGE       = 300  # seconds a directory must exist before processing
 
-ROUTING_FILE  = r"C:\ComicAutomation\routing.json"
+ROUTING_FILE  = r"C:\\git\\ComicAutomation\routing.json"
 
 # ─────────────────────────────────────────────
 

@@ -26,7 +26,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     #r"\\tower\media\comics\Manga",
 ]
-OUTPUT_FOLDER = r"C:\ComicAutomation"
+OUTPUT_FOLDER = r"C:\\git\\ComicAutomation"
 
 # Gaps are only reported when the jump between consecutive issue numbers
 # exceeds this threshold. Set to 1 to report every single missing integer.

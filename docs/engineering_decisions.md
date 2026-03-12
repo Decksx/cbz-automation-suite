@@ -30,7 +30,7 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ## External routing config (routing.json)
 
-**Decision:** Destination routing is driven by `routing.json` — an external JSON file at `C:\ComicAutomation\routing.json` — rather than a hardcoded `SOURCE_ROUTING` dict inside the script.
+**Decision:** Destination routing is driven by `routing.json` — an external JSON file at `C:\\git\\ComicAutomation\routing.json` — rather than a hardcoded `SOURCE_ROUTING` dict inside the script.
 
 **Why:** The old dict had 55 entries, all mapping to the same destination. Adding a new source required editing Python. The JSON config separates concern cleanly: `destinations` defines named paths once, `rules` reference those names, and wildcard patterns (e.g. `Toonily*`) eliminate the need for one entry per site variant. A `routing.example.json` template in `config/` gives new users the structure without committing real network paths to the repo.
 
@@ -102,9 +102,9 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 
 ## Runtime files kept off the repo (partially)
 
-**Decision:** `routing.json` and `*.log` live at `C:\ComicAutomation\` on the host machine and are fully excluded via `.gitignore`. Progress JSONs live inside `progress_tracking/` in the repo directory — the folder itself is committed (so it always exists on a fresh clone), but the JSON contents are gitignored.
+**Decision:** `routing.json` and `*.log` live at `C:\\git\\ComicAutomation\` on the host machine and are fully excluded via `.gitignore`. Progress JSONs live inside `progress_tracking/` in the repo directory — the folder itself is committed (so it always exists on a fresh clone), but the JSON contents are gitignored.
 
-**Why:** Logs and `routing.json` are machine-specific and change-noisy — no value in tracking them. Progress JSONs are also machine-specific runtime state, but keeping them in a dedicated subfolder rather than the repo root or a separate system path makes it easy to find and clear them without hunting through `C:\ComicAutomation\`. The committed empty folder means `os.makedirs` calls are never needed for the progress path on a fresh clone.
+**Why:** Logs and `routing.json` are machine-specific and change-noisy — no value in tracking them. Progress JSONs are also machine-specific runtime state, but keeping them in a dedicated subfolder rather than the repo root or a separate system path makes it easy to find and clear them without hunting through `C:\\git\\ComicAutomation\`. The committed empty folder means `os.makedirs` calls are never needed for the progress path on a fresh clone.
 
 ---
 

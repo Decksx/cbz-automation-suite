@@ -78,7 +78,7 @@ Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER  = r"C:\Comics\Incoming"
-LOG_FILE      = r"C:\ComicAutomation\cbz_watcher.log"
+LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_watcher.log"
 DEFAULT_DEST  = r"\\tower\media\comics\Comix"
 
 # Only list sources that need a NON-default destination

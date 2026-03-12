@@ -12,7 +12,7 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 - **Windows-aware** — explicit handling for `FileExistsError` on rename, UNC paths, and watchdog destination-folder event filtering.
 - **Dry-run everywhere** — all batch tools support `--dry-run` for safe previewing on large libraries.
 - **One canonical reference** — `scripts/cbz_sanitizer.py` owns all shared functions; other scripts sync from it rather than maintaining independent copies.
-- **External config** — routing is driven by `routing.json` at `C:\ComicAutomation\routing.json`, not hardcoded in the script. Add new sources or destinations without touching Python.
+- **External config** — routing is driven by `routing.json` at `C:\\git\\ComicAutomation\routing.json`, not hardcoded in the script. Add new sources or destinations without touching Python.
 
 ---
 
@@ -48,7 +48,7 @@ pip install watchdog
 | `scripts/cbz_series_matcher.py` | Near-duplicate series name detector; auto-merges above threshold | [other_tools.md](other_tools.md#cbz_series_matcherpy) |
 | `scripts/cbz_gap_checker.py` | Scans library, outputs timestamped CSV of missing chapter numbers | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
 | `scripts/strip_duplicates.py` | Removes duplicate number tokens and fixes spaced punctuation; importable as library | [other_tools.md](other_tools.md#strip_duplicatespy) |
-| `config/routing.example.json` | Template for `routing.json` — copy to `C:\ComicAutomation\routing.json` and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
+| `config/routing.example.json` | Template for `routing.json` — copy to `C:\\git\\ComicAutomation\routing.json` and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
 | `config/run_watcher.bat` | Double-click launcher — installs watchdog and starts the watcher | — |
 | `config/CBZWatcher_Task.xml` | Windows Task Scheduler import — auto-starts watcher on login | — |
 
@@ -69,7 +69,7 @@ python scripts\cbz_watcher.py
 ## First-time Setup
 
 1. Clone the repo to `C:\Users\David.Johnson\ComicAutomation`
-2. Copy `config\routing.example.json` to `C:\ComicAutomation\routing.json`
+2. Copy `config\routing.example.json` to `C:\\git\\ComicAutomation\routing.json`
 3. Edit `routing.json` to set your actual destination paths and source rules
 4. Edit the `WATCH_FOLDER`, `LOG_FILE`, and `ROUTING_FILE` constants at the top of `scripts\cbz_watcher.py`
 5. Run via `config\run_watcher.bat` or import `config\CBZWatcher_Task.xml` into Task Scheduler
@@ -90,7 +90,7 @@ cbz-automation-suite/
 │   ├── cbz_gap_checker.py
 │   └── strip_duplicates.py
 ├── config/
-│   ├── routing.example.json        # Template — copy to C:\ComicAutomation\routing.json
+│   ├── routing.example.json        # Template — copy to C:\\git\\ComicAutomation\routing.json
 │   ├── run_watcher.bat
 │   └── CBZWatcher_Task.xml
 ├── docs/
@@ -109,7 +109,7 @@ cbz-automation-suite/
 └── requirements.txt
 ```
 
-> **Runtime files** — `routing.json` and `*.log` live at `C:\ComicAutomation\` on the host machine and are excluded from git. Progress JSONs live in `progress_tracking/` in the repo folder — the folder is committed but the JSON contents are gitignored.
+> **Runtime files** — `routing.json` and `*.log` live at `C:\\git\\ComicAutomation\` on the host machine and are excluded from git. Progress JSONs live in `progress_tracking/` in the repo folder — the folder is committed but the JSON contents are gitignored.
 
 ---
 
@@ -119,11 +119,11 @@ All tools write rotating logs (max 5 MB, 3 backups). Configure `LOG_FILE` at the
 
 | Log file | Script |
 |----------|--------|
-| `C:\ComicAutomation\cbz_watcher.log` | cbz_watcher.py |
-| `C:\ComicAutomation\cbz_sanitizer.log` | cbz_sanitizer.py |
-| `C:\ComicAutomation\cbz_folder_merger.log` | cbz_folder_merger.py |
-| `C:\ComicAutomation\cbz_compilation_resolver.log` | cbz_compilation_resolver.py |
-| `C:\ComicAutomation\cbz_series_matcher.log` | cbz_series_matcher.py |
-| `C:\ComicAutomation\cbz_number_tagger.log` | cbz_number_tagger.py |
-| `C:\ComicAutomation\cbz_gap_checker.log` | cbz_gap_checker.py |
-| `C:\ComicAutomation\strip_duplicates.log` | strip_duplicates.py |
+| `C:\\git\\ComicAutomation\cbz_watcher.log` | cbz_watcher.py |
+| `C:\\git\\ComicAutomation\cbz_sanitizer.log` | cbz_sanitizer.py |
+| `C:\\git\\ComicAutomation\cbz_folder_merger.log` | cbz_folder_merger.py |
+| `C:\\git\\ComicAutomation\cbz_compilation_resolver.log` | cbz_compilation_resolver.py |
+| `C:\\git\\ComicAutomation\cbz_series_matcher.log` | cbz_series_matcher.py |
+| `C:\\git\\ComicAutomation\cbz_number_tagger.log` | cbz_number_tagger.py |
+| `C:\\git\\ComicAutomation\cbz_gap_checker.log` | cbz_gap_checker.py |
+| `C:\\git\\ComicAutomation\strip_duplicates.log` | strip_duplicates.py |

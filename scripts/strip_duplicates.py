@@ -32,7 +32,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 # CONFIGURATION — edit for standalone use
 # ─────────────────────────────────────────────
-LOG_FILE = r"C:\ComicAutomation\strip_duplicates.log"
+LOG_FILE = r"C:\\git\\ComicAutomation\strip_duplicates.log"
 # ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────

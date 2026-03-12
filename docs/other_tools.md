@@ -16,7 +16,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\ComicAutomation\cbz_folder_merger.log"
+LOG_FILE = r"C:\\git\\ComicAutomation\cbz_folder_merger.log"
 ```
 
 **Usage:**
@@ -58,8 +58,8 @@ Cases where only some individual chapters are present are reported but never act
 
 **Configuration** (`scripts\cbz_compilation_resolver.py`):
 ```python
-LOG_FILE         = r"C:\ComicAutomation\cbz_compilation_resolver.log"
-PROCESSED_FOLDER = r"C:\ComicAutomation\Processed"
+LOG_FILE         = r"C:\\git\\ComicAutomation\cbz_compilation_resolver.log"
+PROCESSED_FOLDER = r"C:\\git\\ComicAutomation\Processed"
 ```
 
 **Usage:**
@@ -82,7 +82,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\ComicAutomation\cbz_number_tagger.log"
+LOG_FILE = r"C:\\git\\ComicAutomation\cbz_number_tagger.log"
 ```
 
 **Usage:**
@@ -110,7 +110,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE               = r"C:\ComicAutomation\cbz_series_matcher.log"
+LOG_FILE               = r"C:\\git\\ComicAutomation\cbz_series_matcher.log"
 AUTO_RENAME_THRESHOLD  = 0.90
 REPORT_THRESHOLD       = 0.80
 ```
@@ -133,7 +133,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     # r"\\tower\media\comics\Manga",   # uncomment to include Manga
 ]
-OUTPUT_FOLDER = r"C:\ComicAutomation"
+OUTPUT_FOLDER = r"C:\\git\\ComicAutomation"
 ```
 
 **Usage:**
@@ -142,7 +142,7 @@ python scripts\cbz_gap_checker.py                                        # scan 
 python scripts\cbz_gap_checker.py "\\tower\media\comics\Comix\Batman"    # single series
 ```
 
-Output: `C:\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`
+Output: `C:\\git\\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`
 
 No `--dry-run` needed — this script is read-only and never modifies files.
 

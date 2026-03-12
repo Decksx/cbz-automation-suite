@@ -36,8 +36,8 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 # ─────────────────────────────────────────────
 # CONFIGURATION — edit these as needed
 # ─────────────────────────────────────────────
-LOG_FILE          = r"C:\ComicAutomation\cbz_compilation_resolver.log"
-PROCESSED_FOLDER  = r"C:\ComicAutomation\Processed"   # individual archives moved here
+LOG_FILE          = r"C:\\git\\ComicAutomation\cbz_compilation_resolver.log"
+PROCESSED_FOLDER  = r"C:\\git\\ComicAutomation\Processed"   # individual archives moved here
 
 # Image file extensions treated as comic pages
 IMAGE_EXTENSIONS  = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}

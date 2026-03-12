@@ -10,8 +10,8 @@ Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"   # folder to monitor
-LOG_FILE      = r"C:\ComicAutomation\cbz_watcher.log"
-ROUTING_FILE  = r"C:\ComicAutomation\routing.json"
+LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_watcher.log"
+ROUTING_FILE  = r"C:\\git\\ComicAutomation\routing.json"
 POLL_INTERVAL = 2      # seconds between stability checks
 SETTLE_DELAY  = 5      # seconds of inactivity before a directory is processed
 MIN_AGE       = 300    # minimum directory age in seconds before processing (5 min)
@@ -33,7 +33,7 @@ python scripts\cbz_watcher.py
 
 ## Routing
 
-Destination routing is driven by `routing.json`, an external config file that lives at `C:\ComicAutomation\routing.json` (path set by `ROUTING_FILE`). The watcher loads it at startup. You never need to edit the Python script to add or change a route.
+Destination routing is driven by `routing.json`, an external config file that lives at `C:\\git\\ComicAutomation\routing.json` (path set by `ROUTING_FILE`). The watcher loads it at startup. You never need to edit the Python script to add or change a route.
 
 A `routing.example.json` template is provided in `config/` showing the full structure.
 
