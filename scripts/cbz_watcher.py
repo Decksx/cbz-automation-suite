@@ -8,9 +8,11 @@ immediate comic directory to the configured destination.
 import os
 import re
 import gc
+import json
 import html
 import time
 import shutil
+import fnmatch
 import zipfile
 import logging
 import threading
