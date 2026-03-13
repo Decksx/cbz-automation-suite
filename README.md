@@ -14,7 +14,6 @@ cbz-automation-suite/
 │   ├── cbz_watcher.py              # Live watcher — main day-to-day tool
 │   ├── cbz_sanitizer.py            # Batch sanitizer — canonical shared-function reference
 │   ├── cbz_folder_merger.py        # Merge colliding series folders
-│   ├── cbz_folder_merger_LDrive.py # Local-drive variant of folder merger
 │   ├── cbz_compilation_resolver.py # Resolve compilation vs individual chapter overlaps
 │   ├── cbz_number_tagger.py        # Retroactively set <Number>/<Volume> tags
 │   ├── cbz_series_matcher.py       # Detect and merge near-duplicate series folders
@@ -78,12 +77,22 @@ Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER  = r"C:\Comics\Incoming"
-LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_watcher.log"
-DEFAULT_DEST  = r"\\tower\media\comics\Comix"
+LOG_FILE      = r"C:\git\ComicAutomation\cbz_watcher.log"
+ROUTING_FILE  = r"C:\git\ComicAutomation\routing.json"
+```
 
-# Only list sources that need a NON-default destination
-SOURCE_ROUTING = {
-    "manga-source": r"\\tower\media\comics\Manga",
+Copy `config\routing.example.json` to `C:\git\ComicAutomation\routing.json` and set your destinations and rules:
+
+```json
+{
+  "destinations": {
+    "comix": "\\\\tower\\media\\comics\\Comix",
+    "manga": "\\\\tower\\media\\comics\\Manga"
+  },
+  "default": "comix",
+  "rules": [
+    { "match": "source", "pattern": "MangaDex (EN)", "dest": "manga" }
+  ]
 }
 ```
 
@@ -129,10 +138,12 @@ All tools share a common `sanitize()` pipeline (defined in `cbz_sanitizer.py`) t
 
 ### Routing (watcher only)
 
+Routing is driven by `routing.json` (path set by `ROUTING_FILE`). Rules are evaluated top-to-bottom; first match wins. Unmatched directories fall back to the `default` destination.
+
 ```
 WATCH_FOLDER/
-├── manga-source/     →  \\tower\media\comics\Manga   (SOURCE_ROUTING match)
-└── anything-else/    →  \\tower\media\comics\Comix   (DEFAULT_DEST fallback)
+├── MangaDex (EN)/    →  \\tower\media\comics\Manga   (rule match)
+└── anything-else/    →  \\tower\media\comics\Comix   (default fallback)
 ```
 
 ### Conflict Resolution
