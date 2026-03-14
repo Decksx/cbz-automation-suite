@@ -16,7 +16,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\\git\\ComicAutomation\cbz_folder_merger.log"
+LOG_FILE = r"C:\git\ComicAutomation\cbz_folder_merger.log"
 ```
 
 **Usage:**
@@ -58,8 +58,8 @@ Cases where only some individual chapters are present are reported but never act
 
 **Configuration** (`scripts\cbz_compilation_resolver.py`):
 ```python
-LOG_FILE         = r"C:\\git\\ComicAutomation\cbz_compilation_resolver.log"
-PROCESSED_FOLDER = r"C:\\git\\ComicAutomation\Processed"
+LOG_FILE         = r"C:\git\ComicAutomation\cbz_compilation_resolver.log"
+PROCESSED_FOLDER = r"C:\git\ComicAutomation\Processed"
 ```
 
 **Usage:**
@@ -82,7 +82,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\\git\\ComicAutomation\cbz_number_tagger.log"
+LOG_FILE = r"C:\git\ComicAutomation\cbz_number_tagger.log"
 ```
 
 **Usage:**
@@ -110,7 +110,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE               = r"C:\\git\\ComicAutomation\cbz_series_matcher.log"
+LOG_FILE               = r"C:\git\ComicAutomation\cbz_series_matcher.log"
 AUTO_RENAME_THRESHOLD  = 0.90
 REPORT_THRESHOLD       = 0.80
 ```
@@ -133,7 +133,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     # r"\\tower\media\comics\Manga",   # uncomment to include Manga
 ]
-OUTPUT_FOLDER = r"C:\\git\\ComicAutomation"
+OUTPUT_FOLDER = r"C:\git\ComicAutomation"
 ```
 
 **Usage:**
@@ -142,7 +142,7 @@ python scripts\cbz_gap_checker.py                                        # scan 
 python scripts\cbz_gap_checker.py "\\tower\media\comics\Comix\Batman"    # single series
 ```
 
-Output: `C:\\git\\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`
+Output: `C:\git\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`
 
 No `--dry-run` needed — this script is read-only and never modifies files.
 
@@ -170,3 +170,34 @@ from strip_duplicates import clean
 print(clean("Batman ver. 9 ver.9 Wow! !"))
 # -> "Batman ver. 9 Wow!!"
 ```
+
+---
+
+## cbz_deduplicator.py
+
+Scans one or more library folders for three classes of duplicate or fixable files and resolves them in a single pass:
+
+**Task 1 — Duplicate .cbz files:** Groups `.cbz` files within each directory by their normalised stem (whitespace, hyphens, underscores, and punctuation stripped). When two or more files normalise to the same key (e.g. `Batman - Ch. 12.cbz` and `Batman Ch.12.cbz`), the largest file is kept and the rest deleted. Ties go to the alphabetically-first name.
+
+**Task 2 — CBR vs CBZ pairs:** When the same normalised stem exists as both `.cbr` and `.cbz`, the `.cbr` is always deleted. The `.cbz` is always kept regardless of file size.
+
+**Task 3 — Loose image folders → CBZ:** Any immediate subdirectory containing only image files (jpg, jpeg, png, gif, webp, avif, bmp, tiff) plus optionally a single `ComicInfo.xml` is packed into a `.cbz` archive placed next to the folder. `ComicInfo.xml` is placed first in the archive; images follow in natural sort order. The source folder is removed after successful packing.
+
+**Configuration** (`scripts\cbz_deduplicator.py`):
+```python
+SCAN_FOLDERS = [
+    r"\\tower\media\comics\Comix",
+    r"\\tower\media\comics\Manga",
+]
+LOG_FILE = r"C:\git\ComicAutomation\cbz_deduplicator.log"
+```
+
+**Usage:**
+```powershell
+python scripts\cbz_deduplicator.py                          # scan all SCAN_FOLDERS
+python scripts\cbz_deduplicator.py "\\tower\media\Comix"    # one folder
+python scripts\cbz_deduplicator.py --dry-run                # preview only, no changes
+python scripts\cbz_deduplicator.py --recursive              # descend all subdirectories
+```
+
+**Conflict resolution:** Task 1 keeps the largest file. Task 2 always keeps `.cbz`. Task 3 skips packing if a `.cbz` with the same name already exists next to the folder.

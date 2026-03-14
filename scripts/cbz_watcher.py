@@ -90,9 +90,6 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# CLEANING HELPERS
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
 # COMPILED REGEX PATTERNS
 # ─────────────────────────────────────────────
 _BRACKET_RE       = re.compile(r'\[[^\]]*\]|\([^)]*\)')
@@ -188,7 +185,6 @@ def _write_cbz_with_comicinfo(
 
     for attempt in range(5):
         try:
-            # Step 1: Read entire zip into memory then close the file handle
             zip_entries: list[tuple] = []
             with zipfile.ZipFile(cbz_path, "r") as zin:
                 for item in zin.infolist():
@@ -197,8 +193,6 @@ def _write_cbz_with_comicinfo(
             gc.collect()
             time.sleep(0.5)
 
-            # Step 2: Write to tmp — preserve original compression per entry,
-            #         use DEFLATED only for XML (plain text compresses well)
             with zipfile.ZipFile(tmp_path, "w") as zout:
                 for item, data in zip_entries:
                     if item.filename == replace_entry:
@@ -215,7 +209,6 @@ def _write_cbz_with_comicinfo(
             gc.collect()
             time.sleep(0.5)
 
-            # Step 3: Atomic swap — rename avoids unlink lock issues on Windows
             bak_path = cbz_path.with_suffix(".bak.cbz")
             cbz_path.rename(bak_path)
             tmp_path.rename(cbz_path)
@@ -255,7 +248,6 @@ def process_comicinfo(cbz_path: Path) -> None:
 
     for attempt in range(5):
         try:
-            # Read zip then close before any writes
             found_key = real_name = xml_text = None
             has_xml = False
 
@@ -279,7 +271,6 @@ def process_comicinfo(cbz_path: Path) -> None:
                 title_value  = clean_xml_field(title_match.group(1).strip())  if title_match  else ""
                 series_value = clean_xml_field(series_match.group(1).strip()) if series_match else ""
 
-                # Clean brackets from Series tag if needed
                 if series_match and series_value != series_match.group(1).strip():
                     xml_text = re.sub(
                         r"<Series>.*?</Series>",
@@ -288,19 +279,12 @@ def process_comicinfo(cbz_path: Path) -> None:
                     )
                     log.info(f"    Series cleaned: '{series_match.group(1).strip()}' -> '{series_value}'")
 
-                # Strip leading "# - " prefix (e.g. "3 - Batman" -> "Batman")
                 title_value   = NUMBER_PREFIX_RE.sub("", title_value).strip()
                 filename_stem = NUMBER_PREFIX_RE.sub("", cbz_path.stem).strip()
 
                 title_generic    = is_generic(title_value)
                 filename_generic = is_generic(filename_stem)
 
-                # ── Title resolution logic ──────────────────────────────
-                # Title == dir  + filename custom   → use filename
-                # Title == dir  + filename generic  → already correct
-                # Title generic + filename custom   → use filename
-                # Title generic + filename generic  → use parent dir
-                # Title custom  (any filename)      → leave unchanged
                 if title_value == parent_dir and not filename_generic:
                     new_title = filename_stem
                     log.info(f"    Title matches dir but filename='{filename_stem}' is custom - using filename.")
@@ -383,7 +367,6 @@ def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
         log.warning(f"    Skipping unstable file: {cbz_path.name}")
         return cbz_path
 
-    # Use override_name directly if supplied (avoids redundant clean_filename call)
     if override_name is not None:
         new_name = override_name
     else:
@@ -449,7 +432,6 @@ def _load_routing() -> None:
         _routing_default      = _routing_destinations.get(default_key, '')
         if not _routing_default:
             log.warning(f"  routing.json: default key '{default_key}' not found in destinations.")
-        # Ensure all destination directories exist
         for dest_path in _routing_destinations.values():
             os.makedirs(dest_path, exist_ok=True)
         log.info(f"  Routing   : {len(_routing_rules)} rule(s) loaded from {ROUTING_FILE}")
@@ -497,9 +479,12 @@ def _resolve_dest(comic_dir: Path) -> str:
     return _routing_default or ''
 
 
-
 def _move_cbz_dir(dir_path: Path, dest_folder: str) -> None:
     """Move a processed comic directory to dest_folder, merging if it already exists."""
+    if not dir_path.exists():
+        log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
+        return
+
     dest_dir = Path(dest_folder) / dir_path.name
     log.info(f"  Moving '{dir_path.name}' -> {dest_dir}")
 
@@ -513,8 +498,20 @@ def _move_cbz_dir(dir_path: Path, dest_folder: str) -> None:
                 shutil.rmtree(dir_path, ignore_errors=True)
             log.info(f"  Merge complete.")
         else:
-            shutil.move(str(dir_path), str(dest_dir))
-            log.info(f"  Moved successfully.")
+            try:
+                shutil.move(str(dir_path), str(dest_dir))
+                log.info(f"  Moved successfully.")
+            except (OSError, shutil.Error):
+                # WinError 183: dest was created by a concurrent thread between
+                # our exists() check and the move — fall back to merge.
+                if dest_dir.exists():
+                    log.info(f"  Race on move — destination appeared, falling back to merge.")
+                    _merge_directories(dir_path, dest_dir)
+                    if dir_path.exists():
+                        shutil.rmtree(dir_path, ignore_errors=True)
+                    log.info(f"  Merge complete.")
+                else:
+                    raise
 
     except Exception as e:
         log.error(f"  Failed to move directory '{dir_path.name}': {e}")
@@ -535,21 +532,27 @@ def process_and_move_directory(dir_path: Path) -> None:
 
 
 def _process_and_move_directory_inner(dir_path: Path) -> None:
-    # Clean the top-level watched directory name first (handles the case where
-    # cbz files live in a subdirectory and dir_path itself never enters the
-    # per-comic_dir cleaning loop below).
-    clean_top = clean_directory_name(dir_path.name)
+    # Clean the top-level watched directory name first.
+    clean_top    = clean_directory_name(dir_path.name)
+    old_dir_path = dir_path  # keep original for lock update
     if clean_top and clean_top != dir_path.name:
         new_top = dir_path.parent / clean_top
-        try:
-            dir_path.rename(new_top)
-            log.info(f"  Directory renamed: '{dir_path.name}' -> '{clean_top}'")
-            dir_path = new_top
-        except OSError as e:
-            log.warning(f"  Could not rename top-level dir '{dir_path.name}': {e}")
-    # Also update the processing-lock entry so event suppression stays correct
+        if new_top.exists():
+            log.warning(
+                f"  Could not rename top-level dir '{dir_path.name}': "
+                f"target '{clean_top}' already exists — continuing with original name."
+            )
+        else:
+            try:
+                dir_path.rename(new_top)
+                log.info(f"  Directory renamed: '{dir_path.name}' -> '{clean_top}'")
+                dir_path = new_top
+            except OSError as e:
+                log.warning(f"  Could not rename top-level dir '{dir_path.name}': {e}")
+    # Update the processing-lock entry to use the new path so watchdog events
+    # fired by the rename (which reference the new path) are still suppressed.
     with _processing_dirs_lock:
-        _processing_dirs.discard(dir_path.parent / dir_path.name)
+        _processing_dirs.discard(old_dir_path)
         _processing_dirs.add(dir_path)
 
     log.info("=" * 60)
@@ -559,7 +562,6 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         log.warning(f"  Directory no longer exists: {dir_path}")
         return
 
-    # Group .cbz files by their immediate parent directory
     cbz_dirs: dict[Path, list[Path]] = {}
     for cbz in sorted(dir_path.rglob("*.cbz")):
         cbz_dirs.setdefault(cbz.parent, []).append(cbz)
@@ -575,21 +577,38 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
     for comic_dir, cbz_files in sorted(cbz_dirs.items()):
         dest_folder = _resolve_dest(comic_dir)
 
-        # Clean directory name BEFORE processing files so comicinfo
-        # title logic compares against the final clean name
         clean_dir_name = clean_directory_name(comic_dir.name)
         if not clean_dir_name:
             log.warning(f"  Skipping rename: cleaning '{comic_dir.name}' produced an empty name.")
         elif clean_dir_name != comic_dir.name:
             new_dir_path = comic_dir.parent / clean_dir_name
-            comic_dir.rename(new_dir_path)
-            log.info(f"  Directory renamed: '{comic_dir.name}' -> '{clean_dir_name}'")
-            cbz_files = [new_dir_path / f.name for f in cbz_files]
-            comic_dir = new_dir_path
+            if new_dir_path.exists():
+                log.warning(
+                    f"  Rename skipped: target already exists '{clean_dir_name}' "
+                    f"— merging '{comic_dir.name}' into it."
+                )
+                for f in list(comic_dir.iterdir()):
+                    dest_f = new_dir_path / f.name
+                    if not dest_f.exists():
+                        shutil.move(str(f), str(dest_f))
+                    elif f.stat().st_size > dest_f.stat().st_size:
+                        dest_f.unlink()
+                        shutil.move(str(f), str(dest_f))
+                        log.info(f"    Replaced (larger): '{f.name}'")
+                    else:
+                        f.unlink()
+                try:
+                    comic_dir.rmdir()
+                except OSError:
+                    pass
+                cbz_files = sorted(new_dir_path.glob("*.cbz"))
+                comic_dir = new_dir_path
+            else:
+                comic_dir.rename(new_dir_path)
+                log.info(f"  Directory renamed: '{comic_dir.name}' -> '{clean_dir_name}'")
+                cbz_files = [new_dir_path / f.name for f in cbz_files]
+                comic_dir = new_dir_path
 
-        # Pre-compute fallback names for any files whose cleaned stem is empty.
-        # If only one such file exists, use the directory name directly.
-        # If multiple, enumerate: "DirName 1.cbz", "DirName 2.cbz", ...
         empty_stem_files = [
             cbz for cbz in cbz_files
             if cbz.exists() and not Path(clean_filename(cbz.name)).stem
@@ -627,10 +646,19 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
 
 
 # ─────────────────────────────────────────────
+# PATH HELPERS
+# ─────────────────────────────────────────────
+def _is_subpath(child: Path, parent: Path) -> bool:
+    """Return True if child is equal to or nested under parent."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+# ─────────────────────────────────────────────
 # DIRECTORY SETTLE TRACKER
-# Debounces rapid file events — waits until no
-# new files have arrived for SETTLE_DELAY seconds
-# before triggering processing.
 # ─────────────────────────────────────────────
 class DirectorySettleTracker:
     def __init__(self, settle_delay: float = SETTLE_DELAY):
@@ -651,7 +679,6 @@ class DirectorySettleTracker:
     def _on_settled(self, dir_path: Path) -> None:
         with self._lock:
             self._timers.pop(dir_path, None)
-        # Enforce minimum age — re-schedule if the directory isn't old enough yet
         if dir_path.exists():
             age = time.time() - dir_path.stat().st_ctime
             if age < MIN_AGE:
@@ -666,6 +693,15 @@ class DirectorySettleTracker:
                 timer.start()
                 return
         log.info(f"Directory ready: '{dir_path.name}' (settled + minimum age {MIN_AGE}s met)")
+        # Guard against processing a directory already being handled by another thread.
+        with _processing_dirs_lock:
+            already = any(
+                dir_path == p or _is_subpath(dir_path, p) or _is_subpath(p, dir_path)
+                for p in _processing_dirs
+            )
+        if already:
+            log.info(f"  Skipping '{dir_path.name}': already being processed.")
+            return
         process_and_move_directory(dir_path)
 
 
@@ -680,13 +716,11 @@ class CBZHandler(FileSystemEventHandler):
         if path.suffix.lower() != ".cbz":
             return
         parent = path.parent
-        # Suppress events that are caused by our own rename/rewrite operations
-        # to avoid an infinite re-processing loop.
         with _processing_dirs_lock:
             for proc_dir in _processing_dirs:
                 try:
                     parent.relative_to(proc_dir)
-                    return  # event is inside a directory we're currently processing
+                    return
                 except ValueError:
                     pass
         if parent == Path(WATCH_FOLDER):
@@ -716,7 +750,6 @@ def main():
     watch_path = Path(WATCH_FOLDER)
     os.makedirs(watch_path, exist_ok=True)
 
-    # Load routing config from JSON
     _load_routing()
 
     log.info("=" * 60)
@@ -729,7 +762,6 @@ def main():
 
     tracker = DirectorySettleTracker()
 
-    # Clean up any orphaned temp/bak files left by a previous interrupted run
     stale = list(watch_path.rglob("*.tmp.cbz")) + list(watch_path.rglob("*.bak.cbz"))
     if stale:
         log.info(f"  Cleaning up {len(stale)} stale temp file(s) from previous run...")
@@ -740,7 +772,6 @@ def main():
             except OSError as e:
                 log.warning(f"    Could not delete stale file {f.name}: {e}")
 
-    # Process any directories already present at startup
     for subdir in sorted(watch_path.iterdir()):
         if subdir.is_dir() and any(subdir.rglob("*.cbz")):
             log.info(f"Found existing directory at startup: {subdir.name}")

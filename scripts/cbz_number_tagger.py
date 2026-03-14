@@ -14,7 +14,6 @@ Usage:
 """
 
 import os
-import gc
 import re
 import sys
 import time
@@ -79,6 +78,8 @@ def extract_chapter_number(stem: str) -> str | None:
         n = float(val)
         return str(int(n)) if n == int(n) else str(n)
     return None
+
+
 def read_comicinfo(cbz_path: Path) -> tuple[str | None, str | None]:
     """
     Open a CBZ and return (entry_name, xml_text) for ComicInfo.xml,
@@ -117,18 +118,12 @@ def write_comicinfo(cbz_path: Path, entry_name: str, new_xml: str) -> bool:
                 for item in zin.infolist():
                     zip_entries.append((item, zin.read(item.filename)))
 
-            gc.collect()
-            time.sleep(0.3)
-
             with zipfile.ZipFile(tmp_path, "w") as zout:
                 for item, data in zip_entries:
                     if item.filename == entry_name:
                         zout.writestr(item, new_xml.encode("utf-8"))
                     else:
                         zout.writestr(item, data, compress_type=item.compress_type)
-
-            gc.collect()
-            time.sleep(0.3)
 
             cbz_path.rename(bak_path)
             tmp_path.rename(cbz_path)
@@ -163,7 +158,7 @@ def set_number_tag(xml_text: str, number: str) -> tuple[str, bool]:
     if existing:
         current = existing.group(1).strip()
         if current == number:
-            return xml_text, False  # already correct, no write needed
+            return xml_text, False
         xml_text = re.sub(
             r"<Number>.*?</Number>",
             f"<Number>{number}</Number>",
@@ -250,7 +245,6 @@ def main() -> None:
             continue
 
         if path.is_file() and path.suffix.lower() == ".cbz":
-            # Single file passed directly
             result = process_cbz(path, dry_run=dry_run)
             log.info(f"{path.name}: {result}")
         else:

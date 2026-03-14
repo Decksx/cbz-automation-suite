@@ -10,8 +10,8 @@ Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"   # folder to monitor
-LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_watcher.log"
-ROUTING_FILE  = r"C:\\git\\ComicAutomation\routing.json"
+LOG_FILE      = r"C:\git\ComicAutomation\cbz_watcher.log"
+ROUTING_FILE  = r"C:\git\ComicAutomation\routing.json"
 POLL_INTERVAL = 2      # seconds between stability checks
 SETTLE_DELAY  = 5      # seconds of inactivity before a directory is processed
 MIN_AGE       = 300    # minimum directory age in seconds before processing (5 min)
@@ -33,7 +33,7 @@ python scripts\cbz_watcher.py
 
 ## Routing
 
-Destination routing is driven by `routing.json`, an external config file that lives at `C:\\git\\ComicAutomation\routing.json` (path set by `ROUTING_FILE`). The watcher loads it at startup. You never need to edit the Python script to add or change a route.
+Destination routing is driven by `routing.json`, an external config file that lives at `C:\git\ComicAutomation\routing.json` (path set by `ROUTING_FILE`). The watcher loads it at startup. You never need to edit the Python script to add or change a route.
 
 A `routing.example.json` template is provided in `config/` showing the full structure.
 
@@ -110,10 +110,10 @@ If a directory has settled but hasn't reached `MIN_AGE`, the watcher logs the re
 
 For each directory that passes the timers:
 
-1. **Top-level directory rename** — cleans the incoming directory name via `sanitize()` before anything else runs. Handles cases where `.cbz` files are nested one level deep and the outer directory name would otherwise never be cleaned.
+1. **Top-level directory rename** — cleans the incoming directory name via `sanitize()` before anything else runs. If the cleaned name already exists, files are merged into the existing directory instead of crashing.
 2. **Stability check** — verifies each `.cbz` file is stable (no size change between checks).
 3. **Filename cleaning** — applies `sanitize()` + `normalize_stem()` to each file's stem.
-4. **Rename** — renames each `.cbz` if the cleaned name differs. If the target already exists (e.g. a cloud sync duplicate), the rename is skipped and the original filename is kept — no crash.
+4. **Rename** — renames each `.cbz` if the cleaned name differs. If the target already exists, the rename is skipped and the original filename is kept — no crash.
 5. **ComicInfo.xml** — creates or updates `<Title>`, `<Series>`, `<Number>`, and `<Volume>` tags.
 6. **Archive rewrite** — rewrites the archive if XML changed, preserving original compression.
 7. **Route & move** — resolves the destination via `routing.json` and moves the directory immediately after processing.
@@ -139,8 +139,10 @@ Alternatively, just double-click `config\run_watcher.bat` for a manual session �
 
 ## Windows Notes
 
-- **Loop prevention** — a `_processing_dirs` set (with a threading lock) suppresses watchdog events fired by the watcher's own rename operations. Without this guard, each filename clean would re-trigger the settle timer in an infinite loop.
-- **FileExistsError safety** — before calling `Path.rename()`, the watcher checks whether the target exists. On POSIX, rename silently overwrites; on Windows it raises `FileExistsError`. The pre-check produces a clean skip/warn instead of a crash.
+- **Loop prevention** — a `_processing_dirs` set (with a threading lock) suppresses watchdog events fired by the watcher's own rename operations. The lock is updated to track the new path immediately after any top-level rename, so events referencing the renamed path are also suppressed correctly.
+- **Concurrent thread guard** — `_on_settled()` checks whether a directory (or any parent/child) is already being processed before spawning a new thread. Prevents duplicate processing when a rename re-triggers the settle timer.
+- **Race-condition safe move** — `_move_cbz_dir()` checks whether the source still exists before attempting a move (guards against two threads racing to move the same directory), and catches the Windows race where the destination is created by a concurrent thread between the existence check and `shutil.move()`, falling back to merge in that case.
+- **FileExistsError safety** — before calling `Path.rename()`, the watcher checks whether the target exists. On POSIX, rename silently overwrites; on Windows it raises `FileExistsError`. The pre-check produces a clean skip/merge instead of a crash.
 - **Destination pre-creation** — all destination directories from `routing.json` are created at startup to avoid first-move delays on UNC shares.
 
 ---
