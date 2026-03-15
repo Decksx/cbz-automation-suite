@@ -142,7 +142,6 @@ class OverlapGroup:
 def _fmt_num(n: float) -> str:
     """Format a float chapter number as a clean string (1.0 -> '1', 1.5 -> '1.5')."""
     return str(int(n)) if n == int(n) else str(n)
-
 def extract_chapter_number(stem: str) -> str | None:
     """
     Extract the chapter/issue number from a filename stem.
@@ -156,7 +155,6 @@ def extract_chapter_number(stem: str) -> str | None:
         n = float(val)
         return str(int(n)) if n == int(n) else str(n)
     return None
-
 def extract_compilation_range(stem: str) -> tuple[float, float] | None:
     """Return (start, end) chapter floats if stem contains a range, else None."""
     m = _COMPILATION_RE.search(stem)
@@ -350,6 +348,9 @@ def _rewrite_compilation(
 
             # Write pages from the resolution plan
             for i, (winner, _) in enumerate(plan):
+                # Derive a clean entry name: use the compilation's original
+                # page naming scheme to keep sort order consistent
+                # We'll use a zero-padded index so readers sort correctly
                 ext      = winner.ext
                 new_name = f"page_{i+1:04d}{ext}"
 
