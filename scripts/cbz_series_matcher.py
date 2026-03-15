@@ -183,6 +183,30 @@ def scan_folder(folder: Path) -> list[Path]:
         return []
 
 
+def _collect_dir_groups(folder: Path) -> list[list[Path]]:
+    """
+    Recursively collect groups of sibling directories to compare.
+    Each group is a list of immediate subdirectories sharing the same parent.
+    This lets the matcher catch near-duplicates at every nesting level
+    (e.g. Comix/Batman vs Comix/Batman_, and also nested publisher folders).
+    Returns a list of groups, where each group has >= 2 directories.
+    """
+    groups: list[list[Path]] = []
+    try:
+        siblings = sorted(p for p in folder.iterdir() if p.is_dir())
+    except OSError as e:
+        log.error(f"Cannot scan '{folder}': {e}")
+        return groups
+
+    if len(siblings) >= 2:
+        groups.append(siblings)
+
+    for sibling in siblings:
+        groups.extend(_collect_dir_groups(sibling))
+
+    return groups
+
+
 def find_matches(
     dirs: list[Path],
 ) -> list[tuple[float, Path, Path]]:
@@ -275,31 +299,38 @@ def main() -> None:
             log.error(f"  Folder not found: {folder}")
             continue
 
-        dirs = scan_folder(folder)
-        log.info(f"  Found {len(dirs)} series director{'y' if len(dirs)==1 else 'ies'}.")
-        total_dirs += len(dirs)
+        # Collect sibling groups at every nesting level recursively
+        dir_groups = _collect_dir_groups(folder)
+        all_dirs   = {d for group in dir_groups for d in group}
+        log.info(f"  Found {len(all_dirs)} director{'y' if len(all_dirs)==1 else 'ies'} "
+                 f"across {len(dir_groups)} sibling group(s).")
+        total_dirs += len(all_dirs)
 
-        if len(dirs) < 2:
+        if not dir_groups:
             log.info("  Not enough directories to compare.")
             continue
 
-        matches = find_matches(dirs)
+        # Run matching on each sibling group independently
+        for group in dir_groups:
+            if len(group) < 2:
+                continue
+            matches = find_matches(group)
 
-        auto_pairs    = [(r,a,b) for r,a,b in matches if r >= AUTO_RENAME_THRESHOLD]
-        review_pairs  = [(r,a,b) for r,a,b in matches if REPORT_THRESHOLD <= r < AUTO_RENAME_THRESHOLD]
+            auto_pairs   = [(r, a, b) for r, a, b in matches if r >= AUTO_RENAME_THRESHOLD]
+            review_pairs = [(r, a, b) for r, a, b in matches if REPORT_THRESHOLD <= r < AUTO_RENAME_THRESHOLD]
 
-        log.info(
-            f"  {len(auto_pairs)} pair(s) above auto threshold ({AUTO_RENAME_THRESHOLD}), "
-            f"{len(review_pairs)} pair(s) flagged for review."
-        )
+            if not matches:
+                continue
 
-        if not matches:
-            log.info("  No near-duplicate series names found.")
-            continue
+            parent_label = group[0].parent.name
+            log.info(
+                f"  [{parent_label}]  {len(auto_pairs)} pair(s) above auto threshold, "
+                f"{len(review_pairs)} pair(s) flagged for review."
+            )
 
-        auto, review = process_matches(matches, dry_run=dry_run)
-        total_auto   += auto
-        total_review += review
+            auto, review = process_matches(matches, dry_run=dry_run)
+            total_auto   += auto
+            total_review += review
 
     log.info("\n" + "=" * 60)
     log.info("Series Matcher complete.")

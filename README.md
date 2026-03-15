@@ -15,6 +15,7 @@ cbz-automation-suite/
 │   ├── cbz_sanitizer.py            # Batch sanitizer — canonical shared-function reference
 │   ├── cbz_folder_merger.py        # Merge colliding series folders
 │   ├── cbz_compilation_resolver.py # Resolve compilation vs individual chapter overlaps
+│   ├── cbz_deduplicator.py         # Remove duplicate cbz/cbr files; pack loose image folders
 │   ├── cbz_number_tagger.py        # Retroactively set <Number>/<Volume> tags
 │   ├── cbz_series_matcher.py       # Detect and merge near-duplicate series folders
 │   ├── cbz_gap_checker.py          # Report missing chapter numbers per series
@@ -38,22 +39,23 @@ cbz-automation-suite/
 
 ## Tools
 
-| Script | Purpose |
-|--------|---------|
-| `cbz_watcher.py` | Live watcher — monitors an Incoming folder, cleans filenames, injects `ComicInfo.xml` metadata, and routes files to the correct destination |
-| `cbz_sanitizer.py` | Batch sanitizer — walks a library folder and applies the full cleaning/tagging pipeline in-place; supports `--sort`, `--resume`, `--restart`, and `--dry-run` |
-| `cbz_folder_merger.py` | Merges sibling directories whose cleaned names collide; keeps the larger file on any conflict |
-| `cbz_compilation_resolver.py` | Detects compilation/individual chapter overlaps; performs page-by-page quality comparison and rewrites compilations with the best pages |
-| `cbz_number_tagger.py` | Sets `<Number>` and `<Volume>` tags in `ComicInfo.xml` from the filename — retroactive library tool |
-| `cbz_series_matcher.py` | Finds near-duplicate series folder names and auto-merges above a configurable similarity threshold |
-| `cbz_gap_checker.py` | Scans library folders and writes a timestamped CSV report of missing chapter numbers per series |
-| `strip_duplicates.py` | Removes duplicate number tokens and fixes oddly spaced punctuation in filenames; also importable as a library |
+| Script | Recursive? | Purpose |
+|--------|-----------|---------|
+| `cbz_watcher.py` | Always | Live watcher — monitors an Incoming folder, cleans filenames, injects `ComicInfo.xml` metadata, and routes files to the correct destination |
+| `cbz_sanitizer.py` | Always | Batch sanitizer — walks a library folder and applies the full cleaning/tagging pipeline in-place; supports `--sort`, `--resume`, `--restart`, and `--dry-run` |
+| `cbz_folder_merger.py` | Single-level (by design) | Merges sibling directories whose cleaned names collide; keeps the larger file on any conflict |
+| `cbz_compilation_resolver.py` | **Yes — default** | Detects compilation/individual chapter overlaps; performs page-by-page quality comparison and rewrites compilations with the best pages |
+| `cbz_deduplicator.py` | **Yes — default** | Finds and removes duplicate `.cbz`/`.cbr` files; packs loose image folders into archives. Use `--no-recursive` for single-level |
+| `cbz_number_tagger.py` | Always | Sets `<Number>` and `<Volume>` tags in `ComicInfo.xml` from the filename — retroactive library tool |
+| `cbz_series_matcher.py` | **Yes — default** | Finds near-duplicate series folder names at every nesting level and auto-merges above a configurable similarity threshold |
+| `cbz_gap_checker.py` | **Yes — default** | Scans library folders and writes a timestamped CSV report of missing chapter numbers per series |
+| `strip_duplicates.py` | **Yes — default** | Removes duplicate number tokens and fixes oddly spaced punctuation in filenames; also importable as a library. Use `--no-recursive` for single-level |
 
 ---
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.11+
 - [`watchdog`](https://pypi.org/project/watchdog/) >= 3.0.0 — required by `cbz_watcher.py` **only**; all other scripts use the standard library exclusively
 
 ```powershell
@@ -116,12 +118,18 @@ python scripts\cbz_sanitizer.py --dry-run                     # preview only, no
 ### Other Tools
 
 ```powershell
+# All run recursively by default
+python scripts\cbz_compilation_resolver.py --dry-run
+python scripts\cbz_deduplicator.py --dry-run
 python scripts\cbz_number_tagger.py --dry-run
 python scripts\cbz_series_matcher.py --dry-run
 python scripts\cbz_gap_checker.py
-python scripts\cbz_compilation_resolver.py --dry-run
 python scripts\cbz_folder_merger.py --dry-run
-python scripts\strip_duplicates.py "C:\Comics" --recursive --dry-run
+python scripts\strip_duplicates.py "C:\Comics" --dry-run
+
+# Opt out of recursion where supported
+python scripts\cbz_deduplicator.py --no-recursive --dry-run
+python scripts\strip_duplicates.py "C:\Comics" --no-recursive --dry-run
 ```
 
 See [docs/other_tools.md](docs/other_tools.md) for full details on each.
@@ -158,6 +166,7 @@ On any filename collision during a merge or move, **the larger file is always ke
 - `scripts\cbz_sanitizer.py` is the **canonical reference** for all shared functions. Other tools sync from it.
 - `scripts\strip_duplicates.py` is also importable as a library: `from strip_duplicates import clean`.
 - Progress files (`*_progress.json`) are machine-local and excluded from git via `.gitignore`.
+- All batch tools are **recursive by default**. Use `--no-recursive` on `cbz_deduplicator.py` and `strip_duplicates.py` to limit to a single directory level.
 
 ---
 
@@ -168,6 +177,6 @@ On any filename collision during a merge or move, **the larger file is always ke
 | [docs/overview.md](docs/overview.md) | Design principles, all tools at a glance, repo structure, log paths |
 | [docs/cbz_sanitizer.md](docs/cbz_sanitizer.md) | Full CLI reference, sort modes, progress/resume system |
 | [docs/cbz_watcher.md](docs/cbz_watcher.md) | Configuration, routing logic, settle/age timers, Task Scheduler setup |
-| [docs/other_tools.md](docs/other_tools.md) | folder merger, compilation resolver, number tagger, series matcher, gap checker, strip_duplicates |
+| [docs/other_tools.md](docs/other_tools.md) | folder merger, compilation resolver, deduplicator, number tagger, series matcher, gap checker, strip_duplicates |
 | [docs/shared_pipeline.md](docs/shared_pipeline.md) | sanitize() steps, ComicInfo tag logic, archive rewriting, conflict resolution |
 | [docs/engineering_decisions.md](docs/engineering_decisions.md) | Rationale for non-obvious design choices |

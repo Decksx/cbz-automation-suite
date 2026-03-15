@@ -7,9 +7,9 @@ Usage:
     python cbz_gap_checker.py                          # scans all configured SCAN_FOLDERS
     python cbz_gap_checker.py "C:/path/Series"         # scan a single folder directly
 
-The script treats each immediate subdirectory of a SCAN_FOLDER as a series.
-If a path passed on the command line contains .cbz files directly, it is
-treated as a single series rather than a parent folder.
+The script treats each directory that contains .cbz files directly as a series.
+Directories containing only subdirectories are traversed recursively, so you
+can point it at a top-level library root and it will find all nested series.
 """
 
 import os
@@ -158,19 +158,32 @@ def scan_series(series_dir: Path) -> dict | None:
 
 
 def scan_folder(folder: Path) -> list[dict]:
-    """Scan all immediate subdirectories of folder as individual series."""
+    """
+    Recursively scan folder for series directories.
+    A directory is treated as a series if it contains .cbz files directly.
+    Directories that contain only subdirectories are traversed deeper.
+    """
     results = []
     if not folder.exists():
         print(f"  WARNING: Folder not found, skipping: {folder}")
         return results
 
     subdirs = sorted(d for d in folder.iterdir() if d.is_dir())
+    if not subdirs:
+        return results
+
     print(f"  Scanning {len(subdirs)} series in: {folder}")
 
     for series_dir in subdirs:
-        result = scan_series(series_dir)
-        if result:
-            results.append(result)
+        has_cbz = any(series_dir.glob("*.cbz"))
+        if has_cbz:
+            # This directory contains issues — treat it as a series
+            result = scan_series(series_dir)
+            if result:
+                results.append(result)
+        else:
+            # No direct .cbz files — descend into subdirectories
+            results.extend(scan_folder(series_dir))
 
     return results
 

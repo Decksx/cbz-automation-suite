@@ -1,6 +1,6 @@
 """
 CBZ Compilation Resolver
-Scans a single user-specified directory for series where a compilation archive
+Scans one or more series folders for series where a compilation archive
 (e.g. "Batman Ch. 1-5.cbz") overlaps with individual chapter archives
 (e.g. "Batman Ch. 1.cbz" through "Batman Ch. 5.cbz").
 
@@ -13,10 +13,13 @@ When ALL chapters covered by a compilation are present as individual archives:
   4. Moves the now-redundant individual archives to a configurable processed
      folder under a subfolder named after the series.
 
+Runs recursively by default — every subdirectory under the target is treated
+as a series and checked for compilation/individual overlaps.
+
 Usage:
-    python cbz_compilation_resolver.py                  # prompts for directory
-    python cbz_compilation_resolver.py "C:/path/Batman" # process one directory
-    python cbz_compilation_resolver.py --dry-run        # preview, no changes
+    python cbz_compilation_resolver.py                       # scans all SCAN_FOLDERS
+    python cbz_compilation_resolver.py "C:/path/Batman"      # process one directory
+    python cbz_compilation_resolver.py --dry-run             # preview, no changes
     python cbz_compilation_resolver.py "C:/path" --dry-run
 
 All cases where individual archives are incomplete (some chapters missing) are
@@ -38,6 +41,11 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 # ─────────────────────────────────────────────
 LOG_FILE          = r"C:\git\ComicAutomation\cbz_compilation_resolver.log"
 PROCESSED_FOLDER  = r"C:\git\ComicAutomation\Processed"   # individual archives moved here
+
+SCAN_FOLDERS: list[str] = [
+    r"\\tower\media\comics\Comix",
+    r"\\tower\media\comics\Manga",
+]
 
 # Image file extensions treated as comic pages
 IMAGE_EXTENSIONS  = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
@@ -134,6 +142,7 @@ class OverlapGroup:
 def _fmt_num(n: float) -> str:
     """Format a float chapter number as a clean string (1.0 -> '1', 1.5 -> '1.5')."""
     return str(int(n)) if n == int(n) else str(n)
+
 def extract_chapter_number(stem: str) -> str | None:
     """
     Extract the chapter/issue number from a filename stem.
@@ -147,6 +156,7 @@ def extract_chapter_number(stem: str) -> str | None:
         n = float(val)
         return str(int(n)) if n == int(n) else str(n)
     return None
+
 def extract_compilation_range(stem: str) -> tuple[float, float] | None:
     """Return (start, end) chapter floats if stem contains a range, else None."""
     m = _COMPILATION_RE.search(stem)
@@ -340,9 +350,6 @@ def _rewrite_compilation(
 
             # Write pages from the resolution plan
             for i, (winner, _) in enumerate(plan):
-                # Derive a clean entry name: use the compilation's original
-                # page naming scheme to keep sort order consistent
-                # We'll use a zero-padded index so readers sort correctly
                 ext      = winner.ext
                 new_name = f"page_{i+1:04d}{ext}"
 
@@ -499,6 +506,29 @@ def process_directory(series_dir: Path, dry_run: bool = False) -> None:
 # ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
+def _iter_series_dirs(root: Path) -> list[Path]:
+    """
+    Recursively collect all directories under root that contain at least
+    one .cbz file directly (i.e. are series-level folders, not grouping folders).
+    """
+    series: list[Path] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError as e:
+        log.error(f"Cannot iterate '{root}': {e}")
+        return series
+
+    has_cbz = any(e.is_file() and e.suffix.lower() == ".cbz" for e in entries)
+    if has_cbz:
+        series.append(root)
+    else:
+        for entry in sorted(entries):
+            if entry.is_dir():
+                series.extend(_iter_series_dirs(entry))
+
+    return series
+
+
 def main() -> None:
     args    = [a for a in sys.argv[1:] if a != "--dry-run"]
     dry_run = "--dry-run" in sys.argv
@@ -509,37 +539,43 @@ def main() -> None:
         log.info("  Mode: DRY RUN — no files will be modified or moved")
     log.info("=" * 60)
 
-    # Determine target directory
+    # Determine targets: CLI paths take priority, else fall back to SCAN_FOLDERS
     if args:
-        target = Path(args[0])
+        targets = [Path(a) for a in args]
     else:
-        print("\nCBZ Compilation Resolver")
-        print("-" * 40)
-        print("Enter the full path to the series directory to process.")
-        print("This should be the folder containing the .cbz files")
-        print("(e.g. C:\\Comics\\Batman  or  \\\\tower\\media\\comics\\Comix\\Batman)\n")
-        raw = input("Directory: ").strip().strip('"').strip("'")
-        if not raw:
-            print("No directory entered. Exiting.")
-            return
-        target = Path(raw)
+        targets = [Path(f) for f in SCAN_FOLDERS]
 
-    if not target.exists() or not target.is_dir():
-        print(f"\nERROR: Directory not found: {target}")
-        log.error(f"Directory not found: {target}")
-        return
-
-    log.info(f"  Target   : {target}")
     log.info(f"  Processed: {PROCESSED_FOLDER}")
     log.info(f"  Log      : {LOG_FILE}")
-
     if dry_run:
         log.info("  (Dry-run mode — no files will be written or moved)")
+    log.info("=" * 60)
 
-    process_directory(target, dry_run=dry_run)
+    total_dirs     = 0
+    total_overlaps = 0
+
+    for target in targets:
+        if not target.exists() or not target.is_dir():
+            log.error(f"Directory not found, skipping: {target}")
+            continue
+
+        log.info(f"\nScanning: {target}")
+        series_dirs = _iter_series_dirs(target)
+        log.info(f"  Found {len(series_dirs)} series director{'y' if len(series_dirs) == 1 else 'ies'}.")
+        total_dirs += len(series_dirs)
+
+        for series_dir in series_dirs:
+            groups = scan_directory(series_dir)
+            if groups:
+                total_overlaps += len(groups)
+            process_directory(series_dir, dry_run=dry_run)
 
     log.info("\n" + "=" * 60)
     log.info("CBZ Compilation Resolver complete.")
+    log.info(f"  Series directories checked : {total_dirs}")
+    log.info(f"  Overlap groups found       : {total_overlaps}")
+    if dry_run:
+        log.info("  (Dry-run — no changes written)")
     log.info("=" * 60)
 
 

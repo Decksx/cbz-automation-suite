@@ -10,7 +10,7 @@ Cleans filenames / strings by removing:
 Standalone usage — scan a folder and rename .cbz files in-place:
     python strip_duplicates.py "C:/path/to/folder"
     python strip_duplicates.py "C:/path/to/folder" --dry-run
-    python strip_duplicates.py "C:/path/to/folder" --recursive
+    python strip_duplicates.py "C:/path/to/folder" --no-recursive
 
 Library usage — import and call clean():
     from strip_duplicates import clean
@@ -248,9 +248,9 @@ def _run_tests() -> None:
 # ─────────────────────────────────────────────
 def main() -> None:
     args      = sys.argv[1:]
-    dry_run   = "--dry-run"   in args
-    recursive = "--recursive" in args
-    test_mode = "--test"      in args
+    dry_run   = "--dry-run"      in args
+    recursive = "--no-recursive" not in args   # recursive by default
+    test_mode = "--test"         in args
     paths     = [a for a in args if not a.startswith("--")]
 
     if test_mode:
@@ -265,7 +265,7 @@ def main() -> None:
 
     if not paths:
         print("Usage:")
-        print("  python strip_duplicates.py <folder> [--dry-run] [--recursive]")
+        print("  python strip_duplicates.py <folder> [--dry-run] [--no-recursive]")
         print("  python strip_duplicates.py --test")
         return
 

@@ -45,7 +45,9 @@ python scripts\cbz_folder_merger.py "L:\Comix" --dry-run   # local drive, previe
 
 ## cbz_compilation_resolver.py
 
-Scans a directory for series where a compilation archive (e.g. `Batman Ch. 1-5.cbz`) overlaps with the matching individual chapter archives. When **all** chapters covered by a compilation are present as individual files:
+Scans all series directories under `SCAN_FOLDERS` for cases where a compilation archive (e.g. `Batman Ch. 1-5.cbz`) overlaps with the matching individual chapter archives. Runs **recursively by default** — every subdirectory containing `.cbz` files directly is treated as a series and checked automatically.
+
+When **all** chapters covered by a compilation are present as individual files:
 
 1. Verifies total page counts match between compilation and individuals.
 2. For each page position, selects the higher-quality page:
@@ -58,23 +60,29 @@ Cases where only some individual chapters are present are reported but never act
 
 **Configuration** (`scripts\cbz_compilation_resolver.py`):
 ```python
+SCAN_FOLDERS = [
+    r"\\tower\media\comics\Comix",
+    r"\\tower\media\comics\Manga",
+]
 LOG_FILE         = r"C:\git\ComicAutomation\cbz_compilation_resolver.log"
 PROCESSED_FOLDER = r"C:\git\ComicAutomation\Processed"
 ```
 
 **Usage:**
 ```powershell
-python scripts\cbz_compilation_resolver.py                         # prompts for directory
+python scripts\cbz_compilation_resolver.py                         # scan all SCAN_FOLDERS (recursive)
 python scripts\cbz_compilation_resolver.py "C:\Comics\Batman"      # single series
 python scripts\cbz_compilation_resolver.py --dry-run               # preview, no changes
 python scripts\cbz_compilation_resolver.py "C:\Comics\Batman" --dry-run
 ```
 
+> Previously this script required an interactive directory prompt or a single path argument. It now reads from `SCAN_FOLDERS` by default, matching the behaviour of the other tools.
+
 ---
 
 ## cbz_number_tagger.py
 
-Retroactively sets `<Number>` and `<Volume>` tags in `ComicInfo.xml` for files that predate the pipeline. Only updates files where a chapter keyword is present in the filename (`ch`, `chapter`, `chp`, `issue`, `#`) — bare title digits are ignored to avoid false positives. Files with no detectable number are skipped and logged.
+Retroactively sets `<Number>` and `<Volume>` tags in `ComicInfo.xml` for files that predate the pipeline. Only updates files where a chapter keyword is present in the filename (`ch`, `chapter`, `chp`, `issue`, `#`) — bare title digits are ignored to avoid false positives. Files with no detectable number are skipped and logged. Scans **recursively** via `rglob`.
 
 **Configuration** (`scripts\cbz_number_tagger.py`):
 ```python
@@ -98,11 +106,14 @@ python scripts\cbz_number_tagger.py --dry-run                         # preview,
 
 Detects near-duplicate series folder names caused by punctuation differences, spacing, or romanisation variants. Normalises names (strips punctuation, lowercases) before comparing, so `Batman: Year One` and `Batman Year One` score as identical.
 
+Runs **recursively** — sibling directories at every nesting level under each `SCAN_FOLDER` are compared against each other. Grouping folders (publisher subdirectories, genre buckets, etc.) are descended into automatically so near-duplicate series nested at any depth are caught.
+
 For each matched pair:
 - The directory with **more files** is treated as the canonical name.
 - If file counts are equal, the **longer name** wins.
 - Pairs at or above `AUTO_RENAME_THRESHOLD` (default `0.90`) are auto-merged.
 - Pairs between `REPORT_THRESHOLD` (default `0.80`) and `0.90` are flagged in the log for manual review.
+- Each sibling group is labelled with its parent folder name in the log output for easy navigation.
 
 **Configuration** (`scripts\cbz_series_matcher.py`):
 ```python
@@ -117,7 +128,7 @@ REPORT_THRESHOLD       = 0.80
 
 **Usage:**
 ```powershell
-python scripts\cbz_series_matcher.py             # scan all SCAN_FOLDERS
+python scripts\cbz_series_matcher.py             # scan all SCAN_FOLDERS (recursive)
 python scripts\cbz_series_matcher.py --dry-run   # preview, no changes
 ```
 
@@ -125,7 +136,7 @@ python scripts\cbz_series_matcher.py --dry-run   # preview, no changes
 
 ## cbz_gap_checker.py
 
-Scans library folders for missing chapter numbers per series and writes a consolidated timestamped CSV report. Treats each immediate subdirectory of a `SCAN_FOLDER` as a series. If a path passed on the command line contains `.cbz` files directly, it is treated as a single series rather than a parent folder.
+Scans library folders for missing chapter numbers per series and writes a consolidated timestamped CSV report. Runs **recursively by default** — directories containing `.cbz` files directly are treated as series; directories containing only subdirectories are descended into further, so you can point it at any level of your library hierarchy.
 
 **Configuration** (`scripts\cbz_gap_checker.py`):
 ```python
@@ -133,7 +144,9 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     # r"\\tower\media\comics\Manga",   # uncomment to include Manga
 ]
-OUTPUT_FOLDER = r"C:\git\ComicAutomation"
+OUTPUT_FOLDER  = r"C:\git\ComicAutomation"
+GAP_THRESHOLD  = 1    # minimum jump to count as a gap
+MIN_ISSUES_TO_REPORT = 2  # skip series with fewer numbered issues than this
 ```
 
 **Usage:**
@@ -150,17 +163,17 @@ No `--dry-run` needed — this script is read-only and never modifies files.
 
 ## strip_duplicates.py
 
-Removes duplicate number/label tokens from filenames (e.g. `Batman ver. 9 ver.9` → `Batman ver. 9`) and fixes oddly spaced or repeated punctuation (e.g. `! !` → `!!`, `.. .` → `...`). Also corrects asymmetrically spaced hyphens.
+Removes duplicate number/label tokens from filenames (e.g. `Batman ver. 9 ver.9` → `Batman ver. 9`) and fixes oddly spaced or repeated punctuation (e.g. `! !` → `!!`, `.. .` → `...`). Also corrects asymmetrically spaced hyphens. Runs **recursively by default**; use `--no-recursive` to limit to a single directory.
 
 On any rename collision, the larger file is kept; ties keep the existing file.
 
 **Standalone usage:**
 ```powershell
-python scripts\strip_duplicates.py "C:\Comics\Batman"              # rename in place
-python scripts\strip_duplicates.py "C:\Comics\Batman" --dry-run    # preview only
-python scripts\strip_duplicates.py "C:\Comics" --recursive         # walk all subdirs
-python scripts\strip_duplicates.py "C:\Comics" --recursive --dry-run
-python scripts\strip_duplicates.py --test                          # run built-in self-tests
+python scripts\strip_duplicates.py "C:\Comics\Batman"                 # rename in place (recursive)
+python scripts\strip_duplicates.py "C:\Comics\Batman" --dry-run       # preview only
+python scripts\strip_duplicates.py "C:\Comics" --no-recursive         # single directory only
+python scripts\strip_duplicates.py "C:\Comics" --no-recursive --dry-run
+python scripts\strip_duplicates.py --test                             # run built-in self-tests
 ```
 
 **Library usage:**
@@ -175,7 +188,7 @@ print(clean("Batman ver. 9 ver.9 Wow! !"))
 
 ## cbz_deduplicator.py
 
-Scans one or more library folders for three classes of duplicate or fixable files and resolves them in a single pass:
+Scans one or more library folders for three classes of duplicate or fixable files and resolves them in a single pass. Runs **recursively by default**; use `--no-recursive` to limit duplicate checks to a single level. Loose-image-folder conversion always targets immediate subdirectories only, regardless of the recursion flag.
 
 **Task 1 — Duplicate .cbz files:** Groups `.cbz` files within each directory by their normalised stem (whitespace, hyphens, underscores, and punctuation stripped). When two or more files normalise to the same key (e.g. `Batman - Ch. 12.cbz` and `Batman Ch.12.cbz`), the largest file is kept and the rest deleted. Ties go to the alphabetically-first name.
 
@@ -194,10 +207,10 @@ LOG_FILE = r"C:\git\ComicAutomation\cbz_deduplicator.log"
 
 **Usage:**
 ```powershell
-python scripts\cbz_deduplicator.py                          # scan all SCAN_FOLDERS
-python scripts\cbz_deduplicator.py "\\tower\media\Comix"    # one folder
+python scripts\cbz_deduplicator.py                          # scan all SCAN_FOLDERS (recursive)
+python scripts\cbz_deduplicator.py "\\tower\media\Comix"    # one folder (recursive)
 python scripts\cbz_deduplicator.py --dry-run                # preview only, no changes
-python scripts\cbz_deduplicator.py --recursive              # descend all subdirectories
+python scripts\cbz_deduplicator.py --no-recursive           # single directory level only
 ```
 
 **Conflict resolution:** Task 1 keeps the largest file. Task 2 always keeps `.cbz`. Task 3 skips packing if a `.cbz` with the same name already exists next to the folder.

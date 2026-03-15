@@ -16,13 +16,10 @@ Scans one or more series folders for three classes of problem:
      archive alongside the source folder, then the source folder is removed.
 
 Usage:
-    python cbz_deduplicator.py                          # scan all SCAN_FOLDERS
-    python cbz_deduplicator.py "C:/path/to/series"     # scan one folder
+    python cbz_deduplicator.py                          # scan all SCAN_FOLDERS (recursive)
+    python cbz_deduplicator.py "C:/path/to/series"     # scan one folder (recursive)
     python cbz_deduplicator.py --dry-run               # preview, no changes
-    python cbz_deduplicator.py --recursive             # descend into subdirs for
-                                                        # duplicate checks (image-
-                                                        # folder conversion always
-                                                        # checks one level deep)
+    python cbz_deduplicator.py --no-recursive          # disable recursive descent
 """
 
 import os
@@ -314,15 +311,15 @@ def process_folder(folder: Path, recursive: bool, dry_run: bool) -> None:
 # ─────────────────────────────────────────────
 def main() -> None:
     args      = sys.argv[1:]
-    dry_run   = "--dry-run"   in args
-    recursive = "--recursive" in args
+    dry_run   = "--dry-run"      in args
+    recursive = "--no-recursive" not in args   # recursive by default
     paths     = [a for a in args if not a.startswith("--")]
 
     targets = paths if paths else SCAN_FOLDERS
 
     log.info("=" * 60)
     log.info("CBZ Deduplicator" + (" [DRY RUN]" if dry_run else ""))
-    log.info(f"  Mode      : {'recursive' if recursive else 'single-level'}")
+    log.info(f"  Mode      : {'recursive' if recursive else 'single-level (--no-recursive)'}")
     log.info("=" * 60)
 
     for target in targets:

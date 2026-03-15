@@ -167,3 +167,35 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 **Decision:** The `_CJK_RE` compiled pattern was removed from `cbz_sanitizer.py`. It is no longer referenced anywhere in the file.
 
 **Why:** `_CJK_RE` was superseded by `_NON_LATIN_RE` (which covers CJK and all other non-Latin scripts in a single broader pattern) but was never removed. Leaving a dead compiled regex at module level is misleading — it implies the pattern is in use when it is not. The sanitizer and watcher now have identical regex sets.
+
+---
+
+## Recursive by default across all batch tools
+
+**Decision:** All batch tools that previously required `--recursive` to descend into subdirectories now run recursively by default. Where an opt-out makes sense (`cbz_deduplicator.py`, `strip_duplicates.py`), `--no-recursive` is provided. Tools with no meaningful single-level mode (`cbz_gap_checker.py`, `cbz_series_matcher.py`, `cbz_compilation_resolver.py`) have no opt-out flag.
+
+**Why:** The library is organised as `\\tower\media\comics\Comix\<Series>\<Chapter>.cbz`. Every tool needs to reach the series/chapter level to do meaningful work. Requiring `--recursive` on every invocation is error-prone — it's easy to forget and silently get incomplete results on a large library. Recursive behaviour is the expected default; single-level is the rare exception and should be the opt-in, not the other way around.
+
+---
+
+## cbz_series_matcher.py — sibling-group recursion
+
+**Decision:** Rather than comparing all directories in a flat list against each other, `cbz_series_matcher.py` collects sibling groups at every nesting level via `_collect_dir_groups()` and runs `find_matches()` independently on each group.
+
+**Why:** Comparing across nesting levels would produce meaningless high-similarity scores between series in completely different parts of the library (e.g. `Comix/Batman` vs `Manga/Batman` would look identical after normalisation, but they are intentionally separate). Grouping by siblings ensures only directories that could plausibly be duplicates of each other — those sharing the same parent — are ever compared. Running recursively means near-duplicate detection catches series nested at any depth, not just the top level of each `SCAN_FOLDER`.
+
+---
+
+## cbz_compilation_resolver.py — SCAN_FOLDERS + _iter_series_dirs()
+
+**Decision:** The compilation resolver was changed from requiring an interactive directory prompt to reading from `SCAN_FOLDERS` by default. A new `_iter_series_dirs()` helper recursively walks from a root, collecting only directories that contain `.cbz` files directly (skipping grouping folders that contain only subdirectories).
+
+**Why:** The old interactive prompt made the script unsuitable for scheduled or automated runs. The library has hundreds of series directories — running the resolver against each one manually is not practical. `_iter_series_dirs()` correctly distinguishes between series-level directories (contain `.cbz` files) and organisational grouping folders (contain only subdirectories), so the resolver processes exactly the right set of directories without false positives or missed series.
+
+---
+
+## cbz_gap_checker.py — recursive scan_folder()
+
+**Decision:** `scan_folder()` in `cbz_gap_checker.py` now recurses into subdirectories automatically. Directories containing `.cbz` files directly are treated as series; directories containing only subdirectories are descended into further.
+
+**Why:** The previous implementation treated each immediate subdirectory of a `SCAN_FOLDER` as a series, which worked for a flat `Comix/Batman/` structure but missed series nested one level deeper (e.g. `Comix/Publisher/Batman/`). The recursive approach handles both layouts without requiring any configuration change.
