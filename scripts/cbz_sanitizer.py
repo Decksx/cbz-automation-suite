@@ -50,13 +50,14 @@ COMICINFO_TEMPLATE = """<ComicInfo
 # MODULE-LEVEL CONSTANTS (compiled once)
 # ─────────────────────────────────────────────
 _TITLE_OVERWRITE_RES = [
-    re.compile(r"manga_chapter",          re.IGNORECASE),
+    re.compile(r"manga[\s_]chapter",      re.IGNORECASE),
     re.compile(r"^#\s*english",           re.IGNORECASE),
     re.compile(r"^#\s*chapter",           re.IGNORECASE),
     re.compile(r"^chapter",               re.IGNORECASE),
     re.compile(r"^part\s+\d+",           re.IGNORECASE),
     re.compile(r"^doujinshi[\s_]chapter", re.IGNORECASE),
     re.compile(r"^unknown[\s_]chapter",   re.IGNORECASE),
+    re.compile(r"^official[\s_]chapter",  re.IGNORECASE),
 ]
 NUMBER_PREFIX_RE = re.compile(r"^\d+\s*-\s*", re.IGNORECASE)
 
@@ -66,13 +67,26 @@ GIBBERISH_RE = re.compile(
     re.IGNORECASE
 )
 
-UNKNOWN_CHAPTER_RE = re.compile(
-    r'^unknown[\s_]chapter[\s_]*(\d[\d.]*)(.*?)$',
-    re.IGNORECASE
-)
-
-HASH_CHAPTER_RE = re.compile(
-    r'^#\s*chapter\s*(\d[\d.]*)(.*?)$',
+# Matches stems that are PURELY generic with a chapter keyword + number.
+# Three branches:
+#   A) Known prefix (doujinshi/official/manga/unknown) + any chapter keyword
+#   B) Hash prefix (# / # english) + optional chapter keyword
+#   C) Bare full-word "chapter" or "part" with no series name in front
+# Intentionally does NOT match bare "ch N" or "chap N" — those go to CHAPTER_ONLY_RE.
+GENERIC_CHAPTER_RE = re.compile(
+    r'^'
+    r'(?:'
+        r'(?:(?:doujinshi|official|manga|unknown)[\s_]+)'  # Branch A: required prefix
+        r'(?:#\s*(?:english[\s_]+)?)?'                     # optional # english after prefix
+        r'(?:ch(?:ap(?:ter)?)?p?\.?\s*|part\.?\s*)'        # any chapter keyword
+    r'|'
+        r'#\s*(?:english[\s_]+)?'                          # Branch B: # prefix
+        r'(?:ch(?:ap(?:ter)?)?p?\.?\s*)?'                  # optional chapter keyword after #
+    r'|'
+        r'(?:chapter|part)\.?\s+'                          # Branch C: bare full-word "chapter"/"part"
+    r')'
+    r'(\d[\d.]*)'    # group 1: chapter number
+    r'(.*?)$',       # group 2: optional trailing suffix
     re.IGNORECASE
 )
 
@@ -224,32 +238,50 @@ def normalise_number_tokens(stem: str) -> str:
 
 
 def normalize_stem(stem: str, dir_name: str) -> str:
-    """Apply directory-aware fixes to a cleaned filename stem."""
+    """
+    Apply directory-aware fixes to a cleaned filename stem.
+
+    Priority order:
+      1. Gibberish / hash-only stems           → dir_name
+      2. Generic chapter stem with a number    → dir_name + " Ch. N"
+         Covers: "chapter 5", "doujinshi chapter 3", "official chapter 7",
+                 "manga chapter 12", "unknown chapter 8", "# chapter 5",
+                 "# english chapter 5", "part 2"
+      3. Generic chapter stem with no number   → dir_name  (bare "chapter", etc.)
+      4. Bare ch/chap/chp stem                 → dir_name + " Ch. N" (preserves existing behaviour)
+      5. Numbered-chapter edge cases           → dir_name + " Ch. N"
+      6. Any other generic pattern             → dir_name
+      7. Custom stem                           → unchanged
+    """
     if GIBBERISH_RE.match(stem):
         return dir_name
 
+    # Generic chapter/part stems — extract number if present
+    m = GENERIC_CHAPTER_RE.match(stem)
+    if m:
+        num    = m.group(1)
+        suffix = m.group(2).strip(" -_")
+        n = float(num)
+        num_str = str(int(n)) if n == int(n) else str(n)
+        result = f"{dir_name} Ch. {num_str}"
+        if suffix:
+            result += f" {suffix}"
+        log.info(f"    Generic stem '{stem}' → '{result}'")
+        return result
+
+    # Bare ch/chap/chp + number (e.g. "ch. 5", "chap5")
     m = CHAPTER_ONLY_RE.match(stem)
     if m:
         chapter_part = stem[0].upper() + stem[1:]
         return f"{dir_name} {chapter_part}"
 
+    # Edge case: "12. ch. 5" or "ch. - 5"
     m = NUMBERED_CHAPTER_RE.match(stem)
     if m:
         num = m.group(1) or m.group(2)
         return f"{dir_name} Ch. {num}"
 
-    m = UNKNOWN_CHAPTER_RE.match(stem)
-    if m:
-        num    = m.group(1)
-        suffix = m.group(2).strip(" -_")
-        return f"{dir_name} Chapter {num}" + (f" {suffix}" if suffix else "")
-
-    m = HASH_CHAPTER_RE.match(stem)
-    if m:
-        num    = m.group(1)
-        suffix = m.group(2).strip(" -_")
-        return f"{dir_name} Chapter {num}" + (f" {suffix}" if suffix else "")
-
+    # Any other generic pattern with no extractable number
     if is_generic(stem):
         return dir_name
 
