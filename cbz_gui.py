@@ -39,6 +39,9 @@ FONT_BODY = ("Segoe UI", 10)
 FONT_MONO = ("Consolas", 9)
 
 # ── Tool definitions ────────────────────────────────────────────────────────────
+# scan_folder_flag: how the folder is passed to each script.
+#   "positional"  — appended as a bare arg (default, works for most tools)
+#   "--scan"      — passed as --scan=<path> (used by cbz_sanitizer.py)
 TOOLS = [
     {
         "id": "sanitizer",
@@ -47,6 +50,7 @@ TOOLS = [
         "description": "Clean filenames and fix ComicInfo.xml metadata in-place across a library folder.",
         "icon": "\u2726",
         "color": ACCENT,
+        "scan_folder_flag": "--scan",
         "options": [
             {"type": "folder",    "key": "scan_folder", "label": "Scan folder",     "default": r"\\tower\media\comics\manga"},
             {"type": "select",    "key": "sort",        "label": "Sort order",      "choices": ["newest", "oldest", "alpha", "alpha-reverse"], "default": "newest"},
@@ -398,9 +402,16 @@ class CBZLauncherApp(tk.Tk):
         cmd = [sys.executable, str(script)]
         opts = self._option_vars
 
+        # Pass the scan folder using the method this script expects.
+        # Most scripts take a bare positional path; cbz_sanitizer uses --scan=<path>.
+        folder_flag = tool.get("scan_folder_flag", "positional")
         scan_folder = opts.get("scan_folder")
         if scan_folder and scan_folder.get():
-            cmd.append(scan_folder.get())
+            folder_path = scan_folder.get()
+            if folder_flag == "--scan":
+                cmd.append(f"--scan={folder_path}")
+            else:
+                cmd.append(folder_path)
 
         if opts.get("dry_run") and opts["dry_run"].get():
             cmd.append("--dry-run")

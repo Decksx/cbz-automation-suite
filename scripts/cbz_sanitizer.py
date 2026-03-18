@@ -976,12 +976,6 @@ def sanitize_directory(dir_path: Path, processed: set, started: str) -> None:
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def main():
-    scan_path = Path(SCAN_FOLDER)
-
-    if not scan_path.exists():
-        print(f"ERROR: Scan folder not found: {SCAN_FOLDER}")
-        return
-
     args    = sys.argv[1:]
     restart = "--restart" in args
     resume  = "--resume"  in args
@@ -993,9 +987,23 @@ def main():
             sort_mode = arg.split("=", 1)[1].strip().lower()
             break
 
+    # --scan=<path> overrides the SCAN_FOLDER constant (used by the GUI launcher)
+    scan_override = None
+    for arg in args:
+        if arg.startswith("--scan="):
+            scan_override = arg.split("=", 1)[1].strip().strip('"').strip("'")
+            break
+
     _VALID_SORTS = {"newest", "oldest", "alpha", "alpha-reverse"}
     if sort_mode not in _VALID_SORTS:
         print(f"ERROR: Unknown --sort mode '{sort_mode}'. Valid options: {', '.join(sorted(_VALID_SORTS))}")
+        return
+
+    scan_folder_str = scan_override if scan_override else SCAN_FOLDER
+    scan_path = Path(scan_folder_str)
+
+    if not scan_path.exists():
+        print(f"ERROR: Scan folder not found: {scan_folder_str}")
         return
 
     progress_exists = Path(PROGRESS_FILE).exists()
@@ -1039,7 +1047,7 @@ def main():
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer started")
-    log.info(f"  Scanning : {SCAN_FOLDER}")
+    log.info(f"  Scanning : {scan_folder_str}")
     log.info(f"  Sort     : {_sort_labels[sort_mode]}")
     log.info(f"  Log      : {LOG_FILE}")
     log.info(f"  Progress : {PROGRESS_FILE}")
