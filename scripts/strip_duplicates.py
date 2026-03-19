@@ -1,42 +1,34 @@
 """
-strip_duplicates.py
+strip_duplicates.py — Strip Duplicates (parallelised)
 
-Cleans filenames / strings by removing:
-  1. Duplicated number/label patterns (e.g. "ver. 9 ver.9", "ch. 12 ch.12",
-     "chapter 5 Chapter 5", "9 9")
-  2. Oddly spaced punctuation (e.g. "! !", ".. .", "?  ?  ?")
-  3. Asymmetrically spaced hyphens (e.g. "word -word", "word- word")
-
-Standalone usage — scan a folder and rename .cbz files in-place:
-    python strip_duplicates.py "C:/path/to/folder"
-    python strip_duplicates.py "C:/path/to/folder" --dry-run
-    python strip_duplicates.py "C:/path/to/folder" --no-recursive
-
-Library usage — import and call clean():
-    from strip_duplicates import clean
-    print(clean("Batman ver. 9 ver.9 Wow! !"))
-    # -> "Batman ver. 9 Wow!!"
-
-File conflict resolution (when rename target already exists):
-    The larger file is kept; the smaller file is discarded.
-    Ties (equal size) keep the destination (existing) file.
+Changes in this version
+────────────────────────
+• --workers N  (default: min(8, cpu_count)).  Pass --workers 1 for serial.
+• When recursive, file renaming is parallelised: each directory's batch of
+  .cbz files is an independent unit of work dispatched to ThreadPoolExecutor.
+• Conflict resolution (larger-file-wins) is handled per-directory so no two
+  threads ever touch the same file simultaneously.
+• Library usage / clean() function is completely unchanged.
 """
+
+from __future__ import annotations
 
 import os
 import re
 import sys
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from pathlib import Path
 
 # ─────────────────────────────────────────────
-# CONFIGURATION — edit for standalone use
+# CONFIGURATION
 # ─────────────────────────────────────────────
 LOG_FILE = r"C:\git\ComicAutomation\strip_duplicates.log"
-# ─────────────────────────────────────────────
+DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 
 # ─────────────────────────────────────────────
-# COMPILED PATTERNS
+# COMPILED PATTERNS  (unchanged)
 # ─────────────────────────────────────────────
 _LABEL_FRAG       = r'(?:ver(?:sion)?|v|ch(?:ap(?:ter)?)?|episode|ep|vol(?:ume)?|part|pt)'
 _DUP_LABEL_NUM_RE = re.compile(
@@ -45,24 +37,18 @@ _DUP_LABEL_NUM_RE = re.compile(
 )
 _DUP_BARE_NUM_RE  = re.compile(r'\b(\d+(?:\.\d+)?)\s+\1\b')
 _SPACED_PUNCT_RE  = re.compile(r'([!?.])(?: +\1)+')
-_ASYM_HYPH_L_RE   = re.compile(r'(\S) -(\S)')   # space only on left of hyphen
-_ASYM_HYPH_R_RE   = re.compile(r'(\S)- (\S)')   # space only on right of hyphen
+_ASYM_HYPH_L_RE   = re.compile(r'(\S) -(\S)')
+_ASYM_HYPH_R_RE   = re.compile(r'(\S)- (\S)')
 
 
 # ─────────────────────────────────────────────
-# CORE CLEANING
+# CORE CLEANING  (unchanged — library-safe)
 # ─────────────────────────────────────────────
 def clean(s: str) -> str:
     """
     Apply all three cleaning passes and return the cleaned string.
-
-    1. Labelled duplicate numbers   "ver. 9 ver.9"    -> "ver. 9"
-    2. Bare duplicate numbers       "9 9"              -> "9"
-    3. Spaced punctuation           "! !"              -> "!!"
-    4. Asymmetric hyphens           "word -next"       -> "word-next"
-       (symmetric "word - word" is left untouched)
+    This function is pure (no I/O) and safe to call from any context.
     """
-    # Pass 1: labelled duplicates
     def _replace_labeled(m: re.Match) -> str:
         first  = m.group(1)
         num2   = m.group(2)
@@ -71,38 +57,29 @@ def clean(s: str) -> str:
             return first
         return m.group(0)
     s = _DUP_LABEL_NUM_RE.sub(_replace_labeled, s)
-
-    # Pass 2: bare duplicate numbers
     s = _DUP_BARE_NUM_RE.sub(r'\1', s)
 
-    # Pass 3: spaced punctuation
     def _collapse_punct(m: re.Match) -> str:
         ch    = m.group(1)
         count = len(re.findall(re.escape(ch), m.group(0)))
         return ch * count
     s = _SPACED_PUNCT_RE.sub(_collapse_punct, s)
-
-    # Pass 4: asymmetric hyphens
     s = _ASYM_HYPH_L_RE.sub(r'\1-\2', s)
     s = _ASYM_HYPH_R_RE.sub(r'\1-\2', s)
-
-    # Collapse any double-spaces left behind
     s = re.sub(r'  +', ' ', s).strip()
     return s
 
 
 # ─────────────────────────────────────────────
-# STANDALONE FILE RENAMER
+# LOGGING
 # ─────────────────────────────────────────────
 def _setup_logging() -> logging.Logger:
-    """Configure logging to file + console."""
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     log = logging.getLogger("strip_duplicates")
     log.setLevel(logging.INFO)
-
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         fh = _RotatingFileHandler(
@@ -111,29 +88,22 @@ def _setup_logging() -> logging.Logger:
         fh.setFormatter(fmt)
         log.addHandler(fh)
     except OSError:
-        pass  # log dir not writable — console only
-
+        pass
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     log.addHandler(sh)
     return log
 
 
+# ─────────────────────────────────────────────
+# FILE HELPERS  (unchanged logic)
+# ─────────────────────────────────────────────
 def _clean_name(name: str) -> str:
-    """Clean a filename stem, preserve extension."""
     p    = Path(name)
     stem = clean(p.stem)
     return stem + p.suffix
 
-
 def _resolve_conflict(src: Path, dest: Path, log: logging.Logger) -> bool:
-    """
-    Handle a rename collision: dest already exists.
-    - Keep the larger file.
-    - Ties (equal size) keep dest (existing).
-    Returns True if src should be renamed to dest (caller must do the rename),
-    False if src should be discarded instead.
-    """
     src_size  = src.stat().st_size
     dest_size = dest.stat().st_size
     if src_size > dest_size:
@@ -142,31 +112,34 @@ def _resolve_conflict(src: Path, dest: Path, log: logging.Logger) -> bool:
             f"incoming ({src_size:,} B) > existing ({dest_size:,} B) — replacing."
         )
         dest.unlink()
-        return True   # proceed with rename
+        return True
     else:
         log.info(
             f"    Conflict: '{dest.name}' already exists — "
             f"existing ({dest_size:,} B) >= incoming ({src_size:,} B) — discarding incoming."
         )
         src.unlink()
-        return False  # discard src
+        return False
 
 
-def process_folder(folder: Path, recursive: bool, dry_run: bool, log: logging.Logger) -> None:
-    """Scan folder for .cbz files and rename those whose names change after cleaning."""
-    pattern = "**/*.cbz" if recursive else "*.cbz"
-    cbz_files = sorted(folder.glob(pattern))
-
-    if not cbz_files:
-        log.info(f"No .cbz files found in: {folder}")
-        return
-
-    log.info(f"Found {len(cbz_files)} .cbz file(s) in: {folder}")
+# ─────────────────────────────────────────────
+# PER-DIRECTORY WORKER
+# ─────────────────────────────────────────────
+def _process_dir(
+    directory: Path,
+    cbz_files: list[Path],
+    dry_run: bool,
+    log: logging.Logger,
+) -> tuple[int, int, int, int]:
+    """
+    Rename .cbz files in a single directory.
+    Returns (renamed, unchanged, discarded, errors).
+    Safe to call from threads — all files belong to `directory` only.
+    """
     renamed = skipped = discarded = unchanged = 0
 
     for cbz in cbz_files:
         new_name = _clean_name(cbz.name)
-
         if new_name == cbz.name:
             log.info(f"  Unchanged: {cbz.name}")
             unchanged += 1
@@ -200,14 +173,58 @@ def process_folder(folder: Path, recursive: bool, dry_run: bool, log: logging.Lo
                 log.error(f"  Rename failed for '{cbz.name}': {e}")
                 skipped += 1
 
+    return renamed, unchanged, discarded, skipped
+
+
+# ─────────────────────────────────────────────
+# FOLDER PROCESSING
+# ─────────────────────────────────────────────
+def process_folder(folder: Path, recursive: bool, dry_run: bool, log: logging.Logger, workers: int) -> None:
+    """Scan folder for .cbz files, group by directory, rename in parallel."""
+    pattern   = "**/*.cbz" if recursive else "*.cbz"
+    cbz_files = sorted(folder.glob(pattern))
+
+    if not cbz_files:
+        log.info(f"No .cbz files found in: {folder}")
+        return
+
+    log.info(f"Found {len(cbz_files)} .cbz file(s) in: {folder}  ({workers} worker(s))")
+
+    # Group files by parent directory so each worker gets an isolated batch
+    dir_to_files: dict[Path, list[Path]] = {}
+    for cbz in cbz_files:
+        dir_to_files.setdefault(cbz.parent, []).append(cbz)
+
+    total_renamed = total_unchanged = total_discarded = total_skipped = 0
+
+    if workers == 1 or len(dir_to_files) == 1:
+        for directory, files in dir_to_files.items():
+            r, u, d, s = _process_dir(directory, files, dry_run, log)
+            total_renamed    += r; total_unchanged += u
+            total_discarded  += d; total_skipped   += s
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_process_dir, directory, files, dry_run, log): directory
+                for directory, files in dir_to_files.items()
+            }
+            for future in as_completed(futures):
+                directory = futures[future]
+                try:
+                    r, u, d, s = future.result()
+                    total_renamed    += r; total_unchanged += u
+                    total_discarded  += d; total_skipped   += s
+                except Exception as e:
+                    log.error(f"  Worker failed for '{directory}': {e}")
+
     log.info(
-        f"Done — {renamed} renamed, {unchanged} unchanged, "
-        f"{discarded} discarded (conflict, kept larger), {skipped} error(s)."
+        f"Done — {total_renamed} renamed, {total_unchanged} unchanged, "
+        f"{total_discarded} discarded (conflict, kept larger), {total_skipped} error(s)."
     )
 
 
 # ─────────────────────────────────────────────
-# SELF-TEST
+# SELF-TEST  (unchanged)
 # ─────────────────────────────────────────────
 def _run_tests() -> None:
     tests = [
@@ -224,10 +241,9 @@ def _run_tests() -> None:
         ("Really?  ?  ?",                 "Really???"),
         ("word -next",                    "word-next"),
         ("word- next",                    "word-next"),
-        ("word - next",                   "word - next"),   # symmetric, unchanged
+        ("word - next",                   "word - next"),
         ("ch. 5 ch.5 Wow! ! word -end",   "ch. 5 Wow!! word-end"),
     ]
-
     passed = 0
     for inp, expected in tests:
         result = clean(inp)
@@ -239,7 +255,6 @@ def _run_tests() -> None:
         else:
             print(f"{status} {inp!r}  →  {result!r}")
             passed += 1
-
     print(f"\n{passed}/{len(tests)} tests passed.")
 
 
@@ -249,9 +264,23 @@ def _run_tests() -> None:
 def main() -> None:
     args      = sys.argv[1:]
     dry_run   = "--dry-run"      in args
-    recursive = "--no-recursive" not in args   # recursive by default
+    recursive = "--no-recursive" not in args
     test_mode = "--test"         in args
-    paths     = [a for a in args if not a.startswith("--")]
+
+    workers = DEFAULT_WORKERS
+    for i, arg in enumerate(args):
+        if arg.startswith("--workers="):
+            try:
+                workers = max(1, int(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
+        elif arg == "--workers" and i + 1 < len(args):
+            try:
+                workers = max(1, int(args[i + 1]))
+            except ValueError:
+                pass
+
+    paths = [a for a in args if not a.startswith("--")]
 
     if test_mode:
         _run_tests()
@@ -261,11 +290,12 @@ def main() -> None:
 
     log.info("=" * 60)
     log.info("Strip Duplicates" + (" [DRY RUN]" if dry_run else ""))
+    log.info(f"  Workers : {workers}")
     log.info("=" * 60)
 
     if not paths:
         print("Usage:")
-        print("  python strip_duplicates.py <folder> [--dry-run] [--no-recursive]")
+        print("  python strip_duplicates.py <folder> [--dry-run] [--no-recursive] [--workers N]")
         print("  python strip_duplicates.py --test")
         return
 
@@ -275,7 +305,7 @@ def main() -> None:
             log.warning(f"Not a valid directory, skipping: {folder}")
             continue
         log.info(f"Scanning: {folder}")
-        process_folder(folder, recursive=recursive, dry_run=dry_run, log=log)
+        process_folder(folder, recursive=recursive, dry_run=dry_run, log=log, workers=workers)
 
     log.info("=" * 60)
     log.info("Strip Duplicates complete.")

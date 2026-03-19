@@ -1,6 +1,6 @@
 # Other Tools
 
-Secondary scripts for library maintenance. All support `--dry-run` unless noted.
+Secondary scripts for library maintenance. All support `--dry-run` unless noted. All except `cbz_number_tagger.py` support `--workers N` for parallel processing.
 
 ---
 
@@ -17,6 +17,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Manga",
 ]
 LOG_FILE = r"C:\git\ComicAutomation\cbz_folder_merger.log"
+DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 ```
 
 **Usage:**
@@ -27,6 +28,7 @@ python scripts\cbz_folder_merger.py "L:\Comix"             # local drive path
 python scripts\cbz_folder_merger.py "C:\Comics\Batman"     # single series directory
 python scripts\cbz_folder_merger.py --dry-run              # preview, no changes
 python scripts\cbz_folder_merger.py "L:\Comix" --dry-run   # local drive, preview only
+python scripts\cbz_folder_merger.py --workers 8            # parallel processing
 ```
 
 **Interactive prompt** (when run with no path argument):
@@ -38,6 +40,10 @@ python scripts\cbz_folder_merger.py "L:\Comix" --dry-run   # local drive, previe
   [C] Enter a custom path (local drive or UNC share)
   Choice:
 ```
+
+**Parallel processing:** Groups (e.g. all `Batman ch.*` folders) run in parallel across a `ThreadPoolExecutor`. Within each group, `ComicInfo.xml` updates are also parallelised per-file using a second inner pool. Workers are split evenly between the two levels — at `--workers 8`, up to 4 groups run simultaneously, each with up to 4 ComicInfo workers.
+
+**Two-phase ComicInfo update:** `update_comicinfo()` now reads only the `ComicInfo.xml` entry on the first pass. If no change is needed the zip is never rewritten, avoiding reading hundreds of MB of image data for a no-op. The full zip read/rewrite only happens when a tag actually needs updating.
 
 **Conflict resolution:** On any filename collision, the larger file is kept. Applies to both file merges and directory renames.
 
@@ -66,6 +72,7 @@ SCAN_FOLDERS = [
 ]
 LOG_FILE         = r"C:\git\ComicAutomation\cbz_compilation_resolver.log"
 PROCESSED_FOLDER = r"C:\git\ComicAutomation\Processed"
+DEFAULT_WORKERS  = min(8, os.cpu_count() or 4)
 ```
 
 **Usage:**
@@ -74,9 +81,10 @@ python scripts\cbz_compilation_resolver.py                         # scan all SC
 python scripts\cbz_compilation_resolver.py "C:\Comics\Batman"      # single series
 python scripts\cbz_compilation_resolver.py --dry-run               # preview, no changes
 python scripts\cbz_compilation_resolver.py "C:\Comics\Batman" --dry-run
+python scripts\cbz_compilation_resolver.py --workers 8             # parallel processing
 ```
 
-> Previously this script required an interactive directory prompt or a single path argument. It now reads from `SCAN_FOLDERS` by default, matching the behaviour of the other tools.
+**Parallel processing:** Each series directory is an independent worker. `process_directory()` operates entirely within its own directory so no two threads ever share files.
 
 ---
 
@@ -124,13 +132,17 @@ SCAN_FOLDERS = [
 LOG_FILE               = r"C:\git\ComicAutomation\cbz_series_matcher.log"
 AUTO_RENAME_THRESHOLD  = 0.90
 REPORT_THRESHOLD       = 0.80
+DEFAULT_WORKERS        = min(8, os.cpu_count() or 4)
 ```
 
 **Usage:**
 ```powershell
 python scripts\cbz_series_matcher.py             # scan all SCAN_FOLDERS (recursive)
 python scripts\cbz_series_matcher.py --dry-run   # preview, no changes
+python scripts\cbz_series_matcher.py --workers 4 # parallel processing
 ```
+
+**Parallel processing:** Each sibling group collected by `_collect_dir_groups()` is an independent worker. `find_matches()` and `process_matches()` operate on a single group with no shared state between threads.
 
 ---
 
@@ -147,17 +159,21 @@ SCAN_FOLDERS = [
 OUTPUT_FOLDER  = r"C:\git\ComicAutomation"
 GAP_THRESHOLD  = 1    # minimum jump to count as a gap
 MIN_ISSUES_TO_REPORT = 2  # skip series with fewer numbered issues than this
+DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 ```
 
 **Usage:**
 ```powershell
 python scripts\cbz_gap_checker.py                                        # scan all SCAN_FOLDERS
 python scripts\cbz_gap_checker.py "\\tower\media\comics\Comix\Batman"    # single series
+python scripts\cbz_gap_checker.py --workers 8                            # parallel processing
 ```
 
 Output: `C:\git\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`
 
 No `--dry-run` needed — this script is read-only and never modifies files.
+
+**Parallel processing:** `_collect_series_dirs()` walks the tree serially first, then all `scan_series()` calls run in parallel. Results are aggregated after all futures complete — no shared state.
 
 ---
 
@@ -173,6 +189,7 @@ python scripts\strip_duplicates.py "C:\Comics\Batman"                 # rename i
 python scripts\strip_duplicates.py "C:\Comics\Batman" --dry-run       # preview only
 python scripts\strip_duplicates.py "C:\Comics" --no-recursive         # single directory only
 python scripts\strip_duplicates.py "C:\Comics" --no-recursive --dry-run
+python scripts\strip_duplicates.py "C:\Comics" --workers 4            # parallel processing
 python scripts\strip_duplicates.py --test                             # run built-in self-tests
 ```
 
@@ -183,6 +200,8 @@ from strip_duplicates import clean
 print(clean("Batman ver. 9 ver.9 Wow! !"))
 # -> "Batman ver. 9 Wow!!"
 ```
+
+**Parallel processing:** Files are grouped by parent directory. Each directory's batch is an independent worker — files in different directories are guaranteed independent so there is no collision risk between threads. The `clean()` function itself is pure (no I/O) and safe to call from any context.
 
 ---
 
@@ -203,6 +222,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Manga",
 ]
 LOG_FILE = r"C:\git\ComicAutomation\cbz_deduplicator.log"
+DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 ```
 
 **Usage:**
@@ -211,6 +231,9 @@ python scripts\cbz_deduplicator.py                          # scan all SCAN_FOLD
 python scripts\cbz_deduplicator.py "\\tower\media\Comix"    # one folder (recursive)
 python scripts\cbz_deduplicator.py --dry-run                # preview only, no changes
 python scripts\cbz_deduplicator.py --no-recursive           # single directory level only
+python scripts\cbz_deduplicator.py --workers 8              # parallel processing
 ```
+
+**Parallel processing:** Each directory in the scan tree is an independent worker for Tasks 1 and 2. Task 3 (image folder packing) always runs serially to avoid filesystem races between parent and subdirectory operations.
 
 **Conflict resolution:** Task 1 keeps the largest file. Task 2 always keeps `.cbz`. Task 3 skips packing if a `.cbz` with the same name already exists next to the folder.

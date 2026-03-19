@@ -199,3 +199,36 @@ A record of non-obvious design choices in the suite and the reasoning behind the
 **Decision:** `scan_folder()` in `cbz_gap_checker.py` now recurses into subdirectories automatically. Directories containing `.cbz` files directly are treated as series; directories containing only subdirectories are descended into further.
 
 **Why:** The previous implementation treated each immediate subdirectory of a `SCAN_FOLDER` as a series, which worked for a flat `Comix/Batman/` structure but missed series nested one level deeper (e.g. `Comix/Publisher/Batman/`). The recursive approach handles both layouts without requiring any configuration change.
+
+---
+
+## Parallel processing via --workers N across all batch tools
+
+**Decision:** All batch tools (except `cbz_watcher.py` and `cbz_number_tagger.py`) now support a `--workers N` flag (default: `min(8, cpu_count)`). Each tool parallelises at the most independent grain available. `--workers 1` restores fully serial behaviour.
+
+**Why:** The primary bottleneck in all batch tools is I/O — reading and rewriting zip archives, directory traversal, and file operations. These are largely independent between files and directories, making them well-suited to threading. The GIL is not a significant constraint here because most time is spent waiting on disk I/O rather than CPU-bound computation. The `--workers 1` escape hatch ensures no behaviour regression for users who need deterministic serial output or are debugging edge cases.
+
+Parallelisation grain by tool:
+- **cbz_sanitizer.py** — series directory level; files within a series stay serial for rename/collision safety
+- **cbz_deduplicator.py** — individual directory level for Tasks 1 and 2; Task 3 (image folder packing) stays serial
+- **cbz_gap_checker.py** — series directory level; tree walk is serial, all `scan_series()` calls are parallel
+- **cbz_series_matcher.py** — sibling group level; each group is independent with no shared state
+- **cbz_compilation_resolver.py** — series directory level; each directory is fully isolated
+- **strip_duplicates.py** — directory level; files grouped by parent, each directory batch is a worker
+- **cbz_folder_merger.py** — merge group level (outer pool) + per-file ComicInfo update level (inner pool)
+
+---
+
+## cbz_folder_merger.py — two-phase ComicInfo update
+
+**Decision:** `update_comicinfo()` in `cbz_folder_merger.py` was split into two phases. Phase 1 opens the zip and reads only `ComicInfo.xml` to check whether any tag needs changing. If nothing changed, the function returns immediately without touching image data. Phase 2 (full read + rewrite) only executes when an actual change is required.
+
+**Why:** The original implementation read all zip entry data — including every image — into memory before building the new zip, even when the only goal was to update a few bytes of XML. For a typical 20–50 MB chapter archive this is significant wasted I/O. On a merged folder of 200 chapters where most already have correct metadata, the old approach read gigabytes of image data unnecessarily. The two-phase approach makes the common case (no change needed) essentially free.
+
+---
+
+## cbz_folder_merger.py — two-level parallel pool
+
+**Decision:** `process_library()` uses a two-level `ThreadPoolExecutor` structure: an outer pool where each merge group is a worker, and an inner pool within each group for parallelising `update_comicinfo()` calls per file. Workers are split evenly between the two levels.
+
+**Why:** A single flat pool of all files across all groups would mix files from different groups in the same thread pool, which is safe but produces interleaved log output that is hard to read and debug. The two-level structure keeps each group's work coherent, allows the outer pool to process many groups concurrently, and still exploits file-level parallelism within each group for the ComicInfo update pass (which is the most time-consuming step after the file moves).

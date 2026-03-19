@@ -14,6 +14,7 @@ Edit the constants at the top of `scripts\cbz_sanitizer.py`:
 SCAN_FOLDER   = r"\\tower\media\comics\Comix"       # folder to scan
 LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_sanitizer.log"
 PROGRESS_FILE = r"C:\git\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
+DEFAULT_WORKERS = min(8, os.cpu_count() or 4)        # override with --workers N
 ```
 
 ---
@@ -30,6 +31,8 @@ python scripts\cbz_sanitizer.py --sort=alpha     # alphabetical order
 python scripts\cbz_sanitizer.py --resume         # resume an interrupted run
 python scripts\cbz_sanitizer.py --restart        # ignore saved progress, start fresh
 python scripts\cbz_sanitizer.py --dry-run        # log all planned changes, write nothing
+python scripts\cbz_sanitizer.py --workers 4      # use 4 parallel worker threads
+python scripts\cbz_sanitizer.py --workers 1      # fully serial (original behaviour)
 ```
 
 All flags can be combined:
@@ -37,6 +40,7 @@ All flags can be combined:
 ```powershell
 python scripts\cbz_sanitizer.py --sort=oldest --dry-run
 python scripts\cbz_sanitizer.py --resume --sort=alpha
+python scripts\cbz_sanitizer.py --workers 8 --sort=newest
 ```
 
 ---
@@ -50,6 +54,19 @@ python scripts\cbz_sanitizer.py --resume --sort=alpha
 | `--sort=alpha` | Subdirectories sorted alphabetically |
 
 Sorting applies at the subdirectory level. Files within each subdirectory are always processed in alphabetical order.
+
+---
+
+## Parallel Processing
+
+The sanitizer parallelises at the **series directory** level — each series directory is an independent unit of work dispatched to a `ThreadPoolExecutor`. Files within a series are processed serially to preserve rename/collision safety.
+
+- Default workers: `min(8, cpu_count)`
+- `--workers 1`: fully serial, identical to original behaviour
+- Progress file writes are protected by a `threading.Lock()` — safe at any worker count
+- Counters are aggregated from worker return values — no shared mutable state
+
+Expected speedup on a large library: **2–4×** depending on I/O throughput and series count.
 
 ---
 
@@ -91,4 +108,4 @@ See [shared_pipeline.md](shared_pipeline.md) for the full `sanitize()` step brea
 
 ## Logging
 
-Rotating log file at `LOG_FILE` (5 MB max, 3 backups). Also streams to stdout. Log entries include every rename, tag update, skip, and error with timestamps.
+Rotating log file at `LOG_FILE` (5 MB max, 3 backups). Also streams to stdout. Log entries include every rename, tag update, skip, and error with timestamps. Thread-safe — Python's `logging` module uses internal locks.

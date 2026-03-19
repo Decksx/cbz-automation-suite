@@ -1,27 +1,24 @@
 """
-CBZ Series Matcher
-Scans one or more configured library folders for series directories whose
-names are suspiciously similar (near-duplicates caused by punctuation
-differences, spacing, romanisation variants, etc.).
+cbz_series_matcher.py — CBZ Series Matcher (parallelised)
 
-For each matched pair above the similarity threshold:
-  - The directory with MORE files is treated as the primary (canonical) name.
-  - If both have equal file counts, the LONGER name wins (usually more complete).
-  - If similarity >= AUTO_RENAME_THRESHOLD, the secondary directory is
-    automatically renamed/merged into the primary.
-  - Pairs below AUTO_RENAME_THRESHOLD but above REPORT_THRESHOLD are logged
-    as warnings for manual review.
-
-Usage:
-    python cbz_series_matcher.py             # run with configured folders
-    python cbz_series_matcher.py --dry-run   # preview, no changes
+Changes in this version
+────────────────────────
+• --workers N  (default: min(8, cpu_count)).  Pass --workers 1 for serial.
+• Sibling-group matching runs in parallel: each sibling group collected by
+  _collect_dir_groups() is dispatched to a ThreadPoolExecutor worker.
+• find_matches() and process_matches() are each group's independent unit of
+  work — no shared mutable state between group workers.
+• Counters are summed from returned values after futures complete.
 """
+
+from __future__ import annotations
 
 import os
 import re
 import sys
 import shutil
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib   import SequenceMatcher
 from pathlib   import Path
 from itertools import combinations
@@ -30,20 +27,14 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-
-# Folders to scan — add or remove as needed
 SCAN_FOLDERS: list[str] = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-
-LOG_FILE = r"C:\git\ComicAutomation\cbz_series_matcher.log"
-
-# Pairs at or above this ratio are auto-renamed/merged
+LOG_FILE               = r"C:\git\ComicAutomation\cbz_series_matcher.log"
 AUTO_RENAME_THRESHOLD  = 0.90
-
-# Pairs at or above this ratio (but below auto threshold) are flagged for review
 REPORT_THRESHOLD       = 0.80
+DEFAULT_WORKERS        = min(8, os.cpu_count() or 4)
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -63,28 +54,18 @@ _sh.setFormatter(_fmt)
 log.addHandler(_sh)
 
 # ─────────────────────────────────────────────
-# NAME NORMALISATION FOR COMPARISON ONLY
-# (never written to disk — used only to compute similarity)
+# NAME NORMALISATION
 # ─────────────────────────────────────────────
-_PUNCT_RE    = re.compile(r"[^\w\s]")      # strip all punctuation
-_SPACES_RE   = re.compile(r"\s+")
+_PUNCT_RE  = re.compile(r"[^\w\s]")
+_SPACES_RE = re.compile(r"\s+")
 
 def _normalise_for_compare(name: str) -> str:
-    """
-    Reduce a series name to a comparable form:
-      - Lowercase
-      - Strip all punctuation (hyphens, apostrophes, commas, etc.)
-      - Collapse whitespace
-    This is used ONLY for similarity scoring — never written to disk.
-    """
     name = name.lower()
     name = _PUNCT_RE.sub(" ", name)
     name = _SPACES_RE.sub(" ", name).strip()
     return name
 
-
 def _similarity(a: str, b: str) -> float:
-    """SequenceMatcher ratio of two normalised names."""
     return SequenceMatcher(None, a, b).ratio()
 
 
@@ -92,21 +73,12 @@ def _similarity(a: str, b: str) -> float:
 # DIRECTORY HELPERS
 # ─────────────────────────────────────────────
 def _cbz_count(path: Path) -> int:
-    """Return number of .cbz files directly inside path."""
     try:
         return sum(1 for f in path.iterdir() if f.suffix.lower() == ".cbz")
     except OSError:
         return 0
 
-
 def _choose_primary(a: Path, b: Path) -> tuple[Path, Path]:
-    """
-    Return (primary, secondary) where primary is the canonical name.
-    Rules (in order):
-      1. More CBZ files → primary
-      2. Tie: longer directory name → primary  (usually more complete)
-      3. Tie: alphabetically first → primary
-    """
     ca, cb = _cbz_count(a), _cbz_count(b)
     if ca != cb:
         return (a, b) if ca > cb else (b, a)
@@ -119,11 +91,6 @@ def _choose_primary(a: Path, b: Path) -> tuple[Path, Path]:
 # MERGE / RENAME
 # ─────────────────────────────────────────────
 def _merge_into(secondary: Path, primary: Path, dry_run: bool) -> int:
-    """
-    Move all files from secondary into primary.
-    On filename collision, keep the larger file.
-    Returns number of files moved.
-    """
     moved = 0
     try:
         for item in list(secondary.iterdir()):
@@ -153,7 +120,6 @@ def _merge_into(secondary: Path, primary: Path, dry_run: bool) -> int:
         log.error(f"    Cannot iterate '{secondary}': {e}")
         return moved
 
-    # Remove secondary directory if now empty
     if not dry_run:
         try:
             remaining = list(secondary.iterdir())
@@ -174,80 +140,26 @@ def _merge_into(secondary: Path, primary: Path, dry_run: bool) -> int:
 # ─────────────────────────────────────────────
 # SCAN + MATCH
 # ─────────────────────────────────────────────
-def scan_folder(folder: Path) -> list[Path]:
-    """Return all immediate subdirectories of folder."""
-    try:
-        return sorted(p for p in folder.iterdir() if p.is_dir())
-    except OSError as e:
-        log.error(f"Cannot scan '{folder}': {e}")
-        return []
-
-
-def _collect_dir_groups(folder: Path) -> list[list[Path]]:
-    """
-    Recursively collect groups of sibling directories to compare.
-    Each group is a list of immediate subdirectories sharing the same parent.
-    This lets the matcher catch near-duplicates at every nesting level
-    (e.g. Comix/Batman vs Comix/Batman_, and also nested publisher folders).
-    Returns a list of groups, where each group has >= 2 directories.
-    """
-    groups: list[list[Path]] = []
-    try:
-        siblings = sorted(p for p in folder.iterdir() if p.is_dir())
-    except OSError as e:
-        log.error(f"Cannot scan '{folder}': {e}")
-        return groups
-
-    if len(siblings) >= 2:
-        groups.append(siblings)
-
-    for sibling in siblings:
-        groups.extend(_collect_dir_groups(sibling))
-
-    return groups
-
-
-def find_matches(
-    dirs: list[Path],
-) -> list[tuple[float, Path, Path]]:
-    """
-    Compare every pair of directories by normalised name similarity.
-    Returns list of (ratio, dir_a, dir_b) sorted by ratio descending,
-    filtered to ratio >= REPORT_THRESHOLD.
-    """
+def find_matches(dirs: list[Path]) -> list[tuple[float, Path, Path]]:
     matches: list[tuple[float, Path, Path]] = []
     normalised = {d: _normalise_for_compare(d.name) for d in dirs}
-
     for a, b in combinations(dirs, 2):
         ratio = _similarity(normalised[a], normalised[b])
         if ratio >= REPORT_THRESHOLD:
             matches.append((ratio, a, b))
-
     return sorted(matches, key=lambda t: t[0], reverse=True)
 
-
-# ─────────────────────────────────────────────
-# DEDUPLICATION — avoid processing a dir twice
-# ─────────────────────────────────────────────
 def process_matches(
     matches: list[tuple[float, Path, Path]],
     dry_run: bool,
 ) -> tuple[int, int]:
-    """
-    Process each matched pair.
-    Auto-merges pairs at or above AUTO_RENAME_THRESHOLD.
-    Logs warnings for pairs between REPORT_THRESHOLD and AUTO_RENAME_THRESHOLD.
-    Returns (auto_merged_count, review_count).
-    """
-    auto_merged = 0
+    auto_merged  = 0
     needs_review = 0
-    # Track dirs already consumed by a merge so we don't double-process
     consumed: set[Path] = set()
 
     for ratio, a, b in matches:
         if a in consumed or b in consumed:
             continue
-
         primary, secondary = _choose_primary(a, b)
         ca = _cbz_count(primary)
         cb = _cbz_count(secondary)
@@ -266,7 +178,7 @@ def process_matches(
             log.warning(
                 f"  REVIEW      [{ratio:.3f}]  "
                 f"'{a.name}' ({_cbz_count(a)} files)  <->  "
-                f"'{b.name}' ({_cbz_count(b)} files)  — below auto threshold, manual action needed"
+                f"'{b.name}' ({_cbz_count(b)} files)  — below auto threshold"
             )
             needs_review += 1
 
@@ -274,10 +186,67 @@ def process_matches(
 
 
 # ─────────────────────────────────────────────
+# RECURSIVE GROUP COLLECTION
+# ─────────────────────────────────────────────
+def _collect_dir_groups(folder: Path) -> list[list[Path]]:
+    groups: list[list[Path]] = []
+    try:
+        siblings = sorted(p for p in folder.iterdir() if p.is_dir())
+    except OSError as e:
+        log.error(f"Cannot scan '{folder}': {e}")
+        return groups
+    if len(siblings) >= 2:
+        groups.append(siblings)
+    for sibling in siblings:
+        groups.extend(_collect_dir_groups(sibling))
+    return groups
+
+
+# ─────────────────────────────────────────────
+# PER-GROUP WORKER
+# ─────────────────────────────────────────────
+def _process_group(group: list[Path], dry_run: bool) -> tuple[int, int]:
+    """
+    Match and process a single sibling group.
+    Returns (auto_merged, needs_review).
+    Safe to call from multiple threads — operates on independent directory sets.
+    """
+    if len(group) < 2:
+        return 0, 0
+    matches = find_matches(group)
+    if not matches:
+        return 0, 0
+
+    auto_pairs   = [(r, a, b) for r, a, b in matches if r >= AUTO_RENAME_THRESHOLD]
+    review_pairs = [(r, a, b) for r, a, b in matches if REPORT_THRESHOLD <= r < AUTO_RENAME_THRESHOLD]
+
+    parent_label = group[0].parent.name
+    log.info(
+        f"  [{parent_label}]  {len(auto_pairs)} pair(s) above auto threshold, "
+        f"{len(review_pairs)} pair(s) flagged for review."
+    )
+    return process_matches(matches, dry_run=dry_run)
+
+
+# ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def main() -> None:
-    dry_run = "--dry-run" in sys.argv
+    raw_args = sys.argv[1:]
+    dry_run  = "--dry-run" in raw_args
+
+    workers = DEFAULT_WORKERS
+    for i, arg in enumerate(raw_args):
+        if arg.startswith("--workers="):
+            try:
+                workers = max(1, int(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
+        elif arg == "--workers" and i + 1 < len(raw_args):
+            try:
+                workers = max(1, int(raw_args[i + 1]))
+            except ValueError:
+                pass
 
     log.info("=" * 60)
     log.info("CBZ Series Matcher")
@@ -285,6 +254,7 @@ def main() -> None:
         log.info("  Mode: DRY RUN — no files will be moved or renamed")
     log.info(f"  Auto-merge threshold : {AUTO_RENAME_THRESHOLD}")
     log.info(f"  Review threshold     : {REPORT_THRESHOLD}")
+    log.info(f"  Workers              : {workers}")
     log.info("=" * 60)
 
     total_auto   = 0
@@ -299,38 +269,37 @@ def main() -> None:
             log.error(f"  Folder not found: {folder}")
             continue
 
-        # Collect sibling groups at every nesting level recursively
         dir_groups = _collect_dir_groups(folder)
         all_dirs   = {d for group in dir_groups for d in group}
-        log.info(f"  Found {len(all_dirs)} director{'y' if len(all_dirs)==1 else 'ies'} "
-                 f"across {len(dir_groups)} sibling group(s).")
+        log.info(
+            f"  Found {len(all_dirs)} director{'y' if len(all_dirs) == 1 else 'ies'} "
+            f"across {len(dir_groups)} sibling group(s).  Workers: {workers}."
+        )
         total_dirs += len(all_dirs)
 
         if not dir_groups:
             log.info("  Not enough directories to compare.")
             continue
 
-        # Run matching on each sibling group independently
-        for group in dir_groups:
-            if len(group) < 2:
-                continue
-            matches = find_matches(group)
+        groups_to_process = [g for g in dir_groups if len(g) >= 2]
 
-            auto_pairs   = [(r, a, b) for r, a, b in matches if r >= AUTO_RENAME_THRESHOLD]
-            review_pairs = [(r, a, b) for r, a, b in matches if REPORT_THRESHOLD <= r < AUTO_RENAME_THRESHOLD]
-
-            if not matches:
-                continue
-
-            parent_label = group[0].parent.name
-            log.info(
-                f"  [{parent_label}]  {len(auto_pairs)} pair(s) above auto threshold, "
-                f"{len(review_pairs)} pair(s) flagged for review."
-            )
-
-            auto, review = process_matches(matches, dry_run=dry_run)
-            total_auto   += auto
-            total_review += review
+        if workers == 1:
+            for group in groups_to_process:
+                a, r = _process_group(group, dry_run)
+                total_auto += a; total_review += r
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_process_group, group, dry_run): group
+                    for group in groups_to_process
+                }
+                for future in as_completed(futures):
+                    try:
+                        a, r = future.result()
+                        total_auto += a; total_review += r
+                    except Exception as e:
+                        group = futures[future]
+                        log.error(f"  Worker failed for group under '{group[0].parent.name}': {e}")
 
     log.info("\n" + "=" * 60)
     log.info("Series Matcher complete.")

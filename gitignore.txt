@@ -1,0 +1,47 @@
+# ── Logs ──────────────────────────────────────────────
+*.log
+*.log.1
+*.log.2
+
+# ── Temp files created by the watcher ─────────────────
+*.tmp.cbz
+*.bak.cbz
+
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ───────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── OS / editor cruft ─────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ── CBZ files (don't accidentally commit comics) ───────
+*.cbz
+*.cbr
+*.cb7
+
+# ── Runtime state ─────────────────────────────────────
+# Progress JSONs live in progress_tracking/ — ignore contents, not the folder
+progress_tracking/*.json
+# Live routing config (copy config\routing.example.json and edit)
+routing.json

@@ -8,6 +8,7 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 
 - **Hands-off pipeline** — files dropped into a watch folder are processed and routed automatically.
 - **Recursive by default** — all batch tools descend into subdirectories automatically; opt out with `--no-recursive` where supported.
+- **Parallel by default** — all batch tools use `min(8, cpu_count)` worker threads automatically; opt down with `--workers 1` for serial behaviour.
 - **Resumable** — batch operations track progress in an append-only JSONL file; interrupting a long run costs nothing to recover from.
 - **Non-destructive** — files are renamed in place, never silently deleted; on any collision the larger file wins.
 - **Windows-aware** — explicit handling for `FileExistsError` on rename, UNC paths, and watchdog destination-folder event filtering.
@@ -29,7 +30,7 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 - Python 3.11+
 - [`watchdog`](https://pypi.org/project/watchdog/) >= 3.0.0 — required by `cbz_watcher.py` **only**
 
-All other scripts use the Python standard library exclusively (`zipfile`, `re`, `pathlib`, `logging`, `difflib`, `csv`, `json`, etc.).
+All other scripts use the Python standard library exclusively (`zipfile`, `re`, `pathlib`, `logging`, `difflib`, `csv`, `json`, `concurrent.futures`, etc.).
 
 ```powershell
 pip install watchdog
@@ -39,20 +40,31 @@ pip install watchdog
 
 ## Tools at a Glance
 
-| Script | Recursive? | Purpose | Doc |
-|--------|-----------|---------|-----|
-| `scripts/cbz_watcher.py` | Always (watchdog) | Live watcher — monitors Incoming folder, cleans, tags, and routes files via `routing.json` | [cbz_watcher.md](cbz_watcher.md) |
-| `scripts/cbz_sanitizer.py` | Always (`rglob`) | Batch sanitizer — in-place clean/tag with `--sort`, `--resume`, `--dry-run` | [cbz_sanitizer.md](cbz_sanitizer.md) |
-| `scripts/cbz_folder_merger.py` | Single-level (by design) | Merges colliding series directories; interactive path prompt; supports UNC and local drives | [other_tools.md](other_tools.md#cbz_folder_mergerpy) |
-| `scripts/cbz_compilation_resolver.py` | **Yes — default** | Resolves compilation vs individual overlaps; rewrites with best pages | [other_tools.md](other_tools.md#cbz_compilation_resolverpy) |
-| `scripts/cbz_number_tagger.py` | Always (`rglob`) | Retroactively sets `<Number>` and `<Volume>` ComicInfo tags from filenames | [other_tools.md](other_tools.md#cbz_number_taggerpy) |
-| `scripts/cbz_series_matcher.py` | **Yes — default** | Near-duplicate series name detector; auto-merges above threshold at every nesting level | [other_tools.md](other_tools.md#cbz_series_matcherpy) |
-| `scripts/cbz_gap_checker.py` | **Yes — default** | Scans library, outputs timestamped CSV of missing chapter numbers | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
-| `scripts/cbz_deduplicator.py` | **Yes — default** (`--no-recursive` to disable) | Removes duplicate cbz/cbr files and packs loose image folders into archives | [other_tools.md](other_tools.md#cbz_deduplicatorpy) |
-| `scripts/strip_duplicates.py` | **Yes — default** (`--no-recursive` to disable) | Removes duplicate number tokens and fixes spaced punctuation; importable as library | [other_tools.md](other_tools.md#strip_duplicatespy) |
-| `config/routing.example.json` | — | Template for `routing.json` — copy to `C:\\git\\ComicAutomation\routing.json` and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
-| `config/run_watcher.bat` | — | Double-click launcher — installs watchdog and starts the watcher | — |
-| `config/CBZWatcher_Task.xml` | — | Windows Task Scheduler import — auto-starts watcher on login | — |
+| Script | Recursive? | Workers? | Purpose | Doc |
+|--------|-----------|----------|---------|-----|
+| `scripts/cbz_watcher.py` | Always (watchdog) | — | Live watcher — monitors Incoming folder, cleans, tags, and routes files via `routing.json` | [cbz_watcher.md](cbz_watcher.md) |
+| `scripts/cbz_sanitizer.py` | Always (`rglob`) | **Yes** | Batch sanitizer — in-place clean/tag with `--sort`, `--resume`, `--dry-run`, `--workers` | [cbz_sanitizer.md](cbz_sanitizer.md) |
+| `scripts/cbz_folder_merger.py` | Single-level (by design) | **Yes** | Merges colliding series directories; two-phase ComicInfo update; interactive path prompt; UNC and local drives | [other_tools.md](other_tools.md#cbz_folder_mergerpy) |
+| `scripts/cbz_compilation_resolver.py` | **Yes — default** | **Yes** | Resolves compilation vs individual overlaps; rewrites with best pages | [other_tools.md](other_tools.md#cbz_compilation_resolverpy) |
+| `scripts/cbz_number_tagger.py` | Always (`rglob`) | — | Retroactively sets `<Number>` and `<Volume>` ComicInfo tags from filenames | [other_tools.md](other_tools.md#cbz_number_taggerpy) |
+| `scripts/cbz_series_matcher.py` | **Yes — default** | **Yes** | Near-duplicate series name detector; auto-merges above threshold at every nesting level | [other_tools.md](other_tools.md#cbz_series_matcherpy) |
+| `scripts/cbz_gap_checker.py` | **Yes — default** | **Yes** | Scans library, outputs timestamped CSV of missing chapter numbers | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
+| `scripts/cbz_deduplicator.py` | **Yes — default** (`--no-recursive` to disable) | **Yes** | Removes duplicate cbz/cbr files and packs loose image folders into archives | [other_tools.md](other_tools.md#cbz_deduplicatorpy) |
+| `scripts/strip_duplicates.py` | **Yes — default** (`--no-recursive` to disable) | **Yes** | Removes duplicate number tokens and fixes spaced punctuation; importable as library | [other_tools.md](other_tools.md#strip_duplicatespy) |
+| `config/routing.example.json` | — | — | Template for `routing.json` — copy to `C:\\git\\ComicAutomation\routing.json` and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
+| `config/run_watcher.bat` | — | — | Double-click launcher — installs watchdog and starts the watcher | — |
+| `config/CBZWatcher_Task.xml` | — | — | Windows Task Scheduler import — auto-starts watcher on login | — |
+
+---
+
+## Parallel Processing
+
+All batch tools (except `cbz_watcher.py` and `cbz_number_tagger.py`) support `--workers N`:
+
+- Default: `min(8, cpu_count)` — uses all available cores up to 8
+- `--workers 1` — fully serial, identical to the original behaviour
+- Each tool parallelises at the most independent grain: series directories, sibling groups, or individual files as appropriate
+- Thread safety is maintained throughout — no shared mutable state between workers
 
 ---
 
