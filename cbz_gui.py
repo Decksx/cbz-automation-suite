@@ -52,11 +52,16 @@ TOOLS = [
         "color": ACCENT,
         "scan_folder_flag": "--scan",
         "options": [
-            {"type": "folder",    "key": "scan_folder", "label": "Scan folder",     "default": r"\\tower\media\comics\manga"},
-            {"type": "select",    "key": "sort",        "label": "Sort order",      "choices": ["newest", "oldest", "alpha", "alpha-reverse"], "default": "newest"},
-            {"type": "checkbox",  "key": "dry_run",     "label": "Dry run (preview only)",    "default": False},
-            {"type": "checkbox",  "key": "restart",     "label": "Restart (ignore saved progress)", "default": False},
-            {"type": "checkbox",  "key": "resume",      "label": "Resume from last run",      "default": False},
+            {"type": "folder",       "key": "scan_folder", "label": "Scan folder",             "default": r"\\tower\media\comics\manga"},
+            {"type": "select",       "key": "sort",        "label": "Sort order",              "choices": ["newest", "oldest", "alpha", "alpha-reverse"], "default": "newest"},
+            {"type": "checkbox",     "key": "dry_run",     "label": "Dry run (preview only)",  "default": False},
+            {"type": "checkbox",     "key": "restart",     "label": "Restart (clear progress)","default": False},
+            {"type": "checkbox",     "key": "resume",      "label": "Resume from last run",    "default": False},
+            {"type": "multi_select", "key": "rules",       "label": "Active rules",
+             "choices": ["brackets", "comicinfo", "leading_nums", "non_latin",
+                          "normalize_stem", "number_tokens", "scan_groups", "trailing_junk", "url"],
+             "default": [],
+             "note": "Leave all unchecked to run every rule. Check specific rules to run only those."},
         ],
     },
     {
@@ -406,6 +411,25 @@ class CBZLauncherApp(tk.Tk):
                                   activeforeground=TEXT, font=FONT_BODY)
             om.pack(side=tk.LEFT)
 
+        elif opt["type"] == "multi_select":
+            # Renders each choice as an individual checkbox; stores a list var
+            choices  = opt["choices"]
+            defaults = set(opt.get("default") or [])
+            check_vars = {c: tk.BooleanVar(value=(c in defaults)) for c in choices}
+            self._option_vars[opt["key"]] = check_vars   # dict[str, BooleanVar]
+            # Use a sub-frame so checkboxes wrap naturally
+            cb_frame = tk.Frame(row, bg=BG)
+            cb_frame.pack(side=tk.LEFT, fill=tk.X)
+            for c in choices:
+                tk.Checkbutton(
+                    cb_frame, text=c, variable=check_vars[c],
+                    bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
+                    selectcolor="#12122a", relief="flat", font=FONT_BODY,
+                ).pack(side=tk.LEFT, padx=(0, 6))
+            if opt.get("note"):
+                tk.Label(cb_frame, text=opt["note"], font=("Segoe UI", 8),
+                         bg=BG, fg=MUTED).pack(side=tk.LEFT, padx=(8, 0))
+
     def _browse(self, var):
         path = filedialog.askdirectory(initialdir=var.get() or "C:\\")
         if path:
@@ -454,6 +478,14 @@ class CBZLauncherApp(tk.Tk):
         move_var = opts.get("move_which")
         if move_var:
             cmd.extend(["--move", move_var.get()])
+
+        # multi_select rules: only pass --rules= if at least one box is checked;
+        # all-unchecked means "run everything" (no flag needed)
+        rules_var = opts.get("rules")
+        if rules_var and isinstance(rules_var, dict):
+            selected = [r for r, v in rules_var.items() if v.get()]
+            if selected:
+                cmd.append(f"--rules={','.join(sorted(selected))}")
 
         return cmd
 
