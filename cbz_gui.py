@@ -155,6 +155,21 @@ TOOLS = [
             {"type": "checkbox", "key": "no_recursive", "label": "Single-level only (--no-recursive)", "default": False},
         ],
     },
+    {
+        "id": "uncensored_dupes",
+        "label": "Uncensored Dupes",
+        "script": "find_uncensored_dupes.py",
+        "description": "Find folders that are censored/uncensored duplicates of each other and move them to a _Check folder for manual review.",
+        "icon": "\u26b2",
+        "color": "#E91E63",
+        "scan_folder_flag": "--library",
+        "options": [
+            {"type": "folder",   "key": "scan_folder", "label": "Library folder",         "default": r"\\tower\media\comics\Comix"},
+            {"type": "checkbox", "key": "dry_run",     "label": "Dry run (preview only)", "default": True},
+            {"type": "select",   "key": "move_which",  "label": "Move which folder(s)",   "choices": ["both", "uncensored", "censored"], "default": "both"},
+        ],
+        "note": "Moves matched pairs into a _Check subfolder inside the library. Unmatched uncensored-only folders are left alone.",
+    },
 ]
 
 
@@ -403,18 +418,28 @@ class CBZLauncherApp(tk.Tk):
         opts = self._option_vars
 
         # Pass the scan folder using the method this script expects.
-        # Most scripts take a bare positional path; cbz_sanitizer uses --scan=<path>.
+        # Most scripts take a bare positional path; cbz_sanitizer uses --scan=<path>;
+        # find_uncensored_dupes uses --library <path>.
         folder_flag = tool.get("scan_folder_flag", "positional")
         scan_folder = opts.get("scan_folder")
         if scan_folder and scan_folder.get():
             folder_path = scan_folder.get()
             if folder_flag == "--scan":
                 cmd.append(f"--scan={folder_path}")
+            elif folder_flag == "--library":
+                cmd.extend(["--library", folder_path])
             else:
                 cmd.append(folder_path)
 
         if opts.get("dry_run") and opts["dry_run"].get():
-            cmd.append("--dry-run")
+            # Most scripts use --dry-run; find_uncensored_dupes defaults to dry-run
+            # and uses --live to opt in, so we just omit any flag in that case.
+            if folder_flag != "--library":
+                cmd.append("--dry-run")
+        else:
+            # Live run: scripts that use --live instead of absence-of-dry-run
+            if folder_flag == "--library":
+                cmd.append("--live")
         if opts.get("restart") and opts["restart"].get():
             cmd.append("--restart")
         if opts.get("resume") and opts["resume"].get():
@@ -425,6 +450,10 @@ class CBZLauncherApp(tk.Tk):
         sort_var = opts.get("sort")
         if sort_var:
             cmd.append(f"--sort={sort_var.get()}")
+
+        move_var = opts.get("move_which")
+        if move_var:
+            cmd.extend(["--move", move_var.get()])
 
         return cmd
 

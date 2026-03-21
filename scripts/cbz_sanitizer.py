@@ -72,7 +72,15 @@ _TITLE_OVERWRITE_RES = [
     re.compile(r"^doujinshi[\s_]chapter", re.IGNORECASE),
     re.compile(r"^unknown[\s_]chapter",   re.IGNORECASE),
 ]
-NUMBER_PREFIX_RE = re.compile(r"^\d+\s*-\s*", re.IGNORECASE)
+# Matches leading junk prefixes on filenames:
+#   "1 - "          number-dash style
+#   "3761755 v1 "   long ID + version token style
+NUMBER_PREFIX_RE = re.compile(
+    r'^(?:\d+\s+v\d+\s+|\d+\s*[-_]\s*)',
+    re.IGNORECASE
+)
+# Matches trailing hyphens, dashes, underscores, and whitespace (including em/en dash)
+TRAILING_JUNK_RE = re.compile(r'[\s\-_\u2013\u2014]+$')
 
 GIBBERISH_RE = re.compile(
     r'^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}'
@@ -86,7 +94,7 @@ HASH_CHAPTER_RE = re.compile(
     r'^#\s*chapter\s*(\d[\d.]*)(.*?)$', re.IGNORECASE
 )
 CHAPTER_ONLY_RE = re.compile(
-    r'^(?:ch(?:ap(?:ter)?)?\.?\s*|chp\.?\s*)(\d[\d.]*)', re.IGNORECASE
+    r'^(?:ch(?:ap(?:ter)?)?\\.?\\s*|chp\\.?\\s*)(\\d[\\d.]*)', re.IGNORECASE
 )
 NUMBERED_CHAPTER_RE = re.compile(
     r'^(?:'
@@ -165,7 +173,7 @@ _NUM_TOKEN_RE = re.compile(
 _DIR_LEADING_HASH_RE  = re.compile(r'^#+\s*')
 _DIR_TRAILING_HASH_RE = re.compile(r'\s*#+$')
 _DIR_TRAILING_STUB_RE = re.compile(
-    r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\\s*$', re.IGNORECASE
+    r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
 )
 _CHAPTER_NUMBER_RE = re.compile(
     r'(?:'
@@ -341,6 +349,7 @@ def process_comicinfo(
 ) -> None:
     parent_dir    = cbz_path.parent.name
     filename_stem = NUMBER_PREFIX_RE.sub("", cbz_path.stem).strip()
+    filename_stem = TRAILING_JUNK_RE.sub("", filename_stem).strip()
     for attempt in range(5):
         try:
             if prefetched_xml is not None:
@@ -376,6 +385,7 @@ def process_comicinfo(
                     log.info(f"    Series cleaned: '{series_match.group(1).strip()}' -> '{series_value}'")
 
                 title_value   = NUMBER_PREFIX_RE.sub("", title_value).strip()
+                title_value   = TRAILING_JUNK_RE.sub("", title_value).strip()
                 title_generic    = is_generic(title_value) or bool(GIBBERISH_RE.match(title_value))
                 filename_generic = is_generic(filename_stem)
 
@@ -510,8 +520,10 @@ def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
         new_name = override_name
     else:
         stem     = Path(clean_filename(cbz_path.name)).stem
+        stem     = NUMBER_PREFIX_RE.sub("", stem).strip()
         stem     = normalize_stem(stem, cbz_path.parent.name)
         stem     = normalise_number_tokens(stem)
+        stem     = TRAILING_JUNK_RE.sub("", stem).strip()
         new_name = stem + cbz_path.suffix
 
     if new_name != cbz_path.name:
@@ -691,29 +703,32 @@ def _patch_comicinfo_for_range(cbz_path: Path, start: float, end: float) -> None
 # PROGRESS TRACKING  (thread-safe)
 # ─────────────────────────────────────────────
 def load_progress() -> set:
+    """Load all processed paths from the persistent progress file.
+    Reads every session header and entry — accumulates across all past runs."""
     paths: set[str] = set()
     try:
         with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     obj = json.loads(line)
-                    if i == 0:
-                        continue
+                    # Skip session headers ({"session":...) — only collect path entries
                     if "p" in obj:
                         paths.add(obj["p"])
                 except json.JSONDecodeError:
                     pass
-        log.info(f"  Resumed: {len(paths)} file(s) already processed.")
+        log.info(f"  Resumed: {len(paths)} file(s) already processed across all sessions.")
     except FileNotFoundError:
-        pass
+        log.info("  No progress file found — starting fresh.")
     return paths
 
 def save_progress(path: str) -> None:
+    """Append a single processed-file entry to the persistent progress file."""
     with _progress_lock:
         try:
+            os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
             with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
                 json.dump({"p": path}, f, separators=(",", ":"))
                 f.write("\n")
@@ -721,18 +736,21 @@ def save_progress(path: str) -> None:
             log.warning(f"  Could not save progress file: {e}")
 
 def init_progress_file(started: str) -> None:
+    """Append a session-start marker to the persistent progress file.
+    Never truncates — history from previous sessions is preserved."""
     try:
         os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"started": started, "v": 2}, f, separators=(",", ":"))
+        with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
+            json.dump({"session": started, "v": 2}, f, separators=(",", ":"))
             f.write("\n")
     except OSError as e:
         log.warning(f"  Could not init progress file: {e}")
 
 def clear_progress() -> None:
+    """Delete the progress file entirely. Only called on --restart."""
     try:
         Path(PROGRESS_FILE).unlink(missing_ok=True)
-        log.info("  Progress file cleared (run complete).")
+        log.info("  Progress file cleared (--restart).")
     except OSError as e:
         log.warning(f"  Could not delete progress file: {e}")
 
@@ -873,17 +891,36 @@ def sanitize_directory(dir_path: Path, processed: set, started: str, workers: in
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def main():
-    scan_path = Path(SCAN_FOLDER)
-
-    if not scan_path.exists():
-        print(f"ERROR: Scan folder not found: {SCAN_FOLDER}")
-        return
-
     # ── Parse args ────────────────────────────────────────────────────────────
     args_raw = sys.argv[1:]
     restart  = "--restart"      in args_raw
     resume   = "--resume"       in args_raw
     dry_run  = "--dry-run"      in args_raw
+
+    # --scan=<path> or --scan <path> overrides the hardcoded SCAN_FOLDER
+    scan_folder_override = None
+    for i, arg in enumerate(args_raw):
+        if arg.startswith("--scan="):
+            scan_folder_override = arg.split("=", 1)[1].strip()
+            break
+        elif arg == "--scan" and i + 1 < len(args_raw):
+            scan_folder_override = args_raw[i + 1].strip()
+            break
+
+    # Normalise forward-slash UNC paths that tkinter's filedialog produces
+    # (e.g. //tower/media/... -> \\tower\media\...)
+    if scan_folder_override:
+        if scan_folder_override.startswith("//"):
+            scan_folder_override = "\\\\" + scan_folder_override[2:].replace("/", "\\")
+        effective_folder = scan_folder_override
+    else:
+        effective_folder = SCAN_FOLDER
+
+    scan_path = Path(effective_folder)
+
+    if not scan_path.exists():
+        print(f"ERROR: Scan folder not found: {effective_folder}")
+        return
 
     workers = DEFAULT_WORKERS
     for arg in args_raw:
@@ -909,26 +946,14 @@ def main():
         print(f"ERROR: Unknown --sort mode '{sort_mode}'. Valid: {', '.join(sorted(_VALID_SORTS))}")
         return
 
-    progress_exists = Path(PROGRESS_FILE).exists()
-
     if restart:
+        clear_progress()
         processed = set()
-        log.info("  --restart flag: ignoring any saved progress.")
-    elif resume:
-        processed = load_progress()
-    elif progress_exists:
-        print()
-        print("  A progress file was found from a previous run.")
-        print("  [R] Resume from where it left off")
-        print("  [S] Start over from the beginning")
-        choice = input("  Choice (R/S): ").strip().upper()
-        if choice == "R":
-            processed = load_progress()
-        else:
-            processed = set()
-            log.info("  Starting over — progress file reset.")
+        log.info("  --restart flag: progress file cleared, starting from scratch.")
     else:
-        processed = set()
+        # Always resume from accumulated history; --resume flag is now a no-op
+        # (kept for backwards compatibility) since progress is always persistent.
+        processed = load_progress()
 
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     init_progress_file(started)
@@ -936,8 +961,8 @@ def main():
     _sort_labels = {
         "newest":        "modification time, newest first",
         "oldest":        "modification time, oldest first",
-        "alpha":         "alphabetical A→Z",
-        "alpha-reverse": "alphabetical Z→A",
+        "alpha":         "alphabetical A\u2192Z",
+        "alpha-reverse": "alphabetical Z\u2192A",
     }
     if sort_mode == "newest":
         subdirs = sorted((d for d in scan_path.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
@@ -950,7 +975,7 @@ def main():
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer started")
-    log.info(f"  Scanning : {SCAN_FOLDER}")
+    log.info(f"  Scanning : {effective_folder}")
     log.info(f"  Sort     : {_sort_labels[sort_mode]}")
     log.info(f"  Workers  : {workers}")
     log.info(f"  Log      : {LOG_FILE}")
@@ -966,7 +991,7 @@ def main():
     log.info("=" * 60)
     log.info("CBZ Sanitizer complete.")
     log.info("=" * 60)
-    clear_progress()
+    log.info("  Progress preserved — use --restart to clear and start over.")
 
 
 if __name__ == "__main__":
