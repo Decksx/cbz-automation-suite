@@ -1,93 +1,8 @@
 # cbz_sanitizer.py
 
-Batch sanitizer. Recursively scans a library folder for `.cbz` files and applies the full cleaning and tagging pipeline in-place: filename normalisation, directory renaming, and `ComicInfo.xml` creation/repair. Does **not** move files — use `cbz_watcher.py` for that.
+Batch sanitizer. Recursively scans a library folder for `.cbz` files and applies the full cleaning and tagging pipeline in-place: filename normalization, directory renaming, and `ComicInfo.xml` creation/repair.
 
-`cbz_sanitizer.py` is also the **canonical reference** for all shared functions. Other scripts in the suite sync from it.
-
----
-
-## Configuration
-
-Edit the constants at the top of `scripts\cbz_sanitizer.py`:
-
-```python
-SCAN_FOLDER   = r"\\tower\media\comics\Comix"       # folder to scan
-LOG_FILE      = r"C:\\git\\ComicAutomation\cbz_sanitizer.log"
-PROGRESS_FILE = r"C:\git\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
-DEFAULT_WORKERS = min(8, os.cpu_count() or 4)        # override with --workers N
-```
-
----
-
-## CLI Usage
-
-```powershell
-# Run from the repo root:
-cd C:\git\ComicAutomation
-
-python scripts\cbz_sanitizer.py                  # scan SCAN_FOLDER, newest-modified dirs first
-python scripts\cbz_sanitizer.py --sort=oldest    # oldest-modified dirs first
-python scripts\cbz_sanitizer.py --sort=alpha     # alphabetical order
-python scripts\cbz_sanitizer.py --resume         # resume an interrupted run
-python scripts\cbz_sanitizer.py --restart        # ignore saved progress, start fresh
-python scripts\cbz_sanitizer.py --dry-run        # log all planned changes, write nothing
-python scripts\cbz_sanitizer.py --workers 4      # use 4 parallel worker threads
-python scripts\cbz_sanitizer.py --workers 1      # fully serial (original behaviour)
-```
-
-All flags can be combined:
-
-```powershell
-python scripts\cbz_sanitizer.py --sort=oldest --dry-run
-python scripts\cbz_sanitizer.py --resume --sort=alpha
-python scripts\cbz_sanitizer.py --workers 8 --sort=newest
-```
-
----
-
-## Sort Modes
-
-| Mode | Behaviour |
-|------|-----------|
-| *(default)* | Subdirectories sorted by modification time, **newest first** |
-| `--sort=oldest` | Subdirectories sorted by modification time, oldest first |
-| `--sort=alpha` | Subdirectories sorted alphabetically |
-
-Sorting applies at the subdirectory level. Files within each subdirectory are always processed in alphabetical order.
-
----
-
-## Parallel Processing
-
-The sanitizer parallelises at the **series directory** level — each series directory is an independent unit of work dispatched to a `ThreadPoolExecutor`. Files within a series are processed serially to preserve rename/collision safety.
-
-- Default workers: `min(8, cpu_count)`
-- `--workers 1`: fully serial, identical to original behaviour
-- Progress file writes are protected by a `threading.Lock()` — safe at any worker count
-- Counters are aggregated from worker return values — no shared mutable state
-
-Expected speedup on a large library: **2–4×** depending on I/O throughput and series count.
-
----
-
-## Progress & Resume
-
-The progress file (`cbz_sanitizer_progress.json`) uses **append-only JSONL** — one JSON line is written per completed file immediately after processing. This means:
-
-- Interrupting a run (Ctrl-C, power loss, network drop) costs nothing to recover from.
-- Resuming skips all already-processed files in O(1) per lookup regardless of library size.
-- The progress file is excluded from git.
-
-On the next run, if a progress file exists and no flag is passed, the script interactively prompts:
-
-```
-  A progress file was found from a previous run.
-  [R] Resume from where it left off
-  [S] Start over from the beginning
-  Choice (R/S):
-```
-
-Pass `--resume` or `--restart` to skip the prompt.
+`cbz_sanitizer.py` imports shared normalization and ComicInfo helpers from `scripts/cbz_core.py`, which serves as the suite-wide shared core layer.
 
 ---
 
@@ -95,17 +10,23 @@ Pass `--resume` or `--restart` to skip the prompt.
 
 For each `.cbz` file found:
 
-1. **Filename cleaning** — applies `sanitize()` + `normalize_stem()` to the file's stem.
-2. **Rename** — renames the `.cbz` file if the cleaned name differs (pre-checks for `FileExistsError` before calling `Path.rename()`).
+1. **Filename parsing** — `parse_comic_name()` runs the shared normalization pipeline and returns structured filename/chapter/volume metadata.
+2. **Rename** — renames the `.cbz` file if the parsed filename differs.
 3. **ComicInfo.xml** — creates one from the built-in template if absent, or reads the existing one.
-4. **Tag update** — sets `<Title>`, `<Series>`, `<Number>`, and `<Volume>` from the cleaned filename and directory name.
-5. **Archive rewrite** — if any tag or the XML itself changed, rewrites the archive, preserving the original compression type of every image member.
+4. **Tag update** — delegates metadata decisions to `update_comicinfo_xml()` from `cbz_core.py`, preserving custom titles while normalizing generic metadata.
+5. **Archive rewrite** — if any tag or XML changed, rewrites the archive while preserving the original compression type.
 6. **Directory rename** — after all files in a subdirectory are processed, renames the directory itself if its cleaned name differs.
 
-See [shared_pipeline.md](shared_pipeline.md) for the full `sanitize()` step breakdown and `ComicInfo.xml` tag logic.
+See [shared_pipeline.md](shared_pipeline.md) and [cbz_core.md](cbz_core.md).
 
 ---
 
-## Logging
+## CLI Usage
 
-Rotating log file at `LOG_FILE` (5 MB max, 3 backups). Also streams to stdout. Log entries include every rename, tag update, skip, and error with timestamps. Thread-safe — Python's `logging` module uses internal locks.
+```powershell
+python scripts\cbz_sanitizer.py
+python scripts\cbz_sanitizer.py --dry-run
+python scripts\cbz_sanitizer.py --workers 4
+python scripts\cbz_sanitizer.py --resume
+python scripts\cbz_sanitizer.py --restart
+```
