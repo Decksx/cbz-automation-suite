@@ -38,6 +38,17 @@ FONT_SUB  = ("Segoe UI", 12)
 FONT_BODY = ("Segoe UI", 10)
 FONT_MONO = ("Consolas", 9)
 
+SIDEBAR_W = 244
+MIN_WINDOW_W = 1180
+MIN_WINDOW_H = 760
+PAD_X = 24
+PAD_Y = 12
+SMALL_GAP = 6
+ROW_GAP = 8
+SECTION_GAP = 14
+FIELD_BG = "#12122a"
+BORDER = "#2a2a4a"
+
 # ── Tool definitions ────────────────────────────────────────────────────────────
 # scan_folder_flag: how the folder is passed to each script.
 #   "positional"  — appended as a bare arg (default, works for most tools)
@@ -162,14 +173,19 @@ class CBZLauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CBZ Automation Suite")
-        self.geometry("1100x720")
-        self.minsize(900, 600)
+        self.geometry(f"{MIN_WINDOW_W}x{MIN_WINDOW_H}")
+        self.minsize(MIN_WINDOW_W, MIN_WINDOW_H)
         self.configure(bg=BG)
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
         self._proc = None
         self._log_queue = queue.Queue()
         self._active_tool = None
         self._option_vars = {}
+        self._option_traces = []
+        self._preview_after = None
         self._running = False
 
         self._build_ui()
@@ -179,24 +195,26 @@ class CBZLauncherApp(tk.Tk):
     # ── Layout ─────────────────────────────────────────────────────────────────
     def _build_ui(self):
         # Left sidebar
-        sidebar = tk.Frame(self, bg=PANEL, width=220)
-        sidebar.pack(side=tk.LEFT, fill=tk.Y)
-        sidebar.pack_propagate(False)
+        sidebar = tk.Frame(self, bg=PANEL, width=SIDEBAR_W)
+        sidebar.grid(row=0, column=0, sticky="ns")
+        sidebar.grid_propagate(False)
+        sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(2, weight=1)
 
         # App title
         header = tk.Frame(sidebar, bg=PANEL, pady=16)
-        header.pack(fill=tk.X)
+        header.grid(row=0, column=0, sticky="ew")
         tk.Label(header, text="CBZ Suite", font=("Segoe UI", 16, "bold"),
                  bg=PANEL, fg=TEXT).pack(padx=16, anchor="w")
         tk.Label(header, text="Automation Launcher", font=FONT_BODY,
                  bg=PANEL, fg=MUTED).pack(padx=16, anchor="w")
 
-        tk.Frame(sidebar, bg=ACCENT, height=1).pack(fill=tk.X, padx=12)
+        tk.Frame(sidebar, bg=ACCENT, height=1).grid(row=1, column=0, sticky="ew", padx=12)
 
         # Tool buttons
         self._sidebar_buttons = {}
-        tools_frame = tk.Frame(sidebar, bg=PANEL)
-        tools_frame.pack(fill=tk.BOTH, expand=True, pady=8)
+        sidebar_scroll, tools_frame = self._make_scrollable_frame(sidebar, PANEL)
+        sidebar_scroll.grid(row=2, column=0, sticky="nsew", pady=8)
 
         for tool in TOOLS:
             btn = self._make_sidebar_btn(tools_frame, tool)
@@ -204,57 +222,90 @@ class CBZLauncherApp(tk.Tk):
 
         # Main content area
         self._main = tk.Frame(self, bg=BG)
-        self._main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._main.grid(row=0, column=1, sticky="nsew")
+        self._main.grid_columnconfigure(0, weight=1)
+        self._main.grid_rowconfigure(1, weight=1)
+        self._main.grid_rowconfigure(6, weight=3)
 
         # Top bar
         self._topbar = tk.Frame(self._main, bg=BG, pady=0)
-        self._topbar.pack(fill=tk.X, padx=24, pady=(20, 0))
+        self._topbar.grid(row=0, column=0, sticky="ew", padx=PAD_X, pady=(20, 0))
+        self._topbar.grid_columnconfigure(1, weight=1)
+        self._topbar.bind("<Configure>", self._sync_wraplengths)
 
         self._tool_icon_lbl = tk.Label(self._topbar, text="", font=("Segoe UI", 28),
                                         bg=BG, fg=ACCENT)
-        self._tool_icon_lbl.pack(side=tk.LEFT)
+        self._tool_icon_lbl.grid(row=0, column=0, sticky="nw")
 
         title_block = tk.Frame(self._topbar, bg=BG)
-        title_block.pack(side=tk.LEFT, padx=(10, 0))
+        title_block.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        title_block.grid_columnconfigure(0, weight=1)
         self._tool_name_lbl = tk.Label(title_block, text="", font=FONT_HEAD,
-                                        bg=BG, fg=TEXT)
-        self._tool_name_lbl.pack(anchor="w")
+                                        bg=BG, fg=TEXT, anchor="w", justify="left")
+        self._tool_name_lbl.grid(row=0, column=0, sticky="ew")
         self._tool_desc_lbl = tk.Label(title_block, text="", font=FONT_BODY,
                                         bg=BG, fg=MUTED, wraplength=600, justify="left")
-        self._tool_desc_lbl.pack(anchor="w")
+        self._tool_desc_lbl.grid(row=1, column=0, sticky="ew")
 
         # Options panel
-        self._opts_frame = tk.Frame(self._main, bg=BG)
-        self._opts_frame.pack(fill=tk.X, padx=24, pady=12)
+        opts_shell = tk.Frame(self._main, bg=BG)
+        opts_shell.grid(row=1, column=0, sticky="nsew", padx=PAD_X, pady=PAD_Y)
+        opts_shell.grid_columnconfigure(0, weight=1)
+        opts_shell.grid_rowconfigure(1, weight=1)
+        tk.Label(opts_shell, text="Options", font=("Segoe UI", 10, "bold"),
+                 bg=BG, fg=MUTED).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        opts_scroll, self._opts_frame = self._make_scrollable_frame(opts_shell, BG)
+        opts_scroll.grid(row=1, column=0, sticky="nsew")
+        self._opts_frame.grid_columnconfigure(0, weight=0, minsize=210)
+        self._opts_frame.grid_columnconfigure(1, weight=1)
+
+        # Command preview
+        preview_label = tk.Label(self._main, text="Command Preview",
+                                 font=("Segoe UI", 10, "bold"), bg=BG, fg=MUTED)
+        preview_label.grid(row=2, column=0, sticky="w", padx=PAD_X, pady=(0, 2))
+
+        preview_frame = tk.Frame(self._main, bg=LOG_BG, relief="flat",
+                                 highlightbackground=BORDER, highlightthickness=1)
+        preview_frame.grid(row=3, column=0, sticky="ew", padx=PAD_X, pady=(0, SECTION_GAP))
+        preview_frame.grid_columnconfigure(0, weight=1)
+        self._command_preview = tk.Text(
+            preview_frame, bg=LOG_BG, fg=TEXT, font=FONT_MONO,
+            height=3, relief="flat", bd=0, wrap=tk.WORD,
+            state="disabled", insertbackground=TEXT
+        )
+        self._command_preview.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
 
         # Run / Stop buttons
         btn_row = tk.Frame(self._main, bg=BG)
-        btn_row.pack(fill=tk.X, padx=24, pady=(0, 12))
+        btn_row.grid(row=4, column=0, sticky="ew", padx=PAD_X, pady=(0, SECTION_GAP))
+        btn_row.grid_columnconfigure(2, weight=1)
 
         self._run_btn = tk.Button(btn_row, text="\u25b6  Run", font=("Segoe UI", 11, "bold"),
                                    bg=ACCENT, fg="white", relief="flat", cursor="hand2",
                                    padx=24, pady=8, command=self._run_tool)
-        self._run_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._run_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
 
         self._stop_btn = tk.Button(btn_row, text="\u25a0  Stop", font=("Segoe UI", 11),
                                     bg=CARD, fg=MUTED, relief="flat", cursor="hand2",
                                     padx=20, pady=8, command=self._stop_tool, state="disabled")
-        self._stop_btn.pack(side=tk.LEFT)
+        self._stop_btn.grid(row=0, column=1, sticky="w")
 
         self._status_lbl = tk.Label(btn_row, text="", font=FONT_BODY, bg=BG, fg=MUTED)
-        self._status_lbl.pack(side=tk.LEFT, padx=16)
+        self._status_lbl.grid(row=0, column=2, sticky="w", padx=16)
 
         # Divider
-        tk.Frame(self._main, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=24)
+        tk.Frame(self._main, bg=BORDER, height=1).grid(row=5, column=0, sticky="ew", padx=PAD_X)
 
         # Log output
         log_label = tk.Label(self._main, text="Output", font=("Segoe UI", 10, "bold"),
                               bg=BG, fg=MUTED)
-        log_label.pack(anchor="w", padx=24, pady=(8, 2))
+        log_label.grid(row=6, column=0, sticky="nw", padx=PAD_X, pady=(8, 2))
 
         log_frame = tk.Frame(self._main, bg=LOG_BG, relief="flat",
-                              highlightbackground="#2a2a4a", highlightthickness=1)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
+                              highlightbackground=BORDER, highlightthickness=1)
+        log_frame.grid(row=6, column=0, sticky="nsew", padx=PAD_X, pady=(28, 16))
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(0, weight=1)
 
         self._log = scrolledtext.ScrolledText(
             log_frame, bg=LOG_BG, fg=LOG_FG,
@@ -262,7 +313,7 @@ class CBZLauncherApp(tk.Tk):
             state="disabled", wrap=tk.WORD,
             insertbackground=LOG_FG
         )
-        self._log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._log.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
         # Colour tags for the log
         self._log.tag_config("info",    foreground=LOG_FG)
@@ -274,7 +325,40 @@ class CBZLauncherApp(tk.Tk):
         clear_btn = tk.Button(self._main, text="Clear log", font=FONT_BODY,
                                bg=BG, fg=MUTED, relief="flat", cursor="hand2",
                                command=self._clear_log)
-        clear_btn.pack(anchor="e", padx=24, pady=(0, 8))
+        clear_btn.grid(row=7, column=0, sticky="e", padx=PAD_X, pady=(0, 8))
+
+    def _make_scrollable_frame(self, parent, bg):
+        shell = tk.Frame(parent, bg=bg)
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(shell, bg=bg, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        content = tk.Frame(canvas, bg=bg)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window_id, width=event.width)
+        )
+        self._bind_mousewheel(canvas)
+        return shell, content
+
+    def _bind_mousewheel(self, canvas):
+        def on_wheel(event):
+            if event.delta:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", on_wheel))
+        canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
 
     def _make_sidebar_btn(self, parent, tool):
         color = tool["color"]
@@ -305,25 +389,30 @@ class CBZLauncherApp(tk.Tk):
             widget.bind("<Leave>", lambda e, f=frame, il=icon_lbl, nl=name_lbl:
                         self._sidebar_hover(f, il, nl, False))
 
-        return {"frame": frame, "accent": accent_bar, "icon": icon_lbl,
+        return {"frame": frame, "inner": inner, "accent": accent_bar, "icon": icon_lbl,
                 "name": name_lbl, "color": color}
 
     def _sidebar_hover(self, frame, icon_lbl, name_lbl, entering):
         if self._active_tool and frame == self._sidebar_buttons[self._active_tool["id"]]["frame"]:
             return
         bg = "#1e2d50" if entering else PANEL
-        for w in [frame, icon_lbl, name_lbl]:
+        inner = next((widgets["inner"] for widgets in self._sidebar_buttons.values()
+                      if widgets["frame"] == frame), None)
+        for w in [frame, inner, icon_lbl, name_lbl]:
+            if not w:
+                continue
             w.configure(bg=bg)
 
     def _select_tool(self, tool):
         self._active_tool = tool
+        self._option_traces = []
 
         # Update sidebar highlight
         for tid, widgets in self._sidebar_buttons.items():
             is_active = tid == tool["id"]
             bg = CARD if is_active else PANEL
             ac = widgets["color"] if is_active else PANEL
-            for w in [widgets["frame"], widgets["icon"], widgets["name"]]:
+            for w in [widgets["frame"], widgets["inner"], widgets["icon"], widgets["name"]]:
                 w.configure(bg=bg)
             widgets["accent"].configure(bg=ac)
 
@@ -341,55 +430,63 @@ class CBZLauncherApp(tk.Tk):
         if not options:
             note = tool.get("note", "No configurable options \u2014 uses SCAN_FOLDERS from the script.")
             tk.Label(self._opts_frame, text=note, font=FONT_BODY,
-                     bg=BG, fg=MUTED).pack(anchor="w", pady=4)
+                     bg=BG, fg=MUTED, wraplength=760, justify="left").grid(
+                         row=0, column=0, columnspan=2, sticky="ew", pady=4)
         else:
-            for opt in options:
-                self._build_option_row(self._opts_frame, opt)
+            for row_num, opt in enumerate(options):
+                self._build_option_row(self._opts_frame, opt, row_num)
 
         if "note" in tool:
             tk.Label(self._opts_frame, text=f"\u2139  {tool['note']}", font=FONT_BODY,
-                     bg=BG, fg="#5599cc").pack(anchor="w", pady=(8, 0))
+                     bg=BG, fg="#5599cc", wraplength=760, justify="left").grid(
+                         row=len(options) + 1, column=0, columnspan=2,
+                         sticky="ew", pady=(8, 0))
 
         self._log_line(f"Selected: {tool['label']}", "muted")
+        self._refresh_command_preview()
 
-    def _build_option_row(self, parent, opt):
-        row = tk.Frame(parent, bg=BG)
-        row.pack(fill=tk.X, pady=3)
-
-        tk.Label(row, text=opt["label"], font=FONT_BODY, bg=BG, fg=MUTED,
-                 width=30, anchor="w").pack(side=tk.LEFT)
+    def _build_option_row(self, parent, opt, row_num):
+        label = tk.Label(parent, text=opt["label"], font=FONT_BODY, bg=BG, fg=MUTED,
+                         anchor="w", justify="left", wraplength=200)
+        label.grid(row=row_num, column=0, sticky="nw", padx=(0, SECTION_GAP), pady=ROW_GAP)
 
         if opt["type"] == "folder":
             var = tk.StringVar(value=opt.get("default", ""))
             self._option_vars[opt["key"]] = var
-            entry = tk.Entry(row, textvariable=var, font=FONT_BODY,
-                             bg="#12122a", fg=TEXT, insertbackground=TEXT,
+            field = tk.Frame(parent, bg=BG)
+            field.grid(row=row_num, column=1, sticky="ew", pady=ROW_GAP)
+            field.grid_columnconfigure(0, weight=1)
+            entry = tk.Entry(field, textvariable=var, font=FONT_BODY,
+                             bg=FIELD_BG, fg=TEXT, insertbackground=TEXT,
                              relief="flat", highlightbackground="#3a3a6a",
-                             highlightthickness=1, width=40)
-            entry.pack(side=tk.LEFT, padx=(0, 4))
-            tk.Button(row, text="Browse\u2026", font=FONT_BODY, bg=CARD, fg=TEXT,
+                             highlightthickness=1)
+            entry.grid(row=0, column=0, sticky="ew", padx=(0, SMALL_GAP))
+            tk.Button(field, text="Browse\u2026", font=FONT_BODY, bg=CARD, fg=TEXT,
                       relief="flat", cursor="hand2",
                       command=lambda v=var: self._browse(v)
-                      ).pack(side=tk.LEFT)
+                      ).grid(row=0, column=1, sticky="e")
+            self._trace_option(var)
 
         elif opt["type"] == "checkbox":
             var = tk.BooleanVar(value=opt.get("default", False))
             self._option_vars[opt["key"]] = var
-            cb = tk.Checkbutton(row, variable=var, bg=BG, fg=TEXT,
+            cb = tk.Checkbutton(parent, variable=var, bg=BG, fg=TEXT,
                                  activebackground=BG, activeforeground=TEXT,
-                                 selectcolor="#12122a", relief="flat")
-            cb.pack(side=tk.LEFT)
+                                 selectcolor=FIELD_BG, relief="flat")
+            cb.grid(row=row_num, column=1, sticky="w", pady=ROW_GAP)
+            self._trace_option(var)
 
         elif opt["type"] == "select":
             var = tk.StringVar(value=opt.get("default", opt["choices"][0]))
             self._option_vars[opt["key"]] = var
-            om = tk.OptionMenu(row, var, *opt["choices"])
-            om.configure(bg="#12122a", fg=TEXT, activebackground=CARD,
+            om = tk.OptionMenu(parent, var, *opt["choices"])
+            om.configure(bg=FIELD_BG, fg=TEXT, activebackground=CARD,
                           activeforeground=TEXT, relief="flat", highlightthickness=0,
                           font=FONT_BODY)
-            om["menu"].configure(bg="#12122a", fg=TEXT, activebackground=CARD,
+            om["menu"].configure(bg=FIELD_BG, fg=TEXT, activebackground=CARD,
                                   activeforeground=TEXT, font=FONT_BODY)
-            om.pack(side=tk.LEFT)
+            om.grid(row=row_num, column=1, sticky="w", pady=ROW_GAP)
+            self._trace_option(var)
 
         elif opt["type"] == "multi_select":
             # Renders each choice as an individual checkbox; stores a list var
@@ -397,18 +494,63 @@ class CBZLauncherApp(tk.Tk):
             defaults = set(opt.get("default") or [])
             check_vars = {c: tk.BooleanVar(value=(c in defaults)) for c in choices}
             self._option_vars[opt["key"]] = check_vars   # dict[str, BooleanVar]
-            # Use a sub-frame so checkboxes wrap naturally
-            cb_frame = tk.Frame(row, bg=BG)
-            cb_frame.pack(side=tk.LEFT, fill=tk.X)
+            cb_frame = tk.Frame(parent, bg=BG)
+            cb_frame.grid(row=row_num, column=1, sticky="ew", pady=ROW_GAP)
+            checkbox_widgets = []
             for c in choices:
-                tk.Checkbutton(
+                cb = tk.Checkbutton(
                     cb_frame, text=c, variable=check_vars[c],
                     bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
-                    selectcolor="#12122a", relief="flat", font=FONT_BODY,
-                ).pack(side=tk.LEFT, padx=(0, 6))
+                    selectcolor=FIELD_BG, relief="flat", font=FONT_BODY,
+                    anchor="w"
+                )
+                checkbox_widgets.append(cb)
+                self._trace_option(check_vars[c])
             if opt.get("note"):
-                tk.Label(cb_frame, text=opt["note"], font=("Segoe UI", 8),
-                         bg=BG, fg=MUTED).pack(side=tk.LEFT, padx=(8, 0))
+                note = tk.Label(cb_frame, text=opt["note"], font=("Segoe UI", 8),
+                                bg=BG, fg=MUTED, wraplength=360, justify="left")
+            else:
+                note = None
+
+            def arrange(_event=None):
+                width = max(cb_frame.winfo_width(), 320)
+                columns = max(1, min(4, width // 190))
+                for index, checkbox in enumerate(checkbox_widgets):
+                    checkbox.grid(row=index // columns, column=index % columns,
+                                  sticky="w", padx=(0, 10), pady=(0, 4))
+                for col in range(columns):
+                    cb_frame.grid_columnconfigure(col, weight=1, uniform=f"{opt['key']}_choices")
+                if note:
+                    note.grid(row=(len(checkbox_widgets) + columns - 1) // columns,
+                              column=0, columnspan=columns, sticky="ew", pady=(2, 0))
+
+            cb_frame.bind("<Configure>", arrange)
+            arrange()
+
+    def _trace_option(self, var):
+        token = var.trace_add("write", lambda *_args: self._schedule_command_preview())
+        self._option_traces.append((var, token))
+
+    def _schedule_command_preview(self):
+        if self._preview_after:
+            self.after_cancel(self._preview_after)
+        self._preview_after = self.after(80, self._refresh_command_preview)
+
+    def _refresh_command_preview(self):
+        self._preview_after = None
+        if not getattr(self, "_command_preview", None) or not self._active_tool:
+            return
+        cmd = self._build_command(self._active_tool)
+        preview = subprocess.list2cmdline(cmd)
+        self._command_preview.configure(state="normal")
+        self._command_preview.delete("1.0", tk.END)
+        self._command_preview.insert("1.0", preview)
+        self._command_preview.configure(state="disabled")
+
+    def _sync_wraplengths(self, event=None):
+        width = max(320, (event.width if event else self._topbar.winfo_width()) - 70)
+        self._tool_name_lbl.configure(wraplength=width)
+        self._tool_desc_lbl.configure(wraplength=width)
 
     def _browse(self, var):
         path = filedialog.askdirectory(initialdir=var.get() or "C:\\")
