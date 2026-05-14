@@ -232,9 +232,28 @@ def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
     return _collapse_spaces(text)
 
 
+_FILENAME_EXT_RE = re.compile(r"(\.[a-zA-Z0-9]{2,4})$")
+
+
+def _split_name(name: str) -> tuple[str, str]:
+    """Split a bare filename string into (stem, ext) without Path() parsing.
+
+    Path(name).stem/.suffix treats forward-slashes as directory separators on
+    every platform, silently discarding everything before the last slash.
+    A filename like ``Batman: Year/One?.cbz`` loses ``"Batman: Year"`` before
+    sanitize() ever gets a chance to convert the slash to a space.
+
+    This function operates purely on the string, so the full stem is preserved
+    and sanitize() can handle the forbidden characters itself.
+    """
+    m = _FILENAME_EXT_RE.search(name)
+    if m:
+        return name[: m.start()], m.group(1)
+    return name, ""
+
+
 def clean_filename(name: str, rules: set[str] = ALL_RULES) -> str:
-    stem = Path(name).stem
-    ext = Path(name).suffix
+    stem, ext = _split_name(name)
     return sanitize(stem, rules) + ext
 
 
@@ -341,7 +360,7 @@ def parse_comic_name(
     raw_series = infer_series_name(path, library_root=library_root)
     series = clean_directory_name(raw_series, rules)
 
-    stem = Path(clean_filename(path.name, rules)).stem
+    stem, _ext = _split_name(clean_filename(path.name, rules))
     if "leading_nums" in rules:
         stem = NUMBER_PREFIX_RE.sub("", stem).strip()
     if "normalize_stem" in rules:
