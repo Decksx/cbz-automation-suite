@@ -9,7 +9,6 @@ import os
 import re
 import gc
 import json
-import html
 import time
 import shutil
 import fnmatch
@@ -20,6 +19,37 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+
+try:
+    from scripts.cbz_core import (
+        GIBBERISH_RE,
+        GENERIC_CHAPTER_RE,
+        CHAPTER_ONLY_RE,
+        NUMBERED_CHAPTER_RE,
+        NUMBER_PREFIX_RE,
+        clean_directory_name,
+        clean_filename,
+        clean_xml_field,
+        is_generic,
+        normalise_number_tokens,
+        normalize_stem,
+        sanitize,
+    )
+except ModuleNotFoundError:
+    from cbz_core import (  # type: ignore[no-redef]
+        GIBBERISH_RE,
+        GENERIC_CHAPTER_RE,
+        CHAPTER_ONLY_RE,
+        NUMBERED_CHAPTER_RE,
+        NUMBER_PREFIX_RE,
+        clean_directory_name,
+        clean_filename,
+        clean_xml_field,
+        is_generic,
+        normalise_number_tokens,
+        normalize_stem,
+        sanitize,
+    )
 
 # ─────────────────────────────────────────────
 # CONFIGURATION — edit these as needed
@@ -53,60 +83,9 @@ COMICINFO_TEMPLATE = """<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
 # ─────────────────────────────────────────────
 # Titles/filenames matching these patterns are treated as generic
 # and may be overwritten by the title logic.
-TITLE_OVERWRITE_PATTERNS = [
-    r"manga[\s_]chapter",
-    r"#\s*english",
-    r"^chapter",
-    r"^part\s+\d+",
-    r"doujinshi[\s_]chapter",
-    r"official[\s_]chapter",
-    r"unknown[\s_]chapter",
-]
-NUMBER_PREFIX_RE = re.compile(r"^\d+\s*-\s*", re.IGNORECASE)
+# NUMBER_PREFIX_RE, GIBBERISH_RE, GENERIC_CHAPTER_RE, CHAPTER_ONLY_RE,
+# NUMBERED_CHAPTER_RE imported from cbz_core above.
 
-GIBBERISH_RE = re.compile(
-    r'^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}'
-    r'|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$',
-    re.IGNORECASE
-)
-
-# Matches stems that are PURELY generic with a chapter keyword + number.
-# Three branches:
-#   A) Known prefix (doujinshi/official/manga/unknown) + any chapter keyword
-#   B) Hash prefix (# / # english) + optional chapter keyword
-#   C) Bare full-word "chapter" or "part" with no series name in front
-# Intentionally does NOT match bare "ch N" or "chap N" — those go to CHAPTER_ONLY_RE.
-GENERIC_CHAPTER_RE = re.compile(
-    r'^'
-    r'(?:'
-        r'(?:(?:doujinshi|official|manga|unknown)[\s_]+)'  # Branch A: required prefix
-        r'(?:#\s*(?:english[\s_]+)?)?'                     # optional # english after prefix
-        r'(?:ch(?:ap(?:ter)?)?p?\.?\s*|part\.?\s*)'        # any chapter keyword
-    r'|'
-        r'#\s*(?:english[\s_]+)?'                          # Branch B: # prefix
-        r'(?:ch(?:ap(?:ter)?)?p?\.?\s*)?'                  # optional chapter keyword after #
-    r'|'
-        r'(?:chapter|part)\.?\s+'                          # Branch C: bare full-word "chapter"/"part"
-    r')'
-    r'(\d[\d.]*)'    # group 1: chapter number
-    r'(.*?)$',       # group 2: optional trailing suffix
-    re.IGNORECASE
-)
-
-CHAPTER_ONLY_RE = re.compile(
-    r'^(?:ch(?:ap(?:ter)?)?\.?\s*|chp\.?\s*)(\d[\d.]*)',
-    re.IGNORECASE
-)
-
-NUMBERED_CHAPTER_RE = re.compile(
-    r'^(?:'
-    r'(?:\d+\.\s*)'
-    r'ch(?:ap(?:ter)?)?p?\.?\s*-?\s*(\d[\d.]*)\s*$'
-    r'|'
-    r'ch(?:ap(?:ter)?)?p?\.?\s*-\s*(\d[\d.]*)\s*$'
-    r')',
-    re.IGNORECASE
-)
 
 # Routing state — loaded from ROUTING_FILE at startup
 _routing_destinations: dict[str, str] = {}   # short-name -> full path
@@ -135,144 +114,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# COMPILED REGEX PATTERNS
-# ─────────────────────────────────────────────
-_BRACKET_RE       = re.compile(r'\[[^\]]*\]|\([^)]*\)')
-_STRAY_RE         = re.compile(r'[\[\]()]')
-_SPACES_RE        = re.compile(r' {2,}')
-_URL_RE           = re.compile(
-    r'(?:https?://\S+)|(?:www\.\S+)' +
-    r'|(?:\b[\w-]+\.(?:com|net|org|io|co|info|biz|tv|me|cc|us|uk|ca|au)(?:/\S*)?)'
-    , re.IGNORECASE)
-_SCAN_GROUP_RE    = re.compile(
-    r'\b[\w-]*scans?\b|\b[\w-]*scanners?\b|\b[\w-]*scanlations?\b', re.IGNORECASE)
-_GCODE_RE         = re.compile(r'[\s\-]*\bG\d{3,5}$')
-_TRAILING_SLASH_RE = re.compile(r'[\s/]+$')
-_NON_LATIN_RE     = re.compile(
-    r'[^\u0000-\u024F'
-    r'\u0370-\u03FF'
-    r'\u2000-\u206F'
-    r'\u2600-\u27BF'
-    r'\uFE00-\uFE0F'
-    r'\U0001F300-\U0001FAFF'
-    r']+'
-)
-_NUM_TOKEN_RE     = re.compile(
-    r'((?:ch(?:ap(?:ter)?)?p?|issue|ep(?:isode)?|vol(?:ume)?|v(?=\d))\.?\s*)(\d[\d.]*)',
-    re.IGNORECASE
-)
-_DIR_LEADING_HASH_RE  = re.compile(r'^#+\s*')
-_DIR_TRAILING_HASH_RE = re.compile(r'\s*#+$')
-_DIR_TRAILING_STUB_RE = re.compile(
-    r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE)
 
 
-def sanitize(text: str) -> str:
-    """
-    Shared sanitization pipeline for filenames, directory names, and XML fields.
-    Order: entities → URLs → scan-groups → trailing-slash → G-code → non-Latin
-           → brackets → stray brackets → underscores → collapse whitespace
-    """
-    text = html.unescape(text)
-    text = _URL_RE.sub("", text)
-    text = _SCAN_GROUP_RE.sub("", text)
-    text = _TRAILING_SLASH_RE.sub("", text)
-    text = _GCODE_RE.sub("", text)
-    text = _NON_LATIN_RE.sub("", text)
-    text = _BRACKET_RE.sub("", text)
-    text = _STRAY_RE.sub("", text)
-    text = text.replace("_", " ")
-    return _SPACES_RE.sub(" ", text).strip()
 
 
-def clean_filename(name: str) -> str:
-    """Sanitize a .cbz filename stem, preserving the extension."""
-    stem = Path(name).stem
-    ext  = Path(name).suffix
-    return sanitize(stem) + ext
-
-
-def clean_directory_name(name: str) -> str:
-    """Sanitize a directory name with extra directory-specific cleaning."""
-    name = sanitize(name)
-    name = _DIR_LEADING_HASH_RE.sub('', name)
-    name = _DIR_TRAILING_HASH_RE.sub('', name).strip()
-    name = _DIR_TRAILING_STUB_RE.sub('', name).strip()
-    return name
-
-
-def clean_xml_field(value: str) -> str:
-    """Sanitize an XML field value (Title, Series)."""
-    return sanitize(value)
-
-
-def is_generic(text: str) -> bool:
-    """Return True if text matches any generic title/filename pattern."""
-    return any(re.search(p, text, re.IGNORECASE) for p in TITLE_OVERWRITE_PATTERNS)
-
-
-def normalise_number_tokens(stem: str) -> str:
-    """Normalise chapter/volume number tokens in a filename stem."""
-    def _sub(m: re.Match) -> str:
-        try:
-            n = float(m.group(2))
-            fmt = str(int(n)) if n == int(n) else str(n)
-            return m.group(1) + fmt
-        except ValueError:
-            return m.group(0)
-    return _NUM_TOKEN_RE.sub(_sub, stem)
-
-
-def normalize_stem(stem: str, dir_name: str) -> str:
-    """
-    Apply directory-aware fixes to a cleaned filename stem.
-
-    Priority order:
-      1. Gibberish / hash-only stems           → dir_name
-      2. Generic chapter stem with a number    → dir_name + " Ch. N"
-         Covers: "chapter 5", "doujinshi chapter 3", "official chapter 7",
-                 "manga chapter 12", "unknown chapter 8", "# chapter 5",
-                 "# english chapter 5", "part 2"
-      3. Generic chapter stem with no number   → dir_name  (bare "chapter", etc.)
-      4. Bare ch/chap/chp stem                 → dir_name + " Ch. N" (preserves existing behaviour)
-      5. Numbered-chapter edge cases           → dir_name + " Ch. N"
-      6. Any other generic pattern             → dir_name
-      7. Custom stem                           → unchanged
-    """
-    if GIBBERISH_RE.match(stem):
-        return dir_name
-
-    # Generic chapter/part stems — extract number if present
-    m = GENERIC_CHAPTER_RE.match(stem)
-    if m:
-        num    = m.group(1)
-        suffix = m.group(2).strip(" -_")
-        n = float(num)
-        num_str = str(int(n)) if n == int(n) else str(n)
-        result = f"{dir_name} Ch. {num_str}"
-        if suffix:
-            result += f" {suffix}"
-        log.info(f"    Generic stem '{stem}' → '{result}'")
-        return result
-
-    # Bare ch/chap/chp + number (e.g. "ch. 5", "chap5")
-    m = CHAPTER_ONLY_RE.match(stem)
-    if m:
-        chapter_part = stem[0].upper() + stem[1:]
-        return f"{dir_name} {chapter_part}"
-
-    # Edge case: "12. ch. 5" or "ch. - 5"
-    m = NUMBERED_CHAPTER_RE.match(stem)
-    if m:
-        num = m.group(1) or m.group(2)
-        return f"{dir_name} Ch. {num}"
-
-    # Any other generic pattern with no extractable number
-    if is_generic(stem):
-        return dir_name
-
-    return stem
+# normalize_stem imported from cbz_core above.
 
 
 # ─────────────────────────────────────────────
