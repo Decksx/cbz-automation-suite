@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import queue
+import re
 import subprocess
 import threading
 import tkinter as tk
@@ -63,7 +64,7 @@ TOOLS = [
         "color": ACCENT,
         "scan_folder_flag": "--scan",
         "options": [
-            {"type": "folder", "key": "scan_folder", "label": "Scan folder", "default": r"\\tower\media\comics\manga"},
+            {"type": "folder", "key": "scan_folder", "label": "Scan folder", "default": r"\\tower\media\comics"},
             {"type": "select", "key": "sort", "label": "Sort order", "choices": ["newest", "oldest", "alpha", "alpha-reverse"], "default": "newest"},
             {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": False},
             {"type": "checkbox", "key": "restart", "label": "Restart (clear progress)", "default": False},
@@ -186,6 +187,8 @@ class CBZLauncherApp(tk.Tk):
         self._option_vars = {}
         self._option_traces = []
         self._preview_after = None
+        self._progress_seen = 0
+        self._progress_mode = "idle"
         self._running = False
 
         self._build_ui()
@@ -225,7 +228,17 @@ class CBZLauncherApp(tk.Tk):
         self._main.grid(row=0, column=1, sticky="nsew")
         self._main.grid_columnconfigure(0, weight=1)
         self._main.grid_rowconfigure(1, weight=1)
-        self._main.grid_rowconfigure(6, weight=3)
+        self._main.grid_rowconfigure(7, weight=3)
+
+        self._style = ttk.Style(self)
+        self._style.configure(
+            "CBZ.Horizontal.TProgressbar",
+            troughcolor=FIELD_BG,
+            background=ACCENT,
+            bordercolor=BORDER,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
+        )
 
         # Top bar
         self._topbar = tk.Frame(self._main, bg=BG, pady=0)
@@ -293,17 +306,38 @@ class CBZLauncherApp(tk.Tk):
         self._status_lbl = tk.Label(btn_row, text="", font=FONT_BODY, bg=BG, fg=MUTED)
         self._status_lbl.grid(row=0, column=2, sticky="w", padx=16)
 
+        progress_frame = tk.Frame(self._main, bg=BG)
+        progress_frame.grid(row=5, column=0, sticky="ew", padx=PAD_X, pady=(0, SECTION_GAP))
+        progress_frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(progress_frame, text="Progress", font=("Segoe UI", 10, "bold"),
+                 bg=BG, fg=MUTED).grid(row=0, column=0, sticky="w", padx=(0, SECTION_GAP))
+
+        self._progress = ttk.Progressbar(
+            progress_frame,
+            mode="determinate",
+            maximum=100,
+            style="CBZ.Horizontal.TProgressbar",
+        )
+        self._progress.grid(row=0, column=1, sticky="ew")
+
+        self._progress_lbl = tk.Label(
+            progress_frame, text="Idle", font=FONT_BODY, bg=BG, fg=MUTED,
+            anchor="e", width=24
+        )
+        self._progress_lbl.grid(row=0, column=2, sticky="e", padx=(SECTION_GAP, 0))
+
         # Divider
-        tk.Frame(self._main, bg=BORDER, height=1).grid(row=5, column=0, sticky="ew", padx=PAD_X)
+        tk.Frame(self._main, bg=BORDER, height=1).grid(row=6, column=0, sticky="ew", padx=PAD_X)
 
         # Log output
         log_label = tk.Label(self._main, text="Output", font=("Segoe UI", 10, "bold"),
                               bg=BG, fg=MUTED)
-        log_label.grid(row=6, column=0, sticky="nw", padx=PAD_X, pady=(8, 2))
+        log_label.grid(row=7, column=0, sticky="nw", padx=PAD_X, pady=(8, 2))
 
         log_frame = tk.Frame(self._main, bg=LOG_BG, relief="flat",
                               highlightbackground=BORDER, highlightthickness=1)
-        log_frame.grid(row=6, column=0, sticky="nsew", padx=PAD_X, pady=(28, 16))
+        log_frame.grid(row=7, column=0, sticky="nsew", padx=PAD_X, pady=(28, 16))
         log_frame.grid_columnconfigure(0, weight=1)
         log_frame.grid_rowconfigure(0, weight=1)
 
@@ -325,7 +359,7 @@ class CBZLauncherApp(tk.Tk):
         clear_btn = tk.Button(self._main, text="Clear log", font=FONT_BODY,
                                bg=BG, fg=MUTED, relief="flat", cursor="hand2",
                                command=self._clear_log)
-        clear_btn.grid(row=7, column=0, sticky="e", padx=PAD_X, pady=(0, 8))
+        clear_btn.grid(row=8, column=0, sticky="e", padx=PAD_X, pady=(0, 8))
 
     def _make_scrollable_frame(self, parent, bg):
         shell = tk.Frame(parent, bg=bg)
@@ -566,8 +600,7 @@ class CBZLauncherApp(tk.Tk):
         opts = self._option_vars
 
         # Pass the scan folder using the method this script expects.
-        # Most scripts take a bare positional path; cbz_sanitizer uses --scan=<path>;
-        # find_uncensored_dupes uses --library <path>.
+        # Most scripts take a bare positional path; cbz_sanitizer uses --scan=<path>.
         folder_flag = tool.get("scan_folder_flag", "positional")
         scan_folder = opts.get("scan_folder")
         if scan_folder and scan_folder.get():
@@ -580,12 +613,11 @@ class CBZLauncherApp(tk.Tk):
                 cmd.append(folder_path)
 
         if opts.get("dry_run") and opts["dry_run"].get():
-            # Most scripts use --dry-run; find_uncensored_dupes defaults to dry-run
-            # and uses --live to opt in, so we just omit any flag in that case.
+            # Most scripts use --dry-run.
             if folder_flag != "--library":
                 cmd.append("--dry-run")
         else:
-            # Live run: scripts that use --live instead of absence-of-dry-run
+            # Live run for any future scripts that use --live instead of absence-of-dry-run.
             if folder_flag == "--library":
                 cmd.append("--live")
         if opts.get("restart") and opts["restart"].get():
@@ -652,9 +684,12 @@ class CBZLauncherApp(tk.Tk):
         self._run_btn.configure(state="disabled", bg="#555", fg=MUTED)
         self._stop_btn.configure(state="normal", bg=ERROR, fg="white")
         self._status_lbl.configure(text="Running\u2026", fg=WARNING)
+        self._start_progress(tool)
 
         def target():
             try:
+                env = os.environ.copy()
+                env["CBZ_PROGRESS"] = "1"
                 self._proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -663,6 +698,7 @@ class CBZLauncherApp(tk.Tk):
                     encoding="utf-8",
                     errors="replace",
                     cwd=str(SCRIPT_DIR.parent),
+                    env=env,
                 )
                 for line in self._proc.stdout:
                     self._log_queue.put(line.rstrip())
@@ -681,6 +717,7 @@ class CBZLauncherApp(tk.Tk):
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             self._log_line("Process stopped by user.", "warn")
+        self._stop_progress("Stopped", WARNING, value=0)
         self._set_idle()
 
     def _set_idle(self):
@@ -690,6 +727,57 @@ class CBZLauncherApp(tk.Tk):
         self._stop_btn.configure(state="disabled", bg=CARD, fg=MUTED)
         self._status_lbl.configure(text="")
 
+    def _start_progress(self, tool):
+        self._progress_seen = 0
+        self._progress_mode = "activity"
+        self._progress.configure(mode="indeterminate", maximum=100, value=0)
+        self._progress.start(12)
+        self._progress_lbl.configure(text=f"{tool['label']} running", fg=WARNING)
+
+    def _stop_progress(self, text, color, value=None):
+        self._progress.stop()
+        self._progress.configure(mode="determinate")
+        if value is not None:
+            self._progress.configure(value=value)
+        self._progress_lbl.configure(text=text, fg=color)
+        self._progress_mode = "idle"
+
+    def _update_progress_from_line(self, line):
+        progress_match = re.search(r"CBZ_PROGRESS\s+(\d+)/(\d+)\s+(\d+)%\s*(.*)", line)
+        if progress_match:
+            current = int(progress_match.group(1))
+            total = max(1, int(progress_match.group(2)))
+            percent = max(0, min(100, int(progress_match.group(3))))
+            label = progress_match.group(4).strip()
+            if self._progress_mode != "percent":
+                self._progress.stop()
+                self._progress.configure(mode="determinate", maximum=100)
+                self._progress_mode = "percent"
+            self._progress.configure(value=percent)
+            detail = f"{current}/{total}"
+            if label:
+                detail = f"{detail} {label}"
+            self._progress_lbl.configure(text=detail, fg=WARNING)
+            return True
+
+        percent_match = re.search(r"(?<!\d)(100|[1-9]?\d)(?:\.\d+)?\s*%", line)
+        if percent_match:
+            percent = int(percent_match.group(1))
+            if self._progress_mode != "percent":
+                self._progress.stop()
+                self._progress.configure(mode="determinate", maximum=100)
+                self._progress_mode = "percent"
+            self._progress.configure(value=percent)
+            self._progress_lbl.configure(text=f"{percent}% complete", fg=WARNING)
+            return False
+
+        lo = line.lower()
+        if any(marker in lo for marker in ("processing", "scanning", "renamed", "packed", "moved", "deleted", "updated")):
+            self._progress_seen += 1
+            if self._progress_mode == "activity":
+                self._progress_lbl.configure(text=f"{self._progress_seen} update(s)", fg=WARNING)
+        return False
+
     # ── Log ─────────────────────────────────────────────────────────────────────
     def _poll_log_queue(self):
         try:
@@ -697,16 +785,19 @@ class CBZLauncherApp(tk.Tk):
                 line = self._log_queue.get_nowait()
                 if line == "__DONE_OK__":
                     self._log_line("Done \u2014 completed successfully.", "success")
+                    self._stop_progress("Complete", SUCCESS, value=100)
                     self._set_idle()
                     self._status_lbl.configure(text="Finished", fg=SUCCESS)
                 elif line.startswith("__DONE_ERR__"):
                     rc = line[len("__DONE_ERR__"):]
                     self._log_line(f"Process exited with code {rc}.", "error")
+                    self._stop_progress(f"Failed (exit {rc})", ERROR, value=0)
                     self._set_idle()
                     self._status_lbl.configure(text=f"Exit code {rc}", fg=ERROR)
                 elif line.startswith("__ERROR__"):
                     msg = line[len("__ERROR__"):]
                     self._log_line(f"Launch error: {msg}", "error")
+                    self._stop_progress("Launch error", ERROR, value=0)
                     self._set_idle()
                 else:
                     tag = "info"
@@ -717,6 +808,8 @@ class CBZLauncherApp(tk.Tk):
                         tag = "warn"
                     elif "complete" in lo or "done" in lo or "success" in lo:
                         tag = "success"
+                    if self._running and self._update_progress_from_line(line):
+                        continue
                     self._log_line(line, tag)
         except queue.Empty:
             pass

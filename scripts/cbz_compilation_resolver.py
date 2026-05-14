@@ -18,6 +18,7 @@ import sys
 import shutil
 import zipfile
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -47,6 +48,30 @@ log.addHandler(_fh)
 _sh = logging.StreamHandler()
 _sh.setFormatter(_fmt)
 log.addHandler(_sh)
+
+
+class ProgressReporter:
+    """Emit machine-readable progress lines for GUI launchers."""
+
+    def __init__(self, total: int, label: str = "series") -> None:
+        self.total = max(0, total)
+        self.label = label
+        self.current = 0
+        self.enabled = os.environ.get("CBZ_PROGRESS") == "1"
+        self._lock = threading.Lock()
+        self.emit(0)
+
+    def step(self, amount: int = 1) -> None:
+        with self._lock:
+            self.current = min(self.total, self.current + amount)
+            self.emit(self.current)
+
+    def emit(self, current: int) -> None:
+        if not self.enabled:
+            return
+        percent = 100 if self.total == 0 else int((current / self.total) * 100)
+        print(f"CBZ_PROGRESS {current}/{self.total} {percent}% {self.label}", flush=True)
+
 
 # ─────────────────────────────────────────────
 # REGEX
@@ -417,14 +442,19 @@ def main() -> None:
 
     total_dirs     = 0
     total_overlaps = 0
+    series_by_target: list[tuple[Path, list[Path]]] = []
 
     for target in targets:
         if not target.exists() or not target.is_dir():
             log.error(f"Directory not found, skipping: {target}")
             continue
 
+        series_by_target.append((target, _iter_series_dirs(target)))
+
+    progress = ProgressReporter(sum(len(series_dirs) for _, series_dirs in series_by_target), "series")
+
+    for target, series_dirs in series_by_target:
         log.info(f"\nScanning: {target}")
-        series_dirs = _iter_series_dirs(target)
         log.info(
             f"  Found {len(series_dirs)} series director"
             f"{'y' if len(series_dirs) == 1 else 'ies'}.  Workers: {workers}."
@@ -434,6 +464,7 @@ def main() -> None:
         if workers == 1:
             for sd in series_dirs:
                 total_overlaps += process_directory(sd, dry_run=dry_run)
+                progress.step()
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
@@ -446,6 +477,8 @@ def main() -> None:
                         total_overlaps += future.result()
                     except Exception as e:
                         log.error(f"  Worker failed for '{sd.name}': {e}")
+                    finally:
+                        progress.step()
 
     log.info("\n" + "=" * 60)
     log.info("CBZ Compilation Resolver complete.")

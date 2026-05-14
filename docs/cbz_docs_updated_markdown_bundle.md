@@ -32,13 +32,11 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 | `scripts/cbz_core.py` | — | — | Shared normalization/parsing/ComicInfo layer used by watcher and batch tools | [cbz_core.md](cbz_core.md) |
 | `scripts/cbz_watcher.py` | Always (watchdog) | — | Live watcher — monitors Incoming folder, cleans, tags, and routes files via `routing.json` | [cbz_watcher.md](cbz_watcher.md) |
 | `scripts/cbz_sanitizer.py` | Always (`rglob`) | **Yes** | Batch sanitizer — in-place clean/tag built on shared `cbz_core.py` helpers | [cbz_sanitizer.md](cbz_sanitizer.md) |
-| `scripts/cbz_folder_merger.py` | Single-level (by design) | **Yes** | Merges colliding series directories; two-phase ComicInfo update | [other_tools.md](other_tools.md#cbz_folder_mergerpy) |
+| `scripts/cbz_library_maintenance.py archive-clean` | Configurable | **Yes** | Removes duplicate archives, strips duplicate filename tokens, and packs loose image folders | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
+| `scripts/cbz_library_maintenance.py organize-series` | Configurable | **Yes** | Merges split folders, matches near-duplicate series, repairs merged ComicInfo, and moves review groups to `_Check/` | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
+| `scripts/cbz_library_maintenance.py metadata` | Always (`rglob`) | **Yes** | Retroactively repairs ComicInfo title/series/number/volume tags | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
 | `scripts/cbz_compilation_resolver.py` | **Yes — default** | **Yes** | Resolves compilation vs individual overlaps | [other_tools.md](other_tools.md#cbz_compilation_resolverpy) |
-| `scripts/cbz_number_tagger.py` | Always (`rglob`) | — | Retroactively sets ComicInfo number/volume tags | [other_tools.md](other_tools.md#cbz_number_taggerpy) |
-| `scripts/cbz_series_matcher.py` | **Yes — default** | **Yes** | Near-duplicate series name detector | [other_tools.md](other_tools.md#cbz_series_matcherpy) |
 | `scripts/cbz_gap_checker.py` | **Yes — default** | **Yes** | Outputs CSV of missing chapter numbers | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
-| `scripts/cbz_deduplicator.py` | **Yes — default** | **Yes** | Removes duplicate cbz/cbr files and packs loose image folders | [other_tools.md](other_tools.md#cbz_deduplicatorpy) |
-| `scripts/strip_duplicates.py` | **Yes — default** | **Yes** | Removes duplicate number tokens and fixes spaced punctuation | [other_tools.md](other_tools.md#strip_duplicatespy) |
 
 ---
 

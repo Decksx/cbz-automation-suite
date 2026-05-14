@@ -122,6 +122,30 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+class ProgressReporter:
+    """Emit machine-readable progress lines for GUI launchers."""
+
+    def __init__(self, total: int, label: str = "files") -> None:
+        self.total = max(0, total)
+        self.label = label
+        self.current = 0
+        self.enabled = os.environ.get("CBZ_PROGRESS") == "1"
+        self._lock = threading.Lock()
+        self.emit(0)
+
+    def step(self, amount: int = 1) -> None:
+        with self._lock:
+            self.current = min(self.total, self.current + amount)
+            self.emit(self.current)
+
+    def emit(self, current: int) -> None:
+        if not self.enabled:
+            return
+        percent = 100 if self.total == 0 else int((current / self.total) * 100)
+        print(f"CBZ_PROGRESS {current}/{self.total} {percent}% {self.label}", flush=True)
+
+
 # ─────────────────────────────────────────────
 # PROGRESS LOCK (thread-safe file writes)
 # ─────────────────────────────────────────────
@@ -797,6 +821,7 @@ def _process_series_dir(
     cbz_files: list[Path],
     processed: set[str],
     rules: set[str] = ALL_RULES,
+    progress: ProgressReporter | None = None,
 ) -> tuple[int, int, int, int]:
     """
     Process one series directory.  Returns (processed, renamed, skipped, comp_fixed).
@@ -834,27 +859,31 @@ def _process_series_dir(
     dir_num_to_path: dict[float, Path] = {}
 
     for cbz in cbz_files:
-        if not cbz.exists():
-            total_skipped += 1
-            continue
-        if str(cbz) in processed:
-            log.info(f"    Already processed (skipping): {cbz.name}")
-            total_skipped += 1
-            continue
-        if cbz.stat().st_size == 0:
-            log.warning(f"    Skipping zero-byte file: {cbz.name}")
-            total_skipped += 1
-            continue
-        original_name = cbz.name
-        override = fallback_names.get(cbz)
-        result_path = process_cbz_file(cbz, override_name=override, rules=rules)
-        save_progress(str(result_path))
-        total_processed += 1
-        if result_path.name != original_name:
-            total_renamed += 1
-        ch = extract_chapter(result_path.stem)
-        if ch is not None:
-            dir_num_to_path[ch] = result_path
+        try:
+            if not cbz.exists():
+                total_skipped += 1
+                continue
+            if str(cbz) in processed:
+                log.info(f"    Already processed (skipping): {cbz.name}")
+                total_skipped += 1
+                continue
+            if cbz.stat().st_size == 0:
+                log.warning(f"    Skipping zero-byte file: {cbz.name}")
+                total_skipped += 1
+                continue
+            original_name = cbz.name
+            override = fallback_names.get(cbz)
+            result_path = process_cbz_file(cbz, override_name=override, rules=rules)
+            save_progress(str(result_path))
+            total_processed += 1
+            if result_path.name != original_name:
+                total_renamed += 1
+            ch = extract_chapter(result_path.stem)
+            if ch is not None:
+                dir_num_to_path[ch] = result_path
+        finally:
+            if progress:
+                progress.step()
 
     n = detect_and_fix_compilations(
         comic_dir, dry_run=False, num_to_path=dir_num_to_path or None
@@ -869,7 +898,14 @@ def _process_series_dir(
 # ─────────────────────────────────────────────
 # DIRECTORY SANITIZING  (parallel)
 # ─────────────────────────────────────────────
-def sanitize_directory(dir_path: Path, processed: set, started: str, workers: int, rules: set[str] = ALL_RULES) -> None:
+def sanitize_directory(
+    dir_path: Path,
+    processed: set,
+    started: str,
+    workers: int,
+    rules: set[str] = ALL_RULES,
+    progress: ProgressReporter | None = None,
+) -> None:
     log.info("=" * 60)
     log.info(f"Scanning: {dir_path.name}")
 
@@ -893,7 +929,7 @@ def sanitize_directory(dir_path: Path, processed: set, started: str, workers: in
         # Serial path — identical to original behaviour
         for comic_dir, cbz_files in sorted(cbz_dirs.items()):
             log.info(f"  Directory: {comic_dir.name} ({len(cbz_files)} file(s))")
-            p, r, s, c = _process_series_dir(comic_dir, cbz_files, processed, rules)
+            p, r, s, c = _process_series_dir(comic_dir, cbz_files, processed, rules, progress)
             total_processed += p; total_renamed += r
             total_skipped += s;   total_comp_fixed += c
     else:
@@ -901,7 +937,7 @@ def sanitize_directory(dir_path: Path, processed: set, started: str, workers: in
         items = sorted(cbz_dirs.items())
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_dir = {
-                executor.submit(_process_series_dir, comic_dir, cbz_files, processed, rules): comic_dir
+                executor.submit(_process_series_dir, comic_dir, cbz_files, processed, rules, progress): comic_dir
                 for comic_dir, cbz_files in items
             }
             for future in as_completed(future_to_dir):
@@ -1026,11 +1062,12 @@ def main():
     log.info(f"  Progress : {PROGRESS_FILE}")
     log.info("=" * 60)
 
-    if not subdirs:
-        sanitize_directory(scan_path, processed, started, workers, active_rules)
-    else:
-        for subdir in subdirs:
-            sanitize_directory(subdir, processed, started, workers, active_rules)
+    scan_targets = subdirs or [scan_path]
+    total_cbz = sum(1 for target in scan_targets for _ in target.rglob("*.cbz"))
+    progress = ProgressReporter(total_cbz, "files")
+
+    for target in scan_targets:
+        sanitize_directory(target, processed, started, workers, active_rules, progress)
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer complete.")

@@ -28,7 +28,9 @@ import logging
 import os
 import re
 import shutil
+import statistics
 import sys
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,6 +46,7 @@ try:
         clean_filename,
         extract_chapter_number,
         extract_volume_number,
+        is_generic_title,
         parse_comic_name,
         update_comicinfo_xml,
     )
@@ -53,6 +56,7 @@ except ModuleNotFoundError:
         clean_filename,
         extract_chapter_number,
         extract_volume_number,
+        is_generic_title,
         parse_comic_name,
         update_comicinfo_xml,
     )
@@ -87,6 +91,7 @@ _TRAILING_TOKEN_RE = re.compile(
     r")[\s_\-.,]*$",
     re.IGNORECASE,
 )
+_CHAPTER_TOKEN_RE = re.compile(r"(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -110,6 +115,29 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 log = setup_logging()
+
+
+class ProgressReporter:
+    """Emit machine-readable progress lines for GUI launchers."""
+
+    def __init__(self, total: int, label: str = "items") -> None:
+        self.total = max(0, total)
+        self.label = label
+        self.current = 0
+        self.enabled = os.environ.get("CBZ_PROGRESS") == "1"
+        self._lock = threading.Lock()
+        self.emit(0)
+
+    def step(self, amount: int = 1) -> None:
+        with self._lock:
+            self.current = min(self.total, self.current + amount)
+            self.emit(self.current)
+
+    def emit(self, current: int) -> None:
+        if not self.enabled:
+            return
+        percent = 100 if self.total == 0 else int((current / self.total) * 100)
+        print(f"CBZ_PROGRESS {current}/{self.total} {percent}% {self.label}", flush=True)
 
 
 @dataclass
@@ -191,6 +219,20 @@ def normalise_series_key(name: str) -> str:
     name = name.lower()
     name = _PUNCT_RE.sub(" ", name)
     return _SPACES_RE.sub(" ", name).strip()
+
+
+def fmt_number(value: float) -> str:
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def extract_chapter_float(stem: str) -> float | None:
+    chapter = extract_chapter_number(stem)
+    if chapter is None:
+        return None
+    try:
+        return float(chapter)
+    except ValueError:
+        return None
 
 
 def larger_file_wins(src: Path, dest: Path, dry_run: bool) -> str:
@@ -360,25 +402,32 @@ def run_archive_clean(args: argparse.Namespace) -> int:
             dirs.add(root)
 
     all_dirs = sorted(dirs)
+    pack_folders: list[Path] = []
+    if args.pack_loose_images:
+        for root in paths:
+            pattern = "**/*" if not args.no_recursive else "*"
+            pack_folders.extend([p for p in root.glob(pattern) if p.is_dir()])
+        pack_folders = sorted(pack_folders, key=lambda p: len(p.parts), reverse=True)
+
+    progress = ProgressReporter(len(all_dirs) + len(pack_folders), "items")
     stats = MaintenanceStats()
 
     if args.workers == 1:
         for d in all_dirs:
             stats.add(archive_clean_worker(d, args))
+            progress.step()
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(archive_clean_worker, d, args) for d in all_dirs]
             for fut in as_completed(futures):
                 stats.add(fut.result())
+                progress.step()
 
     if args.pack_loose_images:
         # Pack folders after duplicate archive cleanup to avoid parent/child races.
-        folders = []
-        for root in paths:
-            pattern = "**/*" if not args.no_recursive else "*"
-            folders.extend([p for p in root.glob(pattern) if p.is_dir()])
-        for folder in sorted(folders, key=lambda p: len(p.parts), reverse=True):
+        for folder in pack_folders:
             stats.add(pack_image_folder(folder, args.dry_run))
+            progress.step()
 
     log.info("Archive clean complete: %s", stats)
     return 0
@@ -397,6 +446,66 @@ def canonical_series_name(names: list[str]) -> str:
     bases = [b for b in bases if b]
     candidates = bases or names
     return max(candidates, key=lambda s: (sum(1 for c in s if c.isupper()), len(s)))
+
+
+def rename_generic_files(folder: Path, dry_run: bool) -> MaintenanceStats:
+    """Rename generic archive names to use the containing series folder name."""
+    stats = MaintenanceStats()
+    cbz_files = sorted(folder.glob("*.cbz"))
+    generic_files = [f for f in cbz_files if is_generic_title(f.stem)]
+    if not generic_files:
+        return stats
+
+    log.info("    Renaming %d generic file(s) in %s", len(generic_files), folder.name)
+    fallback_names: dict[Path, str] = {}
+    for index, cbz in enumerate(generic_files, start=1):
+        suffix = f" {index}" if len(generic_files) > 1 else ""
+        fallback_names[cbz] = f"{folder.name}{suffix}.cbz"
+
+    for cbz, new_name in fallback_names.items():
+        dest = cbz.parent / new_name
+        if cbz == dest:
+            continue
+        if dry_run:
+            log.info("      [DRY RUN] Would rename: %s -> %s", cbz.name, new_name)
+            stats.renamed += 1
+            continue
+        outcome = larger_file_wins(cbz, dest, dry_run=False) if dest.exists() else "moved"
+        if outcome == "moved":
+            if not dest.exists():
+                cbz.rename(dest)
+            log.info("      Renamed: %s -> %s", cbz.name, new_name)
+            stats.renamed += 1
+        elif outcome == "replaced":
+            stats.renamed += 1
+        else:
+            stats.deleted += 1
+    return stats
+
+
+def update_series_metadata(folder: Path, dry_run: bool, workers: int = 1) -> MaintenanceStats:
+    """Update ComicInfo for all CBZ files under a merged series folder."""
+    stats = MaintenanceStats()
+    cbz_files = sorted(folder.rglob("*.cbz"))
+    if not cbz_files:
+        return stats
+
+    log.info("    Updating ComicInfo.xml for %d file(s) in %s", len(cbz_files), folder.name)
+    if workers == 1 or len(cbz_files) <= 1:
+        for cbz in cbz_files:
+            stats.add(metadata_worker(cbz, dry_run))
+        return stats
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(metadata_worker, cbz, dry_run): cbz for cbz in cbz_files}
+        for fut in as_completed(futures):
+            cbz = futures[fut]
+            try:
+                stats.add(fut.result())
+            except Exception as exc:
+                log.error("    ComicInfo worker failed for %s: %s", cbz.name, exc)
+                stats.errors += 1
+    return stats
 
 
 def merge_dir_contents(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats:
@@ -418,7 +527,164 @@ def merge_dir_contents(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats
     return stats
 
 
-def merge_chapter_folders(parent: Path, dry_run: bool) -> MaintenanceStats:
+def merge_series_dir(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    stats.add(rename_generic_files(src, dry_run))
+    stats.add(merge_dir_contents(src, dest, dry_run))
+    return stats
+
+
+def detect_compilation_candidates(chapter_nums: list[float]) -> list[tuple[float, float, float]]:
+    """Detect likely concatenated compilation numbers, e.g. 112 -> 1-12."""
+    if len(chapter_nums) < 2:
+        return []
+
+    nums = sorted(set(float(n) for n in chapter_nums))
+    results: list[tuple[float, float, float]] = []
+    for suspect in nums:
+        others = [n for n in nums if n != suspect]
+        if not others or suspect <= max(others):
+            continue
+
+        gaps = [others[i + 1] - others[i] for i in range(len(others) - 1)]
+        gap_to_suspect = suspect - max(others)
+        if gaps:
+            median_gap = statistics.median(gaps)
+            if median_gap > 0 and gap_to_suspect <= 2 * median_gap:
+                continue
+            if median_gap == 0 and gap_to_suspect <= 2:
+                continue
+        elif gap_to_suspect <= 2:
+            continue
+
+        suspect_str = fmt_number(suspect)
+        found_start = found_end = None
+        for candidate_start in others:
+            start_str = fmt_number(candidate_start)
+            if len(start_str) >= len(suspect_str) or not suspect_str.startswith(start_str):
+                continue
+            remainder = suspect_str[len(start_str):]
+            if not remainder or not remainder.isdigit():
+                continue
+            candidate_end = float(remainder)
+            if candidate_end < 1 or candidate_end > max(others):
+                continue
+            if found_start is None or candidate_start > found_start:
+                found_start = candidate_start
+                found_end = candidate_end
+
+        if found_start is not None and found_end is not None:
+            results.append((suspect, found_start, found_end))
+    return results
+
+
+def rename_stem_for_compilation(stem: str, start: float, end: float) -> str:
+    range_str = f"{fmt_number(start)}-{fmt_number(end)}"
+
+    def replace_chapter(match: re.Match) -> str:
+        return match.group(1) + range_str
+
+    new_stem, count = _CHAPTER_TOKEN_RE.subn(replace_chapter, stem, count=1)
+    return new_stem if count else f"{stem} {range_str}"
+
+
+def update_comicinfo_range(xml: str, start: float, end: float) -> tuple[str, bool]:
+    range_str = f"{fmt_number(start)}-{fmt_number(end)}"
+    pattern = re.compile(r"<Number>.*?</Number>", re.IGNORECASE | re.DOTALL)
+    tag = f"<Number>{range_str}</Number>"
+    if pattern.search(xml):
+        if pattern.search(xml).group(0) == tag:
+            return xml, False
+        return pattern.sub(tag, xml, count=1), True
+    return xml.replace("</ComicInfo>", f"  {tag}\n</ComicInfo>"), True
+
+
+def patch_comicinfo_range(cbz_path: Path, start: float, end: float, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    entry_name, xml = read_comicinfo(cbz_path)
+    if xml is None:
+        stats.skipped += 1
+        return stats
+
+    new_xml, changed = update_comicinfo_range(xml, start, end)
+    if not changed:
+        stats.skipped += 1
+        return stats
+
+    if dry_run:
+        log.info(
+            "    [DRY RUN] Would update ComicInfo range Number=%s-%s in %s",
+            fmt_number(start),
+            fmt_number(end),
+            cbz_path.name,
+        )
+        stats.updated_xml += 1
+        return stats
+
+    if write_comicinfo(cbz_path, entry_name, new_xml, dry_run=False):
+        log.info(
+            "    ComicInfo updated: Number=%s-%s in %s",
+            fmt_number(start),
+            fmt_number(end),
+            cbz_path.name,
+        )
+        stats.updated_xml += 1
+    else:
+        stats.errors += 1
+    return stats
+
+
+def detect_and_fix_compilations(series_dir: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    cbz_files = sorted(series_dir.glob("*.cbz"))
+    if len(cbz_files) < 2:
+        return stats
+
+    num_to_path: dict[float, Path] = {}
+    for cbz in cbz_files:
+        chapter = extract_chapter_float(cbz.stem)
+        if chapter is not None:
+            num_to_path[chapter] = cbz
+    if len(num_to_path) < 2:
+        return stats
+
+    for suspect, start, end in detect_compilation_candidates(list(num_to_path.keys())):
+        cbz = num_to_path.get(suspect)
+        if cbz is None or not cbz.exists():
+            continue
+
+        new_stem = rename_stem_for_compilation(cbz.stem, start, end)
+        new_path = cbz.parent / f"{new_stem}{cbz.suffix}"
+        log.info(
+            "    Compilation detected: %s looks like ch.%s-%s",
+            cbz.name,
+            fmt_number(start),
+            fmt_number(end),
+        )
+
+        if dry_run:
+            log.info("    [DRY RUN] Would rename: %s -> %s", cbz.name, new_path.name)
+            stats.renamed += 1
+            stats.add(patch_comicinfo_range(cbz, start, end, dry_run=True))
+            continue
+
+        if new_path != cbz:
+            if new_path.exists():
+                outcome = larger_file_wins(cbz, new_path, dry_run=False)
+                if outcome == "discarded":
+                    stats.deleted += 1
+                    continue
+            else:
+                cbz.rename(new_path)
+                log.info("    Renamed: %s -> %s", cbz.name, new_path.name)
+            stats.renamed += 1
+            cbz = new_path
+
+        stats.add(patch_comicinfo_range(cbz, start, end, dry_run=False))
+    return stats
+
+
+def merge_chapter_folders(parent: Path, dry_run: bool, metadata_workers: int = 1) -> MaintenanceStats:
     stats = MaintenanceStats()
     children = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
     groups: dict[str, list[Path]] = {}
@@ -441,11 +707,19 @@ def merge_chapter_folders(parent: Path, dry_run: bool) -> MaintenanceStats:
         for src in group:
             if src == dest:
                 continue
-            stats.add(merge_dir_contents(src, dest, dry_run))
+            stats.add(merge_series_dir(src, dest, dry_run))
+        stats.add(update_series_metadata(dest, dry_run, workers=metadata_workers))
+        stats.add(detect_and_fix_compilations(dest, dry_run))
     return stats
 
 
-def find_series_matches(parent: Path, report_threshold: float, auto_threshold: float, dry_run: bool) -> MaintenanceStats:
+def find_series_matches(
+    parent: Path,
+    report_threshold: float,
+    auto_threshold: float,
+    dry_run: bool,
+    metadata_workers: int = 1,
+) -> MaintenanceStats:
     stats = MaintenanceStats()
     dirs = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
     entries = [(d, normalise_series_key(d.name)) for d in dirs]
@@ -475,7 +749,9 @@ def find_series_matches(parent: Path, report_threshold: float, auto_threshold: f
 
             if ratio >= auto_threshold:
                 log.info("    Auto-merge: %s -> %s", secondary.name, primary.name)
-                stats.add(merge_dir_contents(secondary, primary, dry_run))
+                stats.add(merge_series_dir(secondary, primary, dry_run))
+                stats.add(update_series_metadata(primary, dry_run, workers=metadata_workers))
+                stats.add(detect_and_fix_compilations(primary, dry_run))
                 consumed.add(secondary)
             else:
                 stats.skipped += 1
@@ -721,23 +997,46 @@ def find_uncensored_pairs(root: Path, dry_run: bool, move_which: str) -> Mainten
 
 def run_organize_series(args: argparse.Namespace) -> int:
     stats = MaintenanceStats()
+    planned_units = 0
+    planned_parents_by_root: dict[Path, list[Path]] = {}
+    for root_arg in args.paths:
+        root = Path(root_arg)
+        if not root.exists():
+            planned_parents_by_root[root] = []
+            planned_units += 1
+            continue
+        parents = [root]
+        if args.recursive_parents:
+            parents.extend(sorted({p.parent for p in root.rglob("*") if p.is_dir()}))
+        unique_parents = sorted(set(parents))
+        planned_parents_by_root[root] = unique_parents
+        planned_units += len(unique_parents)
+        if args.uncensored_check:
+            planned_units += 1
+
+    progress = ProgressReporter(planned_units, "groups")
     for root_arg in args.paths:
         root = Path(root_arg)
         log.info("Organize series root: %s", root)
         if not root.exists():
             log.error("Missing root: %s", root)
             stats.errors += 1
+            progress.step()
             continue
 
-        parents = [root]
-        if args.recursive_parents:
-            parents.extend(sorted({p.parent for p in root.rglob("*") if p.is_dir()}))
-
-        for parent in sorted(set(parents)):
+        for parent in planned_parents_by_root.get(root, [root]):
             if args.merge_chapter_folders:
-                stats.add(merge_chapter_folders(parent, args.dry_run))
+                stats.add(merge_chapter_folders(parent, args.dry_run, metadata_workers=args.workers))
             if args.match_series:
-                stats.add(find_series_matches(parent, args.report_threshold, args.auto_threshold, args.dry_run))
+                stats.add(
+                    find_series_matches(
+                        parent,
+                        args.report_threshold,
+                        args.auto_threshold,
+                        args.dry_run,
+                        metadata_workers=args.workers,
+                    )
+                )
             if args.possible_series_check:
                 stats.add(
                     move_possible_same_series_to_check(
@@ -747,9 +1046,11 @@ def run_organize_series(args: argparse.Namespace) -> int:
                         min_group_size=args.series_min_group_size,
                     )
                 )
+            progress.step()
 
         if args.uncensored_check:
             stats.add(find_uncensored_pairs(root, args.dry_run, args.move_which))
+            progress.step()
 
     log.info("Organize complete: %s", stats)
     return 0
@@ -825,15 +1126,18 @@ def run_metadata(args: argparse.Namespace) -> int:
         root = Path(root_arg)
         cbz_files.extend(sorted(root.rglob("*.cbz")) if root.is_dir() else [root])
 
+    progress = ProgressReporter(len(cbz_files), "files")
     stats = MaintenanceStats()
     if args.workers == 1:
         for cbz in cbz_files:
             stats.add(metadata_worker(cbz, args.dry_run))
+            progress.step()
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(metadata_worker, cbz, args.dry_run) for cbz in cbz_files]
             for fut in as_completed(futures):
                 stats.add(fut.result())
+                progress.step()
 
     log.info("Metadata complete: %s", stats)
     return 0

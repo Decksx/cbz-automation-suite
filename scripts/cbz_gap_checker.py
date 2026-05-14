@@ -15,6 +15,7 @@ import os
 import re
 import csv
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -29,6 +30,29 @@ OUTPUT_FOLDER = r"C:\git\ComicAutomation\Logs"
 GAP_THRESHOLD = 1
 MIN_ISSUES_TO_REPORT = 2
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
+
+
+class ProgressReporter:
+    """Emit machine-readable progress lines for GUI launchers."""
+
+    def __init__(self, total: int, label: str = "series") -> None:
+        self.total = max(0, total)
+        self.label = label
+        self.current = 0
+        self.enabled = os.environ.get("CBZ_PROGRESS") == "1"
+        self._lock = threading.Lock()
+        self.emit(0)
+
+    def step(self, amount: int = 1) -> None:
+        with self._lock:
+            self.current = min(self.total, self.current + amount)
+            self.emit(self.current)
+
+    def emit(self, current: int) -> None:
+        if not self.enabled:
+            return
+        percent = 100 if self.total == 0 else int((current / self.total) * 100)
+        print(f"CBZ_PROGRESS {current}/{self.total} {percent}% {self.label}", flush=True)
 
 # ─────────────────────────────────────────────
 # NUMBER EXTRACTION
@@ -153,9 +177,14 @@ def _collect_series_dirs(folder: Path) -> list[Path]:
 # ─────────────────────────────────────────────
 # PARALLEL SCAN
 # ─────────────────────────────────────────────
-def scan_folder_parallel(folder: Path, workers: int) -> list[dict]:
+def scan_folder_parallel(
+    folder: Path,
+    workers: int,
+    progress: ProgressReporter | None = None,
+    series_dirs: list[Path] | None = None,
+) -> list[dict]:
     """Collect all series dirs then scan them in parallel."""
-    series_dirs = _collect_series_dirs(folder)
+    series_dirs = series_dirs if series_dirs is not None else _collect_series_dirs(folder)
     if not series_dirs:
         return []
 
@@ -168,6 +197,8 @@ def scan_folder_parallel(folder: Path, workers: int) -> list[dict]:
             r = scan_series(sd)
             if r:
                 results.append(r)
+            if progress:
+                progress.step()
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_dir = {executor.submit(scan_series, sd): sd for sd in series_dirs}
@@ -179,6 +210,9 @@ def scan_folder_parallel(folder: Path, workers: int) -> list[dict]:
                 except Exception as e:
                     sd = future_to_dir[future]
                     print(f"  ERROR scanning '{sd.name}': {e}")
+                finally:
+                    if progress:
+                        progress.step()
 
     return results
 
@@ -237,25 +271,41 @@ def main():
     print("=" * 60)
 
     all_results: list[dict] = []
+    scan_jobs: list[tuple[str, Path, list[Path]]] = []
 
     for target in targets:
         target_path = Path(target)
+        if not target_path.exists():
+            print(f"  WARNING: Folder not found, skipping: {target_path}")
+            continue
         has_cbz  = any(target_path.glob("*.cbz"))
         has_dirs = any(d for d in target_path.iterdir() if d.is_dir())
 
         if has_cbz and not has_dirs:
+            scan_jobs.append(("single", target_path, [target_path]))
+        elif has_cbz and has_dirs:
+            scan_jobs.append(("mixed-single", target_path, [target_path]))
+            scan_jobs.append(("folder", target_path, _collect_series_dirs(target_path)))
+        else:
+            scan_jobs.append(("folder", target_path, _collect_series_dirs(target_path)))
+
+    progress = ProgressReporter(sum(len(series_dirs) for _, _, series_dirs in scan_jobs), "series")
+
+    for kind, target_path, series_dirs in scan_jobs:
+        if kind == "single":
             print(f"  Scanning single series: {target_path.name}")
             r = scan_series(target_path)
             if r:
                 all_results.append(r)
-        elif has_cbz and has_dirs:
+            progress.step()
+        elif kind == "mixed-single":
             print(f"  Scanning single series (mixed): {target_path.name}")
             r = scan_series(target_path)
             if r:
                 all_results.append(r)
-            all_results.extend(scan_folder_parallel(target_path, workers))
+            progress.step()
         else:
-            all_results.extend(scan_folder_parallel(target_path, workers))
+            all_results.extend(scan_folder_parallel(target_path, workers, progress, series_dirs))
 
     if not all_results:
         print("  No series found with enough numbered issues to report.")

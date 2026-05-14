@@ -93,13 +93,10 @@ cbz-automation-suite/
 │   ├── cbz_core.py
 │   ├── cbz_watcher.py
 │   ├── cbz_sanitizer.py
-│   ├── cbz_folder_merger.py
+│   ├── cbz_library_maintenance.py
 │   ├── cbz_compilation_resolver.py
-│   ├── cbz_number_tagger.py
-│   ├── cbz_series_matcher.py
 │   ├── cbz_gap_checker.py
-│   ├── cbz_deduplicator.py
-│   └── strip_duplicates.py
+│   └── __init__.py
 ├── tests/
 ├── docs/
 ├── config/
@@ -117,13 +114,9 @@ cbz-automation-suite/
 | `cbz_core.py` | Shared normalization/parsing/ComicInfo layer |
 | `cbz_watcher.py` | Live automated ingest watcher |
 | `cbz_sanitizer.py` | Batch filename + ComicInfo cleaner |
-| `cbz_folder_merger.py` | Merge duplicate series folders |
+| `cbz_library_maintenance.py` | Consolidated archive cleanup, series organization, and metadata repair |
 | `cbz_compilation_resolver.py` | Resolve compilation vs chapter overlap |
-| `cbz_number_tagger.py` | Retroactive ComicInfo number tagging |
-| `cbz_series_matcher.py` | Near-duplicate series detector |
 | `cbz_gap_checker.py` | Missing chapter scanner |
-| `cbz_deduplicator.py` | Duplicate archive remover |
-| `strip_duplicates.py` | Filename cleanup helper |
 
 ---
 
@@ -251,4 +244,3 @@ See:
 # License
 
 MIT License
-

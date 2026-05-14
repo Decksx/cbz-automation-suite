@@ -25,14 +25,11 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 | `scripts/cbz_core.py` | — | — | Shared normalization/parsing/ComicInfo layer used by watcher and batch tools | [cbz_core.md](cbz_core.md) |
 | `scripts/cbz_watcher.py` | Always (watchdog) | — | Live watcher — monitors Incoming folder, cleans, tags, and routes files via `routing.json` | [cbz_watcher.md](cbz_watcher.md) |
 | `scripts/cbz_sanitizer.py` | Always (`rglob`) | **Yes** | Batch sanitizer — in-place clean/tag with `--sort`, `--resume`, `--dry-run`, `--workers`, `--rules` | [cbz_sanitizer.md](cbz_sanitizer.md) |
-| `scripts/cbz_folder_merger.py` | Single-level (by design) | **Yes** | Merges colliding series directories; two-phase ComicInfo update; interactive path prompt; UNC and local drives | [other_tools.md](other_tools.md#cbz_folder_mergerpy) |
+| `scripts/cbz_library_maintenance.py archive-clean` | Configurable | **Yes** | Removes duplicate archives, strips duplicate filename tokens, and packs loose image folders | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
+| `scripts/cbz_library_maintenance.py organize-series` | Configurable | **Yes** | Merges split chapter folders, matches near-duplicate series, repairs merged ComicInfo, fixes likely compilation ranges, and moves review groups to `_Check/` | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
+| `scripts/cbz_library_maintenance.py metadata` | Always (`rglob`) | **Yes** | Retroactively repairs `<Title>`, `<Series>`, `<Number>`, and `<Volume>` tags from filenames | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
 | `scripts/cbz_compilation_resolver.py` | **Yes — default** | **Yes** | Resolves compilation vs individual overlaps; rewrites with best pages | [other_tools.md](other_tools.md#cbz_compilation_resolverpy) |
-| `scripts/cbz_number_tagger.py` | Always (`rglob`) | — | Retroactively sets `<Number>` and `<Volume>` ComicInfo tags from filenames | [other_tools.md](other_tools.md#cbz_number_taggerpy) |
-| `scripts/cbz_series_matcher.py` | **Yes — default** | **Yes** | Near-duplicate series name detector; auto-merges above threshold at every nesting level | [other_tools.md](other_tools.md#cbz_series_matcherpy) |
 | `scripts/cbz_gap_checker.py` | **Yes — default** | **Yes** | Scans library, outputs timestamped CSV of missing chapter numbers to `Logs/` | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
-| `scripts/cbz_deduplicator.py` | **Yes — default** (`--no-recursive` to disable) | **Yes** | Removes duplicate cbz/cbr files and packs loose image folders into archives | [other_tools.md](other_tools.md#cbz_deduplicatorpy) |
-| `scripts/strip_duplicates.py` | **Yes — default** (`--no-recursive` to disable) | **Yes** | Removes duplicate number tokens and fixes spaced punctuation; importable as library | [other_tools.md](other_tools.md#strip_duplicatespy) |
-| `scripts/find_uncensored_dupes.py` | Single-level (by design) | — | Finds censored/uncensored duplicate folder pairs and quarantines them into `_Check/` | [other_tools.md](other_tools.md#find_uncensored_dupespy) |
 | `config/routing.example.json` | — | — | Template for `routing.json` — copy to `C:\\git\\ComicAutomation\routing.json` and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
 | `config/run_watcher.bat` | — | — | Double-click launcher — installs watchdog and starts the watcher | — |
 | `config/CBZWatcher_Task.xml` | — | — | Windows Task Scheduler import — auto-starts watcher on login | — |
@@ -76,14 +73,10 @@ cbz-automation-suite/
 ├── scripts/
 │   ├── cbz_watcher.py              # Live watcher (main tool)
 │   ├── cbz_sanitizer.py            # Canonical shared-function reference
-│   ├── cbz_folder_merger.py
+│   ├── cbz_library_maintenance.py
 │   ├── cbz_compilation_resolver.py
-│   ├── cbz_number_tagger.py
-│   ├── cbz_series_matcher.py
 │   ├── cbz_gap_checker.py
-│   ├── cbz_deduplicator.py
-│   ├── strip_duplicates.py
-│   └── find_uncensored_dupes.py
+│   └── cbz_core.py
 ├── config/
 │   ├── routing.example.json        # Template — copy to C:\git\ComicAutomation\routing.json
 │   ├── run_watcher.bat
@@ -118,12 +111,6 @@ All tools write rotating logs (max 5 MB, 3 backups) to `C:\git\ComicAutomation\L
 |----------|--------|
 | `Logs\cbz_watcher.log` | cbz_watcher.py |
 | `Logs\cbz_sanitizer.log` | cbz_sanitizer.py |
-| `Logs\cbz_folder_merger.log` | cbz_folder_merger.py |
+| `Logs\cbz_library_maintenance.log` | cbz_library_maintenance.py |
 | `Logs\cbz_compilation_resolver.log` | cbz_compilation_resolver.py |
-| `Logs\cbz_series_matcher.log` | cbz_series_matcher.py |
-| `Logs\cbz_number_tagger.log` | cbz_number_tagger.py |
-| `Logs\cbz_deduplicator.log` | cbz_deduplicator.py |
-| `Logs\strip_duplicates.log` | strip_duplicates.py |
 | `Logs\cbz_gaps_YYYYMMDD_HHMMSS.csv` | cbz_gap_checker.py (CSV report, not a log) |
-
-`find_uncensored_dupes.py` logs to stdout only — no persistent log file.

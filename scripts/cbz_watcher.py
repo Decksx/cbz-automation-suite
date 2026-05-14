@@ -96,6 +96,29 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+class ProgressReporter:
+    """Emit machine-readable progress lines for GUI launchers."""
+
+    def __init__(self, total: int, label: str = "files") -> None:
+        self.total = max(0, total)
+        self.label = label
+        self.current = 0
+        self.enabled = os.environ.get("CBZ_PROGRESS") == "1"
+        self._lock = threading.Lock()
+        self.emit(0)
+
+    def step(self, amount: int = 1) -> None:
+        with self._lock:
+            self.current = min(self.total, self.current + amount)
+            self.emit(self.current)
+
+    def emit(self, current: int) -> None:
+        if not self.enabled:
+            return
+        percent = 100 if self.total == 0 else int((current / self.total) * 100)
+        print(f"CBZ_PROGRESS {current}/{self.total} {percent}% {self.label}", flush=True)
+
+
 
 
 
@@ -485,6 +508,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         return
 
     log.info(f"  Found .cbz files in {len(cbz_dirs)} directory(s).")
+    progress = ProgressReporter(sum(len(files) for files in cbz_dirs.values()), "files")
 
     total_processed = total_skipped = total_renamed = 0
 
@@ -536,21 +560,24 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
 
         log.info(f"  Processing directory: {comic_dir.name} ({len(cbz_files)} file(s)) -> {dest_folder}")
         for cbz in cbz_files:
-            if not cbz.exists():
-                total_skipped += 1
-                continue
-            if cbz.stat().st_size == 0:
-                log.warning(f"    Skipping zero-byte file: {cbz.name}")
-                total_skipped += 1
-                continue
-            original_name = cbz.name
-            override = fallback_names.get(cbz)
-            if override:
-                log.info(f"    Empty stem fallback: '{cbz.name}' -> '{override}'")
-            result_path = process_cbz_file(cbz, override_name=override)
-            total_processed += 1
-            if result_path.name != original_name:
-                total_renamed += 1
+            try:
+                if not cbz.exists():
+                    total_skipped += 1
+                    continue
+                if cbz.stat().st_size == 0:
+                    log.warning(f"    Skipping zero-byte file: {cbz.name}")
+                    total_skipped += 1
+                    continue
+                original_name = cbz.name
+                override = fallback_names.get(cbz)
+                if override:
+                    log.info(f"    Empty stem fallback: '{cbz.name}' -> '{override}'")
+                result_path = process_cbz_file(cbz, override_name=override)
+                total_processed += 1
+                if result_path.name != original_name:
+                    total_renamed += 1
+            finally:
+                progress.step()
         _move_cbz_dir(comic_dir, dest_folder)
 
     log.info(
