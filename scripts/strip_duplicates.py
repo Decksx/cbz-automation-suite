@@ -24,7 +24,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-LOG_FILE = r"C:\git\ComicAutomation\strip_duplicates.log"
+LOG_FILE = r"C:\git\ComicAutomation\Logs\strip_duplicates.log"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 
 # ─────────────────────────────────────────────

@@ -53,10 +53,12 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 SCAN_FOLDERS: list[str] = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
+    r"\\tower\media\comics\Horrorsplat",
+    ##r"\\tower\media\comics\Graphic Novels",
 ]
-LOG_FILE               = r"C:\git\ComicAutomation\cbz_series_matcher.log"
-AUTO_RENAME_THRESHOLD  = 0.90
-REPORT_THRESHOLD       = 0.80
+LOG_FILE               = r"C:\git\ComicAutomation\Logs\cbz_series_matcher.log"
+AUTO_RENAME_THRESHOLD  = 0.87
+REPORT_THRESHOLD       = 0.75
 DEFAULT_WORKERS        = min(8, os.cpu_count() or 4)
 
 # ─────────────────────────────────────────────

@@ -6,7 +6,14 @@ Live file watcher. Monitors an Incoming folder for `.cbz` files, applies the ful
 
 ## Shared-core integration
 
-`cbz_watcher.py` imports shared helpers directly from `scripts/cbz_core.py`:
+```python
+WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"   # folder to monitor
+LOG_FILE      = r"C:\git\ComicAutomation\Logs\cbz_watcher.log"
+ROUTING_FILE  = r"C:\git\ComicAutomation\routing.json"
+POLL_INTERVAL = 2      # seconds between stability checks
+SETTLE_DELAY  = 5      # seconds of inactivity before a directory is processed
+MIN_AGE       = 300    # minimum directory age in seconds before processing (5 min)
+```
 
 - `clean_directory_name()`
 - `clean_filename()`
@@ -76,4 +83,4 @@ Destination routing is driven by `routing.json`, an external config file. A `rou
 
 ## Logging
 
-Rotating log file at `LOG_FILE` plus stdout.
+Rotating log file at `Logs\cbz_watcher.log` (5 MB max, 3 backups). Also streams to stdout. Log entries cover every event, stability check, settle/age wait, rename, tag update, route decision, move, and merge conflict.

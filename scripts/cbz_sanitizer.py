@@ -37,7 +37,7 @@ from pathlib import Path
 # CONFIGURATION
 # ─────────────────────────────────────────────
 SCAN_FOLDER    = r"\\tower\media\comics\manga"
-LOG_FILE       = r"C:\git\ComicAutomation\cbz_sanitizer.log"
+LOG_FILE       = r"C:\git\ComicAutomation\Logs\cbz_sanitizer.log"
 PROGRESS_FILE  = r"C:\git\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 
@@ -72,7 +72,15 @@ _TITLE_OVERWRITE_RES = [
     re.compile(r"^doujinshi[\s_]chapter", re.IGNORECASE),
     re.compile(r"^unknown[\s_]chapter",   re.IGNORECASE),
 ]
-NUMBER_PREFIX_RE = re.compile(r"^\d+\s*-\s*", re.IGNORECASE)
+# Matches leading junk prefixes on filenames:
+#   "1 - "          number-dash style
+#   "3761755 v1 "   long ID + version token style
+NUMBER_PREFIX_RE = re.compile(
+    r'^(?:\d+\s+v\d+\s+|\d+\s*[-_]\s*)',
+    re.IGNORECASE
+)
+# Matches trailing hyphens, dashes, underscores, and whitespace (including em/en dash)
+TRAILING_JUNK_RE = re.compile(r'[\s\-_\u2013\u2014]+$')
 
 GIBBERISH_RE = re.compile(
     r'^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}'
@@ -86,7 +94,7 @@ HASH_CHAPTER_RE = re.compile(
     r'^#\s*chapter\s*(\d[\d.]*)(.*?)$', re.IGNORECASE
 )
 CHAPTER_ONLY_RE = re.compile(
-    r'^(?:ch(?:ap(?:ter)?)?\.?\s*|chp\.?\s*)(\d[\d.]*)', re.IGNORECASE
+    r'^(?:ch(?:ap(?:ter)?)?\\.?\\s*|chp\\.?\\s*)(\\d[\\d.]*)', re.IGNORECASE
 )
 NUMBERED_CHAPTER_RE = re.compile(
     r'^(?:'
@@ -165,7 +173,7 @@ _NUM_TOKEN_RE = re.compile(
 _DIR_LEADING_HASH_RE  = re.compile(r'^#+\s*')
 _DIR_TRAILING_HASH_RE = re.compile(r'\s*#+$')
 _DIR_TRAILING_STUB_RE = re.compile(
-    r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\\s*$', re.IGNORECASE
+    r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
 )
 _CHAPTER_NUMBER_RE = re.compile(
     r'(?:'
@@ -189,24 +197,51 @@ _CHAPTER_TOKEN_RE = re.compile(
 
 
 # ─────────────────────────────────────────────
-# SANITIZE HELPERS  (unchanged logic)
+# RULES  — toggleable cleaning operations
 # ─────────────────────────────────────────────
-def sanitize(text: str) -> str:
+# Each rule name corresponds to a --rules= token.
+# ALL_RULES is the default (everything on).
+ALL_RULES = {
+    "url",           # strip URLs and domain-like tokens
+    "scan_groups",   # strip scanlation group names
+    "brackets",      # remove bracketed / parenthesised blocks
+    "non_latin",     # remove non-Latin / non-Western characters
+    "leading_nums",  # strip leading numeric prefixes  ("1 - ", "3761755 v1 ")
+    "trailing_junk", # strip trailing hyphens / dashes / underscores
+    "normalize_stem",# normalise chapter/volume stem patterns
+    "number_tokens", # normalise chapter/vol number formatting tokens
+    "comicinfo",     # update ComicInfo.xml metadata inside the archive
+}
+
+def parse_rules(raw: str) -> set[str]:
+    """Parse a comma-separated --rules= value into a validated set."""
+    tokens = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    unknown = tokens - ALL_RULES
+    if unknown:
+        log.warning(f"  Unknown rule(s) ignored: {', '.join(sorted(unknown))}")
+    return tokens & ALL_RULES  # only keep recognised names
+
+
+# ─────────────────────────────────────────────
+# SANITIZE HELPERS
+# ─────────────────────────────────────────────
+def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
     text = html.unescape(text)
-    text = _URL_RE.sub("", text)
-    text = _SCAN_GROUP_RE.sub("", text)
-    text = _TRAILING_SLASH_RE.sub("", text)
-    text = _GCODE_RE.sub("", text)
-    text = _NON_LATIN_RE.sub("", text)
-    text = _BRACKET_RE.sub("", text)
-    text = _STRAY_RE.sub("", text)
-    text = text.replace("_", " ")
+    if "url"         in rules: text = _URL_RE.sub("", text)
+    if "scan_groups" in rules: text = _SCAN_GROUP_RE.sub("", text)
+    text = _TRAILING_SLASH_RE.sub("", text)   # always — prevents path artefacts
+    text = _GCODE_RE.sub("", text)            # always — G-code suffixes are never wanted
+    if "non_latin"   in rules: text = _NON_LATIN_RE.sub("", text)
+    if "brackets"    in rules:
+        text = _BRACKET_RE.sub("", text)
+        text = _STRAY_RE.sub("", text)
+    text = text.replace("_", " ")             # always — underscores → spaces
     return _SPACES_RE.sub(" ", text).strip()
 
-def clean_filename(name: str) -> str:
+def clean_filename(name: str, rules: set[str] = ALL_RULES) -> str:
     stem = Path(name).stem
     ext  = Path(name).suffix
-    return sanitize(stem) + ext
+    return sanitize(stem, rules) + ext
 
 def clean_directory_name(name: str) -> str:
     name = sanitize(name)
@@ -337,10 +372,13 @@ def _inject_comicinfo(cbz_path: Path) -> None:
 
 def process_comicinfo(
     cbz_path: Path,
-    prefetched_xml: tuple[str, str] | None = None
+    prefetched_xml: tuple[str, str] | None = None,
+    rules: set[str] = ALL_RULES,
 ) -> None:
     parent_dir    = cbz_path.parent.name
-    filename_stem = NUMBER_PREFIX_RE.sub("", cbz_path.stem).strip()
+    filename_stem = cbz_path.stem
+    if "leading_nums"  in rules: filename_stem = NUMBER_PREFIX_RE.sub("", filename_stem).strip()
+    if "trailing_junk" in rules: filename_stem = TRAILING_JUNK_RE.sub("", filename_stem).strip()
     for attempt in range(5):
         try:
             if prefetched_xml is not None:
@@ -375,7 +413,8 @@ def process_comicinfo(
                     )
                     log.info(f"    Series cleaned: '{series_match.group(1).strip()}' -> '{series_value}'")
 
-                title_value   = NUMBER_PREFIX_RE.sub("", title_value).strip()
+                if "leading_nums"  in rules: title_value = NUMBER_PREFIX_RE.sub("", title_value).strip()
+                if "trailing_junk" in rules: title_value = TRAILING_JUNK_RE.sub("", title_value).strip()
                 title_generic    = is_generic(title_value) or bool(GIBBERISH_RE.match(title_value))
                 filename_generic = is_generic(filename_stem)
 
@@ -497,7 +536,11 @@ def _merge_directories(src_dir: Path, dest_dir: Path) -> None:
 # ─────────────────────────────────────────────
 # SINGLE CBZ PROCESSING
 # ─────────────────────────────────────────────
-def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
+def process_cbz_file(
+    cbz_path: Path,
+    override_name: str | None = None,
+    rules: set[str] = ALL_RULES,
+) -> Path:
     log.info(f"  Processing: {cbz_path.name}")
     if not cbz_path.exists():
         log.warning(f"    File no longer exists, skipping: {cbz_path.name}")
@@ -509,9 +552,11 @@ def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
     if override_name is not None:
         new_name = override_name
     else:
-        stem     = Path(clean_filename(cbz_path.name)).stem
-        stem     = normalize_stem(stem, cbz_path.parent.name)
-        stem     = normalise_number_tokens(stem)
+        stem = Path(clean_filename(cbz_path.name, rules)).stem
+        if "leading_nums"   in rules: stem = NUMBER_PREFIX_RE.sub("", stem).strip()
+        if "normalize_stem" in rules: stem = normalize_stem(stem, cbz_path.parent.name)
+        if "number_tokens"  in rules: stem = normalise_number_tokens(stem)
+        if "trailing_junk"  in rules: stem = TRAILING_JUNK_RE.sub("", stem).strip()
         new_name = stem + cbz_path.suffix
 
     if new_name != cbz_path.name:
@@ -548,7 +593,8 @@ def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
     except (zipfile.BadZipFile, OSError):
         pass
 
-    process_comicinfo(cbz_path, prefetched_xml=prefetched)
+    if "comicinfo" in rules:
+        process_comicinfo(cbz_path, prefetched_xml=prefetched, rules=rules)
     return cbz_path
 
 
@@ -691,29 +737,32 @@ def _patch_comicinfo_for_range(cbz_path: Path, start: float, end: float) -> None
 # PROGRESS TRACKING  (thread-safe)
 # ─────────────────────────────────────────────
 def load_progress() -> set:
+    """Load all processed paths from the persistent progress file.
+    Reads every session header and entry — accumulates across all past runs."""
     paths: set[str] = set()
     try:
         with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     obj = json.loads(line)
-                    if i == 0:
-                        continue
+                    # Skip session headers ({"session":...) — only collect path entries
                     if "p" in obj:
                         paths.add(obj["p"])
                 except json.JSONDecodeError:
                     pass
-        log.info(f"  Resumed: {len(paths)} file(s) already processed.")
+        log.info(f"  Resumed: {len(paths)} file(s) already processed across all sessions.")
     except FileNotFoundError:
-        pass
+        log.info("  No progress file found — starting fresh.")
     return paths
 
 def save_progress(path: str) -> None:
+    """Append a single processed-file entry to the persistent progress file."""
     with _progress_lock:
         try:
+            os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
             with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
                 json.dump({"p": path}, f, separators=(",", ":"))
                 f.write("\n")
@@ -721,18 +770,21 @@ def save_progress(path: str) -> None:
             log.warning(f"  Could not save progress file: {e}")
 
 def init_progress_file(started: str) -> None:
+    """Append a session-start marker to the persistent progress file.
+    Never truncates — history from previous sessions is preserved."""
     try:
         os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"started": started, "v": 2}, f, separators=(",", ":"))
+        with open(PROGRESS_FILE, "a", encoding="utf-8") as f:
+            json.dump({"session": started, "v": 2}, f, separators=(",", ":"))
             f.write("\n")
     except OSError as e:
         log.warning(f"  Could not init progress file: {e}")
 
 def clear_progress() -> None:
+    """Delete the progress file entirely. Only called on --restart."""
     try:
         Path(PROGRESS_FILE).unlink(missing_ok=True)
-        log.info("  Progress file cleared (run complete).")
+        log.info("  Progress file cleared (--restart).")
     except OSError as e:
         log.warning(f"  Could not delete progress file: {e}")
 
@@ -744,6 +796,7 @@ def _process_series_dir(
     comic_dir: Path,
     cbz_files: list[Path],
     processed: set[str],
+    rules: set[str] = ALL_RULES,
 ) -> tuple[int, int, int, int]:
     """
     Process one series directory.  Returns (processed, renamed, skipped, comp_fixed).
@@ -794,7 +847,7 @@ def _process_series_dir(
             continue
         original_name = cbz.name
         override = fallback_names.get(cbz)
-        result_path = process_cbz_file(cbz, override_name=override)
+        result_path = process_cbz_file(cbz, override_name=override, rules=rules)
         save_progress(str(result_path))
         total_processed += 1
         if result_path.name != original_name:
@@ -816,7 +869,7 @@ def _process_series_dir(
 # ─────────────────────────────────────────────
 # DIRECTORY SANITIZING  (parallel)
 # ─────────────────────────────────────────────
-def sanitize_directory(dir_path: Path, processed: set, started: str, workers: int) -> None:
+def sanitize_directory(dir_path: Path, processed: set, started: str, workers: int, rules: set[str] = ALL_RULES) -> None:
     log.info("=" * 60)
     log.info(f"Scanning: {dir_path.name}")
 
@@ -840,7 +893,7 @@ def sanitize_directory(dir_path: Path, processed: set, started: str, workers: in
         # Serial path — identical to original behaviour
         for comic_dir, cbz_files in sorted(cbz_dirs.items()):
             log.info(f"  Directory: {comic_dir.name} ({len(cbz_files)} file(s))")
-            p, r, s, c = _process_series_dir(comic_dir, cbz_files, processed)
+            p, r, s, c = _process_series_dir(comic_dir, cbz_files, processed, rules)
             total_processed += p; total_renamed += r
             total_skipped += s;   total_comp_fixed += c
     else:
@@ -848,7 +901,7 @@ def sanitize_directory(dir_path: Path, processed: set, started: str, workers: in
         items = sorted(cbz_dirs.items())
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_dir = {
-                executor.submit(_process_series_dir, comic_dir, cbz_files, processed): comic_dir
+                executor.submit(_process_series_dir, comic_dir, cbz_files, processed, rules): comic_dir
                 for comic_dir, cbz_files in items
             }
             for future in as_completed(future_to_dir):
@@ -873,17 +926,44 @@ def sanitize_directory(dir_path: Path, processed: set, started: str, workers: in
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def main():
-    scan_path = Path(SCAN_FOLDER)
-
-    if not scan_path.exists():
-        print(f"ERROR: Scan folder not found: {SCAN_FOLDER}")
-        return
-
     # ── Parse args ────────────────────────────────────────────────────────────
     args_raw = sys.argv[1:]
     restart  = "--restart"      in args_raw
     resume   = "--resume"       in args_raw
     dry_run  = "--dry-run"      in args_raw
+
+    # --rules=url,brackets,... restricts which cleaning rules run.
+    # Omitting --rules means all rules are active (default behaviour).
+    active_rules = ALL_RULES
+    for arg in args_raw:
+        if arg.startswith("--rules="):
+            active_rules = parse_rules(arg.split("=", 1)[1])
+            break
+
+    # --scan=<path> or --scan <path> overrides the hardcoded SCAN_FOLDER
+    scan_folder_override = None
+    for i, arg in enumerate(args_raw):
+        if arg.startswith("--scan="):
+            scan_folder_override = arg.split("=", 1)[1].strip()
+            break
+        elif arg == "--scan" and i + 1 < len(args_raw):
+            scan_folder_override = args_raw[i + 1].strip()
+            break
+
+    # Normalise forward-slash UNC paths that tkinter's filedialog produces
+    # (e.g. //tower/media/... -> \\tower\media\...)
+    if scan_folder_override:
+        if scan_folder_override.startswith("//"):
+            scan_folder_override = "\\\\" + scan_folder_override[2:].replace("/", "\\")
+        effective_folder = scan_folder_override
+    else:
+        effective_folder = SCAN_FOLDER
+
+    scan_path = Path(effective_folder)
+
+    if not scan_path.exists():
+        print(f"ERROR: Scan folder not found: {effective_folder}")
+        return
 
     workers = DEFAULT_WORKERS
     for arg in args_raw:
@@ -909,26 +989,14 @@ def main():
         print(f"ERROR: Unknown --sort mode '{sort_mode}'. Valid: {', '.join(sorted(_VALID_SORTS))}")
         return
 
-    progress_exists = Path(PROGRESS_FILE).exists()
-
     if restart:
+        clear_progress()
         processed = set()
-        log.info("  --restart flag: ignoring any saved progress.")
-    elif resume:
-        processed = load_progress()
-    elif progress_exists:
-        print()
-        print("  A progress file was found from a previous run.")
-        print("  [R] Resume from where it left off")
-        print("  [S] Start over from the beginning")
-        choice = input("  Choice (R/S): ").strip().upper()
-        if choice == "R":
-            processed = load_progress()
-        else:
-            processed = set()
-            log.info("  Starting over — progress file reset.")
+        log.info("  --restart flag: progress file cleared, starting from scratch.")
     else:
-        processed = set()
+        # Always resume from accumulated history; --resume flag is now a no-op
+        # (kept for backwards compatibility) since progress is always persistent.
+        processed = load_progress()
 
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     init_progress_file(started)
@@ -936,8 +1004,8 @@ def main():
     _sort_labels = {
         "newest":        "modification time, newest first",
         "oldest":        "modification time, oldest first",
-        "alpha":         "alphabetical A→Z",
-        "alpha-reverse": "alphabetical Z→A",
+        "alpha":         "alphabetical A\u2192Z",
+        "alpha-reverse": "alphabetical Z\u2192A",
     }
     if sort_mode == "newest":
         subdirs = sorted((d for d in scan_path.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
@@ -950,23 +1018,24 @@ def main():
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer started")
-    log.info(f"  Scanning : {SCAN_FOLDER}")
+    log.info(f"  Scanning : {effective_folder}")
     log.info(f"  Sort     : {_sort_labels[sort_mode]}")
     log.info(f"  Workers  : {workers}")
+    log.info(f"  Rules    : {', '.join(sorted(active_rules)) if active_rules != ALL_RULES else 'all'}")
     log.info(f"  Log      : {LOG_FILE}")
     log.info(f"  Progress : {PROGRESS_FILE}")
     log.info("=" * 60)
 
     if not subdirs:
-        sanitize_directory(scan_path, processed, started, workers)
+        sanitize_directory(scan_path, processed, started, workers, active_rules)
     else:
         for subdir in subdirs:
-            sanitize_directory(subdir, processed, started, workers)
+            sanitize_directory(subdir, processed, started, workers, active_rules)
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer complete.")
     log.info("=" * 60)
-    clear_progress()
+    log.info("  Progress preserved — use --restart to clear and start over.")
 
 
 if __name__ == "__main__":
