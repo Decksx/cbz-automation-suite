@@ -31,7 +31,7 @@ SCAN_FOLDERS: list[str] = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\git\ComicAutomation\cbz_deduplicator.log"
+LOG_FILE = r"C:\git\ComicAutomation\Logs\cbz_deduplicator.log"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tiff", ".tif"}
@@ -137,6 +137,7 @@ def find_cbr_cbz_pairs(folder: Path, dry_run: bool) -> int:
 # TASK 3 — LOOSE IMAGE FOLDERS → CBZ
 # ─────────────────────────────────────────────
 def _is_image_folder(folder: Path) -> bool:
+    """True only when folder contains exclusively images (+ optional comicinfo.xml), no subdirs."""
     if not folder.is_dir():
         return False
     has_image = False
@@ -152,34 +153,87 @@ def _is_image_folder(folder: Path) -> bool:
             return False
     return has_image
 
+def _has_loose_images(folder: Path) -> bool:
+    """True when folder contains ≥1 image file and no subdirectories (may also contain other files)."""
+    if not folder.is_dir():
+        return False
+    has_image = False
+    for item in folder.iterdir():
+        if item.is_dir():
+            return False
+        if item.suffix.lower() in IMAGE_EXTENSIONS:
+            has_image = True
+    return has_image
+
 def convert_image_folder(folder: Path, dry_run: bool) -> bool:
     cbz_path = folder.parent / (folder.name + ".cbz")
-    all_files = sorted(folder.iterdir(), key=lambda p: (
-        p.name.lower() != "comicinfo.xml",
-        [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', p.name)]
-    ))
-    if cbz_path.exists():
-        log.warning(f"  IMAGE FOLDER '{folder.name}': target '{cbz_path.name}' already exists — skipping.")
+    packable = sorted(
+        [f for f in folder.iterdir() if f.is_file() and (
+            f.suffix.lower() in IMAGE_EXTENSIONS or f.name.lower() == "comicinfo.xml"
+        )],
+        key=lambda p: (
+            p.name.lower() != "comicinfo.xml",
+            [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', p.name)]
+        )
+    )
+    if not packable:
         return False
+
     if dry_run:
-        log.info(f"  [DRY RUN] Would pack {len(all_files)} file(s) from '{folder.name}' -> '{cbz_path.name}'")
-        return True
-    try:
-        with zipfile.ZipFile(cbz_path, "w", compression=zipfile.ZIP_STORED) as zf:
-            for item in all_files:
-                zf.write(item, arcname=item.name)
-        log.info(f"  IMAGE FOLDER packed: '{folder.name}' ({len(all_files)} file(s)) -> '{cbz_path.name}'")
-    except Exception as e:
-        log.error(f"  Failed to create '{cbz_path.name}': {e}")
         if cbz_path.exists():
+            log.info(f"  [DRY RUN] Would pack {len(packable)} file(s) from '{folder.name}' -> compare with existing '{cbz_path.name}'")
+        else:
+            log.info(f"  [DRY RUN] Would pack {len(packable)} file(s) from '{folder.name}' -> '{cbz_path.name}'")
+        return True
+
+    if cbz_path.exists():
+        tmp_path = cbz_path.with_suffix(".tmp")
+        tmp_path.unlink(missing_ok=True)
+        try:
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for item in packable:
+                    zf.write(item, arcname=item.name)
+            new_size = tmp_path.stat().st_size
+            old_size = cbz_path.stat().st_size
+            if new_size > old_size:
+                cbz_path.unlink()
+                tmp_path.rename(cbz_path)
+                log.info(f"  IMAGE FOLDER packed (replaced smaller existing): '{folder.name}' ({len(packable)} file(s)) -> '{cbz_path.name}' ({new_size:,}B > {old_size:,}B)")
+            else:
+                tmp_path.unlink()
+                log.info(f"  IMAGE FOLDER skipped (existing archive is bigger or equal): '{cbz_path.name}' ({old_size:,}B >= {new_size:,}B)")
+                return False
+        except Exception as e:
+            log.error(f"  Failed to create temp archive for '{folder.name}': {e}")
+            tmp_path.unlink(missing_ok=True)
+            return False
+    else:
+        try:
+            with zipfile.ZipFile(cbz_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for item in packable:
+                    zf.write(item, arcname=item.name)
+            log.info(f"  IMAGE FOLDER packed: '{folder.name}' ({len(packable)} file(s)) -> '{cbz_path.name}'")
+        except Exception as e:
+            log.error(f"  Failed to create '{cbz_path.name}': {e}")
             cbz_path.unlink(missing_ok=True)
-        return False
+            return False
+
+    for item in packable:
+        try:
+            item.unlink()
+        except OSError as e:
+            log.warning(f"  Could not remove packed file '{item.name}': {e}")
+
     try:
-        import shutil
-        shutil.rmtree(folder)
-        log.info(f"  Removed source folder: '{folder.name}'")
+        remaining = list(folder.iterdir())
+        if not remaining:
+            folder.rmdir()
+            log.info(f"  Removed source folder: '{folder.name}'")
+        else:
+            log.info(f"  Source folder has {len(remaining)} remaining file(s): '{folder.name}'")
     except OSError as e:
-        log.warning(f"  Archive created but could not remove source folder '{folder.name}': {e}")
+        log.warning(f"  Archive created but could not clean up source folder '{folder.name}': {e}")
+
     return True
 
 def process_image_folders(parent: Path, dry_run: bool) -> int:
@@ -190,8 +244,11 @@ def process_image_folders(parent: Path, dry_run: bool) -> int:
         log.error(f"  Cannot iterate '{parent}': {e}")
         return 0
     for subdir in subdirs:
-        if _is_image_folder(subdir):
-            log.info(f"  IMAGE FOLDER detected: '{subdir.name}'")
+        if _has_loose_images(subdir):
+            if _is_image_folder(subdir):
+                log.info(f"  IMAGE FOLDER detected: '{subdir.name}'")
+            else:
+                log.info(f"  MIXED FOLDER detected: '{subdir.name}'")
             if convert_image_folder(subdir, dry_run):
                 converted += 1
     return converted

@@ -10,7 +10,7 @@ Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"   # folder to monitor
-LOG_FILE      = r"C:\git\ComicAutomation\cbz_watcher.log"
+LOG_FILE      = r"C:\git\ComicAutomation\Logs\cbz_watcher.log"
 ROUTING_FILE  = r"C:\git\ComicAutomation\routing.json"
 POLL_INTERVAL = 2      # seconds between stability checks
 SETTLE_DELAY  = 5      # seconds of inactivity before a directory is processed
@@ -149,4 +149,4 @@ Alternatively, just double-click `config\run_watcher.bat` for a manual session â
 
 ## Logging
 
-Rotating log file at `LOG_FILE` (5 MB max, 3 backups). Also streams to stdout. Log entries cover every event, stability check, settle/age wait, rename, tag update, route decision, move, and merge conflict.
+Rotating log file at `Logs\cbz_watcher.log` (5 MB max, 3 backups). Also streams to stdout. Log entries cover every event, stability check, settle/age wait, rename, tag update, route decision, move, and merge conflict.

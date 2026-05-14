@@ -16,7 +16,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\git\ComicAutomation\cbz_folder_merger.log"
+LOG_FILE = r"C:\git\ComicAutomation\Logs\cbz_folder_merger.log"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 ```
 
@@ -70,7 +70,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE         = r"C:\git\ComicAutomation\cbz_compilation_resolver.log"
+LOG_FILE         = r"C:\git\ComicAutomation\Logs\cbz_compilation_resolver.log"
 PROCESSED_FOLDER = r"C:\git\ComicAutomation\Processed"
 DEFAULT_WORKERS  = min(8, os.cpu_count() or 4)
 ```
@@ -98,7 +98,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\git\ComicAutomation\cbz_number_tagger.log"
+LOG_FILE = r"C:\git\ComicAutomation\Logs\cbz_number_tagger.log"
 ```
 
 **Usage:**
@@ -129,7 +129,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE               = r"C:\git\ComicAutomation\cbz_series_matcher.log"
+LOG_FILE               = r"C:\git\ComicAutomation\Logs\cbz_series_matcher.log"
 AUTO_RENAME_THRESHOLD  = 0.90
 REPORT_THRESHOLD       = 0.80
 DEFAULT_WORKERS        = min(8, os.cpu_count() or 4)
@@ -156,7 +156,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     # r"\\tower\media\comics\Manga",   # uncomment to include Manga
 ]
-OUTPUT_FOLDER  = r"C:\git\ComicAutomation"
+OUTPUT_FOLDER  = r"C:\git\ComicAutomation\Logs"
 GAP_THRESHOLD  = 1    # minimum jump to count as a gap
 MIN_ISSUES_TO_REPORT = 2  # skip series with fewer numbered issues than this
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
@@ -169,7 +169,7 @@ python scripts\cbz_gap_checker.py "\\tower\media\comics\Comix\Batman"    # singl
 python scripts\cbz_gap_checker.py --workers 8                            # parallel processing
 ```
 
-Output: `C:\git\ComicAutomation\cbz_gaps_YYYYMMDD_HHMMSS.csv`
+Output: `C:\git\ComicAutomation\Logs\cbz_gaps_YYYYMMDD_HHMMSS.csv`
 
 No `--dry-run` needed — this script is read-only and never modifies files.
 
@@ -221,7 +221,7 @@ SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
 ]
-LOG_FILE = r"C:\git\ComicAutomation\cbz_deduplicator.log"
+LOG_FILE = r"C:\git\ComicAutomation\Logs\cbz_deduplicator.log"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 ```
 
@@ -237,3 +237,50 @@ python scripts\cbz_deduplicator.py --workers 8              # parallel processin
 **Parallel processing:** Each directory in the scan tree is an independent worker for Tasks 1 and 2. Task 3 (image folder packing) always runs serially to avoid filesystem races between parent and subdirectory operations.
 
 **Conflict resolution:** Task 1 keeps the largest file. Task 2 always keeps `.cbz`. Task 3 skips packing if a `.cbz` with the same name already exists next to the folder.
+
+---
+
+## find_uncensored_dupes.py
+
+Scans a library folder for series directories that appear to be censored/uncensored duplicates of each other (e.g. `My Series` and `My Series Uncensored`). Fuzzy-matches names after stripping the marker words and normalising punctuation, so minor title differences are tolerated. Matched pairs are moved into a `_Check/` subfolder inside the library for manual review.
+
+Folders that contain `uncensored` or `decensored` but have no matching counterpart are left in place and logged — they are standalone, not duplicates.
+
+Uses `\\?\UNC\` raw paths throughout to avoid Windows trailing-dot path normalisation issues.
+
+**Configuration** — no persistent config block; all options are CLI flags. Default library path is set at the top of the script:
+```python
+DEFAULT_LIBRARIES = [r"\\tower\media\comics\Comix"]
+CHECK_FOLDER_NAME = "_Check"
+```
+
+**Usage:**
+```powershell
+# Dry run (default) — shows what would move, touches nothing
+python scripts\find_uncensored_dupes.py
+
+# Scan a specific library
+python scripts\find_uncensored_dupes.py --library "\\tower\media\comics\Comix"
+
+# Scan multiple libraries
+python scripts\find_uncensored_dupes.py --library "\\tower\media\comics\Comix" "\\tower\media\comics\Manga"
+
+# Live run — actually moves folders into _Check
+python scripts\find_uncensored_dupes.py --live
+
+# Move only the uncensored folder (keep the censored one in place)
+python scripts\find_uncensored_dupes.py --live --move uncensored
+
+# Move only the censored folder (keep the uncensored one in place)
+python scripts\find_uncensored_dupes.py --live --move censored
+```
+
+**`--move` options:**
+
+| Value | Which folder moves to `_Check` |
+|-------|--------------------------------|
+| `both` (default) | Both folders — lets you compare them and decide |
+| `uncensored` | Only the uncensored/decensored folder |
+| `censored` | Only the censored counterpart |
+
+**Logging:** stdout only — no persistent log file.

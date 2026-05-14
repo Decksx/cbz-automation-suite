@@ -25,7 +25,7 @@ from datetime import datetime
 SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
 ]
-OUTPUT_FOLDER = r"C:\git\ComicAutomation"
+OUTPUT_FOLDER = r"C:\git\ComicAutomation\Logs"
 GAP_THRESHOLD = 1
 MIN_ISSUES_TO_REPORT = 2
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)

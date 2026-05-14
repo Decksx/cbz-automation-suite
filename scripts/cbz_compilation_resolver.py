@@ -26,7 +26,7 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-LOG_FILE          = r"C:\git\ComicAutomation\cbz_compilation_resolver.log"
+LOG_FILE          = r"C:\git\ComicAutomation\Logs\cbz_compilation_resolver.log"
 PROCESSED_FOLDER  = r"C:\git\ComicAutomation\Processed"
 SCAN_FOLDERS: list[str] = [
     r"\\tower\media\comics\Comix",

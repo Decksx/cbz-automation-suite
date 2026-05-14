@@ -1,7 +1,14 @@
 # ── Logs ──────────────────────────────────────────────
-*.log
-*.log.1
-*.log.2
+# Log files are machine-specific runtime output — never committed.
+# The Logs/ folder itself is committed (via Logs/.gitkeep) so it
+# always exists on a fresh clone without needing os.makedirs.
+Logs/*.log
+Logs/*.log.1
+Logs/*.log.2
+Logs/*.log.3
+Logs/cbz_gaps_*.csv
+# Keep the folder anchor
+!Logs/.gitkeep
 
 # ── Temp files created by the watcher ─────────────────
 *.tmp.cbz

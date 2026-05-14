@@ -37,7 +37,7 @@ from pathlib import Path
 # CONFIGURATION
 # ─────────────────────────────────────────────
 SCAN_FOLDER    = r"\\tower\media\comics\manga"
-LOG_FILE       = r"C:\git\ComicAutomation\cbz_sanitizer.log"
+LOG_FILE       = r"C:\git\ComicAutomation\Logs\cbz_sanitizer.log"
 PROGRESS_FILE  = r"C:\git\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 
