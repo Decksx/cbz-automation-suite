@@ -22,33 +22,17 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 
 try:
     from scripts.cbz_core import (
-        GIBBERISH_RE,
-        GENERIC_CHAPTER_RE,
-        CHAPTER_ONLY_RE,
-        NUMBERED_CHAPTER_RE,
-        NUMBER_PREFIX_RE,
         clean_directory_name,
         clean_filename,
-        clean_xml_field,
-        is_generic,
-        normalise_number_tokens,
-        normalize_stem,
-        sanitize,
+        parse_comic_name,
+        update_comicinfo_xml,
     )
 except ModuleNotFoundError:
     from cbz_core import (  # type: ignore[no-redef]
-        GIBBERISH_RE,
-        GENERIC_CHAPTER_RE,
-        CHAPTER_ONLY_RE,
-        NUMBERED_CHAPTER_RE,
-        NUMBER_PREFIX_RE,
         clean_directory_name,
         clean_filename,
-        clean_xml_field,
-        is_generic,
-        normalise_number_tokens,
-        normalize_stem,
-        sanitize,
+        parse_comic_name,
+        update_comicinfo_xml,
     )
 
 # ─────────────────────────────────────────────
@@ -83,8 +67,6 @@ COMICINFO_TEMPLATE = """<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" 
 # ─────────────────────────────────────────────
 # Titles/filenames matching these patterns are treated as generic
 # and may be overwritten by the title logic.
-# NUMBER_PREFIX_RE, GIBBERISH_RE, GENERIC_CHAPTER_RE, CHAPTER_ONLY_RE,
-# NUMBERED_CHAPTER_RE imported from cbz_core above.
 
 
 # Routing state — loaded from ROUTING_FILE at startup
@@ -118,7 +100,6 @@ log = logging.getLogger(__name__)
 
 
 
-# normalize_stem imported from cbz_core above.
 
 
 # ─────────────────────────────────────────────
@@ -193,14 +174,17 @@ def _inject_comicinfo(cbz_path: Path) -> None:
     _write_cbz_with_comicinfo(cbz_path, COMICINFO_TEMPLATE)
 
 
-def process_comicinfo(cbz_path: Path) -> None:
+def process_comicinfo(cbz_path: Path, parsed: object) -> None:
     """
-    Inspect the .cbz for comicinfo.xml.
-    - Found:   check/fix Title and Series tags.
-    - Missing: inject a fresh comicinfo.xml from template.
-    """
-    parent_dir = cbz_path.parent.name
+    Read ComicInfo.xml from *cbz_path*, delegate all field update decisions
+    to ``update_comicinfo_xml()``, then write back via ``_write_cbz_with_comicinfo()``.
 
+    If no ComicInfo.xml exists the watcher COMICINFO_TEMPLATE is injected first
+    so that Komga-specific namespace tags are preserved, then updated with
+    parsed field values.
+
+    Retry/locking logic is watcher-specific and intentionally kept here.
+    """
     for attempt in range(5):
         try:
             found_key = real_name = xml_text = None
@@ -220,54 +204,23 @@ def process_comicinfo(cbz_path: Path) -> None:
             gc.collect()
             time.sleep(0.2)
 
-            if has_xml:
-                title_match  = re.search(r"<Title>(.*?)</Title>",   xml_text, re.IGNORECASE | re.DOTALL)
-                series_match = re.search(r"<Series>(.*?)</Series>", xml_text, re.IGNORECASE | re.DOTALL)
-                title_value  = clean_xml_field(title_match.group(1).strip())  if title_match  else ""
-                series_value = clean_xml_field(series_match.group(1).strip()) if series_match else ""
-
-                if series_match and series_value != series_match.group(1).strip():
-                    xml_text = re.sub(
-                        r"<Series>.*?</Series>",
-                        f"<Series>{series_value}</Series>",
-                        xml_text, count=1, flags=re.IGNORECASE | re.DOTALL
-                    )
-                    log.info(f"    Series cleaned: '{series_match.group(1).strip()}' -> '{series_value}'")
-
-                title_value   = NUMBER_PREFIX_RE.sub("", title_value).strip()
-                filename_stem = NUMBER_PREFIX_RE.sub("", cbz_path.stem).strip()
-
-                title_generic    = is_generic(title_value)
-                filename_generic = is_generic(filename_stem)
-
-                if title_value == parent_dir and not filename_generic:
-                    new_title = filename_stem
-                    log.info(f"    Title matches dir but filename='{filename_stem}' is custom - using filename.")
-                elif title_value == parent_dir:
-                    log.info(f"    comicinfo.xml OK - Title matches parent dir '{parent_dir}'")
-                    return
-                elif title_generic and not filename_generic:
-                    new_title = filename_stem
-                    log.info(f"    Title='{title_value}' is generic, filename is custom - using filename.")
-                elif title_generic and filename_generic:
-                    new_title = parent_dir
-                    log.info(f"    Both title and filename are generic - using parent dir '{new_title}'.")
-                else:
-                    log.info(f"    Title='{title_value}' is custom - leaving unchanged.")
-                    return
-
-                xml_text = re.sub(
-                    r"<Title>.*?</Title>",
-                    f"<Title>{new_title}</Title>",
-                    xml_text, count=1, flags=re.IGNORECASE | re.DOTALL
-                )
-                _rewrite_comicinfo(cbz_path, real_name, xml_text)
-                return
-
-            else:
+            # Use COMICINFO_TEMPLATE as the base when no existing XML is found.
+            # This preserves the Komga-specific namespace declarations.
+            if not has_xml:
                 log.info(f"    No comicinfo.xml found - injecting template.")
-                _inject_comicinfo(cbz_path)
+                xml_text = COMICINFO_TEMPLATE
+
+            new_xml, changed = update_comicinfo_xml(xml_text, parsed)
+
+            if not changed and has_xml:
+                log.info(f"    comicinfo.xml OK - no changes needed.")
                 return
+
+            if has_xml:
+                _rewrite_comicinfo(cbz_path, real_name, new_xml)
+            else:
+                _write_cbz_with_comicinfo(cbz_path, new_xml)
+            return
 
         except OSError:
             log.warning(f"    File locked reading zip (attempt {attempt + 1}/5), retrying in 5s...")
@@ -312,9 +265,11 @@ def wait_for_file_stable(path: Path, stable_seconds: int = 3) -> bool:
 # ─────────────────────────────────────────────
 def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
     """
-    Stability check → clean filename → normalize stem → process comicinfo.
-    Returns the final (possibly renamed) path. Does NOT move the file.
-    If override_name is given it is used as the filename instead of the cleaned name.
+    Stability check → parse_comic_name → rename → update ComicInfo.
+    Returns the final (possibly renamed) path.  Does NOT move the file.
+
+    If override_name is given it is used as the filename instead of the
+    normalised name from parse_comic_name (empty-stem fallback path).
     """
     log.info(f"  Processing: {cbz_path.name}")
 
@@ -322,13 +277,11 @@ def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
         log.warning(f"    Skipping unstable file: {cbz_path.name}")
         return cbz_path
 
-    if override_name is not None:
-        new_name = override_name
-    else:
-        stem     = Path(clean_filename(cbz_path.name)).stem
-        stem     = normalize_stem(stem, cbz_path.parent.name)
-        stem     = normalise_number_tokens(stem)
-        new_name = stem + cbz_path.suffix
+    # parse_comic_name runs the full normalisation pipeline:
+    #   sanitize → strip leading nums → normalize_stem → normalise_number_tokens
+    # This is the single authoritative source for filename and ComicInfo fields.
+    parsed   = parse_comic_name(cbz_path)
+    new_name = override_name if override_name is not None else parsed.filename
 
     if new_name != cbz_path.name:
         new_path = cbz_path.parent / new_name
@@ -341,10 +294,12 @@ def process_cbz_file(cbz_path: Path, override_name: str | None = None) -> Path:
             cbz_path.rename(new_path)
             log.info(f"    Renamed: '{cbz_path.name}' -> '{new_name}'")
             cbz_path = new_path
+            # Re-parse so parsed.filename matches the actual path on disk
+            parsed = parse_comic_name(cbz_path)
     else:
         log.info(f"    Filename unchanged: '{cbz_path.name}'")
 
-    process_comicinfo(cbz_path)
+    process_comicinfo(cbz_path, parsed)
     return cbz_path
 
 
