@@ -47,93 +47,97 @@ TOOLS = [
         "id": "sanitizer",
         "label": "CBZ Sanitizer",
         "script": "cbz_sanitizer.py",
-        "description": "Clean filenames and fix ComicInfo.xml metadata in-place across a library folder.",
+        "description": "Batch clean filenames and repair ComicInfo metadata in-place.",
         "icon": "\u2726",
         "color": ACCENT,
         "scan_folder_flag": "--scan",
         "options": [
-            {"type": "folder",       "key": "scan_folder", "label": "Scan folder",             "default": r"\\tower\media\comics\manga"},
-            {"type": "select",       "key": "sort",        "label": "Sort order",              "choices": ["newest", "oldest", "alpha", "alpha-reverse"], "default": "newest"},
-            {"type": "checkbox",     "key": "dry_run",     "label": "Dry run (preview only)",  "default": False},
-            {"type": "checkbox",     "key": "restart",     "label": "Restart (clear progress)","default": False},
-            {"type": "checkbox",     "key": "resume",      "label": "Resume from last run",    "default": False},
-            {"type": "multi_select", "key": "rules",       "label": "Active rules",
-             "choices": ["brackets", "comicinfo", "leading_nums", "non_latin",
-                          "normalize_stem", "number_tokens", "scan_groups", "trailing_junk", "url"],
-             "default": [],
-             "note": "Leave all unchecked to run every rule. Check specific rules to run only those."},
+            {"type": "folder", "key": "scan_folder", "label": "Scan folder", "default": r"\\tower\media\comics\manga"},
+            {"type": "select", "key": "sort", "label": "Sort order", "choices": ["newest", "oldest", "alpha", "alpha-reverse"], "default": "newest"},
+            {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": False},
+            {"type": "checkbox", "key": "restart", "label": "Restart (clear progress)", "default": False},
+            {"type": "checkbox", "key": "resume", "label": "Resume from last run", "default": False},
         ],
     },
     {
         "id": "watcher",
         "label": "CBZ Watcher",
         "script": "cbz_watcher.py",
-        "description": "Monitor a folder for incoming .cbz files, process them, and route to the correct destination.",
+        "description": "Monitor incoming folders, normalize files, update ComicInfo, and route automatically.",
         "icon": "\u25ce",
         "color": "#2196F3",
         "options": [],
-        "note": "Runs continuously \u2014 click Stop to shut it down.",
+        "note": "Runs continuously — click Stop to shut it down.",
     },
     {
-        "id": "folder_merger",
-        "label": "Folder Merger",
-        "script": "cbz_folder_merger.py",
-        "description": "Merge sibling folders that represent the same series split across chapter-numbered directories.",
+        "id": "library_archive_clean",
+        "label": "Archive Cleaner",
+        "script": "cbz_library_maintenance.py",
+        "subcommand": "archive-clean",
+        "description": "Clean duplicate archives, strip duplicate filename tokens, and pack loose image folders.",
+        "icon": "\u2297",
+        "color": "#FF5722",
+        "options": [
+            {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
+            {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": True},
+            {"type": "checkbox", "key": "no_recursive", "label": "Single-level only (--no-recursive)", "default": False},
+            {"type": "select", "key": "workers", "label": "Workers", "choices": ["1", "2", "4", "8", "12"], "default": "8"},
+        ],
+    },
+    {
+        "id": "library_organizer",
+        "label": "Series Organizer",
+        "script": "cbz_library_maintenance.py",
+        "subcommand": "organize-series",
+        "description": "Merge split chapter folders, fuzzy-match duplicate series, and optionally find uncensored pairs.",
         "icon": "\u2295",
         "color": "#9C27B0",
         "options": [
-            {"type": "folder",   "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
-            {"type": "checkbox", "key": "dry_run",     "label": "Dry run (preview only)", "default": True},
+            {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
+            {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": True},
+            {"type": "checkbox", "key": "uncensored_check", "label": "Also check uncensored/decensored pairs", "default": False},
+            {"type": "select", "key": "workers", "label": "Workers", "choices": ["1", "2", "4", "8", "12"], "default": "8"},
+        ],
+    },
+    {
+        "id": "metadata_repair",
+        "label": "Metadata Repair",
+        "script": "cbz_library_maintenance.py",
+        "subcommand": "metadata",
+        "description": "Retroactively repair ComicInfo title, series, number, and volume using cbz_core.",
+        "icon": "\u229f",
+        "color": "#8BC34A",
+        "options": [
+            {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
+            {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": True},
+            {"type": "select", "key": "workers", "label": "Workers", "choices": ["1", "2", "4", "8", "12"], "default": "8"},
+        ],
+    },
+    {
+        "id": "library_all",
+        "label": "Full Maintenance",
+        "script": "cbz_library_maintenance.py",
+        "subcommand": "all",
+        "description": "Run archive cleanup, series organization, and metadata repair in one pass.",
+        "icon": "\u2605",
+        "color": "#E91E63",
+        "options": [
+            {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
+            {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": True},
+            {"type": "select", "key": "workers", "label": "Workers", "choices": ["1", "2", "4", "8", "12"], "default": "8"},
         ],
     },
     {
         "id": "compilation_resolver",
         "label": "Compilation Resolver",
         "script": "cbz_compilation_resolver.py",
-        "description": "Detect compilation archives that overlap with individual chapters and rebuild them with the best pages.",
+        "description": "Resolve compilation archives that overlap with individual chapters.",
         "icon": "\u229e",
         "color": "#00BCD4",
         "options": [
-            {"type": "folder",   "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
-            {"type": "checkbox", "key": "dry_run",     "label": "Dry run (preview only)", "default": True},
-        ],
-    },
-    {
-        "id": "deduplicator",
-        "label": "Deduplicator",
-        "script": "cbz_deduplicator.py",
-        "description": "Remove duplicate .cbz/.cbr files and pack loose image folders into archives.",
-        "icon": "\u2297",
-        "color": "#FF5722",
-        "options": [
-            {"type": "folder",   "key": "scan_folder",    "label": "Library folder",          "default": r"\\tower\media\comics\Comix"},
-            {"type": "checkbox", "key": "dry_run",        "label": "Dry run (preview only)",  "default": True},
-            {"type": "checkbox", "key": "no_recursive",   "label": "Single-level only (--no-recursive)", "default": False},
-        ],
-    },
-    {
-        "id": "number_tagger",
-        "label": "Number Tagger",
-        "script": "cbz_number_tagger.py",
-        "description": "Retroactively set <Number> and <Volume> ComicInfo.xml tags from filenames.",
-        "icon": "\u229f",
-        "color": "#8BC34A",
-        "options": [
-            {"type": "folder",   "key": "scan_folder", "label": "Library folder",         "default": r"\\tower\media\comics\Comix"},
-            {"type": "checkbox", "key": "dry_run",     "label": "Dry run (preview only)", "default": True},
-        ],
-    },
-    {
-        "id": "series_matcher",
-        "label": "Series Matcher",
-        "script": "cbz_series_matcher.py",
-        "description": "Detect near-duplicate series folder names and auto-merge above the similarity threshold.",
-        "icon": "\u2248",
-        "color": "#FF9800",
-        "options": [
+            {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
             {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": True},
         ],
-        "note": "Scans the SCAN_FOLDERS configured inside the script.",
     },
     {
         "id": "gap_checker",
@@ -145,37 +149,10 @@ TOOLS = [
         "options": [
             {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
         ],
-        "note": "Read-only \u2014 never modifies files.",
-    },
-    {
-        "id": "strip_duplicates",
-        "label": "Strip Duplicates",
-        "script": "strip_duplicates.py",
-        "description": "Remove duplicate number tokens from filenames (e.g. 'ch. 5 ch.5') and fix spaced punctuation.",
-        "icon": "\u229c",
-        "color": "#607D8B",
-        "options": [
-            {"type": "folder",   "key": "scan_folder",  "label": "Library folder",          "default": r"\\tower\media\comics\Comix"},
-            {"type": "checkbox", "key": "dry_run",      "label": "Dry run (preview only)",  "default": True},
-            {"type": "checkbox", "key": "no_recursive", "label": "Single-level only (--no-recursive)", "default": False},
-        ],
-    },
-    {
-        "id": "uncensored_dupes",
-        "label": "Uncensored Dupes",
-        "script": "find_uncensored_dupes.py",
-        "description": "Find folders that are censored/uncensored duplicates of each other and move them to a _Check folder for manual review.",
-        "icon": "\u26b2",
-        "color": "#E91E63",
-        "scan_folder_flag": "--library",
-        "options": [
-            {"type": "folder",   "key": "scan_folder", "label": "Library folder",         "default": r"\\tower\media\comics\Comix"},
-            {"type": "checkbox", "key": "dry_run",     "label": "Dry run (preview only)", "default": True},
-            {"type": "select",   "key": "move_which",  "label": "Move which folder(s)",   "choices": ["both", "uncensored", "censored"], "default": "both"},
-        ],
-        "note": "Moves matched pairs into a _Check subfolder inside the library. Unmatched uncensored-only folders are left alone.",
+        "note": "Read-only — never modifies files.",
     },
 ]
+
 
 
 class CBZLauncherApp(tk.Tk):
@@ -439,6 +416,8 @@ class CBZLauncherApp(tk.Tk):
     def _build_command(self, tool):
         script = SCRIPT_DIR / tool["script"]
         cmd = [sys.executable, str(script)]
+        if tool.get("subcommand"):
+            cmd.append(tool["subcommand"])
         opts = self._option_vars
 
         # Pass the scan folder using the method this script expects.
@@ -486,6 +465,13 @@ class CBZLauncherApp(tk.Tk):
             selected = [r for r, v in rules_var.items() if v.get()]
             if selected:
                 cmd.append(f"--rules={','.join(sorted(selected))}")
+
+        workers_var = opts.get("workers")
+        if workers_var:
+            cmd.extend(["--workers", workers_var.get()])
+
+        if opts.get("uncensored_check") and opts["uncensored_check"].get():
+            cmd.append("--uncensored-check")
 
         return cmd
 

@@ -1,0 +1,716 @@
+"""
+cbz_library_maintenance.py
+
+Aggressively consolidated maintenance tool for archive cleanup, series
+organization, and retroactive metadata repair.
+
+This is intended to replace day-to-day use of:
+
+- cbz_deduplicator.py
+- strip_duplicates.py
+- cbz_folder_merger.py
+- cbz_series_matcher.py
+- find_uncensored_dupes.py
+- cbz_number_tagger.py
+
+Specialized tools that remain separate for now:
+
+- cbz_watcher.py
+- cbz_sanitizer.py
+- cbz_compilation_resolver.py
+- cbz_gap_checker.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import shutil
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+
+try:
+    from scripts.cbz_core import (
+        clean_directory_name,
+        clean_filename,
+        extract_chapter_number,
+        extract_volume_number,
+        parse_comic_name,
+        update_comicinfo_xml,
+    )
+except ModuleNotFoundError:
+    from cbz_core import (  # type: ignore[no-redef]
+        clean_directory_name,
+        clean_filename,
+        extract_chapter_number,
+        extract_volume_number,
+        parse_comic_name,
+        update_comicinfo_xml,
+    )
+
+
+LOG_FILE = r"C:\git\ComicAutomation\Logs\cbz_library_maintenance.log"
+DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tiff", ".tif"}
+CHECK_FOLDER_NAME = "_Check"
+
+_DUP_LABEL_FRAG = r"(?:ver(?:sion)?|v|ch(?:ap(?:ter)?)?|episode|ep|vol(?:ume)?|part|pt)"
+_DUP_LABEL_NUM_RE = re.compile(
+    rf"({_DUP_LABEL_FRAG}\.?\s*\d+(?:\.\d+)?)\s+{_DUP_LABEL_FRAG}\.?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_DUP_BARE_NUM_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s+\1\b")
+_SPACED_PUNCT_RE = re.compile(r"([!?.])(?: +\1)+")
+_ASYM_HYPH_L_RE = re.compile(r"(\S) -(\S)")
+_ASYM_HYPH_R_RE = re.compile(r"(\S)- (\S)")
+_ARCHIVE_NORM_RE = re.compile(r"[\s\-_.,!?'\"]+")
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_SPACES_RE = re.compile(r"\s+")
+_MARKER_WORDS_RE = re.compile(r"\b(uncensored|decensored)\b", re.IGNORECASE)
+_TRAILING_TOKEN_RE = re.compile(
+    r"[\s_\-]*(?:"
+    r"ch(?:ap(?:ter)?)?p?\.?\s*\d[\d.]*"
+    r"|issue\s*\d[\d.]*"
+    r"|ep(?:isode)?\.?\s*\d[\d.]*"
+    r"|vol(?:ume)?\.?\s*\d[\d.]*"
+    r"|v\d[\d.]*(?=\s*$)"
+    r"|\d+$"
+    r")[\s_\-.,]*$",
+    re.IGNORECASE,
+)
+
+
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    log = logging.getLogger("cbz_library_maintenance")
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    log.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", "%Y-%m-%d %H:%M:%S")
+    try:
+        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except OSError:
+        pass
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+    return log
+
+
+log = setup_logging()
+
+
+@dataclass
+class MaintenanceStats:
+    renamed: int = 0
+    deleted: int = 0
+    packed: int = 0
+    moved: int = 0
+    merged: int = 0
+    updated_xml: int = 0
+    skipped: int = 0
+    errors: int = 0
+
+    def add(self, other: "MaintenanceStats") -> "MaintenanceStats":
+        self.renamed += other.renamed
+        self.deleted += other.deleted
+        self.packed += other.packed
+        self.moved += other.moved
+        self.merged += other.merged
+        self.updated_xml += other.updated_xml
+        self.skipped += other.skipped
+        self.errors += other.errors
+        return self
+
+
+def iter_dirs_with_files(root: Path, recursive: bool = True) -> list[Path]:
+    if not root.exists():
+        return []
+    pattern = "**/*" if recursive else "*"
+    dirs: set[Path] = set()
+    for p in root.glob(pattern):
+        if p.is_file():
+            dirs.add(p.parent)
+    return sorted(dirs)
+
+
+def iter_series_dirs(root: Path) -> list[Path]:
+    """Directories containing CBZ files directly are treated as series dirs."""
+    result: list[Path] = []
+    for d, _, files in os.walk(root):
+        if any(f.lower().endswith(".cbz") for f in files):
+            result.append(Path(d))
+    return sorted(result)
+
+
+def natural_key(path: Path):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
+
+
+def clean_duplicate_tokens(name: str) -> str:
+    def replace_labeled(m: re.Match) -> str:
+        first = m.group(1)
+        num2 = m.group(2)
+        num1_m = re.search(r"\d+(?:\.\d+)?", first)
+        if num1_m and num1_m.group() == num2:
+            return first
+        return m.group(0)
+
+    s = _DUP_LABEL_NUM_RE.sub(replace_labeled, name)
+    s = _DUP_BARE_NUM_RE.sub(r"\1", s)
+
+    def collapse_punct(m: re.Match) -> str:
+        ch = m.group(1)
+        count = len(re.findall(re.escape(ch), m.group(0)))
+        return ch * count
+
+    s = _SPACED_PUNCT_RE.sub(collapse_punct, s)
+    s = _ASYM_HYPH_L_RE.sub(r"\1-\2", s)
+    s = _ASYM_HYPH_R_RE.sub(r"\1-\2", s)
+    return re.sub(r"  +", " ", s).strip()
+
+
+def normalise_archive_key(stem: str) -> str:
+    return _ARCHIVE_NORM_RE.sub("", stem.lower())
+
+
+def normalise_series_key(name: str) -> str:
+    name = _MARKER_WORDS_RE.sub("", name)
+    name = name.lower()
+    name = _PUNCT_RE.sub(" ", name)
+    return _SPACES_RE.sub(" ", name).strip()
+
+
+def larger_file_wins(src: Path, dest: Path, dry_run: bool) -> str:
+    if not dest.exists():
+        if dry_run:
+            log.info("    [DRY RUN] Would move: %s -> %s", src.name, dest)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+        return "moved"
+
+    src_size = src.stat().st_size
+    dest_size = dest.stat().st_size
+    if src_size > dest_size:
+        log.info("    Collision: incoming larger, replacing: %s", dest.name)
+        if not dry_run:
+            dest.unlink()
+            shutil.move(str(src), str(dest))
+        return "replaced"
+
+    log.info("    Collision: existing larger/equal, discarding incoming: %s", src.name)
+    if not dry_run:
+        src.unlink()
+    return "discarded"
+
+
+def rename_duplicate_tokens_in_dir(folder: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    for cbz in sorted(folder.glob("*.cbz")):
+        new_name = clean_duplicate_tokens(cbz.name)
+        if new_name == cbz.name:
+            continue
+        dest = cbz.parent / new_name
+        if dry_run:
+            log.info("  [DRY RUN] Would rename: %s -> %s", cbz.name, new_name)
+            stats.renamed += 1
+        elif dest.exists():
+            outcome = larger_file_wins(cbz, dest, dry_run=False)
+            if outcome in {"moved", "replaced"}:
+                stats.renamed += 1
+            else:
+                stats.deleted += 1
+        else:
+            cbz.rename(dest)
+            log.info("  Renamed: %s -> %s", cbz.name, new_name)
+            stats.renamed += 1
+    return stats
+
+
+def dedupe_archives_in_dir(folder: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in {".cbz", ".cbr"}]
+    if not files:
+        return stats
+
+    by_key: dict[str, list[Path]] = {}
+    for f in files:
+        by_key.setdefault(normalise_archive_key(f.stem), []).append(f)
+
+    for key, group in by_key.items():
+        if len(group) < 2:
+            continue
+
+        cbz_files = [p for p in group if p.suffix.lower() == ".cbz"]
+        if cbz_files:
+            keep = sorted(cbz_files, key=lambda p: (-p.stat().st_size, p.name.lower()))[0]
+        else:
+            keep = sorted(group, key=lambda p: (-p.stat().st_size, p.name.lower()))[0]
+
+        log.info("  Duplicate group [%s], keep: %s", folder.name, keep.name)
+        for dup in group:
+            if dup == keep:
+                continue
+            reason = "cbr superseded by cbz" if keep.suffix.lower() == ".cbz" and dup.suffix.lower() == ".cbr" else "duplicate"
+            if dry_run:
+                log.info("    [DRY RUN] Would delete (%s): %s", reason, dup.name)
+            else:
+                dup.unlink()
+                log.info("    Deleted (%s): %s", reason, dup.name)
+            stats.deleted += 1
+    return stats
+
+
+def is_packable_image_folder(folder: Path) -> bool:
+    if not folder.is_dir():
+        return False
+    has_image = False
+    for item in folder.iterdir():
+        if item.is_dir():
+            return False
+        if item.suffix.lower() in IMAGE_EXTENSIONS:
+            has_image = True
+        elif item.name.lower() == "comicinfo.xml":
+            continue
+        else:
+            return False
+    return has_image
+
+
+def pack_image_folder(folder: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    if not is_packable_image_folder(folder):
+        return stats
+
+    cbz_path = folder.parent / f"{folder.name}.cbz"
+    packable = sorted(
+        [p for p in folder.iterdir() if p.is_file()],
+        key=lambda p: (p.name.lower() != "comicinfo.xml", natural_key(p)),
+    )
+
+    if dry_run:
+        log.info("  [DRY RUN] Would pack image folder: %s -> %s", folder.name, cbz_path.name)
+        stats.packed += 1
+        return stats
+
+    tmp_path = cbz_path.with_suffix(".tmp.cbz")
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for item in packable:
+                zf.write(item, arcname=item.name)
+
+        if cbz_path.exists():
+            if tmp_path.stat().st_size > cbz_path.stat().st_size:
+                cbz_path.unlink()
+                tmp_path.rename(cbz_path)
+                log.info("  Packed image folder and replaced smaller archive: %s", cbz_path.name)
+            else:
+                tmp_path.unlink()
+                log.info("  Packed archive was not larger; kept existing: %s", cbz_path.name)
+                stats.skipped += 1
+                return stats
+        else:
+            tmp_path.rename(cbz_path)
+            log.info("  Packed image folder: %s -> %s", folder.name, cbz_path.name)
+
+        for item in packable:
+            item.unlink(missing_ok=True)
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+        stats.packed += 1
+        return stats
+    except Exception as exc:
+        log.error("  Failed to pack %s: %s", folder, exc)
+        tmp_path.unlink(missing_ok=True)
+        stats.errors += 1
+        return stats
+
+
+def archive_clean_worker(folder: Path, args: argparse.Namespace) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    log.info("Archive clean: %s", folder)
+    if args.strip_names:
+        stats.add(rename_duplicate_tokens_in_dir(folder, args.dry_run))
+    if args.dedupe_archives:
+        stats.add(dedupe_archives_in_dir(folder, args.dry_run))
+    return stats
+
+
+def run_archive_clean(args: argparse.Namespace) -> int:
+    paths = [Path(p) for p in args.paths]
+    dirs: set[Path] = set()
+    for root in paths:
+        dirs.update(iter_dirs_with_files(root, recursive=not args.no_recursive))
+        if not args.no_recursive:
+            dirs.add(root)
+
+    all_dirs = sorted(dirs)
+    stats = MaintenanceStats()
+
+    if args.workers == 1:
+        for d in all_dirs:
+            stats.add(archive_clean_worker(d, args))
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = [ex.submit(archive_clean_worker, d, args) for d in all_dirs]
+            for fut in as_completed(futures):
+                stats.add(fut.result())
+
+    if args.pack_loose_images:
+        # Pack folders after duplicate archive cleanup to avoid parent/child races.
+        folders = []
+        for root in paths:
+            pattern = "**/*" if not args.no_recursive else "*"
+            folders.extend([p for p in root.glob(pattern) if p.is_dir()])
+        for folder in sorted(folders, key=lambda p: len(p.parts), reverse=True):
+            stats.add(pack_image_folder(folder, args.dry_run))
+
+    log.info("Archive clean complete: %s", stats)
+    return 0
+
+
+def series_base_name(name: str) -> str | None:
+    m = _TRAILING_TOKEN_RE.search(name)
+    if not m:
+        return None
+    base = name[: m.start()].strip()
+    return clean_directory_name(base) if base else None
+
+
+def canonical_series_name(names: list[str]) -> str:
+    bases = [series_base_name(n) for n in names]
+    bases = [b for b in bases if b]
+    candidates = bases or names
+    return max(candidates, key=lambda s: (sum(1 for c in s if c.isupper()), len(s)))
+
+
+def merge_dir_contents(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    for item in sorted(src.rglob("*")):
+        if not item.is_file():
+            continue
+        rel = item.relative_to(src)
+        target = dest / rel
+        outcome = larger_file_wins(item, target, dry_run)
+        if outcome in {"moved", "replaced"}:
+            stats.moved += 1
+        elif outcome == "discarded":
+            stats.deleted += 1
+
+    if not dry_run:
+        shutil.rmtree(src, ignore_errors=True)
+    stats.merged += 1
+    return stats
+
+
+def merge_chapter_folders(parent: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    children = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
+    groups: dict[str, list[Path]] = {}
+    for d in children:
+        base = series_base_name(d.name)
+        if base:
+            groups.setdefault(normalise_series_key(base), []).append(d)
+
+    for _, group in groups.items():
+        if len(group) < 2:
+            continue
+        canonical = canonical_series_name([g.name for g in group])
+        dest = parent / canonical
+        log.info("  Merge chapter-folder group -> %s", dest.name)
+        if dry_run:
+            log.info("    [DRY RUN] Would create/use canonical folder: %s", dest)
+        else:
+            dest.mkdir(exist_ok=True)
+
+        for src in group:
+            if src == dest:
+                continue
+            stats.add(merge_dir_contents(src, dest, dry_run))
+    return stats
+
+
+def find_series_matches(parent: Path, report_threshold: float, auto_threshold: float, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    dirs = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
+    entries = [(d, normalise_series_key(d.name)) for d in dirs]
+    consumed: set[Path] = set()
+
+    for i, (a, na) in enumerate(entries):
+        if a in consumed or not na:
+            continue
+        for b, nb in entries[i + 1:]:
+            if b in consumed or not nb:
+                continue
+            if not na or not nb:
+                continue
+            if 2 * min(len(na), len(nb)) / (len(na) + len(nb)) < report_threshold:
+                continue
+            sm = SequenceMatcher(None, na, nb)
+            if sm.quick_ratio() < report_threshold:
+                continue
+            ratio = sm.ratio()
+            if ratio < report_threshold:
+                continue
+
+            a_count = len(list(a.glob("*.cbz")))
+            b_count = len(list(b.glob("*.cbz")))
+            primary, secondary = (a, b) if (a_count, len(a.name), b.name) >= (b_count, len(b.name), a.name) else (b, a)
+            log.info("  Series match %.3f: %s <-> %s", ratio, a.name, b.name)
+
+            if ratio >= auto_threshold:
+                log.info("    Auto-merge: %s -> %s", secondary.name, primary.name)
+                stats.add(merge_dir_contents(secondary, primary, dry_run))
+                consumed.add(secondary)
+            else:
+                stats.skipped += 1
+    return stats
+
+
+def find_uncensored_pairs(root: Path, dry_run: bool, move_which: str) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    dirs = [d for d in root.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
+    marked = [d for d in dirs if _MARKER_WORDS_RE.search(d.name)]
+    normal = {normalise_series_key(d.name): d for d in dirs if not _MARKER_WORDS_RE.search(d.name)}
+    check_dir = root / CHECK_FOLDER_NAME
+
+    for uncensored in marked:
+        match = normal.get(normalise_series_key(uncensored.name))
+        if not match:
+            log.info("  No counterpart for: %s", uncensored.name)
+            continue
+
+        to_move: list[Path]
+        if move_which == "uncensored":
+            to_move = [uncensored]
+        elif move_which == "censored":
+            to_move = [match]
+        else:
+            to_move = [uncensored, match]
+
+        for src in to_move:
+            dest = check_dir / src.name
+            if dry_run:
+                log.info("  [DRY RUN] Would move to _Check: %s", src.name)
+                stats.moved += 1
+            else:
+                check_dir.mkdir(exist_ok=True)
+                suffix = 1
+                while dest.exists():
+                    dest = check_dir / f"{src.name} ({suffix})"
+                    suffix += 1
+                shutil.move(str(src), str(dest))
+                log.info("  Moved to _Check: %s", src.name)
+                stats.moved += 1
+    return stats
+
+
+def run_organize_series(args: argparse.Namespace) -> int:
+    stats = MaintenanceStats()
+    for root_arg in args.paths:
+        root = Path(root_arg)
+        log.info("Organize series root: %s", root)
+        if not root.exists():
+            log.error("Missing root: %s", root)
+            stats.errors += 1
+            continue
+
+        parents = [root]
+        if args.recursive_parents:
+            parents.extend(sorted({p.parent for p in root.rglob("*") if p.is_dir()}))
+
+        for parent in sorted(set(parents)):
+            if args.merge_chapter_folders:
+                stats.add(merge_chapter_folders(parent, args.dry_run))
+            if args.match_series:
+                stats.add(find_series_matches(parent, args.report_threshold, args.auto_threshold, args.dry_run))
+
+        if args.uncensored_check:
+            stats.add(find_uncensored_pairs(root, args.dry_run, args.move_which))
+
+    log.info("Organize complete: %s", stats)
+    return 0
+
+
+def read_comicinfo(cbz_path: Path) -> tuple[str | None, str | None]:
+    try:
+        with zipfile.ZipFile(cbz_path, "r") as zf:
+            names = {n.lower(): n for n in zf.namelist()}
+            key = next((k for k in names if os.path.basename(k).lower() == "comicinfo.xml"), None)
+            if key:
+                real = names[key]
+                return real, zf.read(real).decode("utf-8", errors="replace")
+    except (zipfile.BadZipFile, OSError) as exc:
+        log.error("  Cannot read ComicInfo from %s: %s", cbz_path.name, exc)
+    return None, None
+
+
+def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: bool) -> bool:
+    if dry_run:
+        log.info("  [DRY RUN] Would update ComicInfo: %s", cbz_path.name)
+        return True
+
+    tmp_path = cbz_path.with_suffix(".tmp.cbz")
+    bak_path = cbz_path.with_suffix(".bak.cbz")
+    try:
+        entries: list[tuple[zipfile.ZipInfo, bytes]] = []
+        with zipfile.ZipFile(cbz_path, "r") as zin:
+            for info in zin.infolist():
+                entries.append((info, zin.read(info.filename)))
+
+        with zipfile.ZipFile(tmp_path, "w") as zout:
+            wrote = False
+            for info, data in entries:
+                if entry_name and info.filename == entry_name:
+                    zout.writestr(info, xml.encode("utf-8"))
+                    wrote = True
+                else:
+                    zout.writestr(info, data, compress_type=info.compress_type)
+            if not wrote:
+                zout.writestr("ComicInfo.xml", xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
+
+        cbz_path.rename(bak_path)
+        tmp_path.rename(cbz_path)
+        bak_path.unlink(missing_ok=True)
+        return True
+    except Exception as exc:
+        log.error("  Failed to write ComicInfo for %s: %s", cbz_path.name, exc)
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
+def metadata_worker(cbz_path: Path, dry_run: bool) -> MaintenanceStats:
+    stats = MaintenanceStats()
+    parsed = parse_comic_name(cbz_path)
+    entry, xml = read_comicinfo(cbz_path)
+    if xml is None:
+        xml = "<ComicInfo><Title></Title><Series></Series><Number></Number></ComicInfo>"
+    new_xml, changed = update_comicinfo_xml(xml, parsed)
+    if not changed:
+        stats.skipped += 1
+        return stats
+    if write_comicinfo(cbz_path, entry, new_xml, dry_run):
+        stats.updated_xml += 1
+    else:
+        stats.errors += 1
+    return stats
+
+
+def run_metadata(args: argparse.Namespace) -> int:
+    cbz_files: list[Path] = []
+    for root_arg in args.paths:
+        root = Path(root_arg)
+        cbz_files.extend(sorted(root.rglob("*.cbz")) if root.is_dir() else [root])
+
+    stats = MaintenanceStats()
+    if args.workers == 1:
+        for cbz in cbz_files:
+            stats.add(metadata_worker(cbz, args.dry_run))
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = [ex.submit(metadata_worker, cbz, args.dry_run) for cbz in cbz_files]
+            for fut in as_completed(futures):
+                stats.add(fut.result())
+
+    log.info("Metadata complete: %s", stats)
+    return 0
+
+
+def run_all(args: argparse.Namespace) -> int:
+    archive_args = argparse.Namespace(**vars(args))
+    archive_args.strip_names = True
+    archive_args.dedupe_archives = True
+    archive_args.pack_loose_images = True
+    archive_args.no_recursive = False
+
+    organize_args = argparse.Namespace(**vars(args))
+    organize_args.merge_chapter_folders = True
+    organize_args.match_series = True
+    organize_args.uncensored_check = False
+    organize_args.recursive_parents = False
+    organize_args.report_threshold = args.report_threshold
+    organize_args.auto_threshold = args.auto_threshold
+    organize_args.move_which = "both"
+
+    rc = run_archive_clean(archive_args)
+    if rc != 0:
+        return rc
+    rc = run_organize_series(organize_args)
+    if rc != 0:
+        return rc
+    return run_metadata(args)
+
+
+def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("paths", nargs="+", help="Files or folders to process")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Worker threads")
+    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Consolidated CBZ library maintenance tool.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("archive-clean", help="Clean duplicate archives, duplicate filename tokens, and loose image folders")
+    add_common(p)
+    p.add_argument("--no-recursive", action="store_true")
+    p.add_argument("--strip-names", action="store_true", default=True)
+    p.add_argument("--dedupe-archives", action="store_true", default=True)
+    p.add_argument("--pack-loose-images", action="store_true", default=True)
+    p.set_defaults(func=run_archive_clean)
+
+    p = sub.add_parser("organize-series", help="Merge split folders, fuzzy-match series folders, and find uncensored pairs")
+    add_common(p)
+    p.add_argument("--merge-chapter-folders", action="store_true", default=True)
+    p.add_argument("--match-series", action="store_true", default=True)
+    p.add_argument("--uncensored-check", action="store_true")
+    p.add_argument("--recursive-parents", action="store_true")
+    p.add_argument("--report-threshold", type=float, default=0.75)
+    p.add_argument("--auto-threshold", type=float, default=0.87)
+    p.add_argument("--move-which", choices=["both", "uncensored", "censored"], default="both")
+    p.set_defaults(func=run_organize_series)
+
+    p = sub.add_parser("metadata", help="Repair ComicInfo metadata using cbz_core")
+    add_common(p)
+    p.set_defaults(func=run_metadata)
+
+    p = sub.add_parser("all", help="Run archive-clean, organize-series, then metadata")
+    add_common(p)
+    p.add_argument("--report-threshold", type=float, default=0.75)
+    p.add_argument("--auto-threshold", type=float, default=0.87)
+    p.set_defaults(func=run_all)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    global log
+    log = setup_logging(args.verbose)
+
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
