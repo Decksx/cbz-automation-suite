@@ -482,6 +482,205 @@ def find_series_matches(parent: Path, report_threshold: float, auto_threshold: f
     return stats
 
 
+
+
+# ─────────────────────────────────────────────
+# POSSIBLE SAME-SERIES GROUPING FOR MANUAL REVIEW
+# ─────────────────────────────────────────────
+_SERIES_CONNECTOR_RE = re.compile(r"\s*(?:[:\-–—|/\\])\s*")
+_SERIES_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_SERIES_JOIN_PHRASES = {
+    ("bat", "man"): "batman",
+    ("super", "man"): "superman",
+    ("spider", "man"): "spiderman",
+    ("iron", "man"): "ironman",
+    ("wonder", "woman"): "wonderwoman",
+}
+_SERIES_CANONICAL_TOKENS = {
+    "&": "and",
+    "+": "and",
+}
+
+
+def _series_title_part(name: str) -> str:
+    """Return the likely series/title prefix before a subtitle separator."""
+    # Keep colons/dashes as strong subtitle breaks but normalize connectors first.
+    normalized = name.replace("&", " and ").replace("+", " and ")
+    parts = [p.strip() for p in _SERIES_CONNECTOR_RE.split(normalized) if p.strip()]
+    return parts[0] if parts else normalized
+
+
+def _series_tokens(name: str) -> list[str]:
+    """Return normalized tokens for same-series detection."""
+    title = _series_title_part(name)
+    raw = [t.lower() for t in _SERIES_TOKEN_RE.findall(title)]
+    tokens: list[str] = []
+    i = 0
+    while i < len(raw):
+        if i + 1 < len(raw) and (raw[i], raw[i + 1]) in _SERIES_JOIN_PHRASES:
+            tokens.append(_SERIES_JOIN_PHRASES[(raw[i], raw[i + 1])])
+            i += 2
+            continue
+        tokens.append(_SERIES_CANONICAL_TOKENS.get(raw[i], raw[i]))
+        i += 1
+    return tokens
+
+
+def _tokens_match(a: str, b: str, threshold: float = 0.82) -> bool:
+    if a == b:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
+
+def _common_prefix_tokens(names: list[str]) -> list[str]:
+    """Fuzzy common prefix across a group of directory names."""
+    token_lists = [_series_tokens(name) for name in names]
+    if not token_lists:
+        return []
+
+    common: list[str] = []
+    for pos in range(min(len(t) for t in token_lists)):
+        column = [tokens[pos] for tokens in token_lists]
+        first = column[0]
+        if all(_tokens_match(first, other) for other in column[1:]):
+            # Prefer the most common spelling. Tie-breaker: longest token, then alpha.
+            chosen = sorted(column, key=lambda t: (-column.count(t), -len(t), t))[0]
+            common.append(chosen)
+        else:
+            break
+    return common
+
+
+def _display_series_name(tokens: list[str]) -> str:
+    if not tokens:
+        return "Possible Series"
+    words = []
+    for token in tokens:
+        if token == "and":
+            words.append("And")
+        else:
+            words.append(token[:1].upper() + token[1:])
+    return clean_directory_name(" ".join(words)) or "Possible Series"
+
+
+def _unique_dir(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for i in range(1, 1000):
+        candidate = path.parent / f"{path.name} ({i})"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Unable to find unique destination for {path}")
+
+
+def _group_possible_same_series_dirs(
+    parent: Path,
+    min_common_words: int,
+    min_group_size: int,
+) -> list[tuple[str, list[Path]]]:
+    """Find sibling directories that appear to be different entries in one series.
+
+    Unlike exact duplicate matching, this catches directories that share a likely
+    series title but have different subtitles, e.g.:
+
+        Batman And Superman - Fighting the Joker
+        Batman & Superman - Battle Against Catwoman
+        Bat man + Super man - Team Up Against Evil
+
+    The return value is a list of (suggested_series_name, directories).
+    """
+    dirs = [
+        d for d in parent.iterdir()
+        if d.is_dir() and d.name != CHECK_FOLDER_NAME and not d.name.startswith(".")
+    ]
+    if len(dirs) < min_group_size:
+        return []
+
+    # Build graph where edges connect likely same-series dirs.
+    neighbors: dict[Path, set[Path]] = {d: set() for d in dirs}
+    for i, a in enumerate(dirs):
+        for b in dirs[i + 1:]:
+            common = _common_prefix_tokens([a.name, b.name])
+            if len(common) >= min_common_words:
+                neighbors[a].add(b)
+                neighbors[b].add(a)
+
+    groups: list[list[Path]] = []
+    seen: set[Path] = set()
+    for start in dirs:
+        if start in seen:
+            continue
+        stack = [start]
+        component: list[Path] = []
+        seen.add(start)
+        while stack:
+            cur = stack.pop()
+            component.append(cur)
+            for nxt in neighbors[cur]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        if len(component) >= min_group_size:
+            groups.append(sorted(component, key=lambda p: p.name.lower()))
+
+    results: list[tuple[str, list[Path]]] = []
+    for group in groups:
+        common = _common_prefix_tokens([g.name for g in group])
+        if len(common) < min_common_words:
+            continue
+        results.append((_display_series_name(common), group))
+    return results
+
+
+def move_possible_same_series_to_check(
+    parent: Path,
+    dry_run: bool,
+    min_common_words: int = 2,
+    min_group_size: int = 2,
+) -> MaintenanceStats:
+    """Move likely same-series sibling folders into _Check/<Series Name>/.
+
+    The original folders are preserved as subdirectories for manual review.
+    """
+    stats = MaintenanceStats()
+    groups = _group_possible_same_series_dirs(
+        parent=parent,
+        min_common_words=min_common_words,
+        min_group_size=min_group_size,
+    )
+    if not groups:
+        return stats
+
+    check_root = parent / CHECK_FOLDER_NAME
+    for suggested_name, group in groups:
+        group_dest = _unique_dir(check_root / suggested_name)
+        log.info(
+            "  POSSIBLE SERIES GROUP -> _Check/%s  (%d folder(s))",
+            group_dest.name,
+            len(group),
+        )
+        for folder in group:
+            log.info("    candidate: %s", folder.name)
+
+        if dry_run:
+            for folder in group:
+                log.info("    [DRY RUN] Would move: %s -> %s", folder.name, group_dest)
+                stats.moved += 1
+            stats.merged += 1
+            continue
+
+        group_dest.mkdir(parents=True, exist_ok=True)
+        for folder in group:
+            dest = _unique_dir(group_dest / folder.name)
+            shutil.move(str(folder), str(dest))
+            log.info("    Moved for review: %s -> %s", folder.name, dest)
+            stats.moved += 1
+        stats.merged += 1
+
+    return stats
+
+
+
 def find_uncensored_pairs(root: Path, dry_run: bool, move_which: str) -> MaintenanceStats:
     stats = MaintenanceStats()
     dirs = [d for d in root.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
@@ -539,6 +738,15 @@ def run_organize_series(args: argparse.Namespace) -> int:
                 stats.add(merge_chapter_folders(parent, args.dry_run))
             if args.match_series:
                 stats.add(find_series_matches(parent, args.report_threshold, args.auto_threshold, args.dry_run))
+            if args.possible_series_check:
+                stats.add(
+                    move_possible_same_series_to_check(
+                        parent=parent,
+                        dry_run=args.dry_run,
+                        min_common_words=args.series_common_words,
+                        min_group_size=args.series_min_group_size,
+                    )
+                )
 
         if args.uncensored_check:
             stats.add(find_uncensored_pairs(root, args.dry_run, args.move_which))
@@ -642,9 +850,12 @@ def run_all(args: argparse.Namespace) -> int:
     organize_args.merge_chapter_folders = True
     organize_args.match_series = True
     organize_args.uncensored_check = False
+    organize_args.possible_series_check = False
     organize_args.recursive_parents = False
     organize_args.report_threshold = args.report_threshold
     organize_args.auto_threshold = args.auto_threshold
+    organize_args.series_common_words = 2
+    organize_args.series_min_group_size = 2
     organize_args.move_which = "both"
 
     rc = run_archive_clean(archive_args)
@@ -680,9 +891,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--merge-chapter-folders", action="store_true", default=True)
     p.add_argument("--match-series", action="store_true", default=True)
     p.add_argument("--uncensored-check", action="store_true")
+    p.add_argument(
+        "--possible-series-check",
+        action="store_true",
+        help="Move likely same-series sibling folders into _Check/<suggested series>/ for manual review",
+    )
     p.add_argument("--recursive-parents", action="store_true")
     p.add_argument("--report-threshold", type=float, default=0.75)
     p.add_argument("--auto-threshold", type=float, default=0.87)
+    p.add_argument("--series-common-words", type=int, default=2, help="Minimum fuzzy common prefix words for possible-series groups")
+    p.add_argument("--series-min-group-size", type=int, default=2, help="Minimum directories required to create a possible-series review group")
     p.add_argument("--move-which", choices=["both", "uncensored", "censored"], default="both")
     p.set_defaults(func=run_organize_series)
 
@@ -708,6 +926,10 @@ def main() -> int:
 
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    if hasattr(args, "series_common_words") and args.series_common_words < 1:
+        parser.error("--series-common-words must be >= 1")
+    if hasattr(args, "series_min_group_size") and args.series_min_group_size < 2:
+        parser.error("--series-min-group-size must be >= 2")
 
     return args.func(args)
 
