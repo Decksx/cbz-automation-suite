@@ -20,6 +20,31 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
+__all__ = [
+    "ALL_RULES",
+    "GIBBERISH_RE",
+    "IGNORED_SERIES_FOLDERS",
+    "NUMBER_PREFIX_RE",
+    "TRAILING_JUNK_RE",
+    "ParsedComicName",
+    "clean_directory_name",
+    "clean_filename",
+    "clean_xml_field",
+    "extract_chapter_number",
+    "extract_volume_number",
+    "infer_series_name",
+    "is_generic",
+    "is_generic_title",
+    "normalise_number_tokens",
+    "normalize_stem",
+    "parse_comic_name",
+    "parse_rules",
+    "sanitize",
+    "shorten_mixed_original_title",
+    "update_comicinfo_xml",
+]
+
+
 
 ALL_RULES = {
     "url",
@@ -185,11 +210,37 @@ def _latin_score(text: str) -> tuple[int, int]:
     return (len(_LATIN_RE.findall(text)), -len(text))
 
 
+def _extract_num_suffix(parts: list[str], chosen: str) -> str:
+    """Return any chapter/volume tokens found in segments other than *chosen*.
+
+    Prevents ``shorten_mixed_original_title`` from silently dropping chapter
+    numbers that happen to sit in the non-Latin segment, e.g.
+    ``"One Piece / ワンピース Ch.005"`` -> chosen ``"One Piece"``, suffix ``" Ch.005"``.
+    """
+    for part in parts:
+        if part == chosen:
+            continue
+        tokens: list[str] = []
+        vol = _VOLUME_NUMBER_RE.search(part)
+        ch  = _CHAPTER_NUMBER_RE.search(part)
+        if vol:
+            tokens.append(part[vol.start():vol.end()])
+        if ch:
+            tokens.append(part[ch.start():ch.end()])
+        if tokens:
+            return " " + " ".join(tokens)
+    return ""
+
+
 def shorten_mixed_original_title(text: str, max_length: int = 120) -> str:
     """Prefer a Latin-heavy title segment when a long name includes CJK too.
 
     This avoids the old destructive behavior of deleting every non-Latin
     character. Non-Latin-only names remain intact.
+
+    Chapter/volume tokens present in a non-chosen segment are appended to the
+    result so they are never silently dropped:
+      ``"One Piece / ワンピース Ch.005"``  ->  ``"One Piece Ch.005"``
     """
     if not _CJK_RE.search(text):
         return text
@@ -203,7 +254,7 @@ def shorten_mixed_original_title(text: str, max_length: int = 120) -> str:
         return text[:max_length].rstrip() if len(text) > max_length else text
 
     best = max(latin_parts, key=_latin_score)
-    return best
+    return best + _extract_num_suffix(parts, best)
 
 
 def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
@@ -360,7 +411,7 @@ def parse_comic_name(
     raw_series = infer_series_name(path, library_root=library_root)
     series = clean_directory_name(raw_series, rules)
 
-    stem, _ext = _split_name(clean_filename(path.name, rules))
+    stem, ext = _split_name(clean_filename(path.name, rules))
     if "leading_nums" in rules:
         stem = NUMBER_PREFIX_RE.sub("", stem).strip()
     if "normalize_stem" in rules:
@@ -375,7 +426,7 @@ def parse_comic_name(
 
     return ParsedComicName(
         original_path=path,
-        filename=stem + path.suffix,
+        filename=stem + ext,
         stem=stem,
         series=series,
         chapter=chapter,

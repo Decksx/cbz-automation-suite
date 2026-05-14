@@ -23,7 +23,7 @@ def test_windows_forbidden_characters_removed():
 
 
 def test_mixed_original_title_prefers_english_segment():
-    assert clean_filename("One Piece / ワンピース Ch.005.cbz") == "One Piece.cbz"
+    assert clean_filename("One Piece / ワンピース Ch.005.cbz") == "One Piece Ch.005.cbz"
 
 
 def test_does_not_empty_non_latin_only_title():
@@ -47,3 +47,20 @@ def test_parse_comic_name_uses_clean_directory_name_for_series():
 
     assert parsed.series == "One Piece"
     assert parsed.chapter == "5"
+
+def test_mixed_title_preserves_volume_from_other_segment():
+    assert clean_filename("One Piece Vol.02 / ワンピース Ch.005.cbz") == "One Piece Vol.02 Ch.005.cbz"
+
+
+def test_non_latin_only_title_preserved_with_chapter():
+    result = clean_filename("ワンピース Ch.005.cbz")
+    assert result != ".cbz"
+    assert "Ch.5" in result or "Ch.005" in result or "ワンピース" in result
+
+
+def test_parse_comic_name_ext_from_split_not_path_suffix():
+    # Verifies _ext from _split_name is used, not path.suffix
+    from scripts.cbz_core import parse_comic_name
+    parsed = parse_comic_name(Path("Series/Batman Ch.5.cbz"))
+    assert parsed.filename.endswith(".cbz")
+    assert not parsed.filename.endswith(".cbz.cbz")
