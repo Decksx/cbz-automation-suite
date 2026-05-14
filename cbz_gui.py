@@ -96,6 +96,9 @@ TOOLS = [
             {"type": "folder", "key": "scan_folder", "label": "Library folder", "default": r"\\tower\media\comics\Comix"},
             {"type": "checkbox", "key": "dry_run", "label": "Dry run (preview only)", "default": True},
             {"type": "checkbox", "key": "uncensored_check", "label": "Also check uncensored/decensored pairs", "default": False},
+            {"type": "checkbox", "key": "possible_series_check", "label": "Move likely same-series folders to _Check", "default": False},
+            {"type": "select", "key": "series_common_words", "label": "Common title words", "choices": ["1", "2", "3", "4"], "default": "2"},
+            {"type": "select", "key": "series_min_group_size", "label": "Minimum group size", "choices": ["2", "3", "4", "5"], "default": "2"},
             {"type": "select", "key": "workers", "label": "Workers", "choices": ["1", "2", "4", "8", "12"], "default": "8"},
         ],
     },
@@ -472,6 +475,17 @@ class CBZLauncherApp(tk.Tk):
 
         if opts.get("uncensored_check") and opts["uncensored_check"].get():
             cmd.append("--uncensored-check")
+
+        if opts.get("possible_series_check") and opts["possible_series_check"].get():
+            cmd.append("--possible-series-check")
+
+            common_words_var = opts.get("series_common_words")
+            if common_words_var:
+                cmd.extend(["--series-common-words", common_words_var.get()])
+
+            min_group_size_var = opts.get("series_min_group_size")
+            if min_group_size_var:
+                cmd.extend(["--series-min-group-size", min_group_size_var.get()])
 
         return cmd
 
