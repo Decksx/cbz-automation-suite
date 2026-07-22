@@ -6,7 +6,10 @@ Logs/*.log
 Logs/*.log.1
 Logs/*.log.2
 Logs/*.log.3
+Logs/*_root.log
+Logs/*_root.log.1
 Logs/cbz_gaps_*.csv
+Logs/series_exclusions.json
 # Keep the folder anchor
 !Logs/.gitkeep
 
@@ -16,6 +19,7 @@ Logs/cbz_gaps_*.csv
 
 # ── Python ────────────────────────────────────────────
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -50,5 +54,10 @@ desktop.ini
 # ── Runtime state — lives at C:\\git\\ComicAutomation\ ───────
 # Progress tracking files (auto-generated, machine-specific)
 *_progress.json
+progress_tracking/
+tools/directory_mirroring/WorkDir/
 # Live routing config (copy config\routing.example.json and edit)
 routing.json
+
+# ── Large binary dependencies (exceeds GitHub's 100MB limit) ──
+komga-1.24.4-fork-0.1.5.jar

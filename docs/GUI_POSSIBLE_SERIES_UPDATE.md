@@ -25,6 +25,6 @@ python scripts\cbz_library_maintenance.py organize-series "\\tower\media\comics\
 ## Commit
 
 ```powershell
-git add cbz_gui.py
+git add apps\cbz_gui.py
 git commit -m "feat(gui): expose possible same-series grouping option"
 ```

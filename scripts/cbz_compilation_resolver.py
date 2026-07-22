@@ -1,13 +1,9 @@
 """
-cbz_compilation_resolver.py — CBZ Compilation Resolver (parallelised)
+cbz_compilation_resolver.py — CBZ Compilation Resolver.
 
-Changes in this version
-────────────────────────
-• --workers N  (default: min(8, cpu_count)).  Pass --workers 1 for serial.
-• Each series directory is processed in parallel with ThreadPoolExecutor.
-  process_directory() is the independent unit of work — it operates on a
-  single directory and touches no shared state.
-• Summary counters are aggregated from returned values.
+Processes each series directory as an independent worker task, compares
+compilation archives against individual chapters, and moves replaced individual
+archives into the local Processed folder.
 """
 
 from __future__ import annotations
@@ -27,8 +23,9 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-LOG_FILE          = r"C:\git\ComicAutomation\Logs\cbz_compilation_resolver.log"
-PROCESSED_FOLDER  = r"C:\git\ComicAutomation\Processed"
+REPO_ROOT         = Path(__file__).resolve().parents[1]
+LOG_FILE          = REPO_ROOT / "Logs" / "cbz_compilation_resolver.log"
+PROCESSED_FOLDER  = REPO_ROOT / "Processed"
 SCAN_FOLDERS: list[str] = [
     r"\\tower\media\comics\Comix",
     r"\\tower\media\comics\Manga",
@@ -42,6 +39,7 @@ DEFAULT_WORKERS   = min(8, os.cpu_count() or 4)
 log = logging.getLogger("cbz_resolver")
 log.setLevel(logging.DEBUG)
 _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 _fh  = _RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
 _fh.setFormatter(_fmt)
 log.addHandler(_fh)

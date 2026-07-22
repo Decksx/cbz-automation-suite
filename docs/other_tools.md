@@ -1,5 +1,24 @@
 # Other Tools
 
+## Unified Workflows
+
+Use `cbz_workflows.py` as the primary entry point for related operations:
+
+```powershell
+python scripts\cbz_workflows.py maintenance ROOT --dry-run
+python scripts\cbz_workflows.py maintenance ROOT --stages=sanitize,archive,metadata,names
+python scripts\cbz_workflows.py series ROOT --dry-run --stages=organize,stage,review,compilations
+```
+
+`maintenance` consolidates CBZ Sanitizer, Archive Cleaner, Series Organizer,
+Metadata Repair, Repair Names, and the former Full Maintenance preset.
+
+`series` consolidates Series Organizer, Stage Similar Series, Series Review,
+and Compilation Resolver. The review stage writes `Logs/series_proposal.json`,
+which the GUI opens in its existing interactive review window.
+
+The older subcommands below remain compatibility entry points.
+
 Secondary and library-wide workflows now live in the consolidated maintenance entrypoint:
 
 ```powershell

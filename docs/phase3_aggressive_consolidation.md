@@ -108,7 +108,7 @@ Phase 3 introduces a real consolidated implementation with shared logic and one 
 python scripts\cbz_library_maintenance.py archive-clean "\\tower\media\comics\Comix" --dry-run
 python scripts\cbz_library_maintenance.py organize-series "\\tower\media\comics\Comix" --dry-run
 python scripts\cbz_library_maintenance.py metadata "\\tower\media\comics\Comix" --dry-run
-python scripts\cbz_gui.py
+python apps\cbz_gui.py
 ```
 
 ---
@@ -116,6 +116,6 @@ python scripts\cbz_gui.py
 ## Commit
 
 ```powershell
-git add scripts\cbz_library_maintenance.py cbz_gui.py docs\phase3_aggressive_consolidation.md
+git add scripts\cbz_library_maintenance.py apps\cbz_gui.py docs\phase3_aggressive_consolidation.md
 git commit -m "refactor(tools): consolidate maintenance workflows and update GUI"
 ```

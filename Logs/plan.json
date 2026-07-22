@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "generated": "2026-05-28 21:05:02",
+  "source": "archive-clean",
+  "paths": [
+    "\\\\tower\\media\\comics\\Comix"
+  ],
+  "actions": [
+    {
+      "op": "file",
+      "src": "\\\\tower\\media\\comics\\Comix\\Animated Paizuri Collection\\ [HalfLove] Animated Paizuri Collection (webp) [AI Generated]v1.cbz",
+      "dest": "\\\\tower\\media\\comics\\Comix\\Animated Paizuri Collection\\[HalfLove] Animated Paizuri Collection (webp) [AI Generated]v1.cbz"
+    },
+    {
+      "op": "pack",
+      "folder": "\\\\tower\\media\\comics\\Comix\\[user-1720436145689436690] Dispatch - Invisigal [AI Generated]",
+      "dest": "\\\\tower\\media\\comics\\Comix\\[user-1720436145689436690] Dispatch - Invisigal [AI Generated].cbz"
+    }
+  ]
+}

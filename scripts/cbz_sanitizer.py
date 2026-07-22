@@ -1,15 +1,9 @@
 """
 cbz_sanitizer.py — Clean and repack CBZ archives.
 
-Changes in this version
-────────────────────────
-• --workers N  (default: min(8, cpu_count)).  Pass --workers 1 for serial.
-• Per-series directories are processed in parallel with ThreadPoolExecutor.
-  Each series is one unit of work; within a series files stay serial so
-  rename/collision logic is safe.
-• Thread-safe logging via Python's logging module (already thread-safe).
-• Counters are aggregated from worker return values — no shared mutable state.
-• --no-recursive still supported.
+Processes one series directory per worker. Files within each series stay serial
+so rename/collision logic remains deterministic, while logging and counters are
+safe across workers.
 • Progress file writes are serialised with a lock.
 """
 
@@ -33,13 +27,65 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from pathlib import Path
 
+# Shared CJK translation helpers live in cbz_core so the sanitizer and watcher
+# behave identically. Import defensively: if cbz_core is unavailable the sanitizer
+# still runs, just without CJK translation.
+try:
+    try:
+        from scripts.cbz_core import (
+            ALL_RULES as _CORE_RULES,
+            parse_comic_name as _parse_comic_name,
+            translate_cjk_text as _translate_cjk_text,
+            update_comicinfo_xml as _update_comicinfo_xml,
+            _is_cjk_only as _is_cjk_only,
+            extract_season_number as _extract_season_number,
+            extract_episode_number as _extract_episode_number,
+            extract_part_number as _extract_part_number,
+            build_sep_notes as _build_sep_notes,
+        )
+    except ModuleNotFoundError:
+        from cbz_core import (  # type: ignore[no-redef]
+            ALL_RULES as _CORE_RULES,
+            parse_comic_name as _parse_comic_name,
+            translate_cjk_text as _translate_cjk_text,
+            update_comicinfo_xml as _update_comicinfo_xml,
+            _is_cjk_only as _is_cjk_only,
+            extract_season_number as _extract_season_number,
+            extract_episode_number as _extract_episode_number,
+            extract_part_number as _extract_part_number,
+            build_sep_notes as _build_sep_notes,
+        )
+except Exception:
+    _CORE_RULES = set()
+    _parse_comic_name = None
+    _update_comicinfo_xml = None
+
+    def _is_cjk_only(text: str) -> bool:
+        return False
+
+    def _translate_cjk_text(text: str):
+        return text, None
+
+    def _extract_season_number(stem: str):
+        return None
+
+    def _extract_episode_number(stem: str):
+        return None
+
+    def _extract_part_number(stem: str):
+        return None
+
+    def _build_sep_notes(existing_notes, season, episode, part):
+        return (existing_notes or "").strip(), False
+
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 SCAN_FOLDER    = r"\\tower\media\comics\manga"
-LOG_FILE       = r"C:\git\ComicAutomation\Logs\cbz_sanitizer.log"
-PROGRESS_FILE  = r"C:\git\ComicAutomation\progress_tracking\cbz_sanitizer_progress.json"
-DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
+REPO_ROOT      = Path(__file__).resolve().parents[1]
+LOG_FILE       = REPO_ROOT / "Logs" / "cbz_sanitizer.log"
+PROGRESS_FILE  = REPO_ROOT / "progress_tracking" / "cbz_sanitizer_progress.json"
+DEFAULT_WORKERS = min(20, os.cpu_count() or 12)
 
 # ─────────────────────────────────────────────
 # COMICINFO TEMPLATE
@@ -94,7 +140,7 @@ HASH_CHAPTER_RE = re.compile(
     r'^#\s*chapter\s*(\d[\d.]*)(.*?)$', re.IGNORECASE
 )
 CHAPTER_ONLY_RE = re.compile(
-    r'^(?:ch(?:ap(?:ter)?)?\\.?\\s*|chp\\.?\\s*)(\\d[\\d.]*)', re.IGNORECASE
+    r'^(?:ch(?:ap(?:ter)?)?\.?\s*|chp\.?\s*)(\d[\d.]*)', re.IGNORECASE
 )
 NUMBERED_CHAPTER_RE = re.compile(
     r'^(?:'
@@ -109,6 +155,7 @@ NUMBERED_CHAPTER_RE = re.compile(
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -178,6 +225,7 @@ _NON_LATIN_RE = re.compile(
     r'\U0001F300-\U0001FAFF'
     r']+'
 )
+_CJK_ANY_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 _NUM_TOKEN_RE = re.compile(
     r'''
     (
@@ -197,7 +245,7 @@ _NUM_TOKEN_RE = re.compile(
 _DIR_LEADING_HASH_RE  = re.compile(r'^#+\s*')
 _DIR_TRAILING_HASH_RE = re.compile(r'\s*#+$')
 _DIR_TRAILING_STUB_RE = re.compile(
-    r'[\s_\-]*(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
+    r'[\s_\-]+(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
 )
 _CHAPTER_NUMBER_RE = re.compile(
     r'(?:'
@@ -235,6 +283,7 @@ ALL_RULES = {
     "normalize_stem",# normalise chapter/volume stem patterns
     "number_tokens", # normalise chapter/vol number formatting tokens
     "comicinfo",     # update ComicInfo.xml metadata inside the archive
+    "translate",     # translate CJK-only names to English (AlternateSeries + filename)
 }
 
 def parse_rules(raw: str) -> set[str]:
@@ -394,10 +443,131 @@ def _rewrite_comicinfo(cbz_path: Path, xml_entry_name: str, new_xml: str) -> Non
 def _inject_comicinfo(cbz_path: Path) -> None:
     _write_cbz_with_comicinfo(cbz_path, COMICINFO_TEMPLATE)
 
+def _inject_cjk_titles(xml_text: str, english: str, original: str | None) -> tuple[str, bool]:
+    """Set <AlternateSeries> to *english* and append the *original* to <Notes>.
+
+    Operates on the XML string (consistent with the sanitizer's regex approach).
+    Returns (new_xml, changed).
+    """
+    changed = False
+
+    # AlternateSeries
+    if re.search(r"<AlternateSeries>.*?</AlternateSeries>", xml_text, re.IGNORECASE | re.DOTALL):
+        new_xml = re.sub(
+            r"<AlternateSeries>.*?</AlternateSeries>",
+            f"<AlternateSeries>{english}</AlternateSeries>",
+            xml_text, count=1, flags=re.IGNORECASE | re.DOTALL,
+        )
+        if new_xml != xml_text:
+            xml_text, changed = new_xml, True
+    else:
+        xml_text = xml_text.replace(
+            "</ComicInfo>", f"  <AlternateSeries>{english}</AlternateSeries>\n</ComicInfo>"
+        )
+        changed = True
+
+    # Notes breadcrumb with the untouched original title.
+    if original:
+        note = f"Original title: {original}"
+        notes_match = re.search(r"<Notes>(.*?)</Notes>", xml_text, re.IGNORECASE | re.DOTALL)
+        if notes_match:
+            existing = notes_match.group(1).strip()
+            if note not in existing:
+                merged = f"{existing} | {note}".strip(" |") if existing else note
+                xml_text = re.sub(
+                    r"<Notes>.*?</Notes>", f"<Notes>{merged}</Notes>",
+                    xml_text, count=1, flags=re.IGNORECASE | re.DOTALL,
+                )
+                changed = True
+        else:
+            xml_text = xml_text.replace(
+                "</ComicInfo>", f"  <Notes>{note}</Notes>\n</ComicInfo>"
+            )
+            changed = True
+
+    return xml_text, changed
+
+
+def _resolve_cjk_title(raw_stem: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """For a CJK-only raw stem, return (english_title, original_title, chapter, volume).
+
+    Strips chapter/volume markers (Latin Ch./Vol. and CJK 第N話/第N巻) before
+    translating so only the title is sent to the translator. Returns
+    (None, None, None, None) when *raw_stem* is not CJK-only or no English
+    rendering could be produced.
+    """
+    if not _is_cjk_only(raw_stem):
+        return None, None, None, None
+
+    # Pull CJK chapter/volume numbers for metadata.
+    chapter = None
+    volume = None
+    m = re.search(r"第?\s*(\d+)\s*[話话章]", raw_stem)
+    if m:
+        chapter = format_chapter_number(m.group(1))
+    m = re.search(r"第?\s*(\d+)\s*[巻卷]", raw_stem)
+    if m:
+        volume = format_chapter_number(m.group(1))
+
+    # Strip tokens so the translator sees only the title.
+    title_part = _NUM_TOKEN_RE.sub("", raw_stem)
+    title_part = re.sub(
+        r"\b(?:ch|chap|chapter|chp|vol|volume|v|ep|episode|issue|part)\b\.?",
+        "", title_part, flags=re.IGNORECASE,
+    )
+    title_part = re.sub(r"第?\s*\d+\s*[話巻章话卷]", "", title_part).strip(" .-_#")
+    title_part = title_part or raw_stem
+
+    english, original = _translate_cjk_text(title_part)
+    if original is None or not english or english == title_part:
+        return None, None, chapter, volume
+    return english, original, chapter, volume
+
+
+def format_chapter_number(value: str) -> str:
+    """Format a numeric string, dropping a trailing .0 (e.g. '5.0' -> '5')."""
+    try:
+        f = float(value)
+        return str(int(f)) if f == int(f) else str(f)
+    except ValueError:
+        return value
+
+
+def _inject_sep_notes(xml_text: str, stem: str) -> tuple[str, bool]:
+    """Add/refresh a Season/Episode/Part line in <Notes> from *stem*.
+
+    Mirrors core.update_comicinfo_xml: chapter/volume stay in their native tags
+    (handled elsewhere); season/episode/part — which have no native ComicInfo
+    field — are recorded in <Notes>. Returns (new_xml, changed).
+    """
+    season = _extract_season_number(stem)
+    episode = _extract_episode_number(stem)
+    part = _extract_part_number(stem)
+    if not (season or episode or part):
+        return xml_text, False
+
+    m = re.search(r"<Notes>(.*?)</Notes>", xml_text, re.IGNORECASE | re.DOTALL)
+    existing = m.group(1).strip() if m else ""
+    new_notes, changed = _build_sep_notes(existing, season, episode, part)
+    if not changed:
+        return xml_text, False
+
+    if m:
+        return (
+            re.sub(r"<Notes>.*?</Notes>", f"<Notes>{new_notes}</Notes>",
+                   xml_text, count=1, flags=re.IGNORECASE | re.DOTALL),
+            True,
+        )
+    # No existing Notes element: insert before the closing tag.
+    return xml_text.replace("</ComicInfo>", f"  <Notes>{new_notes}</Notes>\n</ComicInfo>"), True
+
+
 def process_comicinfo(
     cbz_path: Path,
     prefetched_xml: tuple[str, str] | None = None,
     rules: set[str] = ALL_RULES,
+    cjk_english: str | None = None,
+    cjk_original: str | None = None,
 ) -> None:
     parent_dir    = cbz_path.parent.name
     filename_stem = cbz_path.stem
@@ -494,7 +664,17 @@ def process_comicinfo(
                         )
                     log.info(f"    Volume set to '{volume_num}'.")
 
-                if title_changed or chapter_num or volume_num:
+                alt_changed = False
+                if cjk_english:
+                    xml_text, alt_changed = _inject_cjk_titles(xml_text, cjk_english, cjk_original)
+                    if alt_changed:
+                        log.info(f"    AlternateSeries set to '{cjk_english}' (CJK translation).")
+
+                xml_text, sep_changed = _inject_sep_notes(xml_text, cbz_path.stem)
+                if sep_changed:
+                    log.info("    Season/Episode/Part recorded in Notes.")
+
+                if title_changed or chapter_num or volume_num or alt_changed or sep_changed:
                     _rewrite_comicinfo(cbz_path, real_name, xml_text)
                 else:
                     log.info(f"    comicinfo.xml OK - no changes needed.")
@@ -521,6 +701,12 @@ def process_comicinfo(
                 log.info(f"    Injecting comicinfo.xml: Title='{resolved_title}', Series='{parent_dir}'" +
                          (f", Number='{chapter_num}'" if chapter_num else "") +
                          (f", Volume='{volume_num}'" if volume_num else "") + ".")
+                if cjk_english:
+                    injected_xml, _ = _inject_cjk_titles(injected_xml, cjk_english, cjk_original)
+                    log.info(f"    AlternateSeries set to '{cjk_english}' (CJK translation).")
+                injected_xml, _sep = _inject_sep_notes(injected_xml, cbz_path.stem)
+                if _sep:
+                    log.info("    Season/Episode/Part recorded in Notes.")
                 _write_cbz_with_comicinfo(cbz_path, injected_xml)
                 return
 
@@ -531,6 +717,43 @@ def process_comicinfo(
             log.error(f"    Cannot open {cbz_path.name} - bad zip file, skipping.")
             return
     log.error(f"    Gave up reading {cbz_path.name} after 5 attempts.")
+
+
+def _process_comicinfo_with_core(
+    cbz_path: Path,
+    parsed,
+    prefetched_xml: tuple[str, str] | None = None,
+) -> None:
+    """Apply the shared ComicInfo pipeline used by watcher and maintenance."""
+    try:
+        real_name = None
+        xml_text = None
+        if prefetched_xml is not None:
+            real_name, xml_text = prefetched_xml
+        else:
+            with zipfile.ZipFile(cbz_path, "r") as zf:
+                names = {name.lower(): name for name in zf.namelist()}
+                key = next(
+                    (name for name in names if os.path.basename(name) == "comicinfo.xml"),
+                    None,
+                )
+                if key:
+                    real_name = names[key]
+                    xml_text = zf.read(real_name).decode("utf-8", errors="replace")
+
+        has_xml = bool(real_name and xml_text is not None)
+        source_xml = xml_text if has_xml else COMICINFO_TEMPLATE
+        new_xml, changed = _update_comicinfo_xml(source_xml, parsed)
+        if not changed and has_xml:
+            log.info("    comicinfo.xml OK - no changes needed.")
+            return
+        _write_cbz_with_comicinfo(
+            cbz_path,
+            new_xml,
+            replace_entry=real_name if has_xml else None,
+        )
+    except (OSError, zipfile.BadZipFile) as exc:
+        log.error(f"    Cannot update ComicInfo.xml in {cbz_path.name}: {exc}")
 
 
 # ─────────────────────────────────────────────
@@ -564,6 +787,7 @@ def process_cbz_file(
     cbz_path: Path,
     override_name: str | None = None,
     rules: set[str] = ALL_RULES,
+    dry_run: bool = False,
 ) -> Path:
     log.info(f"  Processing: {cbz_path.name}")
     if not cbz_path.exists():
@@ -573,8 +797,17 @@ def process_cbz_file(
         log.warning(f"    Skipping zero-byte file: {cbz_path.name}")
         return cbz_path
 
+    core_rules = set(rules) & set(_CORE_RULES)
+    parsed_core = (
+        _parse_comic_name(cbz_path, rules=core_rules)
+        if _parse_comic_name is not None
+        else None
+    )
+
     if override_name is not None:
         new_name = override_name
+    elif parsed_core is not None:
+        new_name = parsed_core.filename
     else:
         stem = Path(clean_filename(cbz_path.name, rules)).stem
         if "leading_nums"   in rules: stem = NUMBER_PREFIX_RE.sub("", stem).strip()
@@ -583,8 +816,47 @@ def process_cbz_file(
         if "trailing_junk"  in rules: stem = TRAILING_JUNK_RE.sub("", stem).strip()
         new_name = stem + cbz_path.suffix
 
+    # CJK handling: detect a CJK-only original name (filename stem first, then the
+    # parent folder) and translate it. When the *raw* filename stem is CJK-only,
+    # the normal cleaning pipeline mangles or empties it, so we rebuild the
+    # on-disk name from the English rendering. The English and original titles are
+    # also written into ComicInfo below.
+    cjk_english = cjk_original = None
+    if parsed_core is None and "translate" in rules and override_name is None:
+        raw_stem = Path(cbz_path.name).stem
+        stem_is_cjk = _is_cjk_only(raw_stem)
+        source = raw_stem if stem_is_cjk else (
+            cbz_path.parent.name if _is_cjk_only(cbz_path.parent.name) else None
+        )
+        if source is not None:
+            cjk_english, cjk_original, cjk_ch, cjk_vol = _resolve_cjk_title(source)
+            if cjk_english:
+                cur_stem = Path(new_name).stem
+                # Rebuild the filename from English when the raw stem itself was
+                # CJK (cleaned result is unreliable), or when the cleaned stem is
+                # empty / has no Latin / still contains CJK.
+                if (stem_is_cjk or not cur_stem or not re.search(r"[A-Za-z]", cur_stem)
+                        or _CJK_ANY_RE.search(cur_stem)):
+                    eng_stem = (sanitize(cjk_english, rules) or cjk_english).strip()
+                    # Preserve any chapter/volume already present in the cleaned
+                    # stem; otherwise fall back to the CJK-derived numbers.
+                    ch = extract_chapter_number(cur_stem) or cjk_ch
+                    vol = extract_volume_number(cur_stem) or cjk_vol
+                    if ch:
+                        eng_stem = f"{eng_stem} Ch. {ch}"
+                    elif vol:
+                        eng_stem = f"{eng_stem} Vol. {vol}"
+                    eng_stem = eng_stem.strip()
+                    if eng_stem:
+                        new_name = eng_stem + cbz_path.suffix
+
     if new_name != cbz_path.name:
         new_path = cbz_path.parent / new_name
+        if dry_run:
+            log.info(f"    [DRY RUN] Would rename: '{cbz_path.name}' -> '{new_name}'")
+            if "comicinfo" in rules:
+                log.info("    [DRY RUN] Would update ComicInfo.xml metadata.")
+            return new_path
         if new_path.exists():
             src_size  = cbz_path.stat().st_size
             dest_size = new_path.stat().st_size
@@ -600,6 +872,11 @@ def process_cbz_file(
             cbz_path = new_path
     else:
         log.info(f"    Filename unchanged: '{cbz_path.name}'")
+
+    if dry_run:
+        if "comicinfo" in rules:
+            log.info("    [DRY RUN] Would inspect and update ComicInfo.xml metadata.")
+        return cbz_path
 
     prefetched: tuple[str, str] | None = None
     try:
@@ -617,8 +894,12 @@ def process_cbz_file(
     except (zipfile.BadZipFile, OSError):
         pass
 
-    if "comicinfo" in rules:
-        process_comicinfo(cbz_path, prefetched_xml=prefetched, rules=rules)
+    if "comicinfo" in rules and not dry_run:
+        if parsed_core is not None and _update_comicinfo_xml is not None:
+            _process_comicinfo_with_core(cbz_path, parsed_core, prefetched)
+        else:
+            process_comicinfo(cbz_path, prefetched_xml=prefetched, rules=rules,
+                              cjk_english=cjk_english, cjk_original=cjk_original)
     return cbz_path
 
 
@@ -813,6 +1094,65 @@ def clear_progress() -> None:
         log.warning(f"  Could not delete progress file: {e}")
 
 
+def load_last_session_time() -> float | None:
+    """Return the epoch timestamp of the most recent prior session header, or None.
+
+    Call this BEFORE init_progress_file() appends the current run's header so the
+    value reflects the *previous* run. Session headers are written as
+    ``{"session": "YYYY-MM-DD HH:MM:SS", "v": 2}``.
+    """
+    last: float | None = None
+    try:
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                stamp = obj.get("session")
+                if stamp:
+                    try:
+                        last = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").timestamp()
+                    except ValueError:
+                        pass
+    except FileNotFoundError:
+        return None
+    return last
+
+
+_SINCE_REL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw])\s*$", re.IGNORECASE)
+_SINCE_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_since(spec: str) -> float | None:
+    """Parse a --since value into an epoch cutoff.
+
+    Accepts a relative age ("7d", "24h", "30m"), an ISO datetime
+    ("2026-05-20" or "2026-05-20 14:30:00"), or a raw epoch number.
+    Returns None if it cannot be parsed.
+    """
+    spec = spec.strip()
+    if not spec:
+        return None
+    m = _SINCE_REL_RE.match(spec)
+    if m:
+        value = float(m.group(1))
+        unit = m.group(2).lower()
+        return datetime.now().timestamp() - value * _SINCE_UNIT_SECONDS[unit]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(spec, fmt).timestamp()
+        except ValueError:
+            continue
+    try:
+        return float(spec)
+    except ValueError:
+        return None
+
+
 # ─────────────────────────────────────────────
 # PER-SERIES WORKER  (called in thread pool)
 # ─────────────────────────────────────────────
@@ -822,6 +1162,7 @@ def _process_series_dir(
     processed: set[str],
     rules: set[str] = ALL_RULES,
     progress: ProgressReporter | None = None,
+    dry_run: bool = False,
 ) -> tuple[int, int, int, int]:
     """
     Process one series directory.  Returns (processed, renamed, skipped, comp_fixed).
@@ -835,7 +1176,12 @@ def _process_series_dir(
         log.warning(f"  Skipping rename: cleaning '{comic_dir.name}' produced an empty name.")
     elif clean_dir_name != comic_dir.name:
         new_dir_path = comic_dir.parent / clean_dir_name
-        if new_dir_path.exists():
+        if dry_run:
+            log.info(
+                f"    [DRY RUN] Would rename directory: "
+                f"'{comic_dir.name}' -> '{clean_dir_name}'"
+            )
+        elif new_dir_path.exists():
             log.info(f"    Directory conflict: '{clean_dir_name}' already exists - merging.")
             _merge_directories(comic_dir, new_dir_path)
             cbz_files = [new_dir_path / f.name for f in cbz_files if (new_dir_path / f.name).exists()]
@@ -843,7 +1189,8 @@ def _process_series_dir(
             comic_dir.rename(new_dir_path)
             log.info(f"    Directory renamed: '{comic_dir.name}' -> '{clean_dir_name}'")
             cbz_files = [new_dir_path / f.name for f in cbz_files]
-        comic_dir = new_dir_path
+        if not dry_run:
+            comic_dir = new_dir_path
 
     empty_stem_files = [
         cbz for cbz in cbz_files
@@ -873,20 +1220,26 @@ def _process_series_dir(
                 continue
             original_name = cbz.name
             override = fallback_names.get(cbz)
-            result_path = process_cbz_file(cbz, override_name=override, rules=rules)
-            save_progress(str(result_path))
+            result_path = process_cbz_file(
+                cbz,
+                override_name=override,
+                rules=rules,
+                dry_run=dry_run,
+            )
+            if not dry_run:
+                save_progress(str(result_path))
             total_processed += 1
             if result_path.name != original_name:
                 total_renamed += 1
             ch = extract_chapter(result_path.stem)
             if ch is not None:
-                dir_num_to_path[ch] = result_path
+                dir_num_to_path[ch] = cbz if dry_run else result_path
         finally:
             if progress:
                 progress.step()
 
     n = detect_and_fix_compilations(
-        comic_dir, dry_run=False, num_to_path=dir_num_to_path or None
+        comic_dir, dry_run=dry_run, num_to_path=dir_num_to_path or None
     )
     if n:
         log.info(f"    Fixed {n} compilation chapter(s).")
@@ -905,6 +1258,8 @@ def sanitize_directory(
     workers: int,
     rules: set[str] = ALL_RULES,
     progress: ProgressReporter | None = None,
+    cutoff: float | None = None,
+    dry_run: bool = False,
 ) -> None:
     log.info("=" * 60)
     log.info(f"Scanning: {dir_path.name}")
@@ -914,11 +1269,22 @@ def sanitize_directory(
         return
 
     cbz_dirs: dict[Path, list[Path]] = {}
+    skipped_stale = 0
     for cbz in sorted(dir_path.rglob("*.cbz")):
+        if cutoff is not None:
+            try:
+                if cbz.stat().st_mtime < cutoff:
+                    skipped_stale += 1
+                    continue
+            except OSError:
+                pass
         cbz_dirs.setdefault(cbz.parent, []).append(cbz)
 
+    if cutoff is not None and skipped_stale:
+        log.info(f"  Incremental: skipped {skipped_stale} file(s) older than the cutoff.")
+
     if not cbz_dirs:
-        log.info(f"  No .cbz files found under '{dir_path.name}', skipping.")
+        log.info(f"  No .cbz files to process under '{dir_path.name}', skipping.")
         return
 
     log.info(f"  Found .cbz files in {len(cbz_dirs)} directory(s). Using {workers} worker(s).")
@@ -929,7 +1295,9 @@ def sanitize_directory(
         # Serial path — identical to original behaviour
         for comic_dir, cbz_files in sorted(cbz_dirs.items()):
             log.info(f"  Directory: {comic_dir.name} ({len(cbz_files)} file(s))")
-            p, r, s, c = _process_series_dir(comic_dir, cbz_files, processed, rules, progress)
+            p, r, s, c = _process_series_dir(
+                comic_dir, cbz_files, processed, rules, progress, dry_run
+            )
             total_processed += p; total_renamed += r
             total_skipped += s;   total_comp_fixed += c
     else:
@@ -937,7 +1305,15 @@ def sanitize_directory(
         items = sorted(cbz_dirs.items())
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_dir = {
-                executor.submit(_process_series_dir, comic_dir, cbz_files, processed, rules, progress): comic_dir
+                executor.submit(
+                    _process_series_dir,
+                    comic_dir,
+                    cbz_files,
+                    processed,
+                    rules,
+                    progress,
+                    dry_run,
+                ): comic_dir
                 for comic_dir, cbz_files in items
             }
             for future in as_completed(future_to_dir):
@@ -965,7 +1341,6 @@ def main():
     # ── Parse args ────────────────────────────────────────────────────────────
     args_raw = sys.argv[1:]
     restart  = "--restart"      in args_raw
-    resume   = "--resume"       in args_raw
     dry_run  = "--dry-run"      in args_raw
 
     # --rules=url,brackets,... restricts which cleaning rules run.
@@ -976,7 +1351,7 @@ def main():
             active_rules = parse_rules(arg.split("=", 1)[1])
             break
 
-    # --scan=<path> or --scan <path> overrides the hardcoded SCAN_FOLDER
+    # --scan=<path> or --scan <path> overrides the default SCAN_FOLDER
     scan_folder_override = None
     for i, arg in enumerate(args_raw):
         if arg.startswith("--scan="):
@@ -1025,17 +1400,48 @@ def main():
         print(f"ERROR: Unknown --sort mode '{sort_mode}'. Valid: {', '.join(sorted(_VALID_SORTS))}")
         return
 
+    # Incremental scanning: only look at files modified/added since the last run
+    # (or since --since=<spec>). Defaults ON for the "newest" sort, since that is
+    # the mode whose whole point is "just handle the recent stuff". --full forces
+    # a complete rescan; --incremental forces incremental even for other sorts.
+    since_spec = None
+    for arg in args_raw:
+        if arg.startswith("--since="):
+            since_spec = arg.split("=", 1)[1].strip()
+            break
+    force_full = "--full" in args_raw
+    force_incremental = ("--incremental" in args_raw) or (since_spec is not None)
+    incremental = (not restart) and (not force_full) and (force_incremental or sort_mode == "newest")
+
     if restart:
-        clear_progress()
+        if dry_run:
+            log.info("  [DRY RUN] Would clear the sanitizer progress file.")
+        else:
+            clear_progress()
         processed = set()
-        log.info("  --restart flag: progress file cleared, starting from scratch.")
+        log.info("  --restart flag: starting from scratch.")
     else:
         # Always resume from accumulated history; --resume flag is now a no-op
         # (kept for backwards compatibility) since progress is always persistent.
         processed = load_progress()
 
+    # Resolve the incremental cutoff BEFORE init_progress_file() appends this
+    # run's session header, so an explicit cutoff reflects the *previous* run.
+    cutoff: float | None = None
+    if incremental:
+        if since_spec is not None:
+            cutoff = parse_since(since_spec)
+            if cutoff is None:
+                print(f"ERROR: Could not parse --since='{since_spec}'. Use e.g. 7d, 24h, 2026-05-20, or an epoch.")
+                return
+        else:
+            cutoff = load_last_session_time()
+            if cutoff is None:
+                log.info("  Incremental requested but no prior session found — doing a full scan this time.")
+
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    init_progress_file(started)
+    if not dry_run:
+        init_progress_file(started)
 
     _sort_labels = {
         "newest":        "modification time, newest first",
@@ -1054,8 +1460,15 @@ def main():
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer started")
+    if dry_run:
+        log.info("  Mode     : DRY RUN - no files or progress state will be modified")
     log.info(f"  Scanning : {effective_folder}")
     log.info(f"  Sort     : {_sort_labels[sort_mode]}")
+    if cutoff is not None:
+        _cut_str = datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
+        log.info(f"  Mode     : incremental — only files modified since {_cut_str}")
+    else:
+        log.info(f"  Mode     : full scan")
     log.info(f"  Workers  : {workers}")
     log.info(f"  Rules    : {', '.join(sorted(active_rules)) if active_rules != ALL_RULES else 'all'}")
     log.info(f"  Log      : {LOG_FILE}")
@@ -1063,11 +1476,34 @@ def main():
     log.info("=" * 60)
 
     scan_targets = subdirs or [scan_path]
-    total_cbz = sum(1 for target in scan_targets for _ in target.rglob("*.cbz"))
+
+    def _count_cbz(targets, cut: float | None) -> int:
+        n = 0
+        for t in targets:
+            for f in t.rglob("*.cbz"):
+                if cut is not None:
+                    try:
+                        if f.stat().st_mtime < cut:
+                            continue
+                    except OSError:
+                        pass
+                n += 1
+        return n
+
+    total_cbz = _count_cbz(scan_targets, cutoff)
     progress = ProgressReporter(total_cbz, "files")
 
     for target in scan_targets:
-        sanitize_directory(target, processed, started, workers, active_rules, progress)
+        sanitize_directory(
+            target,
+            processed,
+            started,
+            workers,
+            active_rules,
+            progress,
+            cutoff=cutoff,
+            dry_run=dry_run,
+        )
 
     log.info("=" * 60)
     log.info("CBZ Sanitizer complete.")

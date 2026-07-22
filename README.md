@@ -10,16 +10,28 @@
 
 ```
 cbz-automation-suite/
+├── apps/
+│   └── cbz_gui.py                  # GUI launcher for the CBZ tools
 ├── scripts/
 │   ├── cbz_watcher.py              # Live watcher — main day-to-day tool
 │   ├── cbz_sanitizer.py            # Batch sanitizer — canonical shared-function reference
 │   ├── cbz_library_maintenance.py  # Consolidated archive cleanup, organization, metadata repair
+│   ├── cbz_workflows.py            # Unified series and library-maintenance workflows
 │   ├── cbz_compilation_resolver.py # Resolve compilation vs individual chapter overlaps
 │   ├── cbz_gap_checker.py          # Report missing chapter numbers per series
 │   └── cbz_core.py                 # Shared filename and ComicInfo helpers
 ├── config/
 │   ├── run_watcher.bat             # Double-click launcher
 │   └── CBZWatcher_Task.xml         # Windows Task Scheduler import
+├── tools/
+│   ├── comics/                     # Standalone PowerShell comic helpers
+│   ├── directory_mirroring/        # Mirror/sync utility scripts
+│   ├── plex/                       # Plex media organization helpers
+│   └── apply_doc_updates.ps1       # Documentation update helper
+├── integrations/
+│   └── komf/                       # KOMF config and userscript
+├── data/
+│   └── reports/                    # Historical generated reports worth keeping
 ├── docs/
 │   ├── overview.md
 │   ├── cbz_sanitizer.md
@@ -30,6 +42,7 @@ cbz-automation-suite/
 │   └── CBZ_Automation_Suite_Documentation.docx
 ├── Logs/                           # committed folder; contents gitignored
 │   └── .gitkeep
+├── archive/                        # old backups and patch bundles
 ├── README.md
 └── requirements.txt
 ```
@@ -41,12 +54,8 @@ cbz-automation-suite/
 | Script | Recursive? | Workers? | Purpose |
 |--------|-----------|----------|---------|
 | `cbz_watcher.py` | Always | — | Live watcher — monitors an Incoming folder, cleans filenames, injects `ComicInfo.xml` metadata, and routes files to the correct destination |
-| `cbz_sanitizer.py` | Always | **Yes** | Batch sanitizer — walks a library folder and applies the full cleaning/tagging pipeline in-place; supports `--sort`, `--restart`, `--dry-run`, `--workers`, and `--rules` |
-| `cbz_library_maintenance.py archive-clean` | Configurable | **Yes** | Removes duplicate `.cbz`/`.cbr` archives, strips duplicate filename tokens, and packs loose image folders |
-| `cbz_library_maintenance.py organize-series` | Configurable | **Yes** | Merges split chapter folders, auto-merges near-duplicate series folders, repairs merged ComicInfo, fixes likely compilation ranges, and can move censored/uncensored or possible same-series groups to `_Check/` |
-| `cbz_library_maintenance.py metadata` | Always | **Yes** | Retroactively repairs `<Title>`, `<Series>`, `<Number>`, and `<Volume>` from filenames and folders |
-| `cbz_library_maintenance.py all` | Mixed | **Yes** | Runs archive cleanup, series organization, and metadata repair in one pass |
-| `cbz_compilation_resolver.py` | **Yes — default** | **Yes** | Detects compilation/individual chapter overlaps; performs page-by-page quality comparison and rewrites compilations with the best pages |
+| `cbz_workflows.py maintenance` | Mixed | **Yes** | Unified sanitizer, archive cleanup, organization, metadata repair, and name repair workflow |
+| `cbz_workflows.py series` | Mixed | **Yes** | Unified series organizer, similar-series staging/review, and page-level compilation resolver workflow |
 | `cbz_gap_checker.py` | **Yes — default** | **Yes** | Scans library folders and writes a timestamped CSV report of missing chapter numbers per series |
 
 ---
@@ -65,10 +74,10 @@ pip install watchdog
 
 ## Quick Start
 
-All scripts live in `scripts/`. Run them from the repo root:
+Run commands from the repo root:
 
 ```powershell
-cd C:\git\ComicAutomation
+cd C:\Users\David.Johnson\Documents\ComicAutomation
 ```
 
 ### Live Watcher
@@ -77,11 +86,12 @@ Edit the constants at the top of `scripts\cbz_watcher.py`:
 
 ```python
 WATCH_FOLDER  = r"C:\Comics\Incoming"
-LOG_FILE      = r"C:\git\ComicAutomation\Logs\cbz_watcher.log"
-ROUTING_FILE  = r"C:\git\ComicAutomation\routing.json"
+REPO_ROOT     = Path(__file__).resolve().parents[1]
+LOG_FILE      = REPO_ROOT / "Logs" / "cbz_watcher.log"
+ROUTING_FILE  = REPO_ROOT / "routing.json"
 ```
 
-Copy `config\routing.example.json` to `C:\git\ComicAutomation\routing.json` and set your destinations and rules:
+Copy `config\routing.example.json` to `routing.json` in the repo root and set your destinations and rules:
 
 ```json
 {
@@ -95,6 +105,14 @@ Copy `config\routing.example.json` to `C:\git\ComicAutomation\routing.json` and 
   ]
 }
 ```
+
+### GUI Launcher
+
+```powershell
+python apps\cbz_gui.py
+```
+
+### Routing Setup
 
 ```powershell
 python scripts\cbz_watcher.py
@@ -115,6 +133,21 @@ python scripts\cbz_sanitizer.py --rules=leading_nums,trailing_junk  # run specif
 python scripts\cbz_sanitizer.py --rules=comicinfo             # only update ComicInfo.xml
 ```
 
+### Unified Workflows
+
+```powershell
+# Complete maintenance pass; remove stages for a targeted run.
+python scripts\cbz_workflows.py maintenance "\\tower\media\comics\Comix" --dry-run
+python scripts\cbz_workflows.py maintenance "\\tower\media\comics\Comix" --stages=sanitize,metadata,names
+
+# Organize, stage similar series, generate a review proposal, and resolve compilations.
+python scripts\cbz_workflows.py series "\\tower\media\comics\Comix" --dry-run --stages=organize,stage,review,compilations
+```
+
+The GUI exposes these as **Library Maintenance** and **Series Workflow**.
+Existing individual script commands remain available for scheduled jobs and
+backward compatibility.
+
 ### Library Maintenance
 
 ```powershell
@@ -130,7 +163,7 @@ python scripts\cbz_library_maintenance.py all "\\tower\media\comics\Comix" --dry
 
 ```powershell
 cd "C:\Users\David.Johnson\ComicAutomation"
-powershell -ExecutionPolicy Bypass -File "<unzipped-package>\tools\apply_doc_updates.ps1" -RepoRoot "."
+powershell -ExecutionPolicy Bypass -File ".\tools\apply_doc_updates.ps1" -RepoRoot "."
 ```
 
 The script creates a timestamped backup of your current `docs/` folder before overwriting files.
@@ -161,6 +194,15 @@ The default is `min(8, cpu_count)`. Pass `--workers 1` to restore fully serial b
 All tools share a common `sanitize()` pipeline (defined in `cbz_sanitizer.py`) that strips non-Latin/non-Greek/non-emoji characters (covering CJK, Arabic, Cyrillic, full-width forms, etc.), bracketed group and publisher tags, website patterns, scanner/scanlation credits, trailing G-code suffixes, and normalises whitespace. See [docs/shared_pipeline.md](docs/shared_pipeline.md) for the full step-by-step breakdown.
 
 `ComicInfo.xml` is created or updated with `<Title>`, `<Series>`, `<Number>`, and `<Volume>` tags derived from the filename and directory name.
+
+Japanese, Chinese, and Korean titles are translated to English before filename
+and metadata normalization when no separate English title is already present.
+Native-script titles are translated automatically; romanized titles are handled
+when language detection identifies Japanese, Korean, or Chinese. Existing
+original-language values are retained in `<AlternateSeries>` and `<Notes>`.
+Set `CBZ_TRANSLATION_ENABLED=0` to disable online translation; native-script
+titles are preserved unchanged when translation is unavailable. Set
+`CBZ_TRANSLITERATE_FALLBACK=1` to opt into offline transliteration instead.
 
 The sanitizer also supports `--rules=<list>` to run only specific cleaning rules — useful for targeted passes:
 
@@ -206,7 +248,7 @@ On any filename collision during a merge or move, **the larger file is always ke
 
 ## Logs
 
-All logs go to `C:\git\ComicAutomation\Logs\`. The folder is committed to git so it always exists on a fresh clone — no manual creation needed.
+All logs go to `Logs\` under the repo root. The folder is committed to git so it always exists on a fresh clone — no manual creation needed.
 
 | Log file | Script |
 |----------|--------|

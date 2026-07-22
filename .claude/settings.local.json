@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python scripts/cbz_library_maintenance.py rename --dry-run --workers 1 \"\\\\\\\\tower\\\\media\\\\comics\\\\Comix\")",
+      "Bash(Select-String -Pattern \"Would rename|Rename complete\")",
+      "Bash(Select-Object -First 30)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['scripts/cbz_core.py','scripts/cbz_library_maintenance.py','scripts/cbz_watcher.py']]; print\\('syntax OK'\\)\")",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -m pip install pytest -q)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/cbz_library_maintenance.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(gh repo *)",
+      "Bash(gh api *)",
+      "Bash(gh release *)"
+    ]
+  }
+}

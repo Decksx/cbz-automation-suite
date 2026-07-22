@@ -30,7 +30,7 @@ The CBZ Automation Suite is a collection of Python scripts for monitoring, clean
 | `scripts/cbz_library_maintenance.py metadata` | Always (`rglob`) | **Yes** | Retroactively repairs `<Title>`, `<Series>`, `<Number>`, and `<Volume>` tags from filenames | [other_tools.md](other_tools.md#cbz_library_maintenancepy) |
 | `scripts/cbz_compilation_resolver.py` | **Yes — default** | **Yes** | Resolves compilation vs individual overlaps; rewrites with best pages | [other_tools.md](other_tools.md#cbz_compilation_resolverpy) |
 | `scripts/cbz_gap_checker.py` | **Yes — default** | **Yes** | Scans library, outputs timestamped CSV of missing chapter numbers to `Logs/` | [other_tools.md](other_tools.md#cbz_gap_checkerpy) |
-| `config/routing.example.json` | — | — | Template for `routing.json` — copy to `C:\\git\\ComicAutomation\routing.json` and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
+| `config/routing.example.json` | — | — | Template for `routing.json` — copy to the repo root and edit | [cbz_watcher.md](cbz_watcher.md#routing) |
 | `config/run_watcher.bat` | — | — | Double-click launcher — installs watchdog and starts the watcher | — |
 | `config/CBZWatcher_Task.xml` | — | — | Windows Task Scheduler import — auto-starts watcher on login | — |
 
@@ -60,6 +60,7 @@ Run from the repo root:
 
 ```powershell
 cd "C:\Users\David.Johnson\ComicAutomation"
+python apps\cbz_gui.py
 python scripts\cbz_sanitizer.py --dry-run
 python scripts\cbz_watcher.py
 ```
@@ -70,6 +71,8 @@ python scripts\cbz_watcher.py
 
 ```text
 cbz-automation-suite/
+├── apps/
+│   └── cbz_gui.py                  # GUI launcher
 ├── scripts/
 │   ├── cbz_watcher.py              # Live watcher (main tool)
 │   ├── cbz_sanitizer.py            # Canonical shared-function reference
@@ -78,9 +81,18 @@ cbz-automation-suite/
 │   ├── cbz_gap_checker.py
 │   └── cbz_core.py
 ├── config/
-│   ├── routing.example.json        # Template — copy to C:\git\ComicAutomation\routing.json
+│   ├── routing.example.json        # Template — copy to routing.json in the repo root
 │   ├── run_watcher.bat
 │   └── CBZWatcher_Task.xml
+├── tools/
+│   ├── comics/                     # Standalone comic PowerShell helpers
+│   ├── directory_mirroring/        # Mirror/sync PowerShell utilities
+│   ├── plex/                       # Plex media organization helpers
+│   └── apply_doc_updates.ps1
+├── integrations/
+│   └── komf/                       # KOMF config and userscript
+├── data/
+│   └── reports/                    # Historical generated reports worth keeping
 ├── docs/
 │   ├── overview.md                 <- this file
 │   ├── cbz_sanitizer.md
@@ -91,21 +103,19 @@ cbz-automation-suite/
 │   └── CBZ_Automation_Suite_Documentation.docx
 ├── Logs/                           # folder committed; contents gitignored
 │   └── .gitkeep
-├── progress_tracking/              # folder committed; contents gitignored
-│   ├── cbz_sanitizer_progress.json
-│   ├── Newest1st_cbz_sanitizer_progress.json
-│   └── Oldestfirstcbz_sanitizer_progress.json
+├── progress_tracking/              # local runtime state; contents gitignored
+├── archive/                        # old backups and patch bundles
 ├── README.md
 └── requirements.txt
 ```
 
-> **Runtime files** — `routing.json` lives at `C:\\git\\ComicAutomation\` and is excluded from git. Logs live in `Logs\` — the folder is committed (via `Logs\.gitkeep`) but the log contents are gitignored. Progress JSONs live in `progress_tracking\` — the folder is committed but the JSON contents are gitignored.
+> **Runtime files** — `routing.json` lives in the repo root and is excluded from git. Logs live in `Logs\` — the folder is committed (via `Logs\.gitkeep`) but the log contents are gitignored. Progress JSONs live in `progress_tracking\` and are gitignored.
 
 ---
 
 ## Logs
 
-All tools write rotating logs (max 5 MB, 3 backups) to `C:\git\ComicAutomation\Logs\`. The `Logs\` folder is committed to git (via `.gitkeep`) so it always exists on a fresh clone — no manual creation needed. Log file contents are gitignored. Configure `LOG_FILE` at the top of each script.
+All tools write rotating logs (max 5 MB, 3 backups) to `Logs\` under the repo root. The `Logs\` folder is committed to git (via `.gitkeep`) so it always exists on a fresh clone — no manual creation needed. Log file contents are gitignored. Configure `LOG_FILE` at the top of each script.
 
 | Log file | Script |
 |----------|--------|

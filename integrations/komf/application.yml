@@ -1,0 +1,86 @@
+komga:
+  baseUri: KOMF_KOMGA_BASE_URI
+  komgaUser: KOMF_KOMGA_USER
+  komgaPassword: KOMF_KOMGA_PASSWORD
+  eventListener:
+    enabled: true
+    libraries: []  # empty = listen to all libraries
+  notifications:
+    libraries: []
+  metadataUpdate:
+    default:
+      libraryType: "MANGA"  # MANGA covers everything except novels; use "COMIC" per-library for western comics
+      updateModes: [ API ]
+      aggregate: true        # combine metadata from all enabled providers
+      mergeTags: true
+      mergeGenres: true
+      bookCovers: true
+      seriesCovers: true
+      overrideExistingCovers: true
+      postProcessing:
+        seriesTitle: true
+        seriesTitleLanguage: "en"
+        alternativeSeriesTitles: true
+        alternativeSeriesTitleLanguages:
+          - "en"
+          - "ja"
+          - "ja-ro"
+        orderBooks: true
+        scoreTag: false
+        readingDirectionValue:  # leave blank for mixed library; set RIGHT_TO_LEFT or LEFT_TO_RIGHT per-library if needed
+        languageValue: "en"
+
+database:
+  file: ./database.sqlite
+
+metadataProviders:
+  malClientId: KOMF_METADATA_PROVIDERS_MAL_CLIENT_ID
+  comicVineApiKey: KOMF_METADATA_PROVIDERS_COMIC_VINE_API_KEY
+  defaultProviders:
+    mangaUpdates:
+      priority: 10
+      enabled: true
+      mediaType: "MANGA"
+      authorRoles: [ "WRITER" ]
+      artistRoles: [ "PENCILLER","INKER","COLORIST","LETTERER","COVER" ]
+    mal:
+      priority: 20
+      enabled: false
+      mediaType: "MANGA"
+    nautiljon:
+      priority: 30
+      enabled: false
+    aniList:
+      priority: 40
+      enabled: true
+      mediaType: "MANGA"
+      tagsScoreThreshold: 60
+      tagsSizeLimit: 15
+    yenPress:
+      priority: 50
+      enabled: false
+      mediaType: "MANGA"
+    kodansha:
+      priority: 60
+      enabled: false
+    viz:
+      priority: 70
+      enabled: false
+    bookWalker:
+      priority: 80
+      enabled: false
+      mediaType: "MANGA"
+    mangaDex:
+      priority: 90
+      enabled: true
+    bangumi:
+      priority: 100
+      enabled: false
+    comicVine:
+      priority: 110
+      enabled: false
+
+server:
+  port: 8085
+
+logLevel: KOMF_LOG_LEVEL

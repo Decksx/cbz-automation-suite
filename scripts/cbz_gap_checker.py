@@ -1,12 +1,8 @@
 """
-cbz_gap_checker.py — CBZ Gap Checker (parallelised)
+cbz_gap_checker.py — CBZ Gap Checker.
 
-Changes in this version
-────────────────────────
-• --workers N  (default: min(8, cpu_count)).  Pass --workers 1 for serial.
-• Each series directory is scanned in parallel (I/O-bound filename reads).
-• Results are aggregated after all futures complete — no shared state.
-• --no-recursive still supported (via scan_folder's existing recursive logic).
+Scans each series directory in parallel and writes a timestamped CSV report of
+missing chapter numbers. Results are aggregated after worker completion.
 """
 
 from __future__ import annotations
@@ -26,7 +22,8 @@ from datetime import datetime
 SCAN_FOLDERS = [
     r"\\tower\media\comics\Comix",
 ]
-OUTPUT_FOLDER = r"C:\git\ComicAutomation\Logs"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_FOLDER = REPO_ROOT / "Logs"
 GAP_THRESHOLD = 1
 MIN_ISSUES_TO_REPORT = 2
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
@@ -88,10 +85,11 @@ def find_gaps(numbers: list[float]) -> list[str]:
     first = numbers[0]
     if first > 1:
         missing_before = list(range(1, int(first)))
-        if len(missing_before) == 1:
-            gaps.append(format_number(missing_before[0]))
-        else:
-            gaps.append(f"1-{format_number(missing_before[-1])}")
+        if missing_before:
+            if len(missing_before) == 1:
+                gaps.append(format_number(missing_before[0]))
+            else:
+                gaps.append(f"1-{format_number(missing_before[-1])}")
     if len(numbers) < 2:
         return gaps
     for i in range(len(numbers) - 1):
@@ -264,7 +262,15 @@ def main():
             except ValueError:
                 pass
 
-    targets = [a for a in raw_args if not a.startswith("--")] or SCAN_FOLDERS
+    skip_indices = set()
+    for i, arg in enumerate(raw_args):
+        if arg == "--workers" and i + 1 < len(raw_args):
+            skip_indices.add(i + 1)
+
+    targets = [
+        a for i, a in enumerate(raw_args)
+        if not a.startswith("--") and i not in skip_indices
+    ] or SCAN_FOLDERS
 
     print("=" * 60)
     print(f"CBZ Gap Checker  (workers={workers})")

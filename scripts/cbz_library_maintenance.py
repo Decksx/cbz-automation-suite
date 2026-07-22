@@ -24,6 +24,7 @@ Specialized tools that remain separate for now:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -35,6 +36,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -47,7 +49,10 @@ try:
         extract_chapter_number,
         extract_volume_number,
         is_generic_title,
+        normalise_archive_key,
         parse_comic_name,
+        repair_mojibake,
+        series_base_name,
         update_comicinfo_xml,
     )
 except ModuleNotFoundError:
@@ -57,15 +62,70 @@ except ModuleNotFoundError:
         extract_chapter_number,
         extract_volume_number,
         is_generic_title,
+        normalise_archive_key,
         parse_comic_name,
+        repair_mojibake,
+        series_base_name,
         update_comicinfo_xml,
     )
 
 
-LOG_FILE = r"C:\git\ComicAutomation\Logs\cbz_library_maintenance.log"
+REPO_ROOT              = Path(__file__).resolve().parents[1]
+LOG_FILE               = REPO_ROOT / "Logs" / "cbz_library_maintenance.log"
+SERIES_EXCLUSIONS_FILE = REPO_ROOT / "Logs" / "series_exclusions.json"
 DEFAULT_WORKERS = min(8, os.cpu_count() or 4)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tiff", ".tif"}
 CHECK_FOLDER_NAME = "_Check"
+
+# ─────────────────────────────────────────────
+# ACTION PLAN RECORDER  (dry-run -> save -> replay without re-scanning)
+# ─────────────────────────────────────────────
+# When a plan is "open", the mutation primitives record the concrete file
+# operations they *would* perform during a dry run, instead of only logging
+# them. The plan can then be saved to JSON and replayed by the 'apply-plan'
+# subcommand, so a confirmed dry run is executed without re-scanning the library.
+_PLAN: list[dict] | None = None
+_PLAN_LOCK = threading.Lock()
+
+
+def plan_open() -> None:
+    """Begin recording actions into a fresh in-memory plan."""
+    global _PLAN
+    _PLAN = []
+
+
+def plan_is_open() -> bool:
+    return _PLAN is not None
+
+
+def plan_record(op: str, **fields) -> None:
+    """Append one action to the active plan (no-op when no plan is open)."""
+    if _PLAN is None:
+        return
+    entry = {"op": op}
+    for k, v in fields.items():
+        entry[k] = str(v) if isinstance(v, Path) else v
+    with _PLAN_LOCK:
+        _PLAN.append(entry)
+
+
+def plan_save(path: Path, meta: dict | None = None) -> int:
+    """Write the active plan to *path* as JSON. Returns the number of actions."""
+    actions = _PLAN or []
+    data = {
+        "version": 1,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        **(meta or {}),
+        "actions": actions,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        log.info("  Plan written: %s  (%d action(s))", path, len(actions))
+    except OSError as e:
+        log.error("  Could not write plan file %s: %s", path, e)
+    return len(actions)
 
 _DUP_LABEL_FRAG = r"(?:ver(?:sion)?|v|ch(?:ap(?:ter)?)?|episode|ep|vol(?:ume)?|part|pt)"
 _DUP_LABEL_NUM_RE = re.compile(
@@ -76,25 +136,14 @@ _DUP_BARE_NUM_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s+\1\b")
 _SPACED_PUNCT_RE = re.compile(r"([!?.])(?: +\1)+")
 _ASYM_HYPH_L_RE = re.compile(r"(\S) -(\S)")
 _ASYM_HYPH_R_RE = re.compile(r"(\S)- (\S)")
-_ARCHIVE_NORM_RE = re.compile(r"[\s\-_.,!?'\"]+")
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _SPACES_RE = re.compile(r"\s+")
 _MARKER_WORDS_RE = re.compile(r"\b(uncensored|decensored)\b", re.IGNORECASE)
-_TRAILING_TOKEN_RE = re.compile(
-    r"[\s_\-]*(?:"
-    r"ch(?:ap(?:ter)?)?p?\.?\s*\d[\d.]*"
-    r"|issue\s*\d[\d.]*"
-    r"|ep(?:isode)?\.?\s*\d[\d.]*"
-    r"|vol(?:ume)?\.?\s*\d[\d.]*"
-    r"|v\d[\d.]*(?=\s*$)"
-    r"|\d+$"
-    r")[\s_\-.,]*$",
-    re.IGNORECASE,
-)
 _CHAPTER_TOKEN_RE = re.compile(r"(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Configure a rotating file handler and a stderr stream handler; return the logger."""
     log = logging.getLogger("cbz_library_maintenance")
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
     log.handlers.clear()
@@ -164,6 +213,7 @@ class MaintenanceStats:
 
 
 def iter_dirs_with_files(root: Path, recursive: bool = True) -> list[Path]:
+    """Return every unique parent directory that contains at least one file under *root*."""
     if not root.exists():
         return []
     pattern = "**/*" if recursive else "*"
@@ -184,10 +234,17 @@ def iter_series_dirs(root: Path) -> list[Path]:
 
 
 def natural_key(path: Path):
+    """Sort key that orders numeric runs as integers so '10' sorts after '9'."""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
 
 
 def clean_duplicate_tokens(name: str) -> str:
+    """Remove repeated label/number fragments from a filename stem.
+
+    Handles three classes of duplication: labeled tokens (e.g. "Ch.5 Ch 5"),
+    bare repeated numbers (e.g. "12 12"), and spaced repeated punctuation
+    (e.g. "!! !"). Also normalises asymmetric hyphens to "word-word" form.
+    """
     def replace_labeled(m: re.Match) -> str:
         first = m.group(1)
         num2 = m.group(2)
@@ -210,11 +267,8 @@ def clean_duplicate_tokens(name: str) -> str:
     return re.sub(r"  +", " ", s).strip()
 
 
-def normalise_archive_key(stem: str) -> str:
-    return _ARCHIVE_NORM_RE.sub("", stem.lower())
-
-
 def normalise_series_key(name: str) -> str:
+    """Strip censorship markers, punctuation, and extra whitespace for fuzzy series-name comparison."""
     name = _MARKER_WORDS_RE.sub("", name)
     name = name.lower()
     name = _PUNCT_RE.sub(" ", name)
@@ -222,10 +276,12 @@ def normalise_series_key(name: str) -> str:
 
 
 def fmt_number(value: float) -> str:
+    """Format a float as an integer string when it is whole (e.g. 5.0 -> '5'), else as a float string."""
     return str(int(value)) if value == int(value) else str(value)
 
 
 def extract_chapter_float(stem: str) -> float | None:
+    """Parse a chapter number from a filename stem and return it as a float, or None if absent."""
     chapter = extract_chapter_number(stem)
     if chapter is None:
         return None
@@ -236,9 +292,15 @@ def extract_chapter_float(stem: str) -> float | None:
 
 
 def larger_file_wins(src: Path, dest: Path, dry_run: bool) -> str:
+    """Move *src* to *dest*, keeping whichever file is larger on collision.
+
+    Returns 'moved' (no collision), 'replaced' (src was larger, dest overwritten),
+    or 'discarded' (dest was larger/equal, src removed).
+    """
     if not dest.exists():
         if dry_run:
             log.info("    [DRY RUN] Would move: %s -> %s", src.name, dest)
+            plan_record("file", src=src, dest=dest)
         else:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dest))
@@ -251,15 +313,20 @@ def larger_file_wins(src: Path, dest: Path, dry_run: bool) -> str:
         if not dry_run:
             dest.unlink()
             shutil.move(str(src), str(dest))
+        else:
+            plan_record("file", src=src, dest=dest)
         return "replaced"
 
     log.info("    Collision: existing larger/equal, discarding incoming: %s", src.name)
     if not dry_run:
         src.unlink()
+    else:
+        plan_record("file", src=src, dest=dest)
     return "discarded"
 
 
 def rename_duplicate_tokens_in_dir(folder: Path, dry_run: bool) -> MaintenanceStats:
+    """Apply clean_duplicate_tokens to every CBZ filename in *folder*, using larger_file_wins on collisions."""
     stats = MaintenanceStats()
     for cbz in sorted(folder.glob("*.cbz")):
         new_name = clean_duplicate_tokens(cbz.name)
@@ -268,6 +335,7 @@ def rename_duplicate_tokens_in_dir(folder: Path, dry_run: bool) -> MaintenanceSt
         dest = cbz.parent / new_name
         if dry_run:
             log.info("  [DRY RUN] Would rename: %s -> %s", cbz.name, new_name)
+            plan_record("file", src=cbz, dest=dest)
             stats.renamed += 1
         elif dest.exists():
             outcome = larger_file_wins(cbz, dest, dry_run=False)
@@ -282,41 +350,138 @@ def rename_duplicate_tokens_in_dir(folder: Path, dry_run: bool) -> MaintenanceSt
     return stats
 
 
-def dedupe_archives_in_dir(folder: Path, dry_run: bool) -> MaintenanceStats:
+def _normalise_meta_number(value: str) -> str:
+    """Normalise a ComicInfo Number/Volume value so '5', '05' and '5.0' compare equal."""
+    v = value.strip()
+    if not v:
+        return ""
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else str(f)
+    except ValueError:
+        return _SPACES_RE.sub(" ", v.lower())
+
+
+def _comicinfo_dup_key(cbz_path: Path) -> str | None:
+    """Return a duplicate key from a CBZ's ComicInfo.xml (Series + Volume + Number), or None.
+
+    Identifies the same issue/chapter even when filenames differ completely. Returns
+    None when the archive has no readable ComicInfo or lacks a Number — Series alone
+    would wrongly group an entire run, so a per-issue discriminator is required.
+
+    Title is intentionally not used: update_comicinfo_xml derives Title from the
+    filename stem, so duplicate files with different names also have different Titles.
+    """
+    _, xml = read_comicinfo(cbz_path)
+    if not xml:
+        return None
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+
+    def field(tag: str) -> str:
+        el = root.find(tag)
+        return (el.text or "").strip() if el is not None else ""
+
+    number = _normalise_meta_number(field("Number"))
+    if not number:
+        return None
+    series = normalise_series_key(field("Series"))
+    volume = _normalise_meta_number(field("Volume"))
+
+    # Corroborate with the chapter number parsed from the *filename*. Some sources
+    # populate ComicInfo <Number> inconsistently within one folder — e.g. a file
+    # named "Chapter 88 Ep. 1" gets Number=1 (the episode), colliding with a
+    # genuinely different "Chapter 1" file that also has Number=1. Two files are
+    # only the same chapter if their filenames agree on the chapter number too, so
+    # fold it in. When a filename has no parseable chapter we fall back to the
+    # metadata number alone (the original behaviour) rather than guessing.
+    fname_chapter = extract_chapter_number(cbz_path.stem)
+    if fname_chapter is not None:
+        fname_norm = _normalise_meta_number(str(fname_chapter))
+        if fname_norm and fname_norm != number:
+            # Filename disagrees with metadata Number — use the filename chapter as
+            # the authoritative discriminator so different chapters never collide.
+            return f"{series}|v{volume}|c{fname_norm}"
+    return f"{series}|v{volume}|n{number}"
+
+
+def _resolve_dup_group(
+    folder: Path,
+    group: list[Path],
+    dry_run: bool,
+    stats: MaintenanceStats,
+    by: str,
+) -> Path:
+    """Keep the largest CBZ (CBZ preferred over CBR) in *group*, delete the rest; return the keeper."""
+    cbz_files = [p for p in group if p.suffix.lower() == ".cbz"]
+    pool = cbz_files or group
+    keep = sorted(pool, key=lambda p: (-p.stat().st_size, p.name.lower()))[0]
+
+    log.info("  Duplicate group [%s] by %s, keep: %s", folder.name, by, keep.name)
+    for dup in group:
+        if dup == keep:
+            continue
+        if keep.suffix.lower() == ".cbz" and dup.suffix.lower() == ".cbr":
+            reason = "cbr superseded by cbz"
+        else:
+            reason = f"{by} duplicate"
+        if dry_run:
+            log.info("    [DRY RUN] Would delete (%s): %s", reason, dup.name)
+            plan_record("delete", path=dup, reason=reason)
+        else:
+            dup.unlink()
+            log.info("    Deleted (%s): %s", reason, dup.name)
+        stats.deleted += 1
+    return keep
+
+
+def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = True) -> MaintenanceStats:
+    """Delete duplicate CBZ/CBR files in *folder*, keeping the largest CBZ in each duplicate set.
+
+    Two passes:
+      1. Filename: files whose normalise_archive_key matches (insensitive to spacing
+         and punctuation, e.g. "Ch.1" vs "Ch. 1").
+      2. Metadata (when *use_metadata*): among the pass-1 survivors, CBZ files whose
+         ComicInfo.xml resolves to the same Series + Volume + Number — catches the
+         same chapter saved under completely different filenames.
+    """
     stats = MaintenanceStats()
     files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in {".cbz", ".cbr"}]
-    if not files:
+    if len(files) < 2:
         return stats
 
+    # Pass 1 — filename-key duplicates.
     by_key: dict[str, list[Path]] = {}
     for f in files:
         by_key.setdefault(normalise_archive_key(f.stem), []).append(f)
 
-    for key, group in by_key.items():
+    survivors: list[Path] = []
+    for group in by_key.values():
         if len(group) < 2:
-            continue
-
-        cbz_files = [p for p in group if p.suffix.lower() == ".cbz"]
-        if cbz_files:
-            keep = sorted(cbz_files, key=lambda p: (-p.stat().st_size, p.name.lower()))[0]
+            survivors.extend(group)
         else:
-            keep = sorted(group, key=lambda p: (-p.stat().st_size, p.name.lower()))[0]
+            survivors.append(_resolve_dup_group(folder, group, dry_run, stats, by="name"))
 
-        log.info("  Duplicate group [%s], keep: %s", folder.name, keep.name)
-        for dup in group:
-            if dup == keep:
-                continue
-            reason = "cbr superseded by cbz" if keep.suffix.lower() == ".cbz" and dup.suffix.lower() == ".cbr" else "duplicate"
-            if dry_run:
-                log.info("    [DRY RUN] Would delete (%s): %s", reason, dup.name)
-            else:
-                dup.unlink()
-                log.info("    Deleted (%s): %s", reason, dup.name)
-            stats.deleted += 1
+    # Pass 2 — ComicInfo metadata duplicates among survivors.
+    if use_metadata and len(survivors) > 1:
+        by_meta: dict[str, list[Path]] = {}
+        for f in survivors:
+            if f.suffix.lower() != ".cbz":
+                continue  # CBR (RAR) cannot be opened as a zip to read ComicInfo
+            key = _comicinfo_dup_key(f)
+            if key is not None:
+                by_meta.setdefault(key, []).append(f)
+        for group in by_meta.values():
+            if len(group) >= 2:
+                _resolve_dup_group(folder, group, dry_run, stats, by="metadata")
+
     return stats
 
 
 def is_packable_image_folder(folder: Path) -> bool:
+    """Return True if *folder* contains only image files (and optionally ComicInfo.xml) with no subdirectories."""
     if not folder.is_dir():
         return False
     has_image = False
@@ -333,6 +498,11 @@ def is_packable_image_folder(folder: Path) -> bool:
 
 
 def pack_image_folder(folder: Path, dry_run: bool) -> MaintenanceStats:
+    """Zip a flat image folder into a CBZ archive beside it, then delete the source folder.
+
+    Writes to a .tmp.cbz first, then atomically renames. If a same-named CBZ already
+    exists, only replaces it when the newly packed archive is strictly larger.
+    """
     stats = MaintenanceStats()
     if not is_packable_image_folder(folder):
         return stats
@@ -345,6 +515,7 @@ def pack_image_folder(folder: Path, dry_run: bool) -> MaintenanceStats:
 
     if dry_run:
         log.info("  [DRY RUN] Would pack image folder: %s -> %s", folder.name, cbz_path.name)
+        plan_record("pack", folder=folder, dest=cbz_path)
         stats.packed += 1
         return stats
 
@@ -384,16 +555,38 @@ def pack_image_folder(folder: Path, dry_run: bool) -> MaintenanceStats:
 
 
 def archive_clean_worker(folder: Path, args: argparse.Namespace) -> MaintenanceStats:
+    """Run the enabled archive-clean passes (strip names, dedupe) for a single folder; safe to call from a thread.
+
+    A transient network/filesystem error on one folder (e.g. an SMB share blip,
+    WinError 59) is logged and counted as an error, never propagated — so one bad
+    folder cannot abort the entire run.
+    """
     stats = MaintenanceStats()
     log.info("Archive clean: %s", folder)
-    if args.strip_names:
-        stats.add(rename_duplicate_tokens_in_dir(folder, args.dry_run))
-    if args.dedupe_archives:
-        stats.add(dedupe_archives_in_dir(folder, args.dry_run))
+    try:
+        if args.strip_names:
+            stats.add(rename_duplicate_tokens_in_dir(folder, args.dry_run))
+        if args.dedupe_archives:
+            stats.add(
+                dedupe_archives_in_dir(
+                    folder, args.dry_run, use_metadata=getattr(args, "metadata_dedupe", True)
+                )
+            )
+    except OSError as exc:
+        log.error("  Skipping folder (filesystem/network error): %s — %s", folder, exc)
+        stats.errors += 1
     return stats
 
 
 def run_archive_clean(args: argparse.Namespace) -> int:
+    """Entry point for the 'archive-clean' subcommand.
+
+    Discovers all file-containing directories under the given paths, dispatches
+    archive_clean_worker in a thread pool, then packs loose image folders
+    (deepest-first to avoid parent/child races).
+    """
+    if args.dry_run and getattr(args, "plan_out", None):
+        plan_open()
     paths = [Path(p) for p in args.paths]
     dirs: set[Path] = set()
     for root in paths:
@@ -420,28 +613,35 @@ def run_archive_clean(args: argparse.Namespace) -> int:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(archive_clean_worker, d, args) for d in all_dirs]
             for fut in as_completed(futures):
-                stats.add(fut.result())
+                try:
+                    stats.add(fut.result())
+                except OSError as exc:
+                    log.error("  Worker filesystem/network error (skipped): %s", exc)
+                    stats.errors += 1
                 progress.step()
 
     if args.pack_loose_images:
         # Pack folders after duplicate archive cleanup to avoid parent/child races.
         for folder in pack_folders:
-            stats.add(pack_image_folder(folder, args.dry_run))
+            try:
+                stats.add(pack_image_folder(folder, args.dry_run))
+            except OSError as exc:
+                log.error("  Skipping pack (filesystem/network error): %s — %s", folder, exc)
+                stats.errors += 1
             progress.step()
 
     log.info("Archive clean complete: %s", stats)
+    if args.dry_run and getattr(args, "plan_out", None):
+        plan_save(Path(args.plan_out), {"source": "archive-clean", "paths": [str(p) for p in args.paths]})
     return 0
 
 
-def series_base_name(name: str) -> str | None:
-    m = _TRAILING_TOKEN_RE.search(name)
-    if not m:
-        return None
-    base = name[: m.start()].strip()
-    return clean_directory_name(base) if base else None
-
-
 def canonical_series_name(names: list[str]) -> str:
+    """Pick the best display name from a group of related directory names.
+
+    Prefers base names (trailing tokens stripped), then breaks ties by uppercase
+    letter count (proxy for proper capitalisation) and length.
+    """
     bases = [series_base_name(n) for n in names]
     bases = [b for b in bases if b]
     candidates = bases or names
@@ -468,6 +668,7 @@ def rename_generic_files(folder: Path, dry_run: bool) -> MaintenanceStats:
             continue
         if dry_run:
             log.info("      [DRY RUN] Would rename: %s -> %s", cbz.name, new_name)
+            plan_record("file", src=cbz, dest=dest)
             stats.renamed += 1
             continue
         outcome = larger_file_wins(cbz, dest, dry_run=False) if dest.exists() else "moved"
@@ -508,13 +709,38 @@ def update_series_metadata(folder: Path, dry_run: bool, workers: int = 1) -> Mai
     return stats
 
 
+def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
+    """Return an existing archive in *target_dir* whose normalised key matches *stem*.
+
+    Lets the merge treat files that differ only by spacing or punctuation as the
+    same book (e.g. "Series Ch.1" and "Series Ch. 1"), so one copy is kept rather
+    than both landing side-by-side. Returns None when there is no such file.
+    """
+    if not target_dir.is_dir():
+        return None
+    key = normalise_archive_key(stem)
+    for existing in target_dir.iterdir():
+        if existing.is_file() and existing.suffix.lower() in {".cbz", ".cbr"}:
+            if normalise_archive_key(existing.stem) == key:
+                return existing
+    return None
+
+
 def merge_dir_contents(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats:
+    """Recursively move every file from *src* into *dest*, applying larger_file_wins on collisions, then delete *src*."""
     stats = MaintenanceStats()
     for item in sorted(src.rglob("*")):
         if not item.is_file():
             continue
         rel = item.relative_to(src)
         target = dest / rel
+        # When the exact name is free, still treat a file that normalises to the
+        # same key (differs only by spacing/punctuation) as a collision so the
+        # two cosmetic variants don't both survive the merge.
+        if not target.exists() and item.suffix.lower() in {".cbz", ".cbr"}:
+            match = _find_archive_collision(target.parent, item.stem)
+            if match is not None:
+                target = match
         outcome = larger_file_wins(item, target, dry_run)
         if outcome in {"moved", "replaced"}:
             stats.moved += 1
@@ -523,11 +749,14 @@ def merge_dir_contents(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats
 
     if not dry_run:
         shutil.rmtree(src, ignore_errors=True)
+    else:
+        plan_record("rmtree", path=src)
     stats.merged += 1
     return stats
 
 
 def merge_series_dir(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats:
+    """Rename any generic-titled files in *src*, then merge the entire directory into *dest*."""
     stats = MaintenanceStats()
     stats.add(rename_generic_files(src, dry_run))
     stats.add(merge_dir_contents(src, dest, dry_run))
@@ -579,6 +808,7 @@ def detect_compilation_candidates(chapter_nums: list[float]) -> list[tuple[float
 
 
 def rename_stem_for_compilation(stem: str, start: float, end: float) -> str:
+    """Replace the chapter number in *stem* with a range token (e.g. 'Ch.12' -> 'Ch.1-2')."""
     range_str = f"{fmt_number(start)}-{fmt_number(end)}"
 
     def replace_chapter(match: re.Match) -> str:
@@ -589,6 +819,7 @@ def rename_stem_for_compilation(stem: str, start: float, end: float) -> str:
 
 
 def update_comicinfo_range(xml: str, start: float, end: float) -> tuple[str, bool]:
+    """Set the <Number> tag in a ComicInfo XML string to a chapter range; returns (new_xml, changed)."""
     range_str = f"{fmt_number(start)}-{fmt_number(end)}"
     pattern = re.compile(r"<Number>.*?</Number>", re.IGNORECASE | re.DOTALL)
     tag = f"<Number>{range_str}</Number>"
@@ -600,6 +831,7 @@ def update_comicinfo_range(xml: str, start: float, end: float) -> tuple[str, boo
 
 
 def patch_comicinfo_range(cbz_path: Path, start: float, end: float, dry_run: bool) -> MaintenanceStats:
+    """Read the ComicInfo.xml from *cbz_path*, update the Number to a range, and write it back."""
     stats = MaintenanceStats()
     entry_name, xml = read_comicinfo(cbz_path)
     if xml is None:
@@ -635,6 +867,11 @@ def patch_comicinfo_range(cbz_path: Path, start: float, end: float, dry_run: boo
 
 
 def detect_and_fix_compilations(series_dir: Path, dry_run: bool) -> MaintenanceStats:
+    """Find chapter numbers that look like concatenated ranges and rename/patch them.
+
+    Calls detect_compilation_candidates on the chapter numbers present in *series_dir*,
+    then for each suspect renames the file stem to the range form and updates ComicInfo.
+    """
     stats = MaintenanceStats()
     cbz_files = sorted(series_dir.glob("*.cbz"))
     if len(cbz_files) < 2:
@@ -685,31 +922,62 @@ def detect_and_fix_compilations(series_dir: Path, dry_run: bool) -> MaintenanceS
 
 
 def merge_chapter_folders(parent: Path, dry_run: bool, metadata_workers: int = 1) -> MaintenanceStats:
+    """Group sibling directories that share a series base name and merge each group into a single canonical folder.
+
+    Groups are keyed by normalise_series_key(series_base_name(dir)). After merging,
+    ComicInfo is updated and compilation numbers are fixed for the combined folder.
+    """
     stats = MaintenanceStats()
     children = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
+
+    # Folders that carry a trailing chapter/volume/number token are grouped by
+    # their stripped base name. Folders that are ALREADY a bare series title
+    # (series_base_name -> None) are remembered separately so a numbered folder
+    # can be folded into the existing canonical series even when it is the only
+    # numbered sibling — previously a lone "Berserk 4" formed a size-1 group,
+    # was skipped, and survived as its own directory next to "Berserk".
     groups: dict[str, list[Path]] = {}
+    bare_by_key: dict[str, Path] = {}
     for d in children:
         base = series_base_name(d.name)
         if base:
             groups.setdefault(normalise_series_key(base), []).append(d)
+        else:
+            bare_by_key.setdefault(normalise_series_key(clean_directory_name(d.name)), d)
 
-    for _, group in groups.items():
-        if len(group) < 2:
+    for key, group in groups.items():
+        bare = bare_by_key.get(key)
+        members = list(group)
+        if bare is not None and bare not in members:
+            members.append(bare)
+        if len(members) < 2:
             continue
-        canonical = canonical_series_name([g.name for g in group])
+
+        # Prefer the existing bare-named folder as the canonical destination so
+        # files land in "Berserk", not "Berserk 4". Fall back to the best name
+        # derived from the numbered folders when no bare folder exists.
+        if bare is not None:
+            canonical = bare.name
+        else:
+            canonical = canonical_series_name([g.name for g in group])
         dest = parent / canonical
         log.info("  Merge chapter-folder group -> %s", dest.name)
         if dry_run:
             log.info("    [DRY RUN] Would create/use canonical folder: %s", dest)
+            plan_record("mkdir", path=dest)
         else:
             dest.mkdir(exist_ok=True)
 
-        for src in group:
+        for src in members:
             if src == dest:
                 continue
             stats.add(merge_series_dir(src, dest, dry_run))
-        stats.add(update_series_metadata(dest, dry_run, workers=metadata_workers))
-        stats.add(detect_and_fix_compilations(dest, dry_run))
+        # In a dry run the canonical folder may not exist yet; the post-merge
+        # sweeps need a real directory to read, so skip them when it is absent.
+        if dest.exists():
+            stats.add(dedupe_archives_in_dir(dest, dry_run))
+            stats.add(update_series_metadata(dest, dry_run, workers=metadata_workers))
+            stats.add(detect_and_fix_compilations(dest, dry_run))
     return stats
 
 
@@ -719,8 +987,27 @@ def find_series_matches(
     auto_threshold: float,
     dry_run: bool,
     metadata_workers: int = 1,
+    interactive: bool = False,
+    exclusions: set[frozenset] | None = None,
 ) -> MaintenanceStats:
+    """Fuzzy-match sibling directories and merge likely duplicates.
+
+    Every pair of directories in *parent* is compared with SequenceMatcher on their
+    normalised names. Pairs above *report_threshold* are logged; pairs above
+    *auto_threshold* are auto-merged (or prompted when interactive=True). The
+    secondary folder (fewer files, shorter name) is merged into the primary.
+    """
     stats = MaintenanceStats()
+
+    if interactive and not sys.stdin.isatty():
+        log.warning(
+            "  --interactive requires a terminal (stdin is not a tty); "
+            "proceeding without prompts."
+        )
+        interactive = False
+
+    _excl = exclusions or set()
+
     dirs = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
     entries = [(d, normalise_series_key(d.name)) for d in dirs]
     consumed: set[Path] = set()
@@ -732,6 +1019,8 @@ def find_series_matches(
             if b in consumed or not nb:
                 continue
             if not na or not nb:
+                continue
+            if is_excluded_pair(a.name, b.name, _excl):
                 continue
             if 2 * min(len(na), len(nb)) / (len(na) + len(nb)) < report_threshold:
                 continue
@@ -747,9 +1036,38 @@ def find_series_matches(
             primary, secondary = (a, b) if (a_count, len(a.name), b.name) >= (b_count, len(b.name), a.name) else (b, a)
             log.info("  Series match %.3f: %s <-> %s", ratio, a.name, b.name)
 
-            if ratio >= auto_threshold:
+            if interactive:
+                try:
+                    sys.stdout.write(
+                        f"  [{ratio:.3f}] Merge '{secondary.name}' into '{primary.name}'? "
+                        "[y]es / [n]o / e[x]clude permanently: "
+                    )
+                    sys.stdout.flush()
+                    answer = sys.stdin.readline().strip().lower()
+                except EOFError:
+                    answer = "n"
+
+                if answer in ("x", "exclude"):
+                    added = record_series_exclusion([a.name, b.name], _excl, dry_run)
+                    if dry_run:
+                        log.info("    [DRY RUN] Would record %d pair(s) as excluded.", added)
+                    else:
+                        log.info("    Recorded %d pair(s) as excluded.", added)
+                    continue
+                elif answer not in ("y", "yes"):
+                    log.info("    Skipped.")
+                    stats.skipped += 1
+                    continue
+                log.info("    Merging: %s -> %s", secondary.name, primary.name)
+                stats.add(merge_series_dir(secondary, primary, dry_run))
+                stats.add(dedupe_archives_in_dir(primary, dry_run))
+                stats.add(update_series_metadata(primary, dry_run, workers=metadata_workers))
+                stats.add(detect_and_fix_compilations(primary, dry_run))
+                consumed.add(secondary)
+            elif ratio >= auto_threshold:
                 log.info("    Auto-merge: %s -> %s", secondary.name, primary.name)
                 stats.add(merge_series_dir(secondary, primary, dry_run))
+                stats.add(dedupe_archives_in_dir(primary, dry_run))
                 stats.add(update_series_metadata(primary, dry_run, workers=metadata_workers))
                 stats.add(detect_and_fix_compilations(primary, dry_run))
                 consumed.add(secondary)
@@ -763,8 +1081,8 @@ def find_series_matches(
 # ─────────────────────────────────────────────
 # POSSIBLE SAME-SERIES GROUPING FOR MANUAL REVIEW
 # ─────────────────────────────────────────────
-_SERIES_CONNECTOR_RE = re.compile(r"\s*(?:[:\-–—|/\\])\s*")
-_SERIES_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_SERIES_CONNECTOR_RE = re.compile(r"\s+[-]\s+|\s*[/\\|:–—]\s*")
+_SERIES_TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)*", re.IGNORECASE)
 _SERIES_JOIN_PHRASES = {
     ("bat", "man"): "batman",
     ("super", "man"): "superman",
@@ -776,6 +1094,7 @@ _SERIES_CANONICAL_TOKENS = {
     "&": "and",
     "+": "and",
 }
+_SERIES_STOPWORDS = frozenset({"the", "a", "an"})
 
 
 def _series_title_part(name: str) -> str:
@@ -797,12 +1116,15 @@ def _series_tokens(name: str) -> list[str]:
             tokens.append(_SERIES_JOIN_PHRASES[(raw[i], raw[i + 1])])
             i += 2
             continue
-        tokens.append(_SERIES_CANONICAL_TOKENS.get(raw[i], raw[i]))
+        token = _SERIES_CANONICAL_TOKENS.get(raw[i], raw[i])
+        if token not in _SERIES_STOPWORDS:
+            tokens.append(token)
         i += 1
     return tokens
 
 
-def _tokens_match(a: str, b: str, threshold: float = 0.82) -> bool:
+def _tokens_match(a: str, b: str, threshold: float = 0.80) -> bool:
+    """Return True if two tokens are identical or fuzzy-similar above *threshold*."""
     if a == b:
         return True
     return SequenceMatcher(None, a, b).ratio() >= threshold
@@ -828,6 +1150,7 @@ def _common_prefix_tokens(names: list[str]) -> list[str]:
 
 
 def _display_series_name(tokens: list[str]) -> str:
+    """Convert a list of normalised tokens into a title-cased display name suitable for a directory."""
     if not tokens:
         return "Possible Series"
     words = []
@@ -840,6 +1163,7 @@ def _display_series_name(tokens: list[str]) -> str:
 
 
 def _unique_dir(path: Path) -> Path:
+    """Return *path* if it does not exist, otherwise append ' (N)' until a free name is found."""
     if not path.exists():
         return path
     for i in range(1, 1000):
@@ -849,10 +1173,68 @@ def _unique_dir(path: Path) -> Path:
     raise RuntimeError(f"Unable to find unique destination for {path}")
 
 
+# ─────────────────────────────────────────────
+# SERIES EXCLUSION LOG  (persists "not related" decisions across runs)
+# ─────────────────────────────────────────────
+def _exclusion_key(name: str) -> str:
+    """Normalise a directory name to the canonical form used as a key in the exclusions set."""
+    return normalise_series_key(name)
+
+
+def load_series_exclusions() -> set[frozenset]:
+    """Load all excluded pairs from the JSON log. Returns a set of frozensets."""
+    try:
+        with open(SERIES_EXCLUSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {frozenset(pair) for pair in data if len(pair) == 2}
+    except FileNotFoundError:
+        return set()
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning("series_exclusions.json is malformed, ignoring: %s", e)
+        return set()
+
+
+def _save_series_exclusions(exclusions: set[frozenset]) -> None:
+    """Overwrite the exclusion log with the current in-memory set."""
+    try:
+        Path(SERIES_EXCLUSIONS_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(SERIES_EXCLUSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump([sorted(p) for p in exclusions], f, indent=2)
+    except OSError as e:
+        log.warning("Could not save series exclusions: %s", e)
+
+
+def record_series_exclusion(
+    names: list[str],
+    exclusions: set[frozenset],
+    dry_run: bool,
+) -> int:
+    """Add all pairwise combinations of *names* to *exclusions* and persist.
+
+    Returns the number of new pairs added.
+    """
+    added = 0
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            pair = frozenset([_exclusion_key(a), _exclusion_key(b)])
+            if pair not in exclusions:
+                exclusions.add(pair)
+                added += 1
+    if not dry_run and added:
+        _save_series_exclusions(exclusions)
+    return added
+
+
+def is_excluded_pair(name_a: str, name_b: str, exclusions: set[frozenset]) -> bool:
+    """Return True if the normalised pair (name_a, name_b) has been marked as permanently unrelated."""
+    return frozenset([_exclusion_key(name_a), _exclusion_key(name_b)]) in exclusions
+
+
 def _group_possible_same_series_dirs(
     parent: Path,
     min_common_words: int,
     min_group_size: int,
+    exclusions: set[frozenset] | None = None,
 ) -> list[tuple[str, list[Path]]]:
     """Find sibling directories that appear to be different entries in one series.
 
@@ -872,10 +1254,23 @@ def _group_possible_same_series_dirs(
     if len(dirs) < min_group_size:
         return []
 
+    _excl = exclusions or set()
+
     # Build graph where edges connect likely same-series dirs.
     neighbors: dict[Path, set[Path]] = {d: set() for d in dirs}
     for i, a in enumerate(dirs):
         for b in dirs[i + 1:]:
+            if is_excluded_pair(a.name, b.name, _excl):
+                continue
+            # If the only difference is a censorship marker (uncensored/decensored),
+            # treat them as confirmed siblings regardless of the token threshold.
+            if (
+                normalise_series_key(a.name) == normalise_series_key(b.name)
+                and (_MARKER_WORDS_RE.search(a.name) or _MARKER_WORDS_RE.search(b.name))
+            ):
+                neighbors[a].add(b)
+                neighbors[b].add(a)
+                continue
             common = _common_prefix_tokens([a.name, b.name])
             if len(common) >= min_common_words:
                 neighbors[a].add(b)
@@ -902,7 +1297,7 @@ def _group_possible_same_series_dirs(
     results: list[tuple[str, list[Path]]] = []
     for group in groups:
         common = _common_prefix_tokens([g.name for g in group])
-        if len(common) < min_common_words:
+        if not common:
             continue
         results.append((_display_series_name(common), group))
     return results
@@ -911,23 +1306,42 @@ def _group_possible_same_series_dirs(
 def move_possible_same_series_to_check(
     parent: Path,
     dry_run: bool,
-    min_common_words: int = 2,
+    min_common_words: int = 1,
     min_group_size: int = 2,
+    interactive: bool = False,
+    exclusions: set[frozenset] | None = None,
+    check_root: Path | None = None,
 ) -> MaintenanceStats:
     """Move likely same-series sibling folders into _Check/<Series Name>/.
 
     The original folders are preserved as subdirectories for manual review.
+
+    interactive=True prompts for each group before acting:
+      [y] move to _Check   [n] skip this run   [x] exclude permanently
+    Requires a real terminal (stdin tty); falls back to auto-move if not.
     """
     stats = MaintenanceStats()
+
+    if exclusions is None:
+        exclusions = set()
+
+    if interactive and not sys.stdin.isatty():
+        log.warning(
+            "  --interactive requires a terminal (stdin is not a tty); "
+            "proceeding without prompts."
+        )
+        interactive = False
+
     groups = _group_possible_same_series_dirs(
         parent=parent,
         min_common_words=min_common_words,
         min_group_size=min_group_size,
+        exclusions=exclusions,
     )
     if not groups:
         return stats
 
-    check_root = parent / CHECK_FOLDER_NAME
+    check_root = (check_root or parent) / CHECK_FOLDER_NAME
     for suggested_name, group in groups:
         group_dest = _unique_dir(check_root / suggested_name)
         log.info(
@@ -938,9 +1352,37 @@ def move_possible_same_series_to_check(
         for folder in group:
             log.info("    candidate: %s", folder.name)
 
+        if interactive:
+            try:
+                sys.stdout.write(
+                    f"  Move to _Check/{group_dest.name}? "
+                    "[y]es / [n]o / e[x]clude permanently: "
+                )
+                sys.stdout.flush()
+                answer = sys.stdin.readline().strip().lower()
+            except EOFError:
+                answer = "n"
+
+            if answer in ("x", "exclude"):
+                names = [f.name for f in group]
+                added = record_series_exclusion(names, exclusions, dry_run)
+                if dry_run:
+                    log.info(
+                        "    [DRY RUN] Would record %d pair(s) as permanently excluded.",
+                        added,
+                    )
+                else:
+                    log.info("    Recorded %d pair(s) as permanently excluded.", added)
+                continue
+            elif answer not in ("y", "yes"):
+                log.info("    Skipped.")
+                continue
+
         if dry_run:
+            plan_record("mkdir", path=group_dest)
             for folder in group:
                 log.info("    [DRY RUN] Would move: %s -> %s", folder.name, group_dest)
+                plan_record("movedir", src=folder, dest=group_dest / folder.name)
                 stats.moved += 1
             stats.merged += 1
             continue
@@ -958,6 +1400,11 @@ def move_possible_same_series_to_check(
 
 
 def find_uncensored_pairs(root: Path, dry_run: bool, move_which: str) -> MaintenanceStats:
+    """Find directories marked 'uncensored'/'decensored' that have a matching normal counterpart.
+
+    *move_which* controls what gets moved to _Check: 'uncensored', 'censored', or 'both'.
+    Matching is done by normalise_series_key after stripping the marker words.
+    """
     stats = MaintenanceStats()
     dirs = [d for d in root.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
     marked = [d for d in dirs if _MARKER_WORDS_RE.search(d.name)]
@@ -995,7 +1442,76 @@ def find_uncensored_pairs(root: Path, dry_run: bool, move_which: str) -> Mainten
     return stats
 
 
+def run_clear_exclusions(args: argparse.Namespace) -> int:
+    """List and optionally purge the series exclusions log."""
+    exclusions = load_series_exclusions()
+
+    if not exclusions:
+        log.info("Series exclusions log is empty (%s)", SERIES_EXCLUSIONS_FILE)
+        return 0
+
+    # Apply optional substring filter.
+    filter_str = getattr(args, "filter", None)
+    if filter_str:
+        keep = set()
+        remove = set()
+        for pair in exclusions:
+            names = sorted(pair)
+            if any(filter_str.lower() in n.lower() for n in names):
+                remove.add(pair)
+            else:
+                keep.add(pair)
+    else:
+        keep = set()
+        remove = exclusions
+
+    log.info("Series exclusions log: %s", SERIES_EXCLUSIONS_FILE)
+    log.info("  Total pairs : %d", len(exclusions))
+    log.info("  To remove   : %d", len(remove))
+    log.info("  To keep     : %d", len(keep))
+
+    if not remove:
+        log.info("  Nothing to remove.")
+        return 0
+
+    if args.dry_run:
+        log.info("  [DRY RUN] Would remove %d pair(s):", len(remove))
+        for pair in sorted(remove, key=lambda p: sorted(p)):
+            a, b = sorted(pair)
+            log.info("    - %s  <->  %s", a, b)
+        return 0
+
+    log.info("  Removing %d pair(s):", len(remove))
+    for pair in sorted(remove, key=lambda p: sorted(p)):
+        a, b = sorted(pair)
+        log.info("    - %s  <->  %s", a, b)
+
+    if keep:
+        _save_series_exclusions(keep)
+        log.info("  Saved %d remaining pair(s).", len(keep))
+    else:
+        try:
+            Path(SERIES_EXCLUSIONS_FILE).unlink(missing_ok=True)
+            log.info("  Exclusions file deleted (no pairs remain).")
+        except OSError as e:
+            log.error("  Could not delete exclusions file: %s", e)
+            return 1
+
+    return 0
+
+
 def run_organize_series(args: argparse.Namespace) -> int:
+    """Entry point for the 'organize-series' subcommand.
+
+    Iterates each root path, optionally walking recursive parent directories, and
+    runs the enabled organisation passes: merge_chapter_folders, find_series_matches,
+    move_possible_same_series_to_check, find_uncensored_pairs, then a per-folder
+    duplicate-archive sweep (dedupe_archives_in_dir) over every series folder.
+    """
+    dedupe_archives = getattr(args, "dedupe_archives", True)
+    metadata_dedupe = getattr(args, "metadata_dedupe", True)
+    if args.dry_run and getattr(args, "plan_out", None):
+        plan_open()
     stats = MaintenanceStats()
     planned_units = 0
     planned_parents_by_root: dict[Path, list[Path]] = {}
@@ -1013,6 +1529,10 @@ def run_organize_series(args: argparse.Namespace) -> int:
         planned_units += len(unique_parents)
         if args.uncensored_check:
             planned_units += 1
+        if dedupe_archives:
+            planned_units += 1
+
+    exclusions: set[frozenset] = load_series_exclusions()
 
     progress = ProgressReporter(planned_units, "groups")
     for root_arg in args.paths:
@@ -1035,6 +1555,8 @@ def run_organize_series(args: argparse.Namespace) -> int:
                         args.auto_threshold,
                         args.dry_run,
                         metadata_workers=args.workers,
+                        interactive=getattr(args, "interactive", False),
+                        exclusions=exclusions,
                     )
                 )
             if args.possible_series_check:
@@ -1044,6 +1566,9 @@ def run_organize_series(args: argparse.Namespace) -> int:
                         dry_run=args.dry_run,
                         min_common_words=args.series_common_words,
                         min_group_size=args.series_min_group_size,
+                        interactive=getattr(args, "interactive", False),
+                        exclusions=exclusions,
+                        check_root=root / CHECK_FOLDER_NAME,
                     )
                 )
             progress.step()
@@ -1052,11 +1577,23 @@ def run_organize_series(args: argparse.Namespace) -> int:
             stats.add(find_uncensored_pairs(root, args.dry_run, args.move_which))
             progress.step()
 
+        # Sweep every series folder under the root so cosmetic duplicates
+        # (e.g. "Ch.1" vs "Ch. 1") are collapsed even in folders no merge touched.
+        if dedupe_archives:
+            for series_dir in iter_series_dirs(root):
+                stats.add(
+                    dedupe_archives_in_dir(series_dir, args.dry_run, use_metadata=metadata_dedupe)
+                )
+            progress.step()
+
     log.info("Organize complete: %s", stats)
+    if args.dry_run and getattr(args, "plan_out", None):
+        plan_save(Path(args.plan_out), {"source": "organize-series", "paths": [str(p) for p in args.paths]})
     return 0
 
 
 def read_comicinfo(cbz_path: Path) -> tuple[str | None, str | None]:
+    """Read ComicInfo.xml from a CBZ archive; returns (entry_name, xml_text) or (None, None) on failure."""
     try:
         with zipfile.ZipFile(cbz_path, "r") as zf:
             names = {n.lower(): n for n in zf.namelist()}
@@ -1070,6 +1607,12 @@ def read_comicinfo(cbz_path: Path) -> tuple[str | None, str | None]:
 
 
 def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: bool) -> bool:
+    """Rewrite a CBZ archive with an updated ComicInfo.xml, using a tmp+backup swap for atomicity.
+
+    Reads all entries into memory, replaces (or appends) ComicInfo.xml with *xml*,
+    writes a .tmp.cbz, then renames original -> .bak and tmp -> original, finally
+    deleting the backup. Returns True on success.
+    """
     if dry_run:
         log.info("  [DRY RUN] Would update ComicInfo: %s", cbz_path.name)
         return True
@@ -1093,6 +1636,7 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
             if not wrote:
                 zout.writestr("ComicInfo.xml", xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
 
+        bak_path.unlink(missing_ok=True)  # remove any stale backup before renaming
         cbz_path.rename(bak_path)
         tmp_path.rename(cbz_path)
         bak_path.unlink(missing_ok=True)
@@ -1104,6 +1648,7 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
 
 
 def metadata_worker(cbz_path: Path, dry_run: bool) -> MaintenanceStats:
+    """Parse a CBZ filename, merge the result into its ComicInfo.xml, and write the update back; safe to call from a thread."""
     stats = MaintenanceStats()
     parsed = parse_comic_name(cbz_path)
     entry, xml = read_comicinfo(cbz_path)
@@ -1120,7 +1665,62 @@ def metadata_worker(cbz_path: Path, dry_run: bool) -> MaintenanceStats:
     return stats
 
 
+def rename_worker(cbz_path: Path, dry_run: bool) -> MaintenanceStats:
+    """Rename a single CBZ file to the normalised name produced by cbz_core; safe to call from a thread."""
+    stats = MaintenanceStats()
+    try:
+        parsed = parse_comic_name(cbz_path)
+        new_name = parsed.filename
+        if new_name == cbz_path.name:
+            stats.skipped += 1
+            return stats
+        dest = cbz_path.parent / new_name
+        if dry_run:
+            log.info("  [DRY RUN] Would rename: %s -> %s", cbz_path.name, new_name)
+            stats.renamed += 1
+            return stats
+        if dest.exists():
+            outcome = larger_file_wins(cbz_path, dest, dry_run=False)
+            if outcome in {"moved", "replaced"}:
+                stats.renamed += 1
+            else:
+                stats.deleted += 1
+        else:
+            cbz_path.rename(dest)
+            log.info("  Renamed: %s -> %s", cbz_path.name, new_name)
+            stats.renamed += 1
+    except Exception as exc:
+        log.error("  Error processing %s: %s", cbz_path.name, exc)
+        stats.errors += 1
+    return stats
+
+
+def run_rename(args: argparse.Namespace) -> int:
+    """Entry point for the 'rename' subcommand; discovers CBZ files and dispatches rename_worker in a thread pool."""
+    cbz_files: list[Path] = []
+    for root_arg in args.paths:
+        root = Path(root_arg)
+        cbz_files.extend(sorted(root.rglob("*.cbz")) if root.is_dir() else [root])
+
+    progress = ProgressReporter(len(cbz_files), "files")
+    stats = MaintenanceStats()
+    if args.workers == 1:
+        for cbz in cbz_files:
+            stats.add(rename_worker(cbz, args.dry_run))
+            progress.step()
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = [ex.submit(rename_worker, cbz, args.dry_run) for cbz in cbz_files]
+            for fut in as_completed(futures):
+                stats.add(fut.result())
+                progress.step()
+
+    log.info("Rename complete: %s", stats)
+    return 0
+
+
 def run_metadata(args: argparse.Namespace) -> int:
+    """Entry point for the 'metadata' subcommand; discovers CBZ files and dispatches metadata_worker in a thread pool."""
     cbz_files: list[Path] = []
     for root_arg in args.paths:
         root = Path(root_arg)
@@ -1144,23 +1744,36 @@ def run_metadata(args: argparse.Namespace) -> int:
 
 
 def run_all(args: argparse.Namespace) -> int:
+    """Entry point for the 'all' subcommand; runs archive-clean, organize-series, then metadata in sequence."""
+    # When recording a dry-run plan, open it once here and let every sub-pass
+    # record into the same plan, so 'all' produces a single combined plan file
+    # rather than each pass overwriting the last.
+    combined_plan = args.dry_run and getattr(args, "plan_out", None)
+    if combined_plan:
+        plan_open()
+
     archive_args = argparse.Namespace(**vars(args))
     archive_args.strip_names = True
     archive_args.dedupe_archives = True
+    archive_args.metadata_dedupe = True
     archive_args.pack_loose_images = True
     archive_args.no_recursive = False
+    archive_args.plan_out = None  # plan is managed at the run_all level
 
     organize_args = argparse.Namespace(**vars(args))
     organize_args.merge_chapter_folders = True
     organize_args.match_series = True
+    organize_args.dedupe_archives = True
+    organize_args.metadata_dedupe = True
     organize_args.uncensored_check = False
     organize_args.possible_series_check = False
     organize_args.recursive_parents = False
     organize_args.report_threshold = args.report_threshold
     organize_args.auto_threshold = args.auto_threshold
-    organize_args.series_common_words = 2
+    organize_args.series_common_words = 1
     organize_args.series_min_group_size = 2
     organize_args.move_which = "both"
+    organize_args.plan_out = None  # plan is managed at the run_all level
 
     rc = run_archive_clean(archive_args)
     if rc != 0:
@@ -1168,17 +1781,525 @@ def run_all(args: argparse.Namespace) -> int:
     rc = run_organize_series(organize_args)
     if rc != 0:
         return rc
-    return run_metadata(args)
+    rc = run_metadata(args)
+    if combined_plan:
+        plan_save(Path(args.plan_out), {"source": "all", "paths": [str(p) for p in args.paths]})
+    return rc
+
+
+# ─────────────────────────────────────────────
+# PLAN REPLAY  (execute the actions captured during a dry run)
+# ─────────────────────────────────────────────
+def execute_plan(actions: list[dict], dry_run: bool = False) -> MaintenanceStats:
+    """Replay a recorded action plan, re-checking the filesystem at each step.
+
+    Actions are applied in recorded order. Every op re-validates current state so
+    a plan stays safe even if the library changed slightly since the dry run:
+      - file   : resolve src vs dest with larger_file_wins (move/replace/discard)
+      - delete : unlink path if it still exists
+      - rmtree : recursively remove a (now-merged) source directory
+      - mkdir  : create a destination/series directory
+      - movedir: move a whole directory, finding a unique name on collision
+    """
+    stats = MaintenanceStats()
+    for action in actions:
+        op = action.get("op")
+        try:
+            if op == "mkdir":
+                dest = Path(action["path"])
+                if dry_run:
+                    log.info("  [DRY RUN] Would create: %s", dest)
+                else:
+                    dest.mkdir(parents=True, exist_ok=True)
+            elif op == "file":
+                src = Path(action["src"])
+                dest = Path(action["dest"])
+                if not src.exists():
+                    log.info("  Skip (source gone): %s", src.name)
+                    stats.skipped += 1
+                    continue
+                outcome = larger_file_wins(src, dest, dry_run=dry_run)
+                if outcome in {"moved", "replaced"}:
+                    stats.moved += 1
+                else:
+                    stats.deleted += 1
+            elif op == "delete":
+                path = Path(action["path"])
+                if not path.exists():
+                    stats.skipped += 1
+                    continue
+                if dry_run:
+                    log.info("  [DRY RUN] Would delete: %s", path.name)
+                else:
+                    path.unlink()
+                    log.info("  Deleted: %s", path.name)
+                stats.deleted += 1
+            elif op == "rmtree":
+                path = Path(action["path"])
+                if not path.exists():
+                    stats.skipped += 1
+                    continue
+                if dry_run:
+                    log.info("  [DRY RUN] Would remove tree: %s", path)
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
+                    log.info("  Removed: %s", path)
+            elif op == "movedir":
+                src = Path(action["src"])
+                dest = Path(action["dest"])
+                if not src.exists():
+                    stats.skipped += 1
+                    continue
+                if dry_run:
+                    log.info("  [DRY RUN] Would move dir: %s -> %s", src.name, dest)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    final = _unique_dir(dest)
+                    shutil.move(str(src), str(final))
+                    log.info("  Moved dir: %s -> %s", src.name, final)
+                stats.moved += 1
+            elif op == "pack":
+                folder = Path(action["folder"])
+                if not folder.exists():
+                    stats.skipped += 1
+                    continue
+                # Re-run the real pack on the live folder; it re-checks packability
+                # and the larger-wins rule against any existing archive.
+                stats.add(pack_image_folder(folder, dry_run=dry_run))
+            else:
+                log.warning("  Unknown plan op '%s' — skipping.", op)
+                stats.skipped += 1
+        except (OSError, shutil.Error) as exc:
+            log.error("  Plan action failed (%s): %s", op, exc)
+            stats.errors += 1
+    return stats
+
+
+def _repair_xml_titles(xml_text: str) -> tuple[str, bool]:
+    """Repair mojibake in <Title> and <Series> text of a ComicInfo XML string.
+
+    Operates on the parsed tree so only element text is touched. Returns
+    (new_xml, changed).
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return xml_text, False
+    changed = False
+    for tag in ("Title", "Series", "LocalizedSeries", "AlternateSeries"):
+        for el in root.iter(tag):
+            if el.text:
+                fixed = repair_mojibake(el.text)
+                if fixed != el.text:
+                    el.text = fixed
+                    changed = True
+    if not changed:
+        return xml_text, False
+    return ET.tostring(root, encoding="unicode"), True
+
+
+def run_repair_names(args: argparse.Namespace) -> int:
+    """Entry point for 'repair-names'.
+
+    Walks each path and repairs mojibake (non-ASCII written as literal UTF-8 byte
+    hex, e.g. ``Playere28099s`` -> ``Player's``) in:
+      - .cbz file names
+      - directory names (deepest-first, so children are renamed before parents)
+      - ComicInfo <Title>/<Series> metadata inside each archive (unless --names-only)
+
+    Honours --dry-run. Renames skip when a repaired target already exists.
+    """
+    dry = args.dry_run
+    names_only = getattr(args, "names_only", False)
+    stats = MaintenanceStats()
+
+    # Collect every file and directory under the targets up front so we can sort
+    # directories deepest-first (rename children before their parents).
+    files: list[Path] = []
+    dirs: list[Path] = []
+    for raw in args.paths:
+        root = Path(raw)
+        if not root.exists():
+            log.warning("  Path not found, skipping: %s", root)
+            continue
+        for p in root.rglob("*"):
+            if p.is_dir():
+                dirs.append(p)
+            elif p.suffix.lower() == ".cbz":
+                files.append(p)
+    dirs.sort(key=lambda p: len(p.parts), reverse=True)
+
+    progress = ProgressReporter(len(files) + len(dirs), "items")
+
+    # ── 1. Repair file names + (optionally) ComicInfo inside each archive ──
+    for cbz in files:
+        try:
+            fixed_name = repair_mojibake(cbz.name)
+            current = cbz
+            if fixed_name != cbz.name:
+                target = cbz.parent / fixed_name
+                if target.exists():
+                    log.warning("  Rename skipped (target exists): %s", fixed_name)
+                else:
+                    if dry:
+                        log.info("  [DRY RUN] Would rename file: %s -> %s", cbz.name, fixed_name)
+                    else:
+                        cbz.rename(target)
+                        log.info("  Renamed file: %s -> %s", cbz.name, fixed_name)
+                        current = target
+                    stats.renamed += 1
+
+            if not names_only:
+                entry, xml = read_comicinfo(current if not dry else cbz)
+                if xml is not None:
+                    new_xml, changed = _repair_xml_titles(xml)
+                    if changed:
+                        if dry:
+                            log.info("  [DRY RUN] Would repair ComicInfo titles in: %s", current.name)
+                        elif write_comicinfo(current, entry, new_xml, dry_run=False):
+                            log.info("  Repaired ComicInfo titles in: %s", current.name)
+                        stats.updated_xml += 1
+        except Exception as exc:
+            log.error("  Error repairing %s: %s", cbz.name, exc)
+            stats.errors += 1
+        finally:
+            progress.step()
+
+    # ── 2. Repair directory names (deepest-first) ──
+    for d in dirs:
+        try:
+            if not d.exists():
+                progress.step()
+                continue
+            fixed = repair_mojibake(d.name)
+            if fixed != d.name:
+                target = d.parent / fixed
+                if target.exists():
+                    log.warning("  Dir rename skipped (target exists): %s", fixed)
+                else:
+                    if dry:
+                        log.info("  [DRY RUN] Would rename dir: %s -> %s", d.name, fixed)
+                    else:
+                        d.rename(target)
+                        log.info("  Renamed dir: %s -> %s", d.name, fixed)
+                    stats.moved += 1
+        except Exception as exc:
+            log.error("  Error repairing dir %s: %s", d.name, exc)
+            stats.errors += 1
+        finally:
+            progress.step()
+
+    log.info("Repair-names complete: %s", stats)
+    return 0
+
+
+def run_apply_plan(args: argparse.Namespace) -> int:
+    """Entry point for the 'apply-plan' subcommand. Replays a saved dry-run plan."""
+    plan_path = Path(args.plan)
+    try:
+        with open(plan_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.error("Plan file not found: %s", plan_path)
+        return 1
+    except (json.JSONDecodeError, OSError) as e:
+        log.error("Could not read plan file %s: %s", plan_path, e)
+        return 1
+
+    actions = data.get("actions", [])
+    log.info("Applying plan: %s", plan_path)
+    log.info("  Generated : %s", data.get("generated", "unknown"))
+    log.info("  Actions   : %d", len(actions))
+    if args.dry_run:
+        log.info("  Mode      : DRY RUN (no changes will be made)")
+
+    progress = ProgressReporter(len(actions), "actions")
+    stats = MaintenanceStats()
+    # Apply serially: order matters (mkdir before the moves that depend on it).
+    for action in actions:
+        stats.add(execute_plan([action], dry_run=args.dry_run))
+        progress.step()
+
+    log.info("Apply-plan complete: %s", stats)
+    return 0
+
+
+# ─────────────────────────────────────────────
+# SERIES PROPOSAL  (scan once, review in GUI, apply later)
+# ─────────────────────────────────────────────
+def find_fuzzy_series_pairs(
+    parent: Path,
+    report_threshold: float,
+    exclusions: set[frozenset] | None = None,
+) -> list[tuple[float, Path, Path]]:
+    """Return sibling directory pairs whose normalised names are similar.
+
+    This is the detection half of find_series_matches, factored out so it can feed
+    the review-proposal workflow without performing any merges.
+    """
+    _excl = exclusions or set()
+    dirs = [d for d in parent.iterdir() if d.is_dir() and d.name != CHECK_FOLDER_NAME]
+    entries = [(d, normalise_series_key(d.name)) for d in dirs]
+    pairs: list[tuple[float, Path, Path]] = []
+    for i, (a, na) in enumerate(entries):
+        if not na:
+            continue
+        for b, nb in entries[i + 1:]:
+            if not nb or is_excluded_pair(a.name, b.name, _excl):
+                continue
+            if 2 * min(len(na), len(nb)) / (len(na) + len(nb)) < report_threshold:
+                continue
+            sm = SequenceMatcher(None, na, nb)
+            if sm.quick_ratio() < report_threshold:
+                continue
+            ratio = sm.ratio()
+            if ratio < report_threshold:
+                continue
+            pairs.append((ratio, a, b))
+    return pairs
+
+
+def _file_count(folder: Path) -> int:
+    try:
+        return len(list(folder.glob("*.cbz")))
+    except OSError:
+        return 0
+
+
+def collect_series_proposals(
+    parent: Path,
+    report_threshold: float,
+    min_common_words: int,
+    min_group_size: int,
+    exclusions: set[frozenset] | None = None,
+    start_index: int = 1,
+) -> list[dict]:
+    """Build review-ready candidate groups for one parent directory.
+
+    Combines two detectors:
+      - subtitle/variant groups (_group_possible_same_series_dirs)
+      - fuzzy name pairs (find_fuzzy_series_pairs)
+    Fuzzy pairs already covered by a subtitle group are dropped, so each set of
+    folders appears once. Returns a list of group dicts ready for JSON.
+    """
+    _excl = exclusions or set()
+    groups: list[dict] = []
+    covered: set[Path] = set()
+    idx = start_index
+
+    subtitle_groups = _group_possible_same_series_dirs(
+        parent=parent,
+        min_common_words=min_common_words,
+        min_group_size=min_group_size,
+        exclusions=_excl,
+    )
+    for suggested_name, members in subtitle_groups:
+        groups.append({
+            "id": f"g{idx:04d}",
+            "kind": "subtitle-group",
+            "score": None,
+            "suggested_name": suggested_name,
+            "parent": str(parent),
+            "members": [
+                {"name": m.name, "path": str(m), "file_count": _file_count(m)}
+                for m in members
+            ],
+        })
+        covered.update(members)
+        idx += 1
+
+    for ratio, a, b in find_fuzzy_series_pairs(parent, report_threshold, _excl):
+        if a in covered or b in covered:
+            continue
+        members = sorted([a, b], key=lambda p: p.name.lower())
+        suggested = canonical_series_name([m.name for m in members])
+        groups.append({
+            "id": f"g{idx:04d}",
+            "kind": "fuzzy-pair",
+            "score": round(ratio, 3),
+            "suggested_name": suggested,
+            "parent": str(parent),
+            "members": [
+                {"name": m.name, "path": str(m), "file_count": _file_count(m)}
+                for m in members
+            ],
+        })
+        covered.update(members)
+        idx += 1
+
+    return groups
+
+
+def write_series_proposal(path: Path, root: Path, groups: list[dict]) -> None:
+    """Write the candidate groups to *path* as a JSON proposal file."""
+    data = {
+        "version": 1,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "root": str(root),
+        "group_count": len(groups),
+        "groups": groups,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        log.info("Series proposal written: %s  (%d group(s))", path, len(groups))
+    except OSError as e:
+        log.error("Could not write proposal %s: %s", path, e)
+
+
+def run_propose_series(args: argparse.Namespace) -> int:
+    """Entry point for 'propose-series': scan and write a review file. Makes no changes."""
+    exclusions = load_series_exclusions()
+    all_groups: list[dict] = []
+    for root_arg in args.paths:
+        root = Path(root_arg)
+        if not root.exists():
+            log.error("Missing root: %s", root)
+            continue
+        parents = [root]
+        if getattr(args, "recursive_parents", False):
+            parents.extend(sorted({p.parent for p in root.rglob("*") if p.is_dir()}))
+        for parent in sorted(set(parents)):
+            all_groups.extend(
+                collect_series_proposals(
+                    parent=parent,
+                    report_threshold=args.report_threshold,
+                    min_common_words=args.series_common_words,
+                    min_group_size=args.series_min_group_size,
+                    exclusions=exclusions,
+                    start_index=len(all_groups) + 1,
+                )
+            )
+
+    out = Path(args.out)
+    write_series_proposal(out, Path(args.paths[0]), all_groups)
+    log.info("Found %d candidate group(s) for review.", len(all_groups))
+    return 0
+
+
+def apply_series_decisions(
+    decisions: list[dict],
+    dry_run: bool,
+    metadata_workers: int = 1,
+    exclusions: set[frozenset] | None = None,
+) -> MaintenanceStats:
+    """Apply reviewed series decisions.
+
+    Each decision: {"verdict": "yes"|"no", "members": [paths], "target_name": str,
+    "parent": str}. "yes" merges all members into <parent>/<target_name>; "no"
+    records the members as a permanent exclusion so they are not re-proposed.
+    """
+    stats = MaintenanceStats()
+    _excl = exclusions if exclusions is not None else load_series_exclusions()
+
+    for decision in decisions:
+        verdict = (decision.get("verdict") or "").strip().lower()
+        members = [Path(p) for p in decision.get("members", [])]
+        members = [m for m in members if m.exists()]
+        if not members:
+            continue
+
+        if verdict == "no":
+            added = record_series_exclusion([m.name for m in members], _excl, dry_run)
+            log.info(
+                "  %sExcluded %d pair(s) for: %s",
+                "[DRY RUN] " if dry_run else "",
+                added,
+                ", ".join(m.name for m in members),
+            )
+            continue
+
+        if verdict != "yes":
+            continue  # undecided — leave untouched
+
+        parent = Path(decision.get("parent") or members[0].parent)
+        raw_target = (decision.get("target_name") or "").strip()
+        target_name = clean_directory_name(raw_target) if raw_target else canonical_series_name(
+            [m.name for m in members]
+        )
+        if not target_name:
+            log.warning("  Skipping group with empty target name: %s", [m.name for m in members])
+            stats.skipped += 1
+            continue
+
+        dest = parent / target_name
+        log.info(
+            "  %sMerge %d folder(s) -> %s",
+            "[DRY RUN] " if dry_run else "",
+            len(members),
+            dest,
+        )
+        if dry_run:
+            plan_record("mkdir", path=dest)
+        else:
+            dest.mkdir(parents=True, exist_ok=True)
+
+        for src in members:
+            if src == dest:
+                continue
+            stats.add(merge_series_dir(src, dest, dry_run))
+        if dest.exists():
+            stats.add(dedupe_archives_in_dir(dest, dry_run))
+            stats.add(update_series_metadata(dest, dry_run, workers=metadata_workers))
+            stats.add(detect_and_fix_compilations(dest, dry_run))
+
+    return stats
+
+
+def run_apply_series(args: argparse.Namespace) -> int:
+    """Entry point for 'apply-series': read a decisions file and apply it."""
+    dec_path = Path(args.decisions)
+    try:
+        with open(dec_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.error("Decisions file not found: %s", dec_path)
+        return 1
+    except (json.JSONDecodeError, OSError) as e:
+        log.error("Could not read decisions file %s: %s", dec_path, e)
+        return 1
+
+    decisions = data.get("decisions", [])
+    log.info("Applying series decisions: %s  (%d group(s))", dec_path, len(decisions))
+    if args.dry_run:
+        log.info("  Mode: DRY RUN (no changes will be made)")
+
+    plan_out = getattr(args, "plan_out", None)
+    if args.dry_run and plan_out:
+        plan_open()
+
+    stats = apply_series_decisions(
+        decisions,
+        dry_run=args.dry_run,
+        metadata_workers=getattr(args, "workers", 1),
+    )
+
+    if args.dry_run and plan_out:
+        plan_save(Path(plan_out), {"source": "apply-series", "decisions_file": str(dec_path)})
+
+    log.info("Apply-series complete: %s", stats)
+    return 0
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
+    """Add the shared CLI arguments (paths, --dry-run, --workers, --verbose) to a subcommand parser."""
     parser.add_argument("paths", nargs="+", help="Files or folders to process")
     parser.add_argument("--dry-run", action="store_true", help="Preview only")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Worker threads")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument(
+        "--plan-out",
+        dest="plan_out",
+        metavar="FILE",
+        default=None,
+        help="During a --dry-run, record the planned actions to FILE so they can later "
+             "be executed with 'apply-plan' without re-scanning.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct and return the top-level argument parser with all subcommands registered."""
     parser = argparse.ArgumentParser(description="Consolidated CBZ library maintenance tool.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1187,6 +2308,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-recursive", action="store_true")
     p.add_argument("--strip-names", action="store_true", default=True)
     p.add_argument("--dedupe-archives", action="store_true", default=True)
+    p.add_argument(
+        "--metadata-dedupe",
+        action="store_true",
+        default=True,
+        help="During dedupe, also match duplicates by ComicInfo.xml Series+Volume+Number (catches same chapter under different filenames)",
+    )
+    p.add_argument(
+        "--no-metadata-dedupe",
+        dest="metadata_dedupe",
+        action="store_false",
+        help="Dedupe by filename only; do not read ComicInfo.xml metadata",
+    )
     p.add_argument("--pack-loose-images", action="store_true", default=True)
     p.set_defaults(func=run_archive_clean)
 
@@ -1194,6 +2327,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p)
     p.add_argument("--merge-chapter-folders", action="store_true", default=True)
     p.add_argument("--match-series", action="store_true", default=True)
+    p.add_argument(
+        "--dedupe-archives",
+        action="store_true",
+        default=True,
+        help="After merging, delete duplicate archives in every series folder (treats files that differ only by spacing/punctuation as the same book)",
+    )
+    p.add_argument(
+        "--no-dedupe-archives",
+        dest="dedupe_archives",
+        action="store_false",
+        help="Skip the per-folder duplicate-archive sweep",
+    )
+    p.add_argument(
+        "--metadata-dedupe",
+        action="store_true",
+        default=True,
+        help="During dedupe, also match duplicates by ComicInfo.xml Series+Volume+Number (catches same chapter under different filenames)",
+    )
+    p.add_argument(
+        "--no-metadata-dedupe",
+        dest="metadata_dedupe",
+        action="store_false",
+        help="Dedupe by filename only; do not read ComicInfo.xml metadata",
+    )
     p.add_argument("--uncensored-check", action="store_true")
     p.add_argument(
         "--possible-series-check",
@@ -1203,10 +2360,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recursive-parents", action="store_true")
     p.add_argument("--report-threshold", type=float, default=0.75)
     p.add_argument("--auto-threshold", type=float, default=0.87)
-    p.add_argument("--series-common-words", type=int, default=2, help="Minimum fuzzy common prefix words for possible-series groups")
+    p.add_argument("--series-common-words", type=int, default=1, help="Minimum fuzzy common prefix words for possible-series groups")
     p.add_argument("--series-min-group-size", type=int, default=2, help="Minimum directories required to create a possible-series review group")
+    p.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Prompt before moving each possible-series group to _Check. "
+            "Answers: [y]es / [n]o / e[x]clude permanently. "
+            "Requires a real terminal; auto-skips prompts when stdin is not a tty."
+        ),
+    )
     p.add_argument("--move-which", choices=["both", "uncensored", "censored"], default="both")
     p.set_defaults(func=run_organize_series)
+
+    p = sub.add_parser(
+        "clear-exclusions",
+        help="List or purge the series exclusions log",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Preview what would be removed without changing the file")
+    p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    p.add_argument(
+        "--filter",
+        metavar="TEXT",
+        help="Only remove pairs where at least one name contains TEXT (case-insensitive). Omit to remove all.",
+    )
+    p.set_defaults(func=run_clear_exclusions)
+
+    p = sub.add_parser("rename", help="Rename CBZ files using the cbz_core normalisation pipeline (strips hex suffixes, normalises chapter tokens, etc.)")
+    add_common(p)
+    p.set_defaults(func=run_rename)
+
+    p = sub.add_parser(
+        "repair-names",
+        help="Repair mojibake (non-ASCII written as literal UTF-8 hex, e.g. Playere28099s -> Player's) "
+             "in file names, folder names, and ComicInfo Title/Series metadata",
+    )
+    p.add_argument("paths", nargs="+", help="Files or folders to repair")
+    p.add_argument("--dry-run", action="store_true", help="Preview changes without renaming or rewriting")
+    p.add_argument("--names-only", dest="names_only", action="store_true",
+                   help="Only repair file/folder names; do not rewrite ComicInfo metadata inside archives")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=run_repair_names)
 
     p = sub.add_parser("metadata", help="Repair ComicInfo metadata using cbz_core")
     add_common(p)
@@ -1218,17 +2413,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auto-threshold", type=float, default=0.87)
     p.set_defaults(func=run_all)
 
+    p = sub.add_parser(
+        "propose-series",
+        help="Scan for likely same-series folders and write a review file (makes no changes)",
+    )
+    p.add_argument("paths", nargs="+", help="Library folder(s) to scan")
+    p.add_argument("--out", required=True, metavar="FILE", help="Where to write the proposal JSON")
+    p.add_argument("--report-threshold", type=float, default=0.75)
+    p.add_argument("--series-common-words", type=int, default=1)
+    p.add_argument("--series-min-group-size", type=int, default=2)
+    p.add_argument("--recursive-parents", action="store_true")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=run_propose_series)
+
+    p = sub.add_parser(
+        "apply-series",
+        help="Apply a reviewed series decisions file (merge 'yes' groups, exclude 'no' groups)",
+    )
+    p.add_argument("decisions", help="Path to the decisions JSON written by the GUI review window")
+    p.add_argument("--dry-run", action="store_true", help="Preview only")
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    p.add_argument("--plan-out", dest="plan_out", metavar="FILE", default=None,
+                   help="During --dry-run, record planned merges to FILE for later 'apply-plan'")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=run_apply_series)
+
+    p = sub.add_parser(
+        "apply-plan",
+        help="Execute a plan file recorded during an earlier --dry-run (no re-scanning)",
+    )
+    p.add_argument("plan", help="Path to the plan JSON written via --plan-out")
+    p.add_argument("--dry-run", action="store_true", help="Preview the replay without changing files")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=run_apply_plan)
+
     return parser
 
 
 def main() -> int:
+    """Parse CLI arguments, validate them, re-configure logging, and dispatch to the chosen subcommand."""
     parser = build_parser()
     args = parser.parse_args()
 
     global log
     log = setup_logging(args.verbose)
 
-    if args.workers < 1:
+    if hasattr(args, "workers") and args.workers < 1:
         parser.error("--workers must be >= 1")
     if hasattr(args, "series_common_words") and args.series_common_words < 1:
         parser.error("--series-common-words must be >= 1")
