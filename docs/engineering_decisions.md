@@ -1,89 +1,60 @@
 # Engineering Decisions
 
-A record of non-obvious design choices in the suite and the reasoning behind them.
+## Shared core is authoritative
 
----
+Normalization, series inference, title handling, translation helpers, number extraction, and ComicInfo update decisions belong in `cbz_core.py`.
 
-## Shared cbz_core.py normalization layer
+Scripts retain only operation-specific mechanics such as watcher debounce, archive rewrites, worker scheduling, routing, and GUI state.
 
-**Decision:** Shared normalization, parsing, and ComicInfo logic now lives in `scripts/cbz_core.py`. Watcher and batch tools import helpers from the shared module rather than maintaining duplicated copies.
+## Unified workflows are preferred
 
-**Why:** The earlier architecture relied on manually syncing duplicated regexes and helper functions between `cbz_sanitizer.py`, `cbz_watcher.py`, and other tools. This repeatedly caused drift bugs where a fix landed in one script but not another.
+Use `cbz_workflows.py` for multi-stage maintenance and series operations. Individual commands remain available for targeted work, scheduled jobs, and compatibility.
 
-Moving the logic into `cbz_core.py` creates:
+## Persistent progress currently remains JSONL
 
-- one authoritative normalization pipeline
-- one authoritative ComicInfo update policy
-- one authoritative regex set
-- reusable structured parsing via `ParsedComicName`
-- safer future migrations for dedupe, indexing, and image-aware processing
+The sanitizer automatically resumes from append-only JSONL history. Keep this during database migration until database-backed resumability is proven.
 
----
+## Dry-run plans are executable artifacts
 
-## parse_comic_name() as the authoritative normalization pipeline
+A reviewed dry run should be replayable without rescanning. Current JSON plans will map to database action-plan records while retaining JSON export.
 
-**Decision:** Filename generation and metadata extraction now flow through `parse_comic_name()` instead of each script manually chaining helper functions.
+## Uncertain series matches require review
 
-**Why:** The old watcher implementation reconstructed the normalization pipeline manually:
+Fuzzy similarity alone must not silently merge likely matches. Proposals, exclusions, `_Check`, and GUI decisions are first-class concepts.
 
-```python
-clean_filename()
-normalize_stem()
-normalise_number_tokens()
-```
+## Staging precedes final publication
 
-This recreated the exact drift problem the shared-core migration was meant to eliminate.
+The target model identifies, normalizes, analyzes, and reviews archives before they enter the final Komga library.
 
----
+## SQLite is operational
 
-## Mixed-language title shortening instead of destructive Unicode stripping
+The database will control processing state and retain history. It is not merely a report generated after filesystem work.
 
-**Decision:** The suite no longer aggressively strips all non-Latin text during sanitization.
+## SQLite remains local
 
-**Why:** Many incoming archives contain both English and original-language titles, such as:
+The active database belongs on the Office PC. Direct concurrent SMB access from Unraid or the Pi is unsupported.
+
+## Image dedupe is progressive
 
 ```text
-One Piece / ワンピース Ch.005.cbz
+exact archive hash
+ordered exact page hashes
+pHash / dHash
+sequence-aware overlap
+quality scoring
+OpenCLIP embeddings
 ```
 
-The new pipeline preserves non-Latin-only titles, prefers English-heavy segments when duplicate-language titles exist, preserves chapter/volume metadata, and removes only Windows-forbidden path characters.
+CLIP refines candidate matching; it is not the first candidate-generation step.
 
----
+## Deletion is delayed
 
-## ElementTree-based ComicInfo updates
+Use quarantine and review before permanent deletion even though a separate library backup exists.
 
-**Decision:** ComicInfo updates now use `xml.etree.ElementTree` instead of regex substitution.
+## External metadata is evidence
 
-**Why:** Regex replacement against XML was fragile around multiline formatting, namespaces, malformed XML, and duplicate tags.
+Komga and Komf identifiers and titles feed the local series model, but provider and timestamp provenance must be retained.
 
----
+## Office PC is the worker
 
-## Larger file wins on conflict
-
-**Decision:** When two files collide during a merge or move, the larger file is always kept.
-
-**Why:** File size is a practical proxy for scan quality and avoids human prompts during large library merges.
-
----
-
-## External routing config
-
-**Decision:** Destination routing is driven by `routing.json`.
-
-**Why:** Routing is machine-specific and easier to maintain outside Python code.
-
----
-
-## Runtime files kept off the repo
-
-**Decision:** Routing files, logs, and progress JSON contents are excluded from git.
-
-**Why:** They are machine-specific runtime state and create noisy diffs.
-
----
-
-## Dry-run on all batch tools
-
-**Decision:** Every modifying batch tool supports `--dry-run`.
-
-**Why:** Large-library operations need preview mode before applying changes.
+CPU-intensive scanning, image decoding, hashing, and GPU embeddings run on the Office PC. The Pi 5 is for dashboards, scheduling, and health checks.
