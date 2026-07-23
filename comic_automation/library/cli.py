@@ -74,6 +74,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=5.0,
     )
+    parser.add_argument(
+        "--exclude-directory",
+        action="append",
+        default=[],
+        help=(
+            "Directory name to exclude. May be supplied multiple "
+            "times. Common system and Syncthing directories are "
+            "excluded automatically."
+        ),
+    )
 
     return parser
 
@@ -133,10 +143,12 @@ def run_dry_scan(
     *,
     limit: int | None,
     progress_every: int,
+    excluded_directories: list[str] | None = None,
 ) -> dict:
     started = time.monotonic()
     scanned = 0
     errors = 0
+    excluded_directory_count = 0
     limited = False
 
     def on_error(path: Path, error: OSError) -> None:
@@ -147,9 +159,15 @@ def run_dry_scan(
             file=sys.stderr,
         )
 
+    def on_excluded_directory(path: Path) -> None:
+        nonlocal excluded_directory_count
+        excluded_directory_count += 1
+
     for archive in discover_archives(
         root,
+        excluded_directories=excluded_directories,
         on_error=on_error,
+        on_excluded_directory=on_excluded_directory,
     ):
         if limit is not None and scanned >= limit:
             limited = True
@@ -172,6 +190,7 @@ def run_dry_scan(
         "missing": 0,
         "jobs_queued": 0,
         "errors": errors,
+        "excluded_directories": excluded_directory_count,
         "resumed": False,
         "limited": limited,
         "dry_run": True,
@@ -190,6 +209,7 @@ def run_discovery(
     progress_every: int = 1000,
     json_output: Path | None = None,
     minimum_free_space_gb: float = 5.0,
+    excluded_directories: list[str] | None = None,
     migration_directory: Path = DEFAULT_MIGRATION_DIRECTORY,
 ) -> int:
     preflight(
@@ -204,6 +224,7 @@ def run_discovery(
             root,
             limit=limit,
             progress_every=progress_every,
+            excluded_directories=excluded_directories,
         )
     else:
         def progress(scanned: int, path: Path) -> None:
@@ -222,6 +243,7 @@ def run_discovery(
                 connection,
                 root,
                 batch_size=batch_size,
+                excluded_directories=excluded_directories,
                 limit=limit,
                 resume=resume,
                 progress_callback=progress,
@@ -248,6 +270,10 @@ def run_discovery(
     print(f"Missing:     {output['missing']}")
     print(f"Jobs queued: {output['jobs_queued']}")
     print(f"Errors:      {output['errors']}")
+    print(
+        "Excluded:    "
+        f"{output.get('excluded_directories', 0)} directories"
+    )
     print(f"Resumed:     {output['resumed']}")
     print(f"Limited:     {output['limited']}")
     print(f"Dry run:     {output.get('dry_run', False)}")
@@ -281,6 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             minimum_free_space_gb=(
                 args.minimum_free_space_gb
             ),
+            excluded_directories=args.exclude_directory,
         )
     except Exception as exc:
         print(

@@ -15,6 +15,10 @@ from comic_automation.library.discovery import (
     discover_archives,
     normalize_library_path,
 )
+from comic_automation.library.exclusions import (
+    normalize_excluded_directories,
+    path_contains_excluded_directory,
+)
 
 
 ProgressCallback = Callable[[int, Path], None]
@@ -322,8 +326,13 @@ class LibraryRepository:
         self,
         root: str | Path,
         seen_path_keys: set[str],
+        *,
+        excluded_directories: Iterable[str] | None = None,
     ) -> int:
         library_root = normalize_library_path(root)
+        exclusions = normalize_excluded_directories(
+            excluded_directories
+        )
         missing_count = 0
         now = _utc_timestamp()
 
@@ -342,6 +351,13 @@ class LibraryRepository:
             try:
                 location_path.relative_to(library_root)
             except ValueError:
+                continue
+
+            if path_contains_excluded_directory(
+                location_path,
+                library_root,
+                excluded_directories=exclusions,
+            ):
                 continue
 
             if _path_key(location_path) in seen_path_keys:
@@ -433,6 +449,7 @@ def scan_library(
     *,
     batch_size: int = 500,
     extensions: Iterable[str] = DEFAULT_ARCHIVE_EXTENSIONS,
+    excluded_directories: Iterable[str] | None = None,
     limit: int | None = None,
     resume: bool = False,
     progress_callback: ProgressCallback | None = None,
@@ -483,6 +500,7 @@ def scan_library(
         error_count = 0
         resumed = False
 
+    excluded_directory_count = 0
     seen_path_keys: set[str] = set()
     pending: list[DiscoveredArchive] = []
     last_path: str | None = last_checkpoint
@@ -491,6 +509,10 @@ def scan_library(
     def on_error(path: Path, error: OSError) -> None:
         nonlocal error_count
         error_count += 1
+
+    def on_excluded_directory(path: Path) -> None:
+        nonlocal excluded_directory_count
+        excluded_directory_count += 1
 
     def flush() -> None:
         nonlocal new, changed, unchanged, jobs_queued
@@ -539,7 +561,9 @@ def scan_library(
         for archive in discover_archives(
             library_root,
             extensions=extensions,
+            excluded_directories=excluded_directories,
             on_error=on_error,
+            on_excluded_directory=on_excluded_directory,
         ):
             path_text = str(archive.path)
 
@@ -578,6 +602,7 @@ def scan_library(
                 missing = repository.mark_missing(
                     library_root,
                     seen_path_keys,
+                    excluded_directories=excluded_directories,
                 )
                 connection.execute("COMMIT")
             except Exception:
@@ -595,6 +620,7 @@ def scan_library(
             "missing": missing,
             "jobs_queued": jobs_queued,
             "errors": error_count,
+            "excluded_directories": excluded_directory_count,
             "resumed": resumed,
             "limited": limited,
             "elapsed_seconds": elapsed,
@@ -623,6 +649,7 @@ def scan_library(
             missing=missing,
             jobs_queued=jobs_queued,
             errors=error_count,
+            excluded_directories=excluded_directory_count,
             resumed=resumed,
             limited=limited,
             elapsed_seconds=elapsed,
