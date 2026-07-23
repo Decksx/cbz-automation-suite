@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +11,8 @@ DEFAULT_ARCHIVE_EXTENSIONS = frozenset({
     ".cbr",
     ".cb7",
 })
+
+DiscoveryErrorHandler = Callable[[Path, OSError], None]
 
 
 @dataclass(frozen=True)
@@ -23,21 +25,21 @@ class DiscoveredArchive:
 
 @dataclass(frozen=True)
 class DiscoverySummary:
-    batch_id: int
+    batch_id: int | None
     scanned: int
     new: int
     changed: int
     unchanged: int
     missing: int
     jobs_queued: int
+    errors: int = 0
+    resumed: bool = False
+    limited: bool = False
+    dry_run: bool = False
+    elapsed_seconds: float = 0.0
 
 
 def normalize_library_path(path: str | Path) -> Path:
-    """
-    Return a stable absolute path without requiring the target to exist.
-
-    resolve(strict=False) does not open files and is safe for discovery.
-    """
     return Path(path).expanduser().resolve(strict=False)
 
 
@@ -45,12 +47,12 @@ def discover_archives(
     root: str | Path,
     *,
     extensions: Iterable[str] = DEFAULT_ARCHIVE_EXTENSIONS,
+    on_error: DiscoveryErrorHandler | None = None,
 ) -> Iterator[DiscoveredArchive]:
     """
-    Recursively enumerate supported archives beneath root.
+    Enumerate supported archives using directory and stat metadata only.
 
-    Only directory entries and stat metadata are read. Archive contents
-    are never opened.
+    Archive contents are never opened.
     """
     library_root = normalize_library_path(root)
 
@@ -71,12 +73,17 @@ def discover_archives(
         for value in extensions
     }
 
+    def walk_error(error: OSError) -> None:
+        if on_error is not None:
+            filename = error.filename or str(library_root)
+            on_error(Path(filename), error)
+
     for directory, directory_names, filenames in os.walk(
         library_root,
         topdown=True,
         followlinks=False,
+        onerror=walk_error,
     ):
-        # Deterministic traversal makes test results and audit logs stable.
         directory_names.sort(key=str.casefold)
         filenames.sort(key=str.casefold)
 
@@ -91,16 +98,14 @@ def discover_archives(
 
             try:
                 stat_result = path.stat()
-            except FileNotFoundError:
-                # The file disappeared between enumeration and stat.
-                continue
-            except OSError:
-                # Permission and transient filesystem errors are handled
-                # by later logging/service integration. A single file must
-                # not abort the complete read-only crawl.
-                continue
 
-            if not path.is_file():
+                if not path.is_file():
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if on_error is not None:
+                    on_error(path, exc)
                 continue
 
             yield DiscoveredArchive(

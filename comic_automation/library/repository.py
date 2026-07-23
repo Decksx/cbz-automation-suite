@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,9 @@ from comic_automation.library.discovery import (
 )
 
 
+ProgressCallback = Callable[[int, Path], None]
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -23,9 +27,6 @@ def _utc_timestamp() -> str:
 
 
 def _path_key(path: str | Path) -> str:
-    """
-    Produce a case-insensitive key suitable for Windows-library scans.
-    """
     return str(
         normalize_library_path(path)
     ).replace("/", "\\").casefold()
@@ -37,6 +38,8 @@ class LibraryRepository:
         self.queue = JobQueue(connection)
 
     def start_batch(self, source_path: str | Path) -> int:
+        normalized = str(normalize_library_path(source_path))
+
         cursor = self.connection.execute(
             """
             INSERT INTO source_batches (
@@ -47,7 +50,7 @@ class LibraryRepository:
             VALUES (?, 'running', ?)
             """,
             (
-                str(normalize_library_path(source_path)),
+                normalized,
                 json.dumps(
                     {"mode": "read-only-discovery"},
                     sort_keys=True,
@@ -55,12 +58,92 @@ class LibraryRepository:
             ),
         )
 
-        return int(cursor.lastrowid)
+        batch_id = int(cursor.lastrowid)
+
+        self.connection.execute(
+            """
+            INSERT INTO discovery_checkpoints (
+                batch_id,
+                source_path
+            )
+            VALUES (?, ?)
+            """,
+            (batch_id, normalized),
+        )
+
+        return batch_id
+
+    def find_resumable_batch(
+        self,
+        source_path: str | Path,
+    ) -> sqlite3.Row | None:
+        normalized = str(normalize_library_path(source_path))
+
+        return self.connection.execute(
+            """
+            SELECT
+                sb.id AS batch_id,
+                sb.status,
+                dc.last_path,
+                dc.scanned,
+                dc.new_count,
+                dc.changed_count,
+                dc.unchanged_count,
+                dc.jobs_queued,
+                dc.error_count
+            FROM source_batches AS sb
+            JOIN discovery_checkpoints AS dc
+              ON dc.batch_id = sb.id
+            WHERE sb.source_path = ?
+              AND sb.status IN ('running', 'failed')
+            ORDER BY sb.id DESC
+            LIMIT 1
+            """,
+            (normalized,),
+        ).fetchone()
+
+    def update_checkpoint(
+        self,
+        *,
+        batch_id: int,
+        last_path: str | None,
+        scanned: int,
+        new: int,
+        changed: int,
+        unchanged: int,
+        jobs_queued: int,
+        errors: int,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE discovery_checkpoints
+            SET
+                last_path = ?,
+                scanned = ?,
+                new_count = ?,
+                changed_count = ?,
+                unchanged_count = ?,
+                jobs_queued = ?,
+                error_count = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE batch_id = ?
+            """,
+            (
+                last_path,
+                scanned,
+                new,
+                changed,
+                unchanged,
+                jobs_queued,
+                errors,
+                batch_id,
+            ),
+        )
 
     def complete_batch(
         self,
         batch_id: int,
-        summary: dict[str, int],
+        summary: dict,
     ) -> None:
         self.connection.execute(
             """
@@ -70,10 +153,7 @@ class LibraryRepository:
                 details_json = ?
             WHERE id = ?
             """,
-            (
-                json.dumps(summary, sort_keys=True),
-                batch_id,
-            ),
+            (json.dumps(summary, sort_keys=True), batch_id),
         )
 
     def fail_batch(
@@ -105,12 +185,6 @@ class LibraryRepository:
         self,
         archive: DiscoveredArchive,
     ) -> tuple[str, bool]:
-        """
-        Record one discovered archive.
-
-        Returns:
-            (classification, inspection_job_was_queued)
-        """
         path_text = str(archive.path)
 
         row = self.connection.execute(
@@ -139,11 +213,7 @@ class LibraryRepository:
                 )
                 VALUES (?, ?, ?)
                 """,
-                (
-                    archive.file_size,
-                    now,
-                    now,
-                ),
+                (archive.file_size, now, now),
             )
             archive_id = int(archive_cursor.lastrowid)
 
@@ -225,22 +295,12 @@ class LibraryRepository:
                 updated_at = ?
             WHERE id = ?
             """,
-            (
-                archive.file_size,
-                now,
-                archive_id,
-            ),
-        )
-
-        event_type = (
-            "restored"
-            if not was_current
-            else "changed"
+            (archive.file_size, now, archive_id),
         )
 
         self._record_event(
             archive_id,
-            event_type,
+            "restored" if not was_current else "changed",
             source_path=path_text,
             details={
                 "previous_file_size": previous_size,
@@ -269,10 +329,7 @@ class LibraryRepository:
 
         rows = self.connection.execute(
             """
-            SELECT
-                id,
-                archive_id,
-                path
+            SELECT id, archive_id, path
             FROM file_locations
             WHERE is_current = 1
             ORDER BY id
@@ -280,9 +337,7 @@ class LibraryRepository:
         ).fetchall()
 
         for row in rows:
-            location_path = normalize_library_path(
-                row["path"]
-            )
+            location_path = normalize_library_path(row["path"])
 
             try:
                 location_path.relative_to(library_root)
@@ -295,15 +350,10 @@ class LibraryRepository:
             self.connection.execute(
                 """
                 UPDATE file_locations
-                SET
-                    is_current = 0,
-                    last_seen_at = ?
+                SET is_current = 0, last_seen_at = ?
                 WHERE id = ?
                 """,
-                (
-                    now,
-                    int(row["id"]),
-                ),
+                (now, int(row["id"])),
             )
 
             self._record_event(
@@ -383,34 +433,67 @@ def scan_library(
     *,
     batch_size: int = 500,
     extensions: Iterable[str] = DEFAULT_ARCHIVE_EXTENSIONS,
+    limit: int | None = None,
+    resume: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> DiscoverySummary:
-    """
-    Perform a complete read-only inventory scan.
-
-    File metadata is read from the filesystem. Database updates are
-    committed in bounded batches. Missing-file detection runs only after
-    a successful complete traversal.
-    """
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1.")
 
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least 1.")
+
+    started = time.monotonic()
     repository = LibraryRepository(connection)
     library_root = normalize_library_path(root)
-    batch_id = repository.start_batch(library_root)
 
-    scanned = 0
-    new = 0
-    changed = 0
-    unchanged = 0
-    jobs_queued = 0
+    resumable = (
+        repository.find_resumable_batch(library_root)
+        if resume
+        else None
+    )
+
+    if resumable is not None:
+        batch_id = int(resumable["batch_id"])
+        last_checkpoint = resumable["last_path"]
+        scanned = int(resumable["scanned"])
+        new = int(resumable["new_count"])
+        changed = int(resumable["changed_count"])
+        unchanged = int(resumable["unchanged_count"])
+        jobs_queued = int(resumable["jobs_queued"])
+        error_count = int(resumable["error_count"])
+        resumed = True
+
+        connection.execute(
+            """
+            UPDATE source_batches
+            SET status = 'running'
+            WHERE id = ?
+            """,
+            (batch_id,),
+        )
+    else:
+        batch_id = repository.start_batch(library_root)
+        last_checkpoint = None
+        scanned = 0
+        new = 0
+        changed = 0
+        unchanged = 0
+        jobs_queued = 0
+        error_count = 0
+        resumed = False
+
     seen_path_keys: set[str] = set()
     pending: list[DiscoveredArchive] = []
+    last_path: str | None = last_checkpoint
+    limited = False
+
+    def on_error(path: Path, error: OSError) -> None:
+        nonlocal error_count
+        error_count += 1
 
     def flush() -> None:
-        nonlocal new
-        nonlocal changed
-        nonlocal unchanged
-        nonlocal jobs_queued
+        nonlocal new, changed, unchanged, jobs_queued
 
         if not pending:
             return
@@ -433,6 +516,17 @@ def scan_library(
                 if queued:
                     jobs_queued += 1
 
+            repository.update_checkpoint(
+                batch_id=batch_id,
+                last_path=last_path,
+                scanned=scanned,
+                new=new,
+                changed=changed,
+                unchanged=unchanged,
+                jobs_queued=jobs_queued,
+                errors=error_count,
+            )
+
             connection.execute("COMMIT")
             pending.clear()
 
@@ -445,40 +539,80 @@ def scan_library(
         for archive in discover_archives(
             library_root,
             extensions=extensions,
+            on_error=on_error,
         ):
+            path_text = str(archive.path)
+
+            if (
+                last_checkpoint is not None
+                and _path_key(path_text)
+                <= _path_key(last_checkpoint)
+            ):
+                seen_path_keys.add(_path_key(path_text))
+                continue
+
+            if limit is not None and scanned >= limit:
+                limited = True
+                break
+
             scanned += 1
-            seen_path_keys.add(_path_key(archive.path))
+            last_path = path_text
+            seen_path_keys.add(_path_key(path_text))
             pending.append(archive)
+
+            if progress_callback is not None:
+                progress_callback(scanned, archive.path)
 
             if len(pending) >= batch_size:
                 flush()
 
         flush()
 
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            missing = repository.mark_missing(
-                library_root,
-                seen_path_keys,
-            )
+        # Missing-file detection is unsafe after a partial or resumed scan
+        # because the complete set of current paths was not observed.
+        missing = 0
 
-            repository.complete_batch(
-                batch_id,
-                {
-                    "scanned": scanned,
-                    "new": new,
-                    "changed": changed,
-                    "unchanged": unchanged,
-                    "missing": missing,
-                    "jobs_queued": jobs_queued,
-                },
-            )
-            connection.execute("COMMIT")
+        if not limited and not resumed:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                missing = repository.mark_missing(
+                    library_root,
+                    seen_path_keys,
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
 
-        except Exception:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
+        elapsed = time.monotonic() - started
+
+        summary_data = {
+            "scanned": scanned,
+            "new": new,
+            "changed": changed,
+            "unchanged": unchanged,
+            "missing": missing,
+            "jobs_queued": jobs_queued,
+            "errors": error_count,
+            "resumed": resumed,
+            "limited": limited,
+            "elapsed_seconds": elapsed,
+        }
+
+        if limited:
+            repository.update_checkpoint(
+                batch_id=batch_id,
+                last_path=last_path,
+                scanned=scanned,
+                new=new,
+                changed=changed,
+                unchanged=unchanged,
+                jobs_queued=jobs_queued,
+                errors=error_count,
+            )
+        else:
+            repository.complete_batch(batch_id, summary_data)
 
         return DiscoverySummary(
             batch_id=batch_id,
@@ -488,11 +622,25 @@ def scan_library(
             unchanged=unchanged,
             missing=missing,
             jobs_queued=jobs_queued,
+            errors=error_count,
+            resumed=resumed,
+            limited=limited,
+            elapsed_seconds=elapsed,
         )
 
     except Exception as exc:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
 
+        repository.update_checkpoint(
+            batch_id=batch_id,
+            last_path=last_path,
+            scanned=scanned,
+            new=new,
+            changed=changed,
+            unchanged=unchanged,
+            jobs_queued=jobs_queued,
+            errors=error_count,
+        )
         repository.fail_batch(batch_id, str(exc))
         raise

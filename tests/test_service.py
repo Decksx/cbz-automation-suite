@@ -59,7 +59,7 @@ def test_service_initialize_creates_workspace_and_database(
 
     applied = service.initialize()
 
-    assert applied == [1]
+    assert applied == [1, 2]
     assert service.config.workspace.root.is_dir()
     assert service.config.workspace.cache.is_dir()
     assert service.config.workspace.embeddings.is_dir()
@@ -79,7 +79,7 @@ def test_service_initialize_is_idempotent(
     first = service.initialize()
     second = service.initialize()
 
-    assert first == [1]
+    assert first == [1, 2]
     assert second == []
 
 
