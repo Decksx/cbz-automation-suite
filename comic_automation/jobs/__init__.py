@@ -4,11 +4,19 @@ from comic_automation.jobs.queue import (
     JobNotFoundError,
     JobQueue,
 )
+from comic_automation.jobs.worker import (
+    JobHandler,
+    JobWorker,
+    WorkerResult,
+)
 
 __all__ = [
     "InvalidJobTransitionError",
     "Job",
+    "JobHandler",
     "JobNotFoundError",
     "JobQueue",
     "JobStatus",
+    "JobWorker",
+    "WorkerResult",
 ]
