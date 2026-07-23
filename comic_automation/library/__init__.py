@@ -1,3 +1,7 @@
+from comic_automation.library.cli import (
+    build_parser,
+    run_discovery,
+)
 from comic_automation.library.discovery import (
     DEFAULT_ARCHIVE_EXTENSIONS,
     DiscoveredArchive,
@@ -15,7 +19,9 @@ __all__ = [
     "DiscoveredArchive",
     "DiscoverySummary",
     "LibraryRepository",
+    "build_parser",
     "discover_archives",
     "normalize_library_path",
+    "run_discovery",
     "scan_library",
 ]
