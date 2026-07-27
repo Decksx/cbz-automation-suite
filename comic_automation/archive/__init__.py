@@ -18,6 +18,13 @@ from comic_automation.archive.inspection import (
     inspect_archive,
     inspect_cbz,
 )
+from comic_automation.archive.page_hashing import (
+    ArchivePageHashes,
+    ArchivePageHashRepository,
+    HashArchivePagesHandler,
+    PageContentHash,
+    calculate_page_hashes,
+)
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
     ArchiveLocationNotFoundError,
@@ -29,15 +36,20 @@ __all__ = [
     "ArchiveInspectionRepository",
     "CorruptArchiveError",
     "ArchiveLocationNotFoundError",
+    "ArchivePageHashes",
+    "ArchivePageHashRepository",
     "ArchiveHash",
     "ArchiveHashRepository",
     "CalculateArchiveHashHandler",
     "ComicInfoMetadata",
     "InspectArchiveHandler",
     "InvalidInspectionJobError",
+    "HashArchivePagesHandler",
+    "PageContentHash",
     "UnsupportedArchiveFormatError",
     "UnsafeComicInfoError",
     "inspect_archive",
     "inspect_cbz",
     "calculate_archive_hash",
+    "calculate_page_hashes",
 ]
