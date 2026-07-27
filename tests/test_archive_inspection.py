@@ -135,7 +135,7 @@ def test_rejects_comic_info_dtd(
     assert "prohibited" in result.comic_info_error.lower()
 
 
-def test_empty_cbz_is_classified(
+def test_cbz_without_images_is_classified(
     tmp_path: Path,
 ) -> None:
     archive = create_cbz(
@@ -145,9 +145,25 @@ def test_empty_cbz_is_classified(
 
     result = inspect_archive(archive)
 
-    assert result.status == "empty"
+    assert result.status == "no_images"
     assert result.page_count == 0
 
+
+
+def test_truly_empty_cbz_is_classified(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "truly-empty.cbz"
+
+    with zipfile.ZipFile(archive, mode="w"):
+        pass
+
+    result = inspect_archive(archive)
+
+    assert result.status == "empty_archive"
+    assert result.entry_count == 0
+    assert result.page_count == 0
+    assert result.comic_info_present is False
 
 def test_crc_verification_can_be_enabled(
     tmp_path: Path,

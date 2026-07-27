@@ -185,8 +185,10 @@ def inspect_cbz(
 
     if encrypted:
         status = "encrypted"
+    elif not files:
+        status = "empty_archive"
     elif not image_entries:
-        status = "empty"
+        status = "no_images"
 
     return ArchiveInspection(
         path=str(archive_path),
