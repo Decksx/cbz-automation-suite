@@ -2,6 +2,12 @@ from comic_automation.archive.handlers import (
     InspectArchiveHandler,
     InvalidInspectionJobError,
 )
+from comic_automation.archive.hashing import (
+    ArchiveHash,
+    ArchiveHashRepository,
+    CalculateArchiveHashHandler,
+    calculate_archive_hash,
+)
 from comic_automation.archive.inspection import (
     ArchiveInspection,
     ArchiveInspectionError,
@@ -23,6 +29,9 @@ __all__ = [
     "ArchiveInspectionRepository",
     "CorruptArchiveError",
     "ArchiveLocationNotFoundError",
+    "ArchiveHash",
+    "ArchiveHashRepository",
+    "CalculateArchiveHashHandler",
     "ComicInfoMetadata",
     "InspectArchiveHandler",
     "InvalidInspectionJobError",
@@ -30,4 +39,5 @@ __all__ = [
     "UnsafeComicInfoError",
     "inspect_archive",
     "inspect_cbz",
+    "calculate_archive_hash",
 ]
