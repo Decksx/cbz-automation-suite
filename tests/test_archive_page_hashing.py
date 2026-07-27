@@ -235,6 +235,34 @@ def test_enqueue_missing_is_idempotent(tmp_path: Path) -> None:
     assert job_count == 1
 
 
+def test_zero_page_archives_are_not_duplicate_candidates(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "pages.db"
+    first = create_cbz(tmp_path / "first.cbz", [])
+    second = create_cbz(tmp_path / "second.cbz", [])
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATIONS)
+        seed_hashed_archive(connection, first)
+        seed_hashed_archive(connection, second)
+
+    result = main([
+        "--database",
+        str(database),
+        "--limit",
+        "2",
+        "--enqueue-missing",
+    ])
+    captured = capsys.readouterr()
+
+    assert result == 0
+    assert "Archives hashed:   2" in captured.out
+    assert "Pages hashed:      0" in captured.out
+    assert "Duplicate groups:  0" in captured.out
+
+
 def test_corrupt_cbz_fails_page_hash_job_permanently(
     tmp_path: Path,
 ) -> None:

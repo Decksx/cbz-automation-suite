@@ -336,6 +336,7 @@ class ArchivePageHashRepository:
                 acs.digest,
                 acs.page_count
             HAVING COUNT(*) > 1
+               AND acs.page_count > 0
             ORDER BY archive_count DESC, acs.page_count DESC, acs.digest
             """
         ).fetchall()
