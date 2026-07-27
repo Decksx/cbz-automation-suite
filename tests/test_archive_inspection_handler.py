@@ -276,6 +276,7 @@ def test_worker_fails_missing_archive_without_crashing(
     assert result.succeeded is False
     assert failed.status == JobStatus.FAILED
     assert "missing.cbz" in failed.error_message
+    assert failed.failure_category == "filesystem_not_found"
 
 
 def test_corrupt_archive_fails_permanently_on_first_attempt(
@@ -313,3 +314,4 @@ def test_corrupt_archive_fails_permanently_on_first_attempt(
     assert result.succeeded is False
     assert failed.status == JobStatus.FAILED
     assert failed.attempts == 1
+    assert failed.failure_category == "corrupt_archive"

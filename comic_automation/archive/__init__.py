@@ -5,6 +5,7 @@ from comic_automation.archive.handlers import (
 from comic_automation.archive.inspection import (
     ArchiveInspection,
     ArchiveInspectionError,
+    CorruptArchiveError,
     ComicInfoMetadata,
     UnsupportedArchiveFormatError,
     UnsafeComicInfoError,
@@ -20,6 +21,7 @@ __all__ = [
     "ArchiveInspection",
     "ArchiveInspectionError",
     "ArchiveInspectionRepository",
+    "CorruptArchiveError",
     "ArchiveLocationNotFoundError",
     "ComicInfoMetadata",
     "InspectArchiveHandler",

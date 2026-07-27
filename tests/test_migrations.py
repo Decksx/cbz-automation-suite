@@ -31,7 +31,7 @@ def test_apply_migrations_creates_foundation_schema(
             ).fetchall()
         }
 
-    assert applied == [1, 2, 3, 4]
+    assert applied == [1, 2, 3, 4, 5]
 
     expected_tables = {
         "schema_migrations",
@@ -60,6 +60,6 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
 
-    assert first == [1, 2, 3, 4]
+    assert first == [1, 2, 3, 4, 5]
     assert second == []
-    assert migration_count == 4
+    assert migration_count == 5

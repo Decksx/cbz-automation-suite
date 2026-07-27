@@ -15,8 +15,24 @@ log = logging.getLogger(__name__)
 JobHandler = Callable[[Job], None]
 
 
-class PermanentJobError(RuntimeError):
+class CategorizedJobError(RuntimeError):
+    """A job failure with a stable machine-readable category."""
+
+    def __init__(self, message: str, *, category: str) -> None:
+        super().__init__(message)
+        self.category = category
+
+
+class PermanentJobError(CategorizedJobError):
     """A handler failure that cannot succeed when retried unchanged."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "permanent_error",
+    ) -> None:
+        super().__init__(message, category=category)
 
 
 class WorkerOutcome(StrEnum):
@@ -143,6 +159,11 @@ class JobWorker:
             failed_job = self.queue.mark_failed(
                 job.id,
                 str(exc),
+                failure_category=getattr(
+                    exc,
+                    "category",
+                    "unclassified_error",
+                ),
                 retry_delay_seconds=self.retry_delay_seconds,
                 worker_id=self.worker_id,
                 permanent=isinstance(exc, PermanentJobError),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import zipfile
 from pathlib import Path
@@ -312,3 +313,130 @@ def test_cli_reports_corrupt_archive_as_terminal(
 
     assert row["status"] == "failed"
     assert row["attempts"] == 1
+
+
+def test_cli_writes_structured_failure_reports(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "inspection.db"
+    archive = tmp_path / "library" / "corrupt.cbz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"not a zip archive")
+    json_output = tmp_path / "reports" / "failures.json"
+    csv_output = tmp_path / "reports" / "failures.csv"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        seed_job(connection, archive)
+
+    result = main([
+        "--database",
+        str(database),
+        "--limit",
+        "1",
+        "--failure-json-output",
+        str(json_output),
+        "--failure-csv-output",
+        str(csv_output),
+        "--report-only",
+    ])
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    with csv_output.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert result == 0
+    assert payload["terminal_failure_count"] == 0
+    assert payload["failure_category_counts"] == {}
+    assert rows == []
+
+
+def test_cli_failure_reports_include_terminal_corruption(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "inspection.db"
+    archive = tmp_path / "library" / "corrupt.cbz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"not a zip archive")
+    json_output = tmp_path / "reports" / "failures.json"
+    csv_output = tmp_path / "reports" / "failures.csv"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        seed_job(connection, archive)
+
+    assert main([
+        "--database",
+        str(database),
+        "--limit",
+        "1",
+    ]) == 0
+    assert main([
+        "--database",
+        str(database),
+        "--failure-json-output",
+        str(json_output),
+        "--failure-csv-output",
+        str(csv_output),
+        "--report-only",
+    ]) == 0
+    captured = capsys.readouterr()
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    with csv_output.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert payload["terminal_failure_count"] == 1
+    assert payload["failure_category_counts"] == {
+        "corrupt_archive": 1
+    }
+    assert payload["failures"][0]["failure_kind"] == "permanent"
+    assert payload["failures"][0]["error_message"].startswith(
+        "Invalid or corrupt CBZ archive:"
+    )
+    assert rows[0]["failure_category"] == "corrupt_archive"
+    assert rows[0]["failure_kind"] == "permanent"
+    assert "Recorded terminal failures: 1" in captured.out
+    assert "corrupt_archive: 1" in captured.out
+
+
+def test_failure_category_migration_backfills_legacy_errors(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "inspection.db"
+
+    with database_connection(database) as connection:
+        for migration in sorted(MIGRATION_DIRECTORY.glob("00[1-4]_*.sql")):
+            connection.executescript(
+                migration.read_text(encoding="utf-8")
+            )
+
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                job_type, status, error_message
+            )
+            VALUES
+                ('inspect_archive', 'failed',
+                 'Invalid or corrupt CBZ archive: X:\\bad.cbz'),
+                ('inspect_archive', 'failed', 'X:\\missing.cbz')
+            """
+        )
+        migration_five = MIGRATION_DIRECTORY / (
+            "005_job_failure_categories.sql"
+        )
+        connection.executescript(
+            migration_five.read_text(encoding="utf-8")
+        )
+        categories = [
+            row["failure_category"]
+            for row in connection.execute(
+                "SELECT failure_category FROM jobs ORDER BY id"
+            )
+        ]
+
+    assert categories == [
+        "corrupt_archive",
+        "filesystem_not_found",
+    ]

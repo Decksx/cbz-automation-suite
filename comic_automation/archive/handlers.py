@@ -5,13 +5,18 @@ from pathlib import Path
 
 from comic_automation.archive.inspection import (
     ArchiveInspectionError,
+    CorruptArchiveError,
+    UnsupportedArchiveFormatError,
     inspect_archive,
 )
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
 from comic_automation.jobs.models import Job
-from comic_automation.jobs.worker import PermanentJobError
+from comic_automation.jobs.worker import (
+    CategorizedJobError,
+    PermanentJobError,
+)
 
 
 class InvalidInspectionJobError(ValueError):
@@ -42,8 +47,36 @@ class InspectArchiveHandler:
                 path,
                 verify_crc=self.verify_crc,
             )
+        except CorruptArchiveError as exc:
+            raise PermanentJobError(
+                str(exc),
+                category="corrupt_archive",
+            ) from exc
+        except UnsupportedArchiveFormatError as exc:
+            raise PermanentJobError(
+                str(exc),
+                category="unsupported_archive_format",
+            ) from exc
         except ArchiveInspectionError as exc:
-            raise PermanentJobError(str(exc)) from exc
+            raise PermanentJobError(
+                str(exc),
+                category="archive_inspection_error",
+            ) from exc
+        except FileNotFoundError as exc:
+            raise CategorizedJobError(
+                str(exc),
+                category="filesystem_not_found",
+            ) from exc
+        except PermissionError as exc:
+            raise CategorizedJobError(
+                str(exc),
+                category="filesystem_permission",
+            ) from exc
+        except OSError as exc:
+            raise CategorizedJobError(
+                str(exc),
+                category="filesystem_io",
+            ) from exc
 
         self.repository.save(
             archive_id=job.archive_id,

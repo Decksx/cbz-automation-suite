@@ -39,6 +39,10 @@ class UnsafeComicInfoError(ArchiveInspectionError):
     """Raised when ComicInfo.xml exceeds safety limits."""
 
 
+class CorruptArchiveError(ArchiveInspectionError):
+    """Raised when an archive cannot be parsed or fails validation."""
+
+
 @dataclass(frozen=True)
 class ComicInfoMetadata:
     title: str | None = None
@@ -177,7 +181,7 @@ def inspect_cbz(
                 crc_verified = True
 
     except zipfile.BadZipFile as exc:
-        raise ArchiveInspectionError(
+        raise CorruptArchiveError(
             f"Invalid or corrupt CBZ archive: {archive_path}"
         ) from exc
 

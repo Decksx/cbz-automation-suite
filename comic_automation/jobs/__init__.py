@@ -5,6 +5,7 @@ from comic_automation.jobs.queue import (
     JobQueue,
 )
 from comic_automation.jobs.worker import (
+    CategorizedJobError,
     JobHandler,
     JobWorker,
     PermanentJobError,
@@ -14,6 +15,7 @@ from comic_automation.jobs.worker import (
 
 __all__ = [
     "InvalidJobTransitionError",
+    "CategorizedJobError",
     "Job",
     "JobHandler",
     "JobNotFoundError",

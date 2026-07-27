@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import socket
 import sys
@@ -67,6 +68,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional path for the JSON execution summary.",
     )
+    parser.add_argument(
+        "--failure-json-output",
+        type=Path,
+        help="Optional JSON corruption-review report.",
+    )
+    parser.add_argument(
+        "--failure-csv-output",
+        type=Path,
+        help="Optional CSV corruption-review report.",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Apply migrations and export failure reports without "
+            "claiming inspection jobs."
+        ),
+    )
 
     return parser
 
@@ -121,6 +140,110 @@ def _status_counts(connection) -> dict[str, int]:
     }
 
 
+PERMANENT_FAILURE_CATEGORIES = frozenset({
+    "archive_inspection_error",
+    "corrupt_archive",
+    "unsupported_archive_format",
+})
+
+
+def _failure_review(connection) -> list[dict]:
+    rows = connection.execute(
+        """
+        SELECT
+            j.id AS job_id,
+            j.archive_id,
+            fl.path,
+            j.failure_category,
+            j.error_message,
+            j.attempts,
+            j.max_attempts,
+            j.completed_at
+        FROM jobs AS j
+        LEFT JOIN file_locations AS fl
+          ON fl.archive_id = j.archive_id
+         AND fl.is_current = 1
+        WHERE j.job_type = 'inspect_archive'
+          AND j.status = 'failed'
+        ORDER BY j.failure_category, fl.path, j.id
+        """
+    ).fetchall()
+
+    report: list[dict] = []
+
+    for row in rows:
+        category = (
+            str(row["failure_category"])
+            if row["failure_category"] is not None
+            else "legacy_unclassified"
+        )
+        report.append({
+            "job_id": int(row["job_id"]),
+            "archive_id": (
+                int(row["archive_id"])
+                if row["archive_id"] is not None
+                else None
+            ),
+            "path": row["path"],
+            "failure_category": category,
+            "failure_kind": (
+                "permanent"
+                if category in PERMANENT_FAILURE_CATEGORIES
+                else "transient"
+                if category.startswith("filesystem_")
+                else "unknown"
+            ),
+            "error_message": row["error_message"],
+            "attempts": int(row["attempts"]),
+            "max_attempts": int(row["max_attempts"]),
+            "completed_at": row["completed_at"],
+        })
+
+    return report
+
+
+def _write_json(path: Path, payload: object) -> Path:
+    resolved = path.resolve(strict=False)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return resolved
+
+
+def _write_failure_csv(
+    path: Path,
+    failures: list[dict],
+) -> Path:
+    resolved = path.resolve(strict=False)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "job_id",
+        "archive_id",
+        "path",
+        "failure_category",
+        "failure_kind",
+        "error_message",
+        "attempts",
+        "max_attempts",
+        "completed_at",
+    ]
+
+    with resolved.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(failures)
+
+    return resolved
+
+
 def run_inspection_jobs(
     *,
     database: Path,
@@ -129,6 +252,9 @@ def run_inspection_jobs(
     verify_crc: bool,
     retry_delay_seconds: int,
     json_output: Path | None = None,
+    failure_json_output: Path | None = None,
+    failure_csv_output: Path | None = None,
+    report_only: bool = False,
     migration_directory: Path = DEFAULT_MIGRATION_DIRECTORY,
 ) -> dict:
     _validate_arguments(
@@ -179,7 +305,7 @@ def run_inspection_jobs(
 
         seen_job_ids: set[int] = set()
 
-        while processed < limit:
+        while not report_only and processed < limit:
             result = worker.run_once(
                 excluded_job_ids=seen_job_ids,
             )
@@ -224,6 +350,7 @@ def run_inspection_jobs(
 
         pending_after = _count_pending(connection)
         inspection_status_counts = _status_counts(connection)
+        failure_review = _failure_review(connection)
 
     elapsed = time.perf_counter() - started
     jobs_per_second = (
@@ -243,31 +370,46 @@ def run_inspection_jobs(
         "pending_before": pending_before,
         "remaining_pending": pending_after,
         "verify_crc": verify_crc,
+        "report_only": report_only,
         "retry_delay_seconds": retry_delay_seconds,
         "elapsed_seconds": round(elapsed, 6),
         "jobs_per_second": round(jobs_per_second, 4),
         "inspection_status_counts": (
             inspection_status_counts
         ),
+        "failure_category_counts": dict(sorted(Counter(
+            item["failure_category"] for item in failure_review
+        ).items())),
+        "failure_review": failure_review,
         "outcome_counts": dict(outcome_counts),
         "processed_job_ids": processed_job_ids,
         "applied_migrations": applied_migrations,
     }
 
     if json_output is not None:
-        json_output = json_output.resolve(strict=False)
-        json_output.parent.mkdir(parents=True, exist_ok=True)
-        json_output.write_text(
-            json.dumps(
-                output,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
+        output["json_output"] = str(_write_json(json_output, output))
+
+    failure_report = {
+        "database": str(database),
+        "terminal_failure_count": len(failure_review),
+        "failure_category_counts": output[
+            "failure_category_counts"
+        ],
+        "failures": failure_review,
+    }
+
+    if failure_json_output is not None:
+        output["failure_json_output"] = str(
+            _write_json(failure_json_output, failure_report)
         )
-        output["json_output"] = str(json_output)
+
+    if failure_csv_output is not None:
+        output["failure_csv_output"] = str(
+            _write_failure_csv(
+                failure_csv_output,
+                failure_review,
+            )
+        )
 
     return output
 
@@ -311,8 +453,30 @@ def print_summary(output: dict) -> None:
         for status, count in statuses.items():
             print(f"  {status}: {count}")
 
+    failure_counts = output.get("failure_category_counts", {})
+
+    if failure_counts:
+        print(
+            "Recorded terminal failures: "
+            f"{len(output.get('failure_review', []))}"
+        )
+        print("Failure categories:")
+
+        for category, count in failure_counts.items():
+            print(f"  {category}: {count}")
+
     if output.get("json_output"):
         print(f"JSON output:       {output['json_output']}")
+    if output.get("failure_json_output"):
+        print(
+            "Failure JSON:      "
+            f"{output['failure_json_output']}"
+        )
+    if output.get("failure_csv_output"):
+        print(
+            "Failure CSV:       "
+            f"{output['failure_csv_output']}"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -329,6 +493,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.retry_delay_seconds
             ),
             json_output=args.json_output,
+            failure_json_output=args.failure_json_output,
+            failure_csv_output=args.failure_csv_output,
+            report_only=args.report_only,
         )
     except Exception as exc:
         print(

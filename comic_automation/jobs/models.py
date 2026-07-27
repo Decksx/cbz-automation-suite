@@ -32,6 +32,7 @@ class Job:
     completed_at: str | None
     worker_id: str | None
     error_message: str | None
+    failure_category: str | None
     created_at: str
     updated_at: str
 

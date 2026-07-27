@@ -53,6 +53,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         completed_at=row["completed_at"],
         worker_id=row["worker_id"],
         error_message=row["error_message"],
+        failure_category=row["failure_category"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -331,6 +332,7 @@ class JobQueue:
         job_id: int,
         error_message: str,
         *,
+        failure_category: str = "unclassified_error",
         retry_delay_seconds: int = 0,
         worker_id: str | None = None,
         permanent: bool = False,
@@ -380,6 +382,7 @@ class JobQueue:
                         completed_at = NULL,
                         worker_id = NULL,
                         error_message = ?,
+                        failure_category = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
@@ -387,6 +390,7 @@ class JobQueue:
                         JobStatus.PENDING.value,
                         _utc_sql_timestamp(next_available),
                         error_message,
+                        failure_category,
                         _utc_sql_timestamp(now),
                         job_id,
                     ),
@@ -399,6 +403,7 @@ class JobQueue:
                         status = ?,
                         completed_at = ?,
                         error_message = ?,
+                        failure_category = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
@@ -406,6 +411,7 @@ class JobQueue:
                         JobStatus.FAILED.value,
                         _utc_sql_timestamp(now),
                         error_message,
+                        failure_category,
                         _utc_sql_timestamp(now),
                         job_id,
                     ),
