@@ -75,6 +75,23 @@ class ArchiveHashRepository:
         location_id: int,
         result: ArchiveHash,
     ) -> None:
+        previous = self.connection.execute(
+            """
+            SELECT file_size, modified_time_ns
+            FROM file_locations
+            WHERE id = ?
+            """,
+            (location_id,),
+        ).fetchone()
+        metadata_changed = (
+            previous is not None
+            and (
+                previous["file_size"] != result.file_size
+                or previous["modified_time_ns"]
+                != result.modified_time_ns
+            )
+        )
+
         self.connection.execute(
             """
             INSERT INTO archive_hashes (
@@ -110,6 +127,58 @@ class ArchiveHashRepository:
                 result.bytes_read,
             ),
         )
+        self.connection.execute(
+            """
+            UPDATE file_locations
+            SET
+                file_size = ?,
+                modified_time_ns = ?,
+                last_seen_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                result.file_size,
+                result.modified_time_ns,
+                location_id,
+            ),
+        )
+        self.connection.execute(
+            """
+            UPDATE archive_files
+            SET file_size = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (result.file_size, archive_id),
+        )
+
+        if metadata_changed:
+            self._enqueue_reinspection_if_absent(archive_id)
+
+    def _enqueue_reinspection_if_absent(
+        self,
+        archive_id: int,
+    ) -> bool:
+        existing = self.connection.execute(
+            """
+            SELECT id
+            FROM jobs
+            WHERE archive_id = ?
+              AND job_type = 'inspect_archive'
+              AND status IN ('pending', 'claimed', 'running')
+            LIMIT 1
+            """,
+            (archive_id,),
+        ).fetchone()
+
+        if existing is not None:
+            return False
+
+        JobQueue(self.connection).enqueue(
+            "inspect_archive",
+            archive_id=archive_id,
+            priority=100,
+        )
+        return True
 
     def enqueue_missing(self, *, limit: int | None = None) -> int:
         limit_clause = ""
@@ -133,6 +202,8 @@ class ArchiveHashRepository:
              AND ah.file_size = fl.file_size
              AND ah.modified_time_ns = fl.modified_time_ns
             WHERE ai.status IN ('ok', 'no_images', 'empty_archive')
+              AND ai.inspected_file_size = fl.file_size
+              AND ai.inspected_modified_time_ns = fl.modified_time_ns
               AND ah.id IS NULL
               AND NOT EXISTS (
                   SELECT 1

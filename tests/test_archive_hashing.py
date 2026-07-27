@@ -161,3 +161,70 @@ def test_enqueue_missing_is_idempotent(
         ).fetchone()[0]
 
     assert job_count == 1
+
+
+def test_hash_refreshes_changed_metadata_and_queues_reinspection(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "hashes.db"
+    archive = tmp_path / "issue.cbz"
+    archive.write_bytes(b"original")
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATIONS)
+        archive_id = seed_inspected_archive(connection, archive)
+
+    archive.write_bytes(b"changed archive bytes")
+
+    with database_connection(database) as connection:
+        from comic_automation.archive.hashing import (
+            ArchiveHashRepository,
+            CalculateArchiveHashHandler,
+        )
+        from comic_automation.jobs import JobQueue, JobWorker
+
+        queue = JobQueue(connection)
+        job = queue.enqueue(
+            "calculate_archive_hash",
+            archive_id=archive_id,
+        )
+        worker = JobWorker(
+            queue,
+            {
+                "calculate_archive_hash": (
+                    CalculateArchiveHashHandler(connection)
+                )
+            },
+            worker_id="hash-test",
+            poll_interval_seconds=0,
+        )
+
+        result = worker.run_once()
+        location = connection.execute(
+            """
+            SELECT file_size, modified_time_ns
+            FROM file_locations
+            WHERE archive_id = ?
+            """,
+            (archive_id,),
+        ).fetchone()
+        reinspection = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE archive_id = ?
+              AND job_type = 'inspect_archive'
+              AND status = 'pending'
+            """,
+            (archive_id,),
+        ).fetchone()[0]
+        rehash_count = ArchiveHashRepository(
+            connection
+        ).enqueue_missing()
+
+    stat = archive.stat()
+    assert result.succeeded is True
+    assert location["file_size"] == stat.st_size
+    assert location["modified_time_ns"] == stat.st_mtime_ns
+    assert reinspection == 1
+    assert rehash_count == 0
