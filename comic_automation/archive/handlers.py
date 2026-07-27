@@ -3,11 +3,15 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from comic_automation.archive.inspection import inspect_archive
+from comic_automation.archive.inspection import (
+    ArchiveInspectionError,
+    inspect_archive,
+)
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
 from comic_automation.jobs.models import Job
+from comic_automation.jobs.worker import PermanentJobError
 
 
 class InvalidInspectionJobError(ValueError):
@@ -33,10 +37,13 @@ class InspectArchiveHandler:
         location = self.repository.current_location(job.archive_id)
         path = Path(str(location["path"]))
 
-        result = inspect_archive(
-            path,
-            verify_crc=self.verify_crc,
-        )
+        try:
+            result = inspect_archive(
+                path,
+                verify_crc=self.verify_crc,
+            )
+        except ArchiveInspectionError as exc:
+            raise PermanentJobError(str(exc)) from exc
 
         self.repository.save(
             archive_id=job.archive_id,

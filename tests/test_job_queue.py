@@ -205,6 +205,41 @@ def test_retry_delay_prevents_immediate_claim(
     assert queue.claim_next("worker-2") is None
 
 
+def test_permanent_failure_skips_remaining_attempts(
+    queue: JobQueue,
+) -> None:
+    queue.enqueue("inspect_archive", max_attempts=3)
+    claimed = queue.claim_next("worker-1")
+
+    assert claimed is not None
+
+    failed = queue.mark_failed(
+        claimed.id,
+        "Corrupt archive",
+        worker_id="worker-1",
+        permanent=True,
+    )
+
+    assert failed.status == JobStatus.FAILED
+    assert failed.attempts == 1
+    assert failed.completed_at is not None
+
+
+def test_claim_excludes_jobs_seen_by_caller(
+    queue: JobQueue,
+) -> None:
+    first = queue.enqueue("inspect_archive")
+    second = queue.enqueue("inspect_archive")
+
+    claimed = queue.claim_next(
+        "worker-1",
+        excluded_job_ids=[first.id],
+    )
+
+    assert claimed is not None
+    assert claimed.id == second.id
+
+
 def test_recover_abandoned_job(queue: JobQueue) -> None:
     queued = queue.enqueue(
         "inspect_archive",

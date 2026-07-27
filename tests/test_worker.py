@@ -13,6 +13,8 @@ from comic_automation.jobs import (
     JobQueue,
     JobStatus,
     JobWorker,
+    PermanentJobError,
+    WorkerOutcome,
 )
 
 
@@ -93,6 +95,67 @@ def test_worker_retries_handler_failure(
     assert failed.status == JobStatus.FAILED
     assert failed.attempts == 2
     assert failed.error_message == "Test handler failure"
+
+
+def test_worker_permanent_failure_is_terminal_immediately(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "worker.db"
+
+    def permanent_failure(job) -> None:
+        raise PermanentJobError("Corrupt archive")
+
+    with database_connection(database_path) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        queue = JobQueue(connection)
+        queued = queue.enqueue(
+            "inspect_archive",
+            max_attempts=3,
+        )
+        worker = JobWorker(
+            queue,
+            {"inspect_archive": permanent_failure},
+            worker_id="worker-1",
+            poll_interval_seconds=0,
+        )
+
+        result = worker.run_once()
+        failed = queue.get(queued.id)
+
+    assert result.outcome == WorkerOutcome.TERMINALLY_FAILED
+    assert failed.status == JobStatus.FAILED
+    assert failed.attempts == 1
+
+
+def test_worker_reports_retry_scheduled(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "worker.db"
+
+    def transient_failure(job) -> None:
+        raise OSError("Temporary filesystem error")
+
+    with database_connection(database_path) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        queue = JobQueue(connection)
+        queued = queue.enqueue(
+            "inspect_archive",
+            max_attempts=3,
+        )
+        worker = JobWorker(
+            queue,
+            {"inspect_archive": transient_failure},
+            worker_id="worker-1",
+            poll_interval_seconds=0,
+            retry_delay_seconds=60,
+        )
+
+        result = worker.run_once()
+        retried = queue.get(queued.id)
+
+    assert result.outcome == WorkerOutcome.RETRY_SCHEDULED
+    assert retried.status == JobStatus.PENDING
+    assert retried.attempts == 1
 
 
 def test_worker_claims_only_registered_job_types(

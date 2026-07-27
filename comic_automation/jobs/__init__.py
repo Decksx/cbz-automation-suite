@@ -7,6 +7,8 @@ from comic_automation.jobs.queue import (
 from comic_automation.jobs.worker import (
     JobHandler,
     JobWorker,
+    PermanentJobError,
+    WorkerOutcome,
     WorkerResult,
 )
 
@@ -18,5 +20,7 @@ __all__ = [
     "JobQueue",
     "JobStatus",
     "JobWorker",
+    "PermanentJobError",
+    "WorkerOutcome",
     "WorkerResult",
 ]

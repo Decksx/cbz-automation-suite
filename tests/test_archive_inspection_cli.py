@@ -176,6 +176,8 @@ def test_cli_writes_json_summary(
     assert result == 0
     assert payload["processed"] == 1
     assert payload["succeeded"] == 1
+    assert payload["retry_scheduled"] == 0
+    assert payload["terminally_failed"] == 0
     assert payload["failed"] == 0
     assert payload["remaining_pending"] == 0
     assert payload["inspection_status_counts"] == {
@@ -222,3 +224,91 @@ def test_cli_rejects_invalid_limit(
 
     assert result == 1
     assert "--limit must be at least 1" in captured.err
+
+
+def test_cli_processes_retryable_job_only_once_per_run(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "inspection.db"
+    missing = tmp_path / "library" / "missing.cbz"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        archive_cursor = connection.execute(
+            "INSERT INTO archive_files (file_size) VALUES (0)"
+        )
+        archive_id = int(archive_cursor.lastrowid)
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 0, 0)
+            """,
+            (archive_id, str(missing.resolve())),
+        )
+        JobQueue(connection).enqueue(
+            "inspect_archive",
+            archive_id=archive_id,
+            max_attempts=3,
+        )
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--limit",
+            "10",
+            "--retry-delay-seconds",
+            "0",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == 0
+    assert "Processed:         1" in captured.out
+    assert "Retry scheduled:   1" in captured.out
+
+    with database_connection(database) as connection:
+        row = connection.execute(
+            "SELECT status, attempts FROM jobs"
+        ).fetchone()
+
+    assert row["status"] == "pending"
+    assert row["attempts"] == 1
+
+
+def test_cli_reports_corrupt_archive_as_terminal(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "inspection.db"
+    archive = tmp_path / "library" / "corrupt.cbz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"not a zip archive")
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        seed_job(connection, archive)
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--limit",
+            "1",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == 0
+    assert "Terminally failed: 1" in captured.out
+
+    with database_connection(database) as connection:
+        row = connection.execute(
+            "SELECT status, attempts FROM jobs"
+        ).fetchone()
+
+    assert row["status"] == "failed"
+    assert row["attempts"] == 1

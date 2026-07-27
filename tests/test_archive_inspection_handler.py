@@ -276,3 +276,40 @@ def test_worker_fails_missing_archive_without_crashing(
     assert result.succeeded is False
     assert failed.status == JobStatus.FAILED
     assert "missing.cbz" in failed.error_message
+
+
+def test_corrupt_archive_fails_permanently_on_first_attempt(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "inspection.db"
+    archive = tmp_path / "library" / "corrupt.cbz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"not a zip archive")
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        archive_id, _ = seed_archive(connection, archive)
+        queue = JobQueue(connection)
+        queued = queue.enqueue(
+            "inspect_archive",
+            archive_id=archive_id,
+            max_attempts=3,
+        )
+        worker = JobWorker(
+            queue,
+            {
+                "inspect_archive": InspectArchiveHandler(
+                    connection
+                )
+            },
+            worker_id="inspection-test-worker",
+            poll_interval_seconds=0,
+        )
+
+        result = worker.run_once()
+        failed = queue.get(queued.id)
+
+    assert result.processed is True
+    assert result.succeeded is False
+    assert failed.status == JobStatus.FAILED
+    assert failed.attempts == 1

@@ -128,6 +128,7 @@ class JobQueue:
         worker_id: str,
         *,
         job_types: Iterable[str] | None = None,
+        excluded_job_ids: Iterable[int] | None = None,
     ) -> Job | None:
         normalized_worker = worker_id.strip()
 
@@ -138,6 +139,9 @@ class JobQueue:
             value.strip()
             for value in (job_types or ())
             if value.strip()
+        )
+        excluded_ids = tuple(
+            dict.fromkeys(int(value) for value in (excluded_job_ids or ()))
         )
 
         try:
@@ -159,6 +163,13 @@ class JobQueue:
                 )
                 parameters.extend(normalized_types)
 
+            excluded_clause = ""
+
+            if excluded_ids:
+                placeholders = ",".join("?" for _ in excluded_ids)
+                excluded_clause = f" AND id NOT IN ({placeholders})"
+                parameters.extend(excluded_ids)
+
             row = self.connection.execute(
                 f"""
                 SELECT id
@@ -166,6 +177,7 @@ class JobQueue:
                 WHERE status = ?
                   AND available_at <= ?
                   {type_clause}
+                  {excluded_clause}
                 ORDER BY
                     priority ASC,
                     created_at ASC,
@@ -321,6 +333,7 @@ class JobQueue:
         *,
         retry_delay_seconds: int = 0,
         worker_id: str | None = None,
+        permanent: bool = False,
     ) -> Job:
         if retry_delay_seconds < 0:
             raise ValueError(
@@ -351,7 +364,7 @@ class JobQueue:
 
             now = datetime.now(timezone.utc)
 
-            if job.attempts < job.max_attempts:
+            if not permanent and job.attempts < job.max_attempts:
                 next_available = now + timedelta(
                     seconds=retry_delay_seconds
                 )

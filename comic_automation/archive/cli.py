@@ -12,7 +12,11 @@ from typing import Sequence
 from comic_automation.archive import InspectArchiveHandler
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
-from comic_automation.jobs import JobQueue, JobWorker
+from comic_automation.jobs import (
+    JobQueue,
+    JobWorker,
+    WorkerOutcome,
+)
 
 
 DEFAULT_MIGRATION_DIRECTORY = (
@@ -143,7 +147,8 @@ def run_inspection_jobs(
     started = time.perf_counter()
     processed = 0
     succeeded = 0
-    failed = 0
+    retry_scheduled = 0
+    terminally_failed = 0
     processed_job_ids: list[int] = []
     outcome_counts: Counter[str] = Counter()
 
@@ -172,8 +177,12 @@ def run_inspection_jobs(
             retry_delay_seconds=retry_delay_seconds,
         )
 
+        seen_job_ids: set[int] = set()
+
         while processed < limit:
-            result = worker.run_once()
+            result = worker.run_once(
+                excluded_job_ids=seen_job_ids,
+            )
 
             if not result.processed:
                 break
@@ -182,13 +191,17 @@ def run_inspection_jobs(
 
             if result.job_id is not None:
                 processed_job_ids.append(result.job_id)
+                seen_job_ids.add(result.job_id)
 
-            if result.succeeded:
+            if result.outcome == WorkerOutcome.SUCCEEDED:
                 succeeded += 1
                 outcome_counts["succeeded"] += 1
+            elif result.outcome == WorkerOutcome.RETRY_SCHEDULED:
+                retry_scheduled += 1
+                outcome_counts["retry_scheduled"] += 1
             else:
-                failed += 1
-                outcome_counts["failed"] += 1
+                terminally_failed += 1
+                outcome_counts["terminally_failed"] += 1
 
             if (
                 processed % progress_every == 0
@@ -204,7 +217,8 @@ def run_inspection_jobs(
                 print(
                     f"Progress: {processed:,} jobs; "
                     f"succeeded={succeeded:,}; "
-                    f"failed={failed:,}; "
+                    f"retry_scheduled={retry_scheduled:,}; "
+                    f"terminally_failed={terminally_failed:,}; "
                     f"rate={rate:.2f}/sec"
                 )
 
@@ -223,7 +237,9 @@ def run_inspection_jobs(
         "limit": limit,
         "processed": processed,
         "succeeded": succeeded,
-        "failed": failed,
+        "retry_scheduled": retry_scheduled,
+        "terminally_failed": terminally_failed,
+        "failed": retry_scheduled + terminally_failed,
         "pending_before": pending_before,
         "remaining_pending": pending_after,
         "verify_crc": verify_crc,
@@ -262,7 +278,14 @@ def print_summary(output: dict) -> None:
     print(f"Limit:             {output['limit']}")
     print(f"Processed:         {output['processed']}")
     print(f"Succeeded:         {output['succeeded']}")
-    print(f"Failed:            {output['failed']}")
+    print(
+        "Retry scheduled:   "
+        f"{output['retry_scheduled']}"
+    )
+    print(
+        "Terminally failed: "
+        f"{output['terminally_failed']}"
+    )
     print(
         "Remaining pending: "
         f"{output['remaining_pending']}"

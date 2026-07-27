@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 
 from comic_automation.jobs.models import Job
 from comic_automation.jobs.queue import JobQueue
@@ -14,11 +15,22 @@ log = logging.getLogger(__name__)
 JobHandler = Callable[[Job], None]
 
 
+class PermanentJobError(RuntimeError):
+    """A handler failure that cannot succeed when retried unchanged."""
+
+
+class WorkerOutcome(StrEnum):
+    SUCCEEDED = "succeeded"
+    RETRY_SCHEDULED = "retry_scheduled"
+    TERMINALLY_FAILED = "terminally_failed"
+
+
 @dataclass(frozen=True)
 class WorkerResult:
     processed: bool
     job_id: int | None = None
     succeeded: bool | None = None
+    outcome: WorkerOutcome | None = None
 
 
 class JobWorker:
@@ -54,7 +66,11 @@ class JobWorker:
         self.poll_interval_seconds = poll_interval_seconds
         self.retry_delay_seconds = retry_delay_seconds
 
-    def run_once(self) -> WorkerResult:
+    def run_once(
+        self,
+        *,
+        excluded_job_ids: Iterable[int] | None = None,
+    ) -> WorkerResult:
         """
         Claim and process at most one registered job.
 
@@ -67,6 +83,7 @@ class JobWorker:
         job = self.queue.claim_next(
             self.worker_id,
             job_types=self.handlers.keys(),
+            excluded_job_ids=excluded_job_ids,
         )
 
         if job is None:
@@ -112,6 +129,7 @@ class JobWorker:
                 processed=True,
                 job_id=running_job.id,
                 succeeded=True,
+                outcome=WorkerOutcome.SUCCEEDED,
             )
 
         except Exception as exc:
@@ -122,17 +140,25 @@ class JobWorker:
                 job.job_type,
             )
 
-            self.queue.mark_failed(
+            failed_job = self.queue.mark_failed(
                 job.id,
                 str(exc),
                 retry_delay_seconds=self.retry_delay_seconds,
                 worker_id=self.worker_id,
+                permanent=isinstance(exc, PermanentJobError),
+            )
+
+            outcome = (
+                WorkerOutcome.TERMINALLY_FAILED
+                if failed_job.status.value == "failed"
+                else WorkerOutcome.RETRY_SCHEDULED
             )
 
             return WorkerResult(
                 processed=True,
                 job_id=job.id,
                 succeeded=False,
+                outcome=outcome,
             )
 
     def run(self) -> None:
