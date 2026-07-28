@@ -44,7 +44,10 @@
 - [ ] richer aggregate archive signatures;
 - [ ] partial-overlap and compilation detection;
 - review UI;
-- quarantine workflow.
+- [x] quarantine workflow (guarded move-to-holding-folder CLI for
+      permanently-broken archives; see
+      `comic_automation/archive/quarantine_cli.py` and
+      `docs/database_architecture.md`).
 
 ## Phase 6 — quality scoring
 

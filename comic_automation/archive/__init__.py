@@ -34,6 +34,14 @@ from comic_automation.archive.perceptual_hashing import (
     difference_hash,
     perceptual_hash,
 )
+from comic_automation.archive.quarantine import (
+    QuarantineCandidate,
+    QuarantineItemResult,
+    QuarantineRepository,
+    UnsupportedQuarantineCategoryError,
+    execute_quarantine,
+    propose_quarantine_filename,
+)
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
     ArchiveLocationNotFoundError,
@@ -59,6 +67,10 @@ __all__ = [
     "HashArchivePagesPerceptualHandler",
     "PageContentHash",
     "PagePerceptualHash",
+    "QuarantineCandidate",
+    "QuarantineItemResult",
+    "QuarantineRepository",
+    "UnsupportedQuarantineCategoryError",
     "UnsupportedArchiveFormatError",
     "UnsafeComicInfoError",
     "inspect_archive",
@@ -68,4 +80,6 @@ __all__ = [
     "calculate_perceptual_hashes",
     "difference_hash",
     "perceptual_hash",
+    "execute_quarantine",
+    "propose_quarantine_filename",
 ]
