@@ -111,6 +111,8 @@ def _validate_arguments(
 
 
 def _count_pending(connection) -> int:
+    # How many inspect_archive jobs are pending and due right now;
+    # used to report before/after progress for this CLI run.
     return int(
         connection.execute(
             """
@@ -125,6 +127,8 @@ def _count_pending(connection) -> int:
 
 
 def _status_counts(connection) -> dict[str, int]:
+    # Breakdown of archive_inspections rows by status (ok, corrupt,
+    # no_images, etc.), for the run summary.
     return {
         str(row["status"]): int(row["count"])
         for row in connection.execute(
@@ -148,6 +152,11 @@ PERMANENT_FAILURE_CATEGORIES = frozenset({
 
 
 def _failure_review(connection) -> list[dict]:
+    # Every terminally-failed inspect_archive job, joined to its
+    # current file path (if any) for a human-readable report. LEFT
+    # JOIN is used because the archive's current location may no
+    # longer exist (is_current = 1 row missing) if it was since moved
+    # or deleted.
     rows = connection.execute(
         """
         SELECT
