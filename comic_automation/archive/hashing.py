@@ -75,6 +75,10 @@ class ArchiveHashRepository:
         location_id: int,
         result: ArchiveHash,
     ) -> None:
+        # Compare against the file_size/modified_time_ns already
+        # recorded for this location to detect whether the underlying
+        # file changed since the last time it was seen (as opposed to
+        # just being hashed for the first time).
         previous = self.connection.execute(
             """
             SELECT file_size, modified_time_ns
@@ -92,6 +96,8 @@ class ArchiveHashRepository:
             )
         )
 
+        # One archive_hashes row per archive_id: insert on first hash,
+        # or overwrite on rehash via the ON CONFLICT upsert.
         self.connection.execute(
             """
             INSERT INTO archive_hashes (
@@ -127,6 +133,9 @@ class ArchiveHashRepository:
                 result.bytes_read,
             ),
         )
+        # Keep the location's own size/mtime fields current so future
+        # comparisons (e.g. in save() above, or enqueue_missing() below)
+        # use the value observed at hash time.
         self.connection.execute(
             """
             UPDATE file_locations
@@ -142,6 +151,7 @@ class ArchiveHashRepository:
                 location_id,
             ),
         )
+        # Same for the denormalized file_size on archive_files.
         self.connection.execute(
             """
             UPDATE archive_files
@@ -158,6 +168,10 @@ class ArchiveHashRepository:
         self,
         archive_id: int,
     ) -> bool:
+        # If the file changed size/mtime since it was last inspected,
+        # the stored structural inspection (page count, ComicInfo,
+        # etc.) may now be stale, so schedule a fresh inspect_archive
+        # job -- unless one is already in flight.
         existing = self.connection.execute(
             """
             SELECT id
@@ -190,6 +204,13 @@ class ArchiveHashRepository:
             limit_clause = " LIMIT ?"
             parameters.append(limit)
 
+        # Candidates for hashing: archives that passed inspection
+        # (status is one of the "safe to hash" states), whose current
+        # file_size/modified_time_ns still match what was recorded at
+        # inspection time (i.e. haven't changed since), that either
+        # have no hash yet or whose stored hash is for different
+        # file_size/modified_time_ns (i.e. stale), and that don't
+        # already have a calculate_archive_hash job in flight.
         rows = self.connection.execute(
             f"""
             SELECT ai.archive_id
@@ -230,6 +251,9 @@ class ArchiveHashRepository:
         return len(rows)
 
     def duplicate_groups(self) -> list[dict]:
+        # Group archives (restricted to their current, live location)
+        # by algorithm/digest/file_size; any group with more than one
+        # member is a set of byte-for-byte identical archives.
         rows = self.connection.execute(
             """
             SELECT
