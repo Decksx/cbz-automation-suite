@@ -110,6 +110,9 @@ def run_perceptual_hashing(
                     f"terminally_failed={terminally_failed:,}"
                 )
 
+        # Run summary figures pulled directly from the database rather
+        # than accumulated in Python, so they reflect the true state
+        # even if enqueue_missing/report_only skipped the worker loop.
         remaining = connection.execute(
             """
             SELECT COUNT(*)
@@ -119,6 +122,9 @@ def run_perceptual_hashing(
             """,
             (JOB_TYPE,),
         ).fetchone()[0]
+        # Count of archives that have both a dhash and a phash on at
+        # least one page: the two JOINs each pin down one algorithm, so
+        # a page only satisfies both joins if it has both hash rows.
         archive_count = connection.execute(
             """
             SELECT COUNT(DISTINCT ap.archive_id)
