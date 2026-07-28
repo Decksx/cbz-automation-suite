@@ -1,3 +1,12 @@
+-- Migration 003: archive inspections.
+--
+-- Stores the read-only structural inspection result for each archive:
+-- format, page/entry/directory counts, ComicInfo.xml presence and
+-- validity, and whether the archive was encrypted or CRC-verified.
+-- One row per archive_id (see archive_id UNIQUE below); re-inspecting an
+-- archive overwrites the row via the ON CONFLICT upsert in
+-- ArchiveInspectionRepository.save (comic_automation/archive/repository.py)
+-- rather than accumulating history.
 CREATE TABLE IF NOT EXISTS archive_inspections (
     id INTEGER PRIMARY KEY,
     archive_id INTEGER NOT NULL UNIQUE,
@@ -26,8 +35,12 @@ CREATE TABLE IF NOT EXISTS archive_inspections (
         ON DELETE SET NULL
 );
 
+-- Supports the status-breakdown query used by the CLI/report tooling
+-- (for example counting how many archives are "ok" vs "corrupt").
 CREATE INDEX IF NOT EXISTS idx_archive_inspections_status
     ON archive_inspections(status);
 
+-- Supports looking up an inspection result by the path it was inspected
+-- at, independent of archive_id.
 CREATE INDEX IF NOT EXISTS idx_archive_inspections_path
     ON archive_inspections(inspected_path);
