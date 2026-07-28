@@ -20,6 +20,9 @@ class ArchiveInspectionRepository:
         self,
         archive_id: int,
     ) -> sqlite3.Row:
+        # The current location for an archive is the most recently
+        # seen row with is_current = 1; ties (same last_seen_at) break
+        # on the highest id, i.e. the most recently inserted row.
         row = self.connection.execute(
             """
             SELECT
@@ -64,6 +67,10 @@ class ArchiveInspectionRepository:
             else None
         )
 
+        # One inspection row per archive_id: insert the first time, or
+        # overwrite every column via the ON CONFLICT upsert on
+        # re-inspection so archive_inspections always reflects the
+        # latest result rather than accumulating history.
         self.connection.execute(
             """
             INSERT INTO archive_inspections (
@@ -136,6 +143,9 @@ class ArchiveInspectionRepository:
             ),
         )
 
+        # Keep the denormalized page_count on archive_files in sync with
+        # what inspection just found, so other stages can filter/order
+        # by page_count without joining archive_inspections.
         self.connection.execute(
             """
             UPDATE archive_files
