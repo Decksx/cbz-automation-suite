@@ -160,6 +160,59 @@ without generating candidates. New records use `pending_review`.
 Previously reviewed decisions are never overwritten. The command does
 not delete, move, rename, replace, or rewrite archive files.
 
+### Review UI (design, not yet built)
+
+Design agreed 2026-07-28, ahead of any actual frontend/API work.
+Comparison is at the **archive level**, not the individual page level --
+a `near_duplicate_candidates` row is two whole archives, and pages
+aren't removable from a CBZ without breaking its sequence.
+
+Each review card shows the **cover page** of both archives side by
+side, with metadata under each:
+
+```text
+filename
+series (once series/issue normalization exists; falls back to folder
+        name until then)
+chapter/volume, if available
+size on disk
+page count
+resolution (of the cover, or a dimension summary)
+```
+
+Three actions per card:
+
+- click either cover -> that archive is the preferred/kept copy
+- a box between the two covers -> keep both
+
+The queue advances automatically to the next `pending_review` row,
+ordered by `similarity_score` descending (the existing
+`idx_near_duplicate_review` index already supports this ordering, no
+schema change needed there).
+
+Resolved: `review_status` has a fourth state, `rejected` (the matcher
+was wrong, these aren't actually the same release), with no button
+mapped to it above. Decided 2026-07-28 that it doesn't need one --
+"false positive, keep both" and "true duplicate, keep both anyway" both
+end in the same action (delete nothing, advance to the next pair), so
+the three-button design is sufficient. `rejected` stays a valid value
+in the schema, just unreached by this particular interface; the only
+cost is losing data on the matcher's false-positive rate, which only
+matters for tuning Tier C's thresholds later, not for the review
+workflow itself.
+
+Still open before this can be built:
+
+- `confirmed_duplicate` records that one side was preferred, but the
+  table has no column yet for *which* archive was chosen. A small
+  migration (e.g. `preferred_archive_id`) is needed before this can
+  actually be written to, not just designed.
+
+Every decision made through this UI is also a labeled preference
+signal (`archive A chosen over B`) that the quality-scoring phase could
+train against later, rather than starting quality scoring from
+nothing.
+
 ### Tier D
 
 Partial overlap, missing pages, or compilation/individual relationships.
