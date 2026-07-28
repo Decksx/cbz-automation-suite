@@ -161,6 +161,9 @@ class ArchivePageHashRepository:
     ) -> None:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
+            # Rehashing replaces the entire page inventory rather than
+            # trying to diff it: delete-then-reinsert is simpler and
+            # correct even if pages were added, removed, or reordered.
             self.connection.execute(
                 "DELETE FROM archive_pages WHERE archive_id = ?",
                 (archive_id,),
@@ -190,6 +193,9 @@ class ArchivePageHashRepository:
                         page.crc32,
                     ),
                 )
+                # page_hashes rows are keyed off the archive_pages row
+                # just inserted (lastrowid), storing the exact
+                # sha256 content digest for this page.
                 self.connection.execute(
                     """
                     INSERT INTO page_hashes (
@@ -210,6 +216,9 @@ class ArchivePageHashRepository:
                     ),
                 )
 
+            # One archive_content_signatures row per archive_id,
+            # summarizing the ordered page digests into a single
+            # comparable value; upsert on rehash.
             self.connection.execute(
                 """
                 INSERT INTO archive_content_signatures (
@@ -249,6 +258,8 @@ class ArchivePageHashRepository:
                     result.source_modified_time_ns,
                 ),
             )
+            # Keep the denormalized content_signature/page_count on
+            # archive_files current for quick lookups without a join.
             self.connection.execute(
                 """
                 UPDATE archive_files
@@ -280,6 +291,13 @@ class ArchivePageHashRepository:
             limit_clause = " LIMIT ?"
             parameters.append(limit)
 
+        # Candidates for page hashing: archives that already have an
+        # exact archive hash whose recorded file_size/modified_time_ns
+        # still match the current file_locations row, and that either
+        # lack a content signature for that exact size/mtime or don't
+        # already have a hash_archive_pages job in flight (including
+        # 'failed', so a job that previously failed permanently isn't
+        # silently retried here -- see the module's job handler).
         rows = self.connection.execute(
             f"""
             SELECT ah.archive_id
@@ -323,6 +341,10 @@ class ArchivePageHashRepository:
         return len(rows)
 
     def duplicate_content_groups(self) -> list[dict]:
+        # Group archives (current location only) by content signature
+        # algorithm/version/digest/page_count; more than one member
+        # means byte-for-byte identical page sequences, i.e. the same
+        # comic content even if the container files differ.
         rows = self.connection.execute(
             """
             SELECT
