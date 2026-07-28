@@ -25,6 +25,15 @@ from comic_automation.archive.page_hashing import (
     PageContentHash,
     calculate_page_hashes,
 )
+from comic_automation.archive.perceptual_hashing import (
+    ArchivePerceptualHashes,
+    ArchivePerceptualHashRepository,
+    HashArchivePagesPerceptualHandler,
+    PagePerceptualHash,
+    calculate_perceptual_hashes,
+    difference_hash,
+    perceptual_hash,
+)
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
     ArchiveLocationNotFoundError,
@@ -38,6 +47,8 @@ __all__ = [
     "ArchiveLocationNotFoundError",
     "ArchivePageHashes",
     "ArchivePageHashRepository",
+    "ArchivePerceptualHashes",
+    "ArchivePerceptualHashRepository",
     "ArchiveHash",
     "ArchiveHashRepository",
     "CalculateArchiveHashHandler",
@@ -45,11 +56,16 @@ __all__ = [
     "InspectArchiveHandler",
     "InvalidInspectionJobError",
     "HashArchivePagesHandler",
+    "HashArchivePagesPerceptualHandler",
     "PageContentHash",
+    "PagePerceptualHash",
     "UnsupportedArchiveFormatError",
     "UnsafeComicInfoError",
     "inspect_archive",
     "inspect_cbz",
     "calculate_archive_hash",
     "calculate_page_hashes",
+    "calculate_perceptual_hashes",
+    "difference_hash",
+    "perceptual_hash",
 ]

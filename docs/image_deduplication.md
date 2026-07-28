@@ -2,9 +2,17 @@
 
 ## Status
 
-**Planned implementation.**
+**Implementation in progress.**
 
 The first usable system will combine exact hashes, page perceptual hashes, ordered page comparison, and quality scoring. OpenCLIP comes after candidate generation is stable.
+
+Implemented foundations:
+
+- whole-archive SHA-256;
+- ordered exact page SHA-256 and archive content signatures;
+- Pillow-backed 64-bit dHash and pHash;
+- persistent, versioned page hashes in SQLite;
+- bounded, resumable queue workers for exact and perceptual hashing.
 
 ## Safety policy
 
@@ -70,6 +78,23 @@ pHash
 dHash
 wHash (optional)
 ```
+
+The current perceptual hashing worker stores `dhash` and `phash` version
+`1`. It only enqueues archives whose exact page inventory is current and
+skips archives that already have both perceptual hashes for every page.
+
+Run a bounded batch:
+
+```powershell
+python scripts/comic_perceptual_hashing.py `
+  --database G:\ComicAutomation\db\comics.db `
+  --limit 10 `
+  --progress-every 1 `
+  --enqueue-missing
+```
+
+Use `--report-only` to inspect queue and stored-hash counts without
+processing jobs. No CBZ content is rewritten.
 
 ## Aggregate archive signatures
 
