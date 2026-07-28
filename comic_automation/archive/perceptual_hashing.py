@@ -261,6 +261,10 @@ class ArchivePerceptualHashRepository:
         archive_id: int,
         result: ArchivePerceptualHashes,
     ) -> None:
+        # Perceptual hashing runs after exact page hashing, so
+        # archive_pages rows already exist; load them to match each
+        # freshly-computed perceptual hash back to its page_id and to
+        # sanity-check the page inventory hasn't drifted underneath us.
         stored_pages = self.connection.execute(
             """
             SELECT id, page_index, entry_name
@@ -292,6 +296,8 @@ class ArchivePerceptualHashRepository:
             for row, page in zip(stored_pages, result.pages):
                 page_id = int(row["id"])
 
+                # Backfill the width/height/image_format columns added
+                # by migration 008, now that they're known.
                 self.connection.execute(
                     """
                     UPDATE archive_pages
@@ -309,6 +315,11 @@ class ArchivePerceptualHashRepository:
                     ),
                 )
 
+                # Store both the dhash and phash as separate
+                # page_hashes rows (same table used for the exact
+                # sha256 content hash), keyed by algorithm so all three
+                # hash kinds can coexist per page; upsert so
+                # recomputing perceptual hashes overwrites in place.
                 for algorithm, version, digest in (
                     (
                         DHASH_ALGORITHM,
@@ -365,6 +376,14 @@ class ArchivePerceptualHashRepository:
             limit_clause = " LIMIT ?"
             parameters.append(limit)
 
+        # Candidates for perceptual hashing: archives with a current
+        # content signature (i.e. exact page hashing already ran) whose
+        # recorded source_file_size/source_modified_time_ns still match
+        # the live file_locations row, that have at least one page
+        # still missing a dhash, phash, or decoded width/height, and
+        # that don't already have a perceptual-hash job in flight
+        # (including 'failed', mirroring enqueue_missing() in
+        # page_hashing.py).
         rows = self.connection.execute(
             f"""
             SELECT acs.archive_id
