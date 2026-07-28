@@ -5,6 +5,9 @@ from pathlib import Path
 
 
 def ensure_migration_table(connection: sqlite3.Connection) -> None:
+    # Tracks which numbered migration files have already been applied
+    # to this database, so apply_migrations() can be called repeatedly
+    # (e.g. on every service/CLI startup) and only run new migrations.
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -19,6 +22,7 @@ def ensure_migration_table(connection: sqlite3.Connection) -> None:
 def applied_versions(connection: sqlite3.Connection) -> set[int]:
     ensure_migration_table(connection)
 
+    # Every version number that has already been recorded as applied.
     rows = connection.execute(
         "SELECT version FROM schema_migrations"
     ).fetchall()
@@ -87,11 +91,20 @@ def apply_migrations(
         statements = iter_sql_statements(sql)
 
         try:
+            # Each migration file is applied as a single transaction:
+            # either every statement in it succeeds and the version is
+            # recorded, or none of it takes effect. BEGIN IMMEDIATE
+            # (rather than a bare BEGIN) acquires the write lock
+            # up front so a concurrent writer can't interleave with a
+            # migration mid-way through.
             connection.execute("BEGIN IMMEDIATE")
 
             for statement in statements:
                 connection.execute(statement)
 
+            # Record this version as applied inside the same
+            # transaction as the schema change itself, so a crash
+            # between the two is impossible to observe.
             connection.execute(
                 """
                 INSERT INTO schema_migrations (version, name)
