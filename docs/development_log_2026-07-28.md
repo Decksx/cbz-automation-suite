@@ -243,36 +243,153 @@ gap needing a fresh download. The other two `filesystem_not_found`
 entries are stale references to already-replaced content and need no
 further action.
 
-## 8. Current outstanding state
+## 8. Repository commits
+
+Three commits were made covering the work in sections 4 and above (the
+corruption-handling fix predates this session but was still
+uncommitted; everything else is new). The ~34 other files `git status`
+shows as modified are line-ending-only noise from this checkout's
+`core.autocrlf` (working tree CRLF vs. committed LF, byte-identical
+content otherwise) and were deliberately left out of every commit:
 
 ```text
-Original 147 terminal failures:
-  105  Feng Shen Ji III     -- deleted by user, pending re-download
-    4  Blood Lad tmp files  -- deleted by user, pending re-download
-   35  quarantined          -- in X:\_NeedsRedownload, pending re-download
-    2  filesystem_not_found -- already superseded, no action needed
-    1  filesystem_not_found -- genuine gap (Stupidemic ch. 39), pending re-download
+2154adf fix: classify zlib.error/EOFError as corrupt_archive during CBZ inspection
+23ed81c feat: add guarded archive quarantine workflow for permanently-broken CBZs
+5b15843 docs: log 2026-07-28 terminal-failure review and quarantine session
 ```
 
-Also outstanding from the 2026-07-28 rescan:
+Branch `feature/archive-inspection` is 24 commits ahead of
+`origin/feature/archive-inspection`; not yet pushed.
+
+## 9. Post-rescan inspection run
+
+Ran the bounded inspection CLI (with `--verify-crc`) against the 1,120
+jobs queued by the rescan in section 6, to fully validate the
+watcher-synced content before moving on to hashing:
+
+```powershell
+python scripts/comic_archive_inspection.py --database G:\ComicAutomation\TestDatabase\inspection-working.db --limit 1200 --verify-crc --progress-every 100 --json-output G:\ComicAutomation\logs\archive-inspection\post-rescan-inspection-20260728.json --failure-csv-output G:\ComicAutomation\logs\archive-inspection\post-rescan-inspection-20260728-failures.csv
+```
+
+Result:
 
 ```text
-1,120  inspect_archive jobs queued (new/changed archives from ongoing
-       watcher sync), not yet processed
+Processed:         1,120
+Succeeded:         1,119
+Terminally failed: 1
+Remaining pending: 0
+Inspection statuses:  ok: 59,536   no_images: 5
+Terminal failures:    148  (145 corrupt_archive, 3 filesystem_not_found)
 ```
 
-No commits had been made as of the end of this session's investigative
-work; see the corresponding commit for exactly what was included.
+One new corrupt archive turned up, isolated (not a cluster):
 
-## 9. Next steps
+```text
+X:\_extraneous\Drunk on You\Drunk on You Chapter 51.cbz  (archive 58664)
+```
 
-- Run the bounded inspection CLI against the 1,120 newly-queued jobs.
-- Continue toward the original roadmap: exact hashing across the full
-  library, exact-duplicate grouping, perceptual/near-duplicate review
-  (implemented but not yet run at full scale), and eventual
-  remediation/Komga-integration work.
-- `docs/database_architecture.md`'s original "Planned migrations"
-  section describes an early aspirational schema that has since
-  diverged from the actual implemented migrations; a summary of the
-  real schema was added alongside it, but the section itself was left
-  as historical context rather than rewritten.
+Folded into the same pending-redownload bucket as the rest of section
+8's original list rather than tracked separately.
+
+## 10. Archive-level exact hashing (SHA-256)
+
+With the library fully inspected (0 pending `inspect_archive` jobs),
+moved to the hashing phase of the roadmap. Archive-level (whole-file)
+SHA-256 hashing first:
+
+```powershell
+python scripts/comic_archive_hashing.py --database G:\ComicAutomation\TestDatabase\inspection-working.db --enqueue-missing --limit 5000 --progress-every 250 --json-output G:\ComicAutomation\logs\archive-hashing\batch-1-20260728.json
+```
+
+Completed in a single batch — most of the library already had hashes
+from earlier work; only the 1,119 archives freshly inspected in section
+9 needed catching up:
+
+```text
+Processed:          1,119
+Succeeded:           1,119
+Hashes stored:      59,541  (100% of currently-valid archives)
+Remaining pending:       0
+Duplicate groups:        2
+Elapsed:             99.04 seconds
+```
+
+Archive-level exact hashing is now complete for the entire library.
+
+### Exact-duplicate groups found
+
+```text
+1. X:\Manga\Gundam - Gundam Perfect File\Oneshot.cbz
+   ≡ X:\_extraneous\Gundam - Gundam Perfect File\Oneshot.cbz
+   (629 MB, byte-identical, sha256 match)
+
+2. X:\Comix\Ai no Katachi 2\Ai no Katachi 2.cbz
+   ≡ X:\_extraneous\Ai no Katachi 2\anime Chapter.cbz
+   (29,699 bytes, byte-identical despite different filename)
+```
+
+Both pairs follow the same shape: one copy already organized into the
+live library (`Manga`/`Comix`), and a byte-identical copy sitting in
+`X:\_extraneous`.
+
+### `X:\_extraneous` clarified
+
+`_extraneous` is a holding folder for suspected duplicate copies (not
+a curated library folder). Confirmed: when an archive in `_extraneous`
+has a confirmed exact match already in the organized library, the
+`_extraneous` copy can be deleted. This is an explicitly approved,
+bounded remediation rule, distinct from the quarantine workflow in
+section 4 (that one *moves* permanently-broken files out of the
+library and preserves them for re-download; this one *deletes* a
+confirmed-redundant copy that already exists elsewhere).
+
+As of this writing, whether to build a small reusable "resolve
+confirmed exact duplicates in `_extraneous`" CLI (mirroring the
+quarantine tool's guarded pattern: preview by default, `--confirm` +
+backup required to actually delete) versus a one-time manual cleanup of
+just these 2 pairs is still an open decision — `_extraneous` is fed
+continuously by the watcher script, so more matches are expected over
+time, which favors the reusable option, but no build work has started
+on it yet.
+
+## 11. Current outstanding state
+
+```text
+Original 147 terminal failures, now 148 (see section 9):
+  105  Feng Shen Ji III        -- deleted by user, pending re-download
+    4  Blood Lad tmp files     -- deleted by user, pending re-download
+   35  quarantined             -- in X:\_NeedsRedownload, pending re-download
+    1  _extraneous corrupt     -- Drunk on You ch.51, pending re-download
+    2  filesystem_not_found    -- already superseded, no action needed
+    1  filesystem_not_found    -- genuine gap (Stupidemic ch. 39), pending re-download
+
+Exact-duplicate groups: 2, pending a decision on resolution tooling
+(see section 10) and then execution -- not yet deleted.
+```
+
+## 12. Next steps
+
+Recommended order, updated from the original roadmap based on this
+session's findings (dependency-driven: validate before hashing, exact
+dedup before perceptual dedup, identity before quality scoring):
+
+1. ~~Run pending inspection jobs~~ -- done, section 9.
+2. ~~Exact archive-level hashing~~ -- done, section 10. Page-level
+   content hashing (`scripts/comic_page_hashing.py`, same
+   `--enqueue-missing`/batched pattern) is still outstanding and is the
+   more thorough half of "exact hashing" -- it catches same-content
+   archives that were repackaged/recompressed differently and so don't
+   share a whole-file SHA-256.
+3. Resolve the 2 known exact-duplicate groups (decision pending, see
+   section 10) -- and re-run duplicate detection after each future
+   hashing batch, since `_extraneous` is fed continuously.
+4. Run perceptual/near-duplicate analysis (implemented, not yet run at
+   scale) -- review-only, never auto-deletes.
+5. Build series and issue normalization.
+6. Quality scoring and preferred-copy selection.
+7. Komga/Komf publication integration.
+8. Productionize service/monitoring/dashboard.
+
+The redownload backlog (105 + 4 + 35 + 1 + 1 = 146 archives across
+sections 8-11) is explicitly deferred by the user to be handled
+separately later; it does not block the above.

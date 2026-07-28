@@ -19,12 +19,20 @@
 
 ## Phase 3 — archive audit
 
-- non-mutating crawler;
-- archive SHA-256;
-- archive metadata inventory;
-- page inventory;
-- exact page hashes;
-- resumable database jobs.
+- [x] non-mutating crawler;
+- [x] archive SHA-256 (run across the full library 2026-07-28: 59,541
+      archives hashed, 100% coverage; 2 exact-duplicate groups found,
+      both involving the `_extraneous` suspected-duplicate holding
+      folder);
+- [ ] exact-duplicate group review and resolution (2 groups found;
+      resolution tooling scope -- reusable CLI vs. one-time cleanup --
+      not yet decided);
+- [x] archive metadata inventory (ComicInfo.xml parsing via the
+      inspection pipeline);
+- [ ] page inventory;
+- [ ] exact page hashes (implemented, not yet run at production scale
+      -- next planned step);
+- [x] resumable database jobs.
 
 ## Phase 4 — series identity
 
