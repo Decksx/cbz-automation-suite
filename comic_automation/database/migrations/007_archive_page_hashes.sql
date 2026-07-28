@@ -1,3 +1,13 @@
+-- Migration 007: archive page hashes.
+--
+-- Adds the per-page inventory and exact page-content hashing tables
+-- (phase 3: ordered exact page hashes, one level more granular than the
+-- whole-archive hash in migration 006). See
+-- comic_automation/archive/page_hashing.py for the code that populates
+-- these tables.
+
+-- archive_pages inventories every image entry inside an archive, in
+-- natural reading order (page_index), independent of hashing.
 CREATE TABLE IF NOT EXISTS archive_pages (
     id INTEGER PRIMARY KEY,
     archive_id INTEGER NOT NULL,
@@ -16,6 +26,9 @@ CREATE TABLE IF NOT EXISTS archive_pages (
     UNIQUE (archive_id, page_index)
 );
 
+-- page_hashes stores one digest per (page, algorithm, algorithm_version)
+-- triple. Reused later by perceptual hashing (migration 008 / dhash and
+-- phash rows), not just the exact sha256 content hash.
 CREATE TABLE IF NOT EXISTS page_hashes (
     id INTEGER PRIMARY KEY,
     page_id INTEGER NOT NULL,
@@ -30,6 +43,10 @@ CREATE TABLE IF NOT EXISTS page_hashes (
     UNIQUE (page_id, algorithm, algorithm_version)
 );
 
+-- archive_content_signatures is a single digest over the ordered
+-- sequence of page hashes for an archive (see calculate_page_hashes),
+-- letting two archives be compared for exact content equality without
+-- comparing every page individually.
 CREATE TABLE IF NOT EXISTS archive_content_signatures (
     id INTEGER PRIMARY KEY,
     archive_id INTEGER NOT NULL UNIQUE,
@@ -50,12 +67,19 @@ CREATE TABLE IF NOT EXISTS archive_content_signatures (
         ON DELETE SET NULL
 );
 
+-- Supports iterating an archive's pages in reading order.
 CREATE INDEX IF NOT EXISTS idx_archive_pages_archive
     ON archive_pages(archive_id, page_index);
 
+-- Supports the per-page exact-duplicate lookup: find other pages
+-- sharing the same algorithm/version/digest.
 CREATE INDEX IF NOT EXISTS idx_page_hashes_digest
     ON page_hashes(algorithm, algorithm_version, digest);
 
+-- Supports the whole-archive exact-duplicate lookup
+-- (see ArchivePageHashRepository.duplicate_content_groups), including
+-- page_count so archives are only grouped when both digest and length
+-- agree.
 CREATE INDEX IF NOT EXISTS idx_content_signatures_digest
     ON archive_content_signatures(
         algorithm,
