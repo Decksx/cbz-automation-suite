@@ -264,6 +264,13 @@ class NearDuplicateRepository:
         self.connection = connection
 
     def load_fingerprints(self) -> list[ArchiveFingerprint]:
+        # Pull one row per (archive, page) with both perceptual hashes
+        # attached, restricted to archives whose page hashing is
+        # current for the live file (matching source_file_size /
+        # source_modified_time_ns against file_locations). The two
+        # JOINs against page_hashes (aliased dh/ph) each pick out a
+        # specific algorithm/version, effectively pivoting the
+        # per-algorithm hash rows onto a single page row.
         rows = self.connection.execute(
             """
             SELECT
@@ -314,6 +321,10 @@ class NearDuplicateRepository:
         fingerprints = []
 
         for archive_id, archive_rows in grouped.items():
+            # Defensive check: only build a fingerprint if every page
+            # for this archive came back with both hashes (an archive
+            # mid-way through perceptual hashing would otherwise
+            # produce a partial, misleading fingerprint).
             expected_count = int(archive_rows[0]["page_count"])
             if len(archive_rows) != expected_count:
                 continue
@@ -356,6 +367,13 @@ class NearDuplicateRepository:
             DEFAULT_MAX_PAGE_COUNT_DELTA_RATIO
         ),
     ) -> set[tuple[int, int]]:
+        # Locality-sensitive-hashing-style blocking, entirely in
+        # Python/memory (no SQL here): rather than comparing every
+        # archive against every other archive (O(n^2) full comparisons,
+        # each itself expensive), sample a few representative pages per
+        # archive and bucket archives that share a hash "band" so only
+        # plausible candidate pairs go on to the expensive comparison
+        # in generate_candidates().
         if max_bucket_size < 2:
             raise ValueError("max_bucket_size must be at least 2.")
 
@@ -396,6 +414,10 @@ class NearDuplicateRepository:
         for archive_ids in buckets.values():
             unique_ids = sorted(set(archive_ids))
             if len(unique_ids) > max_bucket_size:
+                # Skip buckets that are too large to be useful blocking
+                # (a bucket this big means the sampled hash band wasn't
+                # discriminating, so pairing everything in it would
+                # blow up comparison cost with little benefit).
                 continue
 
             for archive_a_id, archive_b_id in combinations(
@@ -472,6 +494,12 @@ class NearDuplicateRepository:
             self.connection.execute("BEGIN IMMEDIATE")
 
             for item in selected:
+                # Upsert into the review queue, but only overwrite an
+                # existing row's computed metrics while it's still
+                # 'pending_review' (the WHERE clause on the UPDATE
+                # branch) -- once a reviewer has confirmed, rejected, or
+                # kept-both a candidate, rerunning detection must not
+                # silently clobber that decision.
                 self.connection.execute(
                     """
                     INSERT INTO near_duplicate_candidates (
@@ -543,6 +571,8 @@ class NearDuplicateRepository:
         return selected
 
     def review_summary(self) -> dict[str, int]:
+        # Count of candidates in each review_status bucket, used for
+        # CLI/report summaries of the review queue.
         rows = self.connection.execute(
             """
             SELECT review_status, COUNT(*) AS count
