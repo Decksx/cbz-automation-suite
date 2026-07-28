@@ -103,6 +103,9 @@ def run_hashing(
                     f"terminally_failed={terminally_failed:,}"
                 )
 
+        # Run summary figures pulled directly from the database rather
+        # than accumulated in Python, so they reflect the true state
+        # even if enqueue_missing/report_only skipped the worker loop.
         remaining = connection.execute(
             """
             SELECT COUNT(*)
