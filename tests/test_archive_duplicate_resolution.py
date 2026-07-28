@@ -5,6 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import comic_automation.archive.duplicate_resolution as duplicate_resolution
 from comic_automation.archive.duplicate_resolution import (
     DuplicateResolutionRepository,
 )
@@ -187,6 +188,69 @@ def test_plan_blocks_active_job(tmp_path: Path) -> None:
 
     assert plan[0].status == "blocked"
     assert "active job" in str(plan[0].error)
+
+
+def test_plan_indexes_hashes_without_resolving_every_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "inventory.db"
+    extraneous_root = tmp_path / "library" / "_extraneous"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+
+        for index in range(4):
+            content = f"duplicate-{index}".encode()
+            _seed_hashed_archive(
+                connection,
+                extraneous_root / f"Issue-{index}.cbz",
+                content,
+            )
+            _seed_hashed_archive(
+                connection,
+                tmp_path
+                / "library"
+                / "Manga"
+                / f"Issue-{index}.cbz",
+                content,
+            )
+
+        for index in range(200):
+            _seed_hashed_archive(
+                connection,
+                tmp_path
+                / "library"
+                / "Unrelated"
+                / f"Issue-{index}.cbz",
+                f"unrelated-{index}".encode(),
+            )
+
+        def fail_if_resolved(*args, **kwargs):
+            raise AssertionError(
+                "Planning must not resolve every stored filesystem path."
+            )
+
+        monkeypatch.setattr(
+            duplicate_resolution,
+            "path_is_within",
+            fail_if_resolved,
+        )
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        plan = DuplicateResolutionRepository(
+            connection
+        ).build_plan(extraneous_root=extraneous_root)
+        connection.set_trace_callback(None)
+
+    assert len(plan) == 4
+    assert all(candidate.status == "planned" for candidate in plan)
+    job_queries = [
+        statement
+        for statement in statements
+        if "FROM jobs" in statement
+    ]
+    assert len(job_queries) == 1
 
 
 def test_cli_preview_is_read_only(tmp_path: Path) -> None:

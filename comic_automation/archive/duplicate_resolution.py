@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -50,6 +51,24 @@ def path_is_within(path: Path, root: Path) -> bool:
     return True
 
 
+def _path_is_within_lexically(path: Path, root: Path) -> bool:
+    """Classify stored paths without touching every filesystem entry.
+
+    This is only used while building a plan. Execution repeats the
+    containment check with ``Path.resolve`` before moving any file, so
+    junctions and symlinks cannot bypass the destructive-action guard.
+    """
+    absolute_path = Path(os.path.abspath(path))
+    absolute_root = Path(os.path.abspath(root))
+
+    try:
+        absolute_path.relative_to(absolute_root)
+    except ValueError:
+        return False
+
+    return True
+
+
 class DuplicateResolutionRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
@@ -83,33 +102,56 @@ class DuplicateResolutionRepository:
             """
         ).fetchall()
 
-        records = [dict(row) for row in rows]
+        records: list[dict] = []
+        organized_by_hash: dict[
+            tuple[str, str, int],
+            list[dict],
+        ] = {}
+
+        for row in rows:
+            record = dict(row)
+            record_path = Path(str(record["path"]))
+            record_error = self._stored_hash_error(record)
+            is_extraneous = _path_is_within_lexically(
+                record_path,
+                extraneous_root,
+            )
+            record["_path"] = record_path
+            record["_stored_hash_error"] = record_error
+            record["_is_extraneous"] = is_extraneous
+            records.append(record)
+
+            if not is_extraneous and record_error is None:
+                key = (
+                    str(record["algorithm"]),
+                    str(record["digest"]),
+                    int(record["hash_file_size"]),
+                )
+                organized_by_hash.setdefault(key, []).append(record)
+
+        active_job_counts = self._active_job_counts()
         plan: list[DuplicateResolutionCandidate] = []
 
         for source in records:
-            source_path = Path(str(source["path"]))
+            source_path = source["_path"]
 
-            if not path_is_within(source_path, extraneous_root):
+            if not source["_is_extraneous"]:
                 continue
 
-            error = self._stored_hash_error(source)
+            error = source["_stored_hash_error"]
             counterparts: list[dict] = []
 
             if error is None:
+                key = (
+                    str(source["algorithm"]),
+                    str(source["digest"]),
+                    int(source["hash_file_size"]),
+                )
                 counterparts = [
                     record
-                    for record in records
+                    for record in organized_by_hash.get(key, [])
                     if int(record["archive_id"])
                     != int(source["archive_id"])
-                    and not path_is_within(
-                        Path(str(record["path"])),
-                        extraneous_root,
-                    )
-                    and self._stored_hash_error(record) is None
-                    and record["algorithm"] == source["algorithm"]
-                    and record["digest"] == source["digest"]
-                    and int(record["hash_file_size"])
-                    == int(source["hash_file_size"])
                 ]
 
                 if len(counterparts) != 1:
@@ -126,9 +168,15 @@ class DuplicateResolutionRepository:
             )
 
             if error is None and counterpart is not None:
-                active_jobs = self._active_job_count(
-                    int(source["archive_id"]),
-                    int(counterpart["archive_id"]),
+                active_jobs = (
+                    active_job_counts.get(
+                        int(source["archive_id"]),
+                        0,
+                    )
+                    + active_job_counts.get(
+                        int(counterpart["archive_id"]),
+                        0,
+                    )
                 )
                 if active_jobs:
                     error = (
@@ -205,6 +253,23 @@ class DuplicateResolutionRepository:
             return "Stored SHA-256 or file metadata is stale."
 
         return None
+
+    def _active_job_counts(self) -> dict[int, int]:
+        placeholders = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        rows = self.connection.execute(
+            f"""
+            SELECT archive_id, COUNT(*) AS active_job_count
+            FROM jobs
+            WHERE archive_id IS NOT NULL
+              AND status IN ({placeholders})
+            GROUP BY archive_id
+            """,
+            tuple(sorted(ACTIVE_JOB_STATUSES)),
+        ).fetchall()
+        return {
+            int(row["archive_id"]): int(row["active_job_count"])
+            for row in rows
+        }
 
     def _active_job_count(
         self,
