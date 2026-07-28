@@ -37,10 +37,12 @@
 
 ## Phase 5 — perceptual dedupe
 
-- pHash/dHash workers;
-- aggregate archive signatures;
-- blocked candidate generation;
-- ordered page comparison;
+- [x] pHash/dHash workers;
+- [x] sampled hash blocking and decoded dimension summaries;
+- [x] conservative ordered page comparison;
+- [x] persistent review-only Tier C candidates;
+- [ ] richer aggregate archive signatures;
+- [ ] partial-overlap and compilation detection;
 - review UI;
 - quarantine workflow.
 

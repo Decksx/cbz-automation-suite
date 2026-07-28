@@ -12,7 +12,10 @@ Implemented foundations:
 - ordered exact page SHA-256 and archive content signatures;
 - Pillow-backed 64-bit dHash and pHash;
 - persistent, versioned page hashes in SQLite;
-- bounded, resumable queue workers for exact and perceptual hashing.
+- decoded page dimensions and image formats;
+- bounded, resumable queue workers for exact and perceptual hashing;
+- conservative Tier C candidate blocking and ordered comparison;
+- persistent review-only near-duplicate candidates.
 
 ## Safety policy
 
@@ -96,6 +99,10 @@ python scripts/comic_perceptual_hashing.py `
 Use `--report-only` to inspect queue and stored-hash counts without
 processing jobs. No CBZ content is rewritten.
 
+The perceptual worker also stores decoded width, height, and image
+format. Archives hashed before that schema addition are automatically
+eligible for a bounded perceptual-hash pass to backfill those values.
+
 ## Aggregate archive signatures
 
 Precompute:
@@ -125,9 +132,41 @@ Same ordered exact page-hash sequence despite packaging or metadata differences.
 
 Similar page count and strongly matching ordered pHash sequence.
 
+The first Tier C implementation uses both dHash and pHash. It:
+
+- blocks on 16-bit bands from the first, middle, and last page hashes;
+- ignores overly broad blocking buckets;
+- allows a page-count difference of 5%, with a minimum allowance of one
+  page;
+- tries small sequence offsets to account for an added or removed
+  leading/trailing page;
+- requires at least 90% of the larger archive's pages to match;
+- requires both 64-bit hashes on each matched page to have Hamming
+  distance 6 or less;
+- records aspect-ratio agreement and median pixel area for review;
+- excludes archives already represented by the same ordered exact page
+  signature.
+
+Generate a bounded set of review candidates:
+
+```powershell
+python scripts/comic_near_duplicate_candidates.py `
+  --database G:\ComicAutomation\db\comics.db `
+  --limit 100
+```
+
+Use `--report-only` to inspect readiness and current review counts
+without generating candidates. New records use `pending_review`.
+Previously reviewed decisions are never overwritten. The command does
+not delete, move, rename, replace, or rewrite archive files.
+
 ### Tier D
 
 Partial overlap, missing pages, or compilation/individual relationships.
+
+Tier D remains future work. The conservative Tier C implementation does
+not claim to detect inserted interior pages, compilations, or substantial
+partial overlap.
 
 ## Sequence-aware requirements
 

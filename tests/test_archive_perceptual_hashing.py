@@ -201,6 +201,15 @@ def test_perceptual_hash_job_persists_both_algorithms(
             """,
             (archive_id,),
         ).fetchall()
+        dimensions = connection.execute(
+            """
+            SELECT width, height, image_format
+            FROM archive_pages
+            WHERE archive_id = ?
+            ORDER BY page_index
+            """,
+            (archive_id,),
+        ).fetchall()
 
         assert result.outcome == WorkerOutcome.SUCCEEDED
         assert [(row["algorithm"], row["count"]) for row in hashes] == [
@@ -208,7 +217,24 @@ def test_perceptual_hash_job_persists_both_algorithms(
             ("phash", 2),
             ("sha256", 2),
         ]
+        assert [
+            (row["width"], row["height"], row["image_format"])
+            for row in dimensions
+        ] == [
+            (80, 120, "PNG"),
+            (90, 130, "PNG"),
+        ]
         assert repository.enqueue_missing(limit=10) == 0
+
+        connection.execute(
+            """
+            UPDATE archive_pages
+            SET width = NULL, height = NULL
+            WHERE archive_id = ?
+            """,
+            (archive_id,),
+        )
+        assert repository.enqueue_missing(limit=10) == 1
 
 
 def test_perceptual_hash_cli_processes_a_bounded_batch(

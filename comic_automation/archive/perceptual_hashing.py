@@ -292,6 +292,23 @@ class ArchivePerceptualHashRepository:
             for row, page in zip(stored_pages, result.pages):
                 page_id = int(row["id"])
 
+                self.connection.execute(
+                    """
+                    UPDATE archive_pages
+                    SET width = ?,
+                        height = ?,
+                        image_format = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        page.width,
+                        page.height,
+                        page.image_format,
+                        page_id,
+                    ),
+                )
+
                 for algorithm, version, digest in (
                     (
                         DHASH_ALGORITHM,
@@ -370,7 +387,12 @@ class ArchivePerceptualHashRepository:
                    AND ph.algorithm = ?
                    AND ph.algorithm_version = ?
                   WHERE ap.archive_id = acs.archive_id
-                    AND (dh.id IS NULL OR ph.id IS NULL)
+                    AND (
+                        dh.id IS NULL
+                        OR ph.id IS NULL
+                        OR ap.width IS NULL
+                        OR ap.height IS NULL
+                    )
               )
               AND NOT EXISTS (
                   SELECT 1
