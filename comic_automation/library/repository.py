@@ -37,6 +37,13 @@ def _path_key(path: str | Path) -> str:
 
 
 class LibraryRepository:
+    """
+    Persists the results of a read-only library discovery scan: batch
+    and checkpoint bookkeeping (source_batches, discovery_checkpoints),
+    archive identity and location tracking (archive_files,
+    file_locations), and the resulting inspect_archive job enqueues.
+    """
+
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
         self.queue = JobQueue(connection)
@@ -44,6 +51,7 @@ class LibraryRepository:
     def start_batch(self, source_path: str | Path) -> int:
         normalized = str(normalize_library_path(source_path))
 
+        # A source_batches row represents this scan run as a whole.
         cursor = self.connection.execute(
             """
             INSERT INTO source_batches (
@@ -64,6 +72,9 @@ class LibraryRepository:
 
         batch_id = int(cursor.lastrowid)
 
+        # Its paired discovery_checkpoints row starts at zero progress;
+        # update_checkpoint() advances it as the scan proceeds so a
+        # crash mid-scan can be resumed from the last checkpoint.
         self.connection.execute(
             """
             INSERT INTO discovery_checkpoints (
@@ -83,6 +94,10 @@ class LibraryRepository:
     ) -> sqlite3.Row | None:
         normalized = str(normalize_library_path(source_path))
 
+        # A batch is resumable if it's still 'running' (crashed without
+        # finishing) or 'failed' (raised an exception); 'completed'
+        # batches are excluded so a finished scan is never resumed by
+        # mistake. Most recent batch for the path wins.
         return self.connection.execute(
             """
             SELECT
@@ -118,6 +133,9 @@ class LibraryRepository:
         jobs_queued: int,
         errors: int,
     ) -> None:
+        # Overwrites the checkpoint's running totals and last_path (the
+        # most recently processed path in scan order), so a resumed
+        # scan knows both where to continue and what to add to.
         self.connection.execute(
             """
             UPDATE discovery_checkpoints
@@ -191,6 +209,9 @@ class LibraryRepository:
     ) -> tuple[str, bool]:
         path_text = str(archive.path)
 
+        # Look up whether this exact path is already tracked, and if
+        # so, whether it's currently considered the live location for
+        # its archive.
         row = self.connection.execute(
             """
             SELECT
@@ -208,6 +229,8 @@ class LibraryRepository:
         now = _utc_timestamp()
 
         if row is None:
+            # Never seen this path before: create a brand-new archive
+            # identity and its first location row together.
             archive_cursor = self.connection.execute(
                 """
                 INSERT INTO archive_files (
@@ -261,6 +284,9 @@ class LibraryRepository:
         previous_size = row["file_size"]
         previous_modified = row["modified_time_ns"]
 
+        # "changed" covers both a genuine content change (size or
+        # mtime differ from what's recorded) and a path that had been
+        # marked missing and has now reappeared (was_current is false).
         changed = (
             not was_current
             or previous_size != archive.file_size
@@ -288,6 +314,10 @@ class LibraryRepository:
         if not changed:
             return "unchanged", False
 
+        # File content may have changed: invalidate the previously
+        # computed hash/content-signature/page-count so downstream
+        # hashing stages recompute them rather than trusting stale
+        # values.
         self.connection.execute(
             """
             UPDATE archive_files
@@ -336,6 +366,10 @@ class LibraryRepository:
         missing_count = 0
         now = _utc_timestamp()
 
+        # Every location currently believed to be live, across the
+        # whole database (not scoped to this scan's root by the query
+        # itself -- the relative_to() check below filters to this
+        # root in Python).
         rows = self.connection.execute(
             """
             SELECT id, archive_id, path
@@ -363,6 +397,9 @@ class LibraryRepository:
             if _path_key(location_path) in seen_path_keys:
                 continue
 
+            # Not seen during this complete scan of the root: flip
+            # is_current off rather than deleting the row, preserving
+            # location history for later moves/restores.
             self.connection.execute(
                 """
                 UPDATE file_locations
@@ -386,6 +423,8 @@ class LibraryRepository:
         archive_id: int,
         path: str,
     ) -> bool:
+        # Avoid piling up duplicate inspect_archive jobs for the same
+        # archive if one is already pending/claimed/running.
         existing = self.connection.execute(
             """
             SELECT id
@@ -418,6 +457,8 @@ class LibraryRepository:
         destination_path: str | None = None,
         details: dict | None = None,
     ) -> None:
+        # Appends one row to the file_events audit log; never updates
+        # or deletes existing events.
         self.connection.execute(
             """
             INSERT INTO file_events (
@@ -481,6 +522,8 @@ def scan_library(
         error_count = int(resumable["error_count"])
         resumed = True
 
+        # Flip a previously 'failed' batch back to 'running' now that
+        # it's being resumed.
         connection.execute(
             """
             UPDATE source_batches
@@ -521,6 +564,10 @@ def scan_library(
             return
 
         try:
+            # Record a whole batch of discovered archives and advance
+            # the checkpoint in one transaction, so a crash mid-batch
+            # either records all of it or none of it (never a partial,
+            # inconsistent checkpoint).
             connection.execute("BEGIN IMMEDIATE")
 
             for archive in pending:
