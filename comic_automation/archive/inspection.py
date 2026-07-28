@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -180,7 +181,11 @@ def inspect_cbz(
 
                 crc_verified = True
 
-    except zipfile.BadZipFile as exc:
+    except (
+        zipfile.BadZipFile,
+        zlib.error,
+        EOFError,
+    ) as exc:
         raise CorruptArchiveError(
             f"Invalid or corrupt CBZ archive: {archive_path}"
         ) from exc
