@@ -4,6 +4,7 @@ import hashlib
 import re
 import sqlite3
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -111,7 +112,7 @@ def calculate_page_hashes(
                         bytes_read=bytes_read,
                     )
                 )
-    except zipfile.BadZipFile as exc:
+    except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
         raise PermanentJobError(
             f"Invalid or corrupt CBZ archive: {archive_path}",
             category="archive_corrupt",
@@ -298,7 +299,12 @@ class ArchivePageHashRepository:
                   FROM jobs AS j
                   WHERE j.archive_id = ah.archive_id
                     AND j.job_type = 'hash_archive_pages'
-                    AND j.status IN ('pending', 'claimed', 'running')
+                    AND j.status IN (
+                        'pending',
+                        'claimed',
+                        'running',
+                        'failed'
+                    )
               )
             ORDER BY ah.archive_id
             {limit_clause}

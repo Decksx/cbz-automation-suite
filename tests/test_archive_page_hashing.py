@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import zipfile
+import zlib
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from comic_automation.archive.page_hash_cli import main
 from comic_automation.archive.page_hashing import calculate_page_hashes
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
+from comic_automation.jobs import PermanentJobError
 
 
 MIGRATIONS = (
@@ -124,6 +129,27 @@ def test_content_signature_ignores_zip_metadata_and_compression(
         first_result.content_digest
         == second_result.content_digest
     )
+
+
+def test_decompression_error_is_permanent_archive_corruption(
+    tmp_path: Path,
+) -> None:
+    archive = create_cbz(
+        tmp_path / "corrupt-stream.cbz",
+        [("001.jpg", b"image bytes")],
+    )
+
+    with patch(
+        "zipfile.ZipExtFile.read",
+        side_effect=zlib.error(
+            "Error -3 while decompressing data"
+        ),
+    ):
+        with pytest.raises(PermanentJobError) as caught:
+            calculate_page_hashes(archive)
+
+    assert caught.value.category == "archive_corrupt"
+    assert "Invalid or corrupt CBZ archive" in str(caught.value)
 
 
 def test_page_hash_cli_detects_content_duplicates(
@@ -281,6 +307,14 @@ def test_corrupt_cbz_fails_page_hash_job_permanently(
         "1",
         "--enqueue-missing",
     ]) == 0
+    assert main([
+        "--database",
+        str(database),
+        "--limit",
+        "1",
+        "--enqueue-missing",
+        "--report-only",
+    ]) == 0
 
     with database_connection(database) as connection:
         job = connection.execute(
@@ -292,7 +326,17 @@ def test_corrupt_cbz_fails_page_hash_job_permanently(
             """,
             (archive_id,),
         ).fetchone()
+        job_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE archive_id = ?
+              AND job_type = 'hash_archive_pages'
+            """,
+            (archive_id,),
+        ).fetchone()[0]
 
     assert job["status"] == "failed"
     assert job["attempts"] == 1
     assert job["failure_category"] == "archive_corrupt"
+    assert job_count == 1
