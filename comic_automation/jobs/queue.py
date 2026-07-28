@@ -60,6 +60,13 @@ def _row_to_job(row: sqlite3.Row) -> Job:
 
 
 class JobQueue:
+    """
+    Thin wrapper around the `jobs` table (see
+    database/migrations/001_operational_foundation.sql) implementing the
+    job lifecycle: pending -> claimed -> running -> completed/failed,
+    with retry and abandoned-job recovery.
+    """
+
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
@@ -81,6 +88,9 @@ class JobQueue:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1.")
 
+        # Insert a new row in the 'pending' state. available_at defaults
+        # to now, so the job is immediately eligible for claim_next();
+        # callers pass a future timestamp to schedule delayed work.
         cursor = self.connection.execute(
             """
             INSERT INTO jobs (
@@ -108,6 +118,8 @@ class JobQueue:
         return self.get(int(cursor.lastrowid))
 
     def get(self, job_id: int) -> Job:
+        # Simple primary-key lookup; used internally after every
+        # mutation to return the caller a fresh Job snapshot.
         row = self.connection.execute(
             """
             SELECT *
@@ -146,6 +158,9 @@ class JobQueue:
         )
 
         try:
+            # BEGIN IMMEDIATE takes the write lock before the SELECT, so
+            # the "find a candidate, then claim it" sequence below can't
+            # race with another worker doing the same thing concurrently.
             self.connection.execute("BEGIN IMMEDIATE")
 
             parameters: list[Any] = [
@@ -171,6 +186,13 @@ class JobQueue:
                 excluded_clause = f" AND id NOT IN ({placeholders})"
                 parameters.extend(excluded_ids)
 
+            # Pick the single best candidate job: pending, due
+            # (available_at has passed), optionally restricted to
+            # certain job_types, and excluding job IDs this worker has
+            # already seen in the current run (used to avoid reclaiming
+            # a job that was just retried with a future available_at).
+            # Ordered by priority first (lower number = higher
+            # priority), then FIFO within the same priority.
             row = self.connection.execute(
                 f"""
                 SELECT id
@@ -195,6 +217,10 @@ class JobQueue:
             job_id = int(row["id"])
             now = _utc_sql_timestamp()
 
+            # Transition pending -> claimed. The trailing
+            # "AND status = ?" guards against a lost race even though
+            # BEGIN IMMEDIATE already serializes writers; rowcount is
+            # checked below rather than trusted implicitly.
             cursor = self.connection.execute(
                 """
                 UPDATE jobs
@@ -238,6 +264,9 @@ class JobQueue:
         *,
         worker_id: str | None = None,
     ) -> Job:
+        # Transition claimed -> running. worker_id, if given, is an
+        # ownership check: the update only affects the row if it's
+        # still claimed by this worker.
         clauses = [
             "id = ?",
             "status = ?",
@@ -285,6 +314,9 @@ class JobQueue:
         *,
         worker_id: str | None = None,
     ) -> Job:
+        # Transition claimed or running -> completed. Both source
+        # statuses are accepted since a caller may skip mark_running()
+        # and complete a job directly after claiming it.
         clauses = [
             "id = ?",
             "status IN (?, ?)",
@@ -367,6 +399,10 @@ class JobQueue:
             now = datetime.now(timezone.utc)
 
             if not permanent and job.attempts < job.max_attempts:
+                # Retry path: reset back to 'pending' with a delayed
+                # available_at, clearing claim/run bookkeeping so the
+                # job looks freshly enqueued to claim_next() once the
+                # delay elapses.
                 next_available = now + timedelta(
                     seconds=retry_delay_seconds
                 )
@@ -396,6 +432,10 @@ class JobQueue:
                     ),
                 )
             else:
+                # Terminal path: attempts are exhausted, or the caller
+                # explicitly marked this as a permanent failure (for
+                # example a corrupt archive that will never succeed on
+                # retry). No further claim_next() will pick this up.
                 self.connection.execute(
                     """
                     UPDATE jobs
@@ -443,6 +483,11 @@ class JobQueue:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
 
+            # Find jobs still marked claimed/running whose most recent
+            # activity (started_at, falling back to claimed_at) is
+            # older than the cutoff -- these belong to a worker that
+            # crashed or was killed without ever calling
+            # mark_completed/mark_failed.
             rows = self.connection.execute(
                 """
                 SELECT *
@@ -464,6 +509,9 @@ class JobQueue:
             for row in rows:
                 job = _row_to_job(row)
 
+                # Give abandoned jobs the same attempts-remaining
+                # treatment as a normal failure: retry if attempts
+                # remain, otherwise mark permanently failed.
                 if job.attempts < job.max_attempts:
                     status = JobStatus.PENDING.value
                     completed_at = None
