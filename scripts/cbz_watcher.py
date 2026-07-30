@@ -1333,20 +1333,140 @@ def _is_subpath(child: Path, parent: Path) -> bool:
 
 
 # ─────────────────────────────────────────────
+# READINESS-GATED DIRECTORY PROCESSING
+# ─────────────────────────────────────────────
+# Seconds before re-probing a directory that wasn't ready last time. Kept
+# on the same order of magnitude as SETTLE_DELAY so a not-yet-ready
+# directory gets rechecked at a similar cadence to the settle timer itself,
+# rather than hammering the filesystem or waiting unreasonably long.
+READINESS_RETRY_DELAY_SECONDS = 5
+
+
+def _log_directory_not_ready(
+    dir_path: Path,
+    result: DirectoryReadinessResult,
+) -> None:
+    log.info(
+        f"  Directory not ready: '{dir_path.name}' "
+        f"({result.ready_count}/{result.archive_count} archive(s) ready) "
+        f"— retrying in {READINESS_RETRY_DELAY_SECONDS}s."
+    )
+    for entry in result.entries:
+        if entry.status == ZipReadiness.READY:
+            continue
+        detail_suffix = f" ({entry.detail})" if entry.detail else ""
+        log.info(
+            f"    Not ready: '{entry.path.name}' - "
+            f"{entry.reason}{detail_suffix}"
+        )
+
+
+def _process_directory_when_ready(
+    dir_path: Path,
+    tracker: "DirectorySettleTracker",
+    *,
+    readiness_generation: int | None = None,
+) -> None:
+    """
+    Readiness gate in front of process_and_move_directory().
+
+    Enumerates dir_path's .cbz files and probes them with
+    probe_cbz_directory_readiness() -- a pure, read-only check (no
+    database access, no locks, no file mutation; see the ZIP READINESS
+    PROBE sections above). Only calls process_and_move_directory() (which
+    performs the actual renames/metadata edits/moves) once every archive
+    reports READY.
+
+    If any archive is not ready, this performs no mutation of any kind and
+    schedules exactly one retry via `tracker` after
+    READINESS_RETRY_DELAY_SECONDS. If that retry also finds something not
+    ready, it schedules its own single retry in turn -- this is a normal
+    timer-based recheck cadence, not a busy loop.
+
+    A directory that no longer exists, or that contains no .cbz files at
+    all, stops immediately with no retry scheduled -- there is nothing
+    that could become "ready" later for either case, so retrying would
+    loop forever.
+    """
+    if not dir_path.exists() or not dir_path.is_dir():
+        log.info(
+            f"  Directory no longer exists, not probing: {dir_path}"
+        )
+        return
+
+    cbz_files = sorted(dir_path.rglob("*.cbz"))
+
+    if not cbz_files:
+        log.info(
+            f"  No .cbz files found under '{dir_path.name}', "
+            "not probing."
+        )
+        return
+
+    if readiness_generation is None:
+        readiness_generation = tracker._current_readiness_generation(
+            dir_path
+        )
+
+    result = probe_cbz_directory_readiness(cbz_files)
+
+    # Timer.cancel() cannot stop a callback that has already begun. A fresh
+    # filesystem event may therefore arrive while this probe is in progress.
+    # Discard that stale result instead of processing or scheduling another
+    # retry from information that predates the new event.
+    if not tracker._readiness_generation_is_current(
+        dir_path,
+        readiness_generation,
+    ):
+        return
+
+    if result.status == ZipReadiness.READY:
+        process_and_move_directory(dir_path)
+        return
+
+    _log_directory_not_ready(dir_path, result)
+    tracker._schedule_readiness_retry(
+        dir_path,
+        expected_generation=readiness_generation,
+    )
+
+
+# ─────────────────────────────────────────────
 # DIRECTORY SETTLE TRACKER
 # ─────────────────────────────────────────────
 class DirectorySettleTracker:
     def __init__(self, settle_delay: float = SETTLE_DELAY):
         self.settle_delay = settle_delay
         self._timers: dict = {}
+        # Pending single-shot readiness recheck timers, keyed by directory
+        # -- kept separate from _timers (the settle-notify timers) so a
+        # fresh filesystem event (notify()) can always cancel a stale
+        # readiness retry without disturbing the bookkeeping for the
+        # normal settle cycle, and vice versa.
+        self._readiness_retry_timers: dict = {}
+        # A monotonically increasing generation invalidates readiness callbacks
+        # that were already running when a newer filesystem event arrived.
+        self._readiness_generations: dict[Path, int] = {}
         self._lock = threading.Lock()
 
     def notify(self, dir_path: Path) -> None:
-        """Reset the settle timer each time a file event fires."""
+        """Reset the settle timer each time a file event fires.
+
+        A fresh filesystem event always supersedes any readiness retry
+        already pending for this directory: cancelling it here means a new
+        event's settle timer can never be overwritten or raced by an older
+        readiness retry firing later on stale information.
+        """
         with self._lock:
             existing = self._timers.get(dir_path)
             if existing:
                 existing.cancel()
+            stale_retry = self._readiness_retry_timers.pop(dir_path, None)
+            if stale_retry:
+                stale_retry.cancel()
+            self._readiness_generations[dir_path] = (
+                self._readiness_generations.get(dir_path, 0) + 1
+            )
             timer = threading.Timer(self.settle_delay, self._on_settled, args=[dir_path])
             self._timers[dir_path] = timer
             timer.start()
@@ -1368,6 +1488,25 @@ class DirectorySettleTracker:
                 timer.start()
                 return
         log.info(f"Directory ready: '{dir_path.name}' (settled + minimum age {MIN_AGE}s met)")
+        self._dispatch(dir_path)
+
+    def _dispatch(
+        self,
+        dir_path: Path,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            readiness_generation = self._readiness_generations.get(
+                dir_path,
+                0,
+            )
+            if (
+                expected_generation is not None
+                and expected_generation != readiness_generation
+            ):
+                return
+
         # Guard against processing a directory already being handled by another thread.
         with _processing_dirs_lock:
             already = any(
@@ -1377,7 +1516,71 @@ class DirectorySettleTracker:
         if already:
             log.info(f"  Skipping '{dir_path.name}': already being processed.")
             return
-        process_and_move_directory(dir_path)
+        _process_directory_when_ready(
+            dir_path,
+            self,
+            readiness_generation=readiness_generation,
+        )
+
+    def _current_readiness_generation(self, dir_path: Path) -> int:
+        with self._lock:
+            return self._readiness_generations.get(dir_path, 0)
+
+    def _readiness_generation_is_current(
+        self,
+        dir_path: Path,
+        generation: int,
+    ) -> bool:
+        with self._lock:
+            return self._readiness_generations.get(dir_path, 0) == generation
+
+    def _schedule_readiness_retry(
+        self,
+        dir_path: Path,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        with self._lock:
+            current_generation = self._readiness_generations.get(
+                dir_path,
+                0,
+            )
+            if (
+                expected_generation is not None
+                and expected_generation != current_generation
+            ):
+                return False
+
+            existing = self._readiness_retry_timers.get(dir_path)
+            if existing:
+                existing.cancel()
+            retry_generation = current_generation + 1
+            self._readiness_generations[dir_path] = retry_generation
+            timer = threading.Timer(
+                READINESS_RETRY_DELAY_SECONDS,
+                self._on_readiness_retry,
+                args=[dir_path, retry_generation],
+            )
+            self._readiness_retry_timers[dir_path] = timer
+            timer.start()
+            return True
+
+    def _on_readiness_retry(
+        self,
+        dir_path: Path,
+        readiness_generation: int,
+    ) -> None:
+        with self._lock:
+            if (
+                self._readiness_generations.get(dir_path, 0)
+                != readiness_generation
+            ):
+                return
+            self._readiness_retry_timers.pop(dir_path, None)
+        self._dispatch(
+            dir_path,
+            expected_generation=readiness_generation,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1421,6 +1624,24 @@ class CBZHandler(FileSystemEventHandler):
 # ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
+def _discover_startup_directories(
+    watch_path: Path,
+    tracker: DirectorySettleTracker,
+) -> None:
+    """
+    Route directories that already contain .cbz files at watcher startup
+    through the same readiness gate as live filesystem events, rather than
+    calling process_and_move_directory() directly -- a directory dropped
+    in while the watcher was offline deserves the same
+    probe_cbz_directory_readiness() check as one that arrives while it's
+    running.
+    """
+    for subdir in sorted(watch_path.iterdir()):
+        if subdir.is_dir() and any(subdir.rglob("*.cbz")):
+            log.info(f"Found existing directory at startup: {subdir.name}")
+            _process_directory_when_ready(subdir, tracker)
+
+
 def main():
     watch_path = Path(WATCH_FOLDER)
     os.makedirs(watch_path, exist_ok=True)
@@ -1447,10 +1668,7 @@ def main():
             except OSError as e:
                 log.warning(f"    Could not delete stale file {f.name}: {e}")
 
-    for subdir in sorted(watch_path.iterdir()):
-        if subdir.is_dir() and any(subdir.rglob("*.cbz")):
-            log.info(f"Found existing directory at startup: {subdir.name}")
-            process_and_move_directory(subdir)
+    _discover_startup_directories(watch_path, tracker)
 
     handler  = CBZHandler(tracker)
     observer = Observer()
