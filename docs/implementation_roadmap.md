@@ -1,6 +1,6 @@
 # Implementation Roadmap
 
-## Status as of 2026-07-29
+## Status as of 2026-07-30
 
 The project has moved beyond a collection of standalone scripts into a
 SQLite-backed automation platform for discovering, inspecting, hashing,
@@ -24,18 +24,19 @@ audit.
 | Archive SHA-256 coverage | 59,541 |
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 20,700 |
-| Perceptual jobs completed | 20,631 |
-| Perceptual jobs failed | 69 |
-| Active perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,028,793 |
-| pHash rows, Version 1 | 1,028,793 |
-| Eligible archives remaining | 37,554 |
+| Perceptual job rows | 25,700 |
+| Perceptual jobs completed | 25,622 |
+| Perceptual jobs failed | 77 |
+| Active perceptual jobs | 1 pending retry |
+| dHash rows, Version 1 | 1,279,216 |
+| pHash rows, Version 1 | 1,279,216 |
+| Eligible archives remaining | 32,554 |
 | Near-duplicate candidates | 0 |
-| Last guarded batch | 100 processed |
-| Last-batch terminal failures | 0 of 100 (0.00%) |
-| Last-batch throughput | approximately 1,303 archives/hour |
-| Estimated active processing time remaining | approximately 28.8 hours |
+| Last guarded batch | 5,000 processed |
+| Last-batch outcomes | 4,991 succeeded, 8 terminal failures, 1 retry |
+| Last-batch terminal-failure rate | 0.16% |
+| Last-batch throughput | approximately 1,241 archives/hour |
+| Estimated active processing time remaining | approximately 26.2 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -53,6 +54,13 @@ This is an estimate of active processing time, not a predicted calendar
 completion date. It varies with archive size, page count, image
 complexity, storage performance, cache opportunity, and terminal
 failures.
+
+The one pending retry is archive `23258`. The library file changed
+after its exact-page inventory was recorded: the stored 6.9 MB
+WebP-based archive is now an 18.2 MB JPEG-based archive at the same
+path. It must be rediscovered and exact-page-inspected before
+perceptual hashing; retrying the stale inventory unchanged is not
+expected to succeed.
 
 The guarded runner already reports `processed` and `elapsed_seconds`.
 Preserve those fields in future runner revisions. Before adding a
@@ -479,6 +487,8 @@ Acceptance criteria:
 
 #### G. Resume guarded 5,000-archive backfill
 
+**First optimized production batch completed 2026-07-30.**
+
 Resume production batches only after the selected optimizations pass
 their regression, database-copy, and benchmark gates.
 
@@ -497,6 +507,45 @@ For the first optimized batch:
 
 Do not treat a throughput improvement alone as success. Integrity,
 idempotency, Version 1 equality, and reconciliation remain mandatory.
+
+Production result:
+
+```text
+processed:                              5,000
+succeeded:                              4,991
+terminally failed:                          8
+retry scheduled / pending:                  1
+elapsed seconds:                       14,509.332
+throughput:                    1,240.58 archives/hour
+profiled archives / pages:        4,991 / 250,423
+dHash Version 1 rows:                 1,279,216
+pHash Version 1 rows:                 1,279,216
+eligible archives remaining:             32,554
+```
+
+The report, job outcomes, phase totals, database counts, and
+eligible-archive reduction reconciled exactly. Both the working
+database and protected backup passed `PRAGMA quick_check`; the backup
+retained its pre-batch counts; near-duplicate candidates remained zero;
+and the repository stayed clean.
+
+Production phase distribution:
+
+```text
+image open and decode:       51.257%
+pHash:                       29.799%
+dHash:                       13.972%
+ZIP entry read:               3.966%
+database save:                0.543%
+ZIP open and inventory:       0.436%
+database lookup:              0.027%
+```
+
+The eight new terminal failures are all classified
+`page_image_corrupt`. The full read-only audit now classifies all 77
+terminal failures as 40 corrupt archives and 37 corrupt images, with
+no missing-file, permission, unsupported-format, or unclassified
+failures.
 
 #### Deferred Version 2 research
 
@@ -926,7 +975,12 @@ minimum DAL are stable.
 - [x] freeze exact Version 1 regression vectors and implement
       output-preserving immutable pHash constant caching;
 - [x] capture optional phase timing from both a local 50-archive
-      benchmark and a guarded 100-archive SMB production sample;
+      benchmark, a guarded 100-archive SMB production sample, and the
+      first optimized 5,000-archive production batch;
+- [x] resume the guarded 5,000-archive backfill with immutable pHash
+      constant caching and phase timing;
+- [x] add and run a read-only terminal-failure audit that verifies the
+      database remains unchanged;
 - [ ] perform a final coverage and terminal-failure audit;
 - [ ] generate near-duplicate candidates at production scale;
 - [ ] add richer aggregate archive signatures;

@@ -19,23 +19,30 @@ Implemented foundations:
 - conservative Tier C candidate blocking and ordered comparison;
 - persistent review-only near-duplicate candidates.
 
-Last reconciled production state on 2026-07-29:
+Last reconciled production state on 2026-07-30:
 
 ```text
 page SHA-256 rows:            2,955,304
-perceptual job rows:             20,700
-completed:                       20,631
-terminally failed:                   69
-pending / claimed / running:          0
-dHash Version 1 rows:          1,028,793
-pHash Version 1 rows:          1,028,793
-eligible archives remaining:      37,554
+perceptual job rows:             25,700
+completed:                       25,622
+terminally failed:                   77
+pending / claimed / running:      1 / 0 / 0
+dHash Version 1 rows:          1,279,216
+pHash Version 1 rows:          1,279,216
+eligible archives remaining:      32,554
 near-duplicate candidates:             0
 ```
 
-The two latest guarded batches processed 10,000 archives with 9,991
-successes, 9 legitimate terminal image-decoding failures, no retries,
-and exact pre/post reconciliation.
+The latest optimized guarded batch processed 5,000 archives with 4,991
+successes, 8 legitimate terminal image-decoding failures, one scheduled
+retry, and exact pre/post reconciliation. It averaged approximately
+1,241 archives/hour across 250,423 successfully profiled pages.
+
+The read-only terminal-failure audit classifies the cumulative 77
+failures as 40 corrupt archives and 37 corrupt images. The pending retry
+is not a decoding failure: its CBZ changed from a stored WebP-based
+revision to a JPEG-based revision after inventorying and must be
+rediscovered and exact-page-inspected before perceptual hashing.
 
 ## Safety policy
 
@@ -263,6 +270,28 @@ together accounted for only 0.35%.
 This production result supersedes the synthetic phase ranking for
 optimization decisions. JPEG draft decoding and other decode-path
 research remain Version 2 work because they may change hash bits.
+
+The first optimized 5,000-archive batch confirmed the ranking across
+250,423 successfully profiled pages: image open/decode used 51.26% of
+timed work, pHash 29.80%, dHash 13.97%, ZIP entry reads 3.97%, and
+SQLite lookup/save 0.57%.
+
+### Terminal-failure audit
+
+Audit terminal perceptual-hashing failures without retrying, enqueuing,
+quarantining, moving files, or changing the database:
+
+```powershell
+python scripts\comic_perceptual_failure_audit.py `
+  --database G:\ComicAutomation\TestDatabase\inspection-working.db `
+  --json-output G:\ComicAutomation\logs\perceptual-hashing\failure-audit.json `
+  --csv-output G:\ComicAutomation\logs\perceptual-hashing\failure-audit.csv
+```
+
+The command opens SQLite with `mode=ro` and `PRAGMA query_only`, groups
+failures into stable categories, includes the current file location
+when available, and verifies that database size and modification time
+remain unchanged throughout the audit.
 
 ## Aggregate archive signatures
 

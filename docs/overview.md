@@ -46,38 +46,45 @@ Komga / Komf
   5 for current coverage and remaining gaps (aggregate signatures,
   partial-overlap detection, review UI).
 - The Version 1 perceptual-hash backfill is incomplete. The last
-  reconciled state contains 1,028,793 dHash rows and 1,028,793 pHash
-  rows, with 37,554 further archives eligible for processing.
+  reconciled state contains 1,279,216 dHash rows and 1,279,216 pHash
+  rows, with 32,554 further archives eligible for processing.
 - Komga/Komf metadata is not yet fed back into a canonical local series identity database.
 
 ## Current production status
 
-As of the last reconciled guarded batch on 2026-07-29:
+As of the last reconciled guarded batch on 2026-07-30:
 
 | Metric | Value |
 | --- | ---: |
 | Archives with archive SHA-256 | 59,541 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual jobs completed | 20,631 |
-| Perceptual jobs failed | 69 |
-| Pending/claimed/running perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,028,793 |
-| pHash rows, Version 1 | 1,028,793 |
-| Eligible archives remaining | 37,554 |
+| Perceptual jobs completed | 25,622 |
+| Perceptual jobs failed | 77 |
+| Pending/claimed/running perceptual jobs | 1 / 0 / 0 |
+| dHash rows, Version 1 | 1,279,216 |
+| pHash rows, Version 1 | 1,279,216 |
+| Eligible archives remaining | 32,554 |
 | Near-duplicate candidates | 0 |
 
-The two most recent guarded 5,000-archive batches processed 10,000
-archives with 9,991 successes, 9 legitimate terminal image-decoding
-failures, no scheduled retries, and exact pre/post reconciliation.
-Both completed with `PRAGMA quick_check = ok`; the protected backups
-remained unchanged.
+The latest optimized guarded batch processed 5,000 archives with 4,991
+successes, 8 legitimate terminal image-decoding failures, one scheduled
+retry, and exact pre/post reconciliation. It completed with
+`PRAGMA quick_check = ok`; the protected backup retained its pre-batch
+state.
 
-A subsequent guarded 100-archive profiling sample succeeded without
-failures or retries and showed that production image decoding consumes
-64.22% of timed work, versus 21.15% for pHash and 3.09% for ZIP entry
-reads.
+Across 4,991 successfully profiled archives and 250,423 pages, image
+opening and decoding consumed 51.26% of timed work, versus 29.80% for
+pHash, 13.97% for dHash, 3.97% for ZIP entry reads, and 0.57% for
+database lookup and save combined.
 
-See `docs/development_log_2026-07-29.md` for the operational record and
+The read-only terminal-failure audit classifies all 77 failures as 40
+corrupt archives and 37 corrupt images. The one pending retry is a
+source-drift case: archive `23258` changed on disk after its exact-page
+inventory was recorded and requires rediscovery and exact-page
+reinspection before perceptual hashing.
+
+See `docs/development_log_2026-07-30.md` for the latest operational
+record and
 `docs/implementation_roadmap.md` for the next optimization and
 architecture work.
 
