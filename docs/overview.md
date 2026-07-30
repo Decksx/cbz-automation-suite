@@ -46,8 +46,8 @@ Komga / Komf
   5 for current coverage and remaining gaps (aggregate signatures,
   partial-overlap detection, review UI).
 - The Version 1 perceptual-hash backfill is incomplete. The last
-  reconciled state contains 1,025,682 dHash rows and 1,025,682 pHash
-  rows, with 37,654 further archives eligible for processing.
+  reconciled state contains 1,028,793 dHash rows and 1,028,793 pHash
+  rows, with 37,554 further archives eligible for processing.
 - Komga/Komf metadata is not yet fed back into a canonical local series identity database.
 
 ## Current production status
@@ -58,12 +58,12 @@ As of the last reconciled guarded batch on 2026-07-29:
 | --- | ---: |
 | Archives with archive SHA-256 | 59,541 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual jobs completed | 20,531 |
+| Perceptual jobs completed | 20,631 |
 | Perceptual jobs failed | 69 |
 | Pending/claimed/running perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,025,682 |
-| pHash rows, Version 1 | 1,025,682 |
-| Eligible archives remaining | 37,654 |
+| dHash rows, Version 1 | 1,028,793 |
+| pHash rows, Version 1 | 1,028,793 |
+| Eligible archives remaining | 37,554 |
 | Near-duplicate candidates | 0 |
 
 The two most recent guarded 5,000-archive batches processed 10,000
@@ -71,6 +71,11 @@ archives with 9,991 successes, 9 legitimate terminal image-decoding
 failures, no scheduled retries, and exact pre/post reconciliation.
 Both completed with `PRAGMA quick_check = ok`; the protected backups
 remained unchanged.
+
+A subsequent guarded 100-archive profiling sample succeeded without
+failures or retries and showed that production image decoding consumes
+64.22% of timed work, versus 21.15% for pHash and 3.09% for ZIP entry
+reads.
 
 See `docs/development_log_2026-07-29.md` for the operational record and
 `docs/implementation_roadmap.md` for the next optimization and

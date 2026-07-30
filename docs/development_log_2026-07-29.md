@@ -672,3 +672,70 @@ This confirms pure-Python pHash as the dominant measured phase for the
 local synthetic workload. The next guarded production batch should
 enable `--profile` to quantify SMB read and decode behavior before the
 roadmap timing step is marked fully complete.
+
+### Guarded production profiling sample
+
+Created and verified the protected backup:
+
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-profiled-sample-20260729-212747.db
+```
+
+Then processed exactly 100 eligible archives with `--profile`.
+
+Outcome:
+
+```text
+processed:                    100
+succeeded:                    100
+retry scheduled:                0
+terminally failed:              0
+profiled pages:             3,111
+profiled payload bytes: 3,833,679,369
+elapsed seconds:           276.262
+timed milliseconds/page:    79.940
+```
+
+Aggregate production phase distribution:
+
+```text
+image open and decode:       64.224%
+pHash:                       21.149%
+dHash:                       10.408%
+ZIP entry read:               3.088%
+ZIP open and inventory:       0.784%
+database save:                0.342%
+database lookup:              0.006%
+```
+
+Postflight:
+
+```text
+quick_check:                         ok
+completed jobs:                  20,631
+failed jobs:                         69
+pending / claimed / running:          0
+total jobs:                      20,700
+dHash Version 1:              1,028,793
+pHash Version 1:              1,028,793
+eligible archives remaining:      37,554
+near-duplicate candidates:             0
+protected backup unchanged:          yes
+validation passed:                   yes
+```
+
+Reports:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-profile-sample-100-20260729-212747.json
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-profile-sample-100-20260729-212747-audit.json
+```
+
+The real workload differs materially from the local synthetic sample:
+Pillow image decoding, not pHash or SMB ZIP reads, dominates elapsed
+work. The timing step is now complete. Database write batching and WAL
+checkpoint tuning remain low priority; decode-path changes remain
+deferred to Version 2 because they may alter stored hashes.

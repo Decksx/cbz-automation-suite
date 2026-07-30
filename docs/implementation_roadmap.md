@@ -24,18 +24,18 @@ audit.
 | Archive SHA-256 coverage | 59,541 |
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 20,600 |
-| Perceptual jobs completed | 20,531 |
+| Perceptual job rows | 20,700 |
+| Perceptual jobs completed | 20,631 |
 | Perceptual jobs failed | 69 |
 | Active perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,025,682 |
-| pHash rows, Version 1 | 1,025,682 |
-| Eligible archives remaining | 37,654 |
+| dHash rows, Version 1 | 1,028,793 |
+| pHash rows, Version 1 | 1,028,793 |
+| Eligible archives remaining | 37,554 |
 | Near-duplicate candidates | 0 |
-| Last guarded batch | 5,000 processed |
-| Last-batch terminal failures | 2 of 5,000 (0.04%) |
-| Last-batch throughput | approximately 1,124 archives/hour |
-| Estimated active processing time remaining | approximately 33.5 hours |
+| Last guarded batch | 100 processed |
+| Last-batch terminal failures | 0 of 100 (0.00%) |
+| Last-batch throughput | approximately 1,303 archives/hour |
+| Estimated active processing time remaining | approximately 28.8 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -304,7 +304,7 @@ Implementation result:
 
 #### D. Add optional phase timing
 
-**Implemented 2026-07-29; production-storage sample pending.**
+**Completed 2026-07-29.**
 
 Timing must be captured inside `calculate_perceptual_hashes()` and the
 repository lookup/save path. The batch runner may aggregate the
@@ -377,10 +377,26 @@ ZIP open and inventory:       0.63%
 database lookup:              0.22%
 ```
 
-This confirms pure-Python pHash as the dominant measured phase on local
-storage. Enable profiling for a representative guarded production batch
-to measure the same breakdown across the SMB library before closing
-this step completely.
+The subsequent guarded production sample processed 100 archives and
+3,111 pages from the SMB library. All 100 jobs succeeded, database
+integrity and eligibility reconciled, and the protected backup remained
+unchanged. The production phase distribution was:
+
+```text
+image open and decode:       64.22%
+phash:                       21.15%
+dhash:                       10.41%
+ZIP entry read:               3.09%
+ZIP open and inventory:       0.78%
+database save:                0.34%
+database lookup:              0.01%
+```
+
+The run processed 3.83 GB of image payload in 276.26 seconds at 79.94
+timed milliseconds per page. Unlike the local synthetic benchmark, the
+production workload is dominated by Pillow image decoding rather than
+pHash. ZIP entry reads and SQLite together remain a small share, so
+neither WAL tuning nor database write batching is a current priority.
 
 #### E. Implement bulk exact-hash reuse if material
 
@@ -909,8 +925,8 @@ minimum DAL are stable.
       and selective missing-page hashing for the current backfill;
 - [x] freeze exact Version 1 regression vectors and implement
       output-preserving immutable pHash constant caching;
-- [ ] capture optional phase timing from a guarded production batch
-      over the SMB library (local 50-archive benchmark complete);
+- [x] capture optional phase timing from both a local 50-archive
+      benchmark and a guarded 100-archive SMB production sample;
 - [ ] perform a final coverage and terminal-failure audit;
 - [ ] generate near-duplicate candidates at production scale;
 - [ ] add richer aggregate archive signatures;

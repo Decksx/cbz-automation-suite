@@ -23,13 +23,13 @@ Last reconciled production state on 2026-07-29:
 
 ```text
 page SHA-256 rows:            2,955,304
-perceptual job rows:             20,600
-completed:                       20,531
+perceptual job rows:             20,700
+completed:                       20,631
 terminally failed:                   69
 pending / claimed / running:          0
-dHash Version 1 rows:          1,025,682
-pHash Version 1 rows:          1,025,682
-eligible archives remaining:      37,654
+dHash Version 1 rows:          1,028,793
+pHash Version 1 rows:          1,028,793
+eligible archives remaining:      37,554
 near-duplicate candidates:             0
 ```
 
@@ -254,8 +254,15 @@ noise). pHash accounted for 88.51% of timed work across 600 profiled
 pages, followed by image open/decode at 5.35% and dHash at 3.07%.
 
 This establishes pHash as the measured local CPU hotspot. A guarded
-production batch with `--profile` is still required to quantify SMB
-read behavior.
+100-archive production sample then profiled 3,111 real pages from the
+SMB library. All jobs succeeded and reconciled. The real workload was
+dominated by image open/decode (64.22%), followed by pHash (21.15%),
+dHash (10.41%), and ZIP entry reads (3.09%). SQLite lookup and save
+together accounted for only 0.35%.
+
+This production result supersedes the synthetic phase ranking for
+optimization decisions. JPEG draft decoding and other decode-path
+research remain Version 2 work because they may change hash bits.
 
 ## Aggregate archive signatures
 
