@@ -8,3 +8,6 @@ watchdog>=3.0.0
 googletrans>=4.0.2
 Unidecode>=1.3.8
 truststore>=0.10.4
+
+# Image decoding for perceptual page hashing
+Pillow>=10.0.0

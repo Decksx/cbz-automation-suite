@@ -1,0 +1,18 @@
+[workspace]
+root = "G:\\ComicAutomation"
+database = "G:\\ComicAutomation\\database\\comics.db"
+cache = "G:\\ComicAutomation\\cache"
+embeddings = "G:\\ComicAutomation\\embeddings"
+staging = "G:\\ComicAutomation\\staging"
+temp = "G:\\ComicAutomation\\temp"
+logs = "G:\\ComicAutomation\\logs"
+backups = "G:\\ComicAutomation\\backups"
+
+[library]
+root = 'X:\'
+
+[service]
+poll_interval_seconds = 5
+cpu_workers = 8
+gpu_workers = 1
+operating_mode = "audit"

@@ -1,76 +1,874 @@
 # Implementation Roadmap
 
-## Phase 1 — baseline and tests
+## Status as of 2026-07-29
 
-- keep documentation aligned with code;
-- add regression coverage for normalization, proposal generation, action plans, and workflow command construction;
-- verify dry-run behavior.
+The project has moved beyond a collection of standalone scripts into a
+SQLite-backed automation platform for discovering, inspecting, hashing,
+comparing, reviewing, quarantining, and eventually publishing comic
+archives.
 
-## Phase 2 — operational SQLite core
+The current active workstream is production-scale per-page perceptual
+hashing. Structural changes to archive identity, revision ownership, and
+hash foreign keys are intentionally deferred until the Version 1
+perceptual-hash backfill and its final coverage audit are complete.
 
-- migration framework;
-- connection policy;
-- runs and stages;
-- source batches;
-- archive identity;
-- path history;
-- file events;
-- watcher/workflow integration.
+### Current production metrics
 
-## Phase 3 — archive audit
+These values are the last fully reconciled production baseline. Update
+this table after each major guarded run and after the final coverage
+audit.
 
-- non-mutating crawler;
-- archive SHA-256;
-- archive metadata inventory;
-- page inventory;
-- exact page hashes;
-- resumable database jobs.
+| Metric | Verified value |
+| --- | ---: |
+| Archives | 59,541 |
+| Archive SHA-256 coverage | 59,541 |
+| Exact duplicate groups | 2 |
+| Page SHA-256 rows | 2,955,304 |
+| Perceptual job rows | 20,600 |
+| Perceptual jobs completed | 20,531 |
+| Perceptual jobs failed | 69 |
+| Active perceptual jobs | 0 |
+| dHash rows, Version 1 | 1,025,682 |
+| pHash rows, Version 1 | 1,025,682 |
+| Eligible archives remaining | 37,654 |
+| Near-duplicate candidates | 0 |
+| Last guarded batch | 5,000 processed |
+| Last-batch terminal failures | 2 of 5,000 (0.04%) |
+| Last-batch throughput | approximately 1,124 archives/hour |
+| Estimated active processing time remaining | approximately 33.5 hours |
 
-## Phase 4 — series identity
+Throughput is calculated from the guarded batch result:
 
-- canonical series;
-- title observations and aliases;
-- language, script, and provenance;
-- candidate scoring;
-- review cases;
-- Komga/Komf IDs.
+```text
+archives_per_hour = processed / (elapsed_seconds / 3600)
+```
 
-## Phase 5 — perceptual dedupe
+Estimated active processing time remaining is:
 
-- pHash/dHash workers;
-- aggregate archive signatures;
-- blocked candidate generation;
-- ordered page comparison;
-- review UI;
-- quarantine workflow.
+```text
+eligible_archives_remaining / archives_per_hour
+```
 
-## Phase 6 — quality scoring
+This is an estimate of active processing time, not a predicted calendar
+completion date. It varies with archive size, page count, image
+complexity, storage performance, cache opportunity, and terminal
+failures.
 
-- page and archive metrics;
-- model versioning;
-- preferred-copy selection;
-- operator overrides.
+The guarded runner already reports `processed` and `elapsed_seconds`.
+Preserve those fields in future runner revisions. Before adding a
+perceptual-hashing-specific run table, determine whether the existing
+`processing_runs` model can store or reference batch limits, outcomes,
+timestamps, elapsed time, and phase timing.
 
-## Phase 7 — OpenCLIP
+## Architectural principles
 
-- GPU environment;
-- batched sampled embeddings;
-- cosine-similarity refinement;
-- full-page embeddings for ambiguous candidates.
+- SQLite remains the operational database while the project is
+  single-host and single-operator.
+- New database access goes through a shared local data-access layer
+  (DAL); local high-throughput work is not routed through HTTP.
+- SQLite writes occur locally on the database host, not directly over
+  SMB.
+- Archive identity is separate from filesystem location.
+- Revision content identity is immutable.
+- Observations, retention state, and operator-control metadata may
+  change without changing revision content identity.
+- Derived evidence is versioned and attributable to a source revision
+  and processing run.
+- Evidence is preserved separately from later conclusions or
+  resolution actions.
+- Heavy work uses the persistent job queue.
+- Destructive actions remain previewable, guarded, auditable, and
+  quarantine-first.
+- Optimizations are measured before deployment and must preserve
+  Version 1 hash semantics unless a new algorithm version is declared.
+- Infrastructure is introduced in response to demonstrated need, not
+  anticipated scale.
 
-## Phase 8 — managed publication
+## Deliberate deferrals
 
-- staging-first watcher;
-- approval gates;
-- final-library promotion;
-- Komga scan coordination;
-- Komf feedback ingestion.
+Do not introduce these until a concrete operational need justifies
+them:
 
-## Phase 9 — dashboard
+- a network-facing FastAPI control plane;
+- remote or GPU workers;
+- OpenTelemetry or distributed tracing;
+- message brokers or a distributed job framework;
+- microservices;
+- PostgreSQL;
+- a full single-page frontend framework;
+- a generic lifecycle-event framework;
+- a generalized invalidation engine;
+- a speculative multi-table review schema;
+- workflow-orchestration platforms such as Airflow, Dagster, or Prefect.
 
-- Pi-hosted status UI;
-- queue health;
-- run history;
-- review counts;
-- read-only reports;
-- no direct SMB SQLite writes.
+Use structured JSON logs, `processing_runs`, guarded reports, and a
+lightweight `docs/engineering_decisions.md` log in the current
+environment.
+
+## Near-term implementation sequence
+
+### Step 1 — Finish and audit the Version 1 perceptual-hash backfill
+
+After each active guarded batch completes:
+
+- reconcile `succeeded + terminally_failed + retry_scheduled` against
+  `processed`;
+- require no unexpected pending, claimed, or running work;
+- run SQLite `quick_check`;
+- verify the eligible-archive reduction;
+- verify dHash and pHash Version 1 counts remain aligned;
+- verify the protected backup remains unchanged;
+- verify repository status does not change unexpectedly;
+- record throughput, terminal-failure rate, and the updated production
+  metrics.
+
+Before the next structural database migration:
+
+- complete the remaining Version 1 backfill;
+- audit full-library coverage;
+- classify legitimate terminal failures;
+- capture a final database backup;
+- verify the backup independently;
+- update the production metrics and development log.
+
+### Step 1A — Phase 5 performance optimization
+
+Perform these optimizations only after the currently active guarded
+batch finishes and reconciles. They must not change JPEG decoding,
+resize behavior, DCT arithmetic, floating-point accumulation order, or
+stored Version 1 hash semantics.
+
+#### A. Read-only exact-SHA reuse analysis
+
+Run a read-only opportunity query limited to currently eligible
+archives. A destination page is reusable only when:
+
+- it has matching versioned page SHA-256 evidence;
+- a source page with the same SHA-256 has complete dHash and pHash
+  evidence for the required algorithm versions;
+- the source also has complete width and height values;
+- source evidence is internally consistent and unambiguous.
+
+The report must include:
+
+```text
+reusable_pages
+fully_satisfied_archives
+partially_satisfied_archives
+pages_still_requiring_decode
+archives_still_requiring_processing
+```
+
+The opportunity report must distinguish archives that can be fully
+satisfied by reuse from archives with only partial page reuse. Under
+the current archive-level worker, partial reuse does not avoid decoding
+unless selective missing-page processing is implemented.
+
+Also:
+
+- inspect the query plan;
+- add an index only if the measured plan requires one;
+- record the exact SQL and algorithm-version assumptions in the report;
+- make no database changes during this analysis;
+- use the number of fully satisfied archives and avoidable decodes—not
+  only the raw reusable-page count—to decide whether reuse is material.
+
+Acceptance criteria:
+
+- both page-level and archive-level reuse opportunities are reported;
+- full and partial reuse are never conflated;
+- only currently eligible archives are included;
+- no database rows or files are changed;
+- the report is reproducible against the same database snapshot.
+
+#### B. Freeze Version 1 regression vectors
+
+Create a small frozen regression set before changing the pHash
+implementation. Record the expected exact dHash and pHash digest
+strings produced by the current Version 1 implementation.
+
+Include, where supported:
+
+- JPEG, PNG, WebP, GIF, and TIFF;
+- grayscale, RGB, RGBA, and palette images;
+- very small and very large dimensions;
+- unusual aspect ratios;
+- representative known production pages;
+- non-default `hash_size` and `high_frequency_factor` values.
+
+The equality gate is exact:
+
+```text
+cached_digest == uncached_digest
+```
+
+Zero Hamming distance is not used as a substitute for exact string
+equality.
+
+Acceptance criteria:
+
+- expected digest strings are frozen before implementation changes;
+- existing tests pass against the unchanged implementation;
+- cached and uncached dHash/pHash output is byte-for-byte identical for
+  every regression vector;
+- any change in a stored digest blocks deployment as Version 1.
+
+#### C. Implement immutable pHash constant caching
+
+Cache the pHash cosine and normalization constants by:
+
+```text
+(hash_size, high_frequency_factor)
+```
+
+Implementation requirements:
+
+- use immutable nested tuples;
+- use a bounded or parameter-keyed process-local cache such as
+  `functools.lru_cache`;
+- preserve the existing coefficient loop order;
+- preserve floating-point accumulation order;
+- preserve current resize and grayscale conversion behavior;
+- do not alter the public digest format or algorithm-version label.
+
+This optimization removes repeated constant construction but does not
+remove the pure-Python DCT accumulation loops. Its actual throughput
+impact must be measured rather than assumed.
+
+Acceptance criteria:
+
+- all Version 1 regression vectors match exactly;
+- existing perceptual-hash tests pass;
+- non-default supported parameters are covered;
+- before/after benchmark results are recorded;
+- the cached objects cannot be mutated by callers.
+
+#### D. Add optional phase timing
+
+Timing must be captured inside `calculate_perceptual_hashes()` and the
+repository lookup/save path. The batch runner may aggregate the
+results, but it cannot infer internal phases accurately.
+
+Use `time.perf_counter()` and aggregate these values per archive and
+per batch:
+
+```text
+zip_open_and_inventory_seconds
+zip_entry_read_seconds
+image_open_and_decode_seconds
+dhash_seconds
+phash_seconds
+database_lookup_seconds
+database_save_seconds
+```
+
+Also report page count and, where cheaply available, bytes read so the
+results can be normalized.
+
+Requirements:
+
+- profiling is optional;
+- normal processing behavior is unchanged when profiling is disabled;
+- no telemetry row is written per page;
+- timing overhead is measured and kept small;
+- batch output reports phase totals and normalized values such as
+  milliseconds per page and phase percentage.
+
+Benchmark a representative sample of 50–200 archives before and after
+cosine caching. Include a mixture of common image formats, archive
+sizes, page counts, and storage conditions.
+
+Acceptance criteria:
+
+- phase totals reconcile plausibly with total elapsed time;
+- results identify measured bottlenecks rather than asserting them from
+  static operation counts alone;
+- benchmark inputs and configuration are recorded;
+- profiling does not change any stored hash digest.
+
+#### E. Implement bulk exact-hash reuse if material
+
+If the read-only analysis shows meaningful savings, implement a
+version-aware bulk reuse operation on a database copy first.
+
+Requirements:
+
+- match exact page SHA-256 algorithm and version;
+- require complete source dHash and pHash evidence for the requested
+  versions;
+- require complete width and height;
+- insert distinct evidence rows for each destination `page_id`;
+- never reuse a source row ID as destination evidence;
+- copy or safely derive image format only when current schema semantics
+  support it;
+- preserve destination-page ownership;
+- remain idempotent under repeated execution;
+- perform writes in explicit, bounded transactions without weakening
+  archive-level consistency;
+- record reused counts and version assumptions in the run report.
+
+After the operation:
+
+- reconcile inserted dHash and pHash rows;
+- reconcile filled width and height values;
+- recount eligible archives;
+- distinguish fully satisfied from partially satisfied archives;
+- run SQLite integrity checks;
+- verify no source evidence changed;
+- retain the pre-operation database backup.
+
+Acceptance criteria:
+
+- only complete, version-compatible evidence is reused;
+- repeated execution creates no duplicate evidence;
+- destination rows reference the correct destination pages;
+- dHash and pHash counts remain aligned;
+- the eligible-archive change matches the fully satisfied archive
+  count;
+- database-copy validation succeeds before production use.
+
+#### F. Evaluate selective missing-page hashing
+
+Implement selective missing-page hashing only if partial reuse leaves a
+material number of avoidable page decodes.
+
+The selective worker must:
+
+- validate the archive's current content signature before processing;
+- read and validate the complete archive inventory;
+- confirm page ordering and page-to-entry mapping;
+- skip only pages that already have complete width, height, dHash, and
+  pHash evidence for the requested versions;
+- decode every page whose required evidence is missing or incomplete;
+- preserve archive-level transactional saves;
+- abort safely on inventory or source-revision mismatch;
+- avoid mixing algorithm versions;
+- remain correct when rerun after a crash.
+
+Acceptance criteria:
+
+- selective and full processing produce identical complete Version 1
+  evidence on the same test archives;
+- already complete pages are not decoded;
+- missing or incomplete pages are processed;
+- inventory validation still covers the whole archive;
+- a failure cannot leave an archive falsely marked complete;
+- archive-level reconciliation and idempotency remain intact;
+- measured partial-reuse savings justify the added code path.
+
+#### G. Resume guarded 5,000-archive backfill
+
+Resume production batches only after the selected optimizations pass
+their regression, database-copy, and benchmark gates.
+
+For the first optimized batch:
+
+- capture a fresh verified backup;
+- record exact preflight counts;
+- process no more than 5,000 archives;
+- retain the existing production worker and queue reconciliation;
+- compare throughput and terminal-failure rate with the prior baseline;
+- report phase timing when profiling is enabled;
+- confirm exact Version 1 digest semantics;
+- verify no pending, claimed, or running jobs remain unexpectedly;
+- run `quick_check`;
+- verify the protected backup and repository state.
+
+Do not treat a throughput improvement alone as success. Integrity,
+idempotency, Version 1 equality, and reconciliation remain mandatory.
+
+#### Deferred Version 2 research
+
+Research these only after the Version 1 backfill:
+
+- Pillow JPEG `draft()` decoding;
+- vectorized or third-party DCT implementations;
+- different resize filters or grayscale conversions;
+- fused inspection/exact-hash/perceptual-hash execution.
+
+Any change that alters stored digest bits requires a new algorithm
+version. Version 1 and Version 2 evidence must not be compared as if
+they were produced by the same algorithm.
+
+### Step 2 — Design immutable archive revisions
+
+Separate stable logical identity from observed byte-level content:
+
+```text
+archive_files
+    stable logical identity
+
+archive_revisions
+    unique byte-level content states for one archive
+
+file_locations
+    current and historical paths
+
+archive_observations
+    sightings of a revision at a location during a run
+```
+
+An archive revision represents one unique byte-level content state for
+one logical archive, not an individual observation event. If previously
+seen bytes reappear, reuse the existing revision and record a new
+observation.
+
+Revision content identity is immutable: `archive_id`,
+`archive_sha256`, content-derived metadata, and source relationships are
+never rewritten to represent different bytes. Observation, retention,
+and operator-control metadata may be updated without changing revision
+identity.
+
+Use `archive_files.current_revision_id` as the sole authoritative
+pointer to the current revision. Do not persist a second `is_current`
+source of truth.
+
+Schema requirements:
+
+- index `archive_sha256` for duplicate lookup;
+- do not make `archive_sha256` globally unique;
+- use `UNIQUE (archive_id, archive_sha256)` so the same logical archive
+  cannot accumulate duplicate rows for the same byte state;
+- structurally prevent an archive from pointing to a revision owned by
+  another archive, using a composite foreign key or equivalent;
+- retain direct foreign keys rather than a generic polymorphic
+  provenance relationship.
+
+Migration requirements:
+
+- every existing `archive_id` receives exactly one initial revision;
+- no archive identities are merged as a migration side effect;
+- the two known exact-duplicate groups remain distinct `archive_files`
+  rows whose initial revisions share the same `archive_sha256`;
+- canonical-copy selection and duplicate cleanup remain later guarded
+  resolution actions;
+- all migration steps run in a transaction where feasible;
+- pre/post counts, foreign keys, current-revision pointers, and hashes
+  are reconciled;
+- rollback and restore procedures are tested against a database copy.
+
+Acceptance criteria:
+
+- every archive has exactly one deterministic current revision;
+- every current-revision pointer belongs to its parent archive;
+- every pre-migration archive maps one-to-one to its initial revision;
+- byte-identical archives remain separately addressable;
+- paths and observations can change without rewriting revision identity;
+- derived data can be migrated to the correct source revision.
+
+### Step 3 — Define revision retention and guarded pruning
+
+Immutable revisions do not imply unbounded retention.
+
+Keep:
+
+- the current revision;
+- at least the immediately previous revision for a defined retention
+  window;
+- revisions referenced by active or recoverable jobs;
+- revisions referenced by open review work;
+- revisions referenced by quarantine or resolution history;
+- revisions associated with unresolved failures;
+- operator-pinned revisions.
+
+Use a two-stage process:
+
+1. Classify and report revisions as prunable.
+2. Remove them only through a separate guarded plan/apply operation.
+
+Useful administrative fields may include:
+
+```text
+prunable_at
+prune_reason
+pinned_at
+pinned_reason
+```
+
+Avoid broad cascading deletes. Prefer restrictive foreign keys and an
+explicit purge plan that enumerates every derived row to be removed.
+
+Acceptance criteria:
+
+- a dry-run plan identifies all protected and prunable revisions;
+- applying a plan requires the exact reviewed plan;
+- current or referenced revisions cannot be pruned;
+- prune operations reconcile all affected row counts;
+- interrupted pruning is recoverable or safely repeatable.
+
+### Step 4 — Add revision-aware provenance
+
+Add the schema support needed by existing and near-term derived
+artifacts without building a generalized invalidation engine.
+
+Use applicable fields such as:
+
+```text
+source_revision_id
+algorithm
+algorithm_version
+parameters_json
+processing_run_id
+created_at
+superseded_at
+superseded_by_id
+```
+
+Not every table needs every field. Prefer direct foreign keys and
+table-specific uniqueness constraints.
+
+For page evidence, uniqueness should encode page ownership and
+algorithm version so rerunning a job cannot create duplicate results.
+Future candidate scores and embeddings must likewise retain their
+method, version, parameters, source revisions, and processing run.
+
+Defer automatic invalidation rules until the corresponding producers
+and consumers exist.
+
+Acceptance criteria:
+
+- existing evidence is attributable to a revision;
+- algorithm versions cannot be silently mixed;
+- repeated work is idempotent at the data layer;
+- superseded evidence remains distinguishable from active evidence;
+- migration preserves all current hash values and counts.
+
+### Step 5 — Establish the minimum local DAL before migrations
+
+Steps 2 through 4 define the revision, retention, and provenance model.
+Before applying their migrations or implementing their repositories,
+establish the minimum DAL foundation.
+
+Recommended package shape:
+
+```text
+comic_automation/
+    db/
+        connection.py
+        transactions.py
+        migrations.py
+        backups.py
+        repositories/
+            archives.py
+            revisions.py
+            observations.py
+            pages.py
+            hashes.py
+            jobs.py
+            runs.py
+```
+
+The DAL owns:
+
+- connection construction;
+- SQLite pragmas and busy timeout;
+- read-only connections;
+- transaction boundaries;
+- migration checks;
+- backup operations;
+- repository queries;
+- transient lock handling;
+- schema invariants.
+
+It does not own:
+
+- image processing;
+- archive parsing;
+- similarity algorithms;
+- filesystem moves;
+- CLI formatting;
+- business-policy decisions.
+
+Migration strategy:
+
+1. All new database code uses the DAL.
+2. Existing `comic_automation` access moves first.
+3. Standalone scripts migrate when touched for functional work.
+4. Raw `sqlite3.connect()` calls outside approved modules are
+   deprecated.
+5. A test or lint rule prevents new unauthorized direct connections.
+
+Acceptance criteria:
+
+- revision migrations use DAL-managed transactions and backups;
+- production connection settings are defined once;
+- read-only and writable connections are explicit;
+- current workflows remain functional during incremental migration;
+- the project is not paused for an all-at-once rewrite.
+
+### Step 6 — Harden the persistent job queue
+
+Add directly relevant single-host recovery controls:
+
+- `claimed_by`;
+- `claimed_at`;
+- `lease_expires_at`;
+- `heartbeat_at` or lease renewal;
+- `attempt_count`;
+- deterministic `idempotency_key`;
+- failure class and failure code;
+- explicit retryability;
+- terminal-failure reporting.
+
+Job acquisition must be atomic. Abandoned ownership must expire
+predictably. Enqueue must be idempotent for the same revision,
+algorithm version, and parameters.
+
+A separate dead-letter status is optional. The existing failed status
+may remain terminal if failure classification and retryability are
+unambiguous.
+
+Acceptance criteria:
+
+- two workers cannot acquire the same job;
+- a crashed worker's lease can be recovered safely;
+- repeated enqueue attempts create no duplicate job;
+- malformed content is not blindly retried;
+- transient failures follow an explicit bounded retry policy;
+- recovery tests prove that no completed evidence is duplicated.
+
+### Step 7 — Harden archive resource handling
+
+Audit:
+
+```text
+archive/inspection.py
+archive/handlers.py
+archive/page_hashing.py
+archive/perceptual_hashing.py
+```
+
+Verify and enforce:
+
+- maximum entry count;
+- maximum individual compressed and uncompressed entry size;
+- maximum total declared uncompressed size;
+- maximum decoded pixels;
+- absolute-path and path-traversal rejection;
+- duplicate member-name handling;
+- encrypted entry handling;
+- nested archive policy;
+- processing timeout and temporary-disk budget;
+- prompt closing of archive and member streams.
+
+For mutating workflows such as sanitization:
+
+- copy the source to local scratch;
+- rewrite locally using streaming member-to-member copies;
+- validate the completed ZIP;
+- copy the result to a unique sibling temporary file on the destination
+  share;
+- validate the destination temporary file;
+- use a guarded destination-side replacement with backup retention;
+- remove scratch files only after post-replacement validation.
+
+Benchmark local stage-and-swap against direct SMB rewriting. Do not
+claim a fixed performance multiplier without project-specific results.
+
+Acceptance criteria:
+
+- whole archives are not accumulated in memory;
+- malformed or dangerous members fail with explicit reason codes;
+- large legitimate scans follow a documented allow/warn/review/reject
+  policy;
+- an interrupted rewrite cannot silently destroy the only good copy;
+- source and replacement archives are independently verifiable.
+
+### Step 8 — Add a golden corpus and focused property tests
+
+Create a small routine regression corpus covering:
+
+- a valid ordinary CBZ;
+- corrupt or truncated ZIP structures;
+- truncated and unidentified images;
+- exact duplicate pages;
+- reordered pages;
+- a one-page difference;
+- ComicInfo-only changes;
+- Unicode and punctuation in paths;
+- an archive replaced in place;
+- duplicate content at multiple locations;
+- unsafe member paths;
+- excessive entries or decoded pixels.
+
+Keep large or sensitive real-world fixtures outside Git and reference
+them through an optional integration-test manifest.
+
+Use property-based tests for inexpensive invariants:
+
+- normalization is idempotent;
+- page ordering is deterministic;
+- idempotency keys are stable;
+- repeated completed jobs do not create duplicate rows;
+- moving a file does not change archive identity;
+- changed bytes create or select the correct revision;
+- a current-revision pointer always belongs to its archive;
+- batch outcome accounting reconciles;
+- dry-run and plan generation do not mutate sources;
+- invalid job-state transitions are rejected.
+
+Add crash and fault-injection tests around job acquisition, hash saves,
+database commits, archive replacement, quarantine moves, and recovery.
+
+### Step 9 — Maintain a lightweight decisions log
+
+Continue using the existing file:
+
+```text
+docs/engineering_decisions.md
+```
+
+Record dated entries with:
+
+- context;
+- decision;
+- alternatives considered;
+- consequences.
+
+Initial decisions should cover:
+
+- SQLite remains the operational database;
+- database writes occur on the database host;
+- archive revisions represent immutable byte states;
+- observations are separate from revisions;
+- duplicate identities are not merged during revision migration;
+- evidence is versioned;
+- quarantine precedes deletion;
+- heavy work uses the persistent queue;
+- Version 1 hash semantics are frozen during the active backfill.
+
+## Phase 1 — Baseline and tests
+
+- [x] keep documentation aligned with code;
+- [x] establish repeatable unit and integration tests;
+- [x] preserve dry-run behavior for mutating workflows;
+- [ ] complete the focused golden corpus;
+- [ ] add property and crash-recovery tests from Step 8.
+
+## Phase 2 — SQLite operational core
+
+- [x] schema migrations;
+- [x] persistent jobs;
+- [x] processing-run records;
+- [x] archive identity separate from file location;
+- [x] archive inspection foundation;
+- [ ] consolidate new and touched database access through the local DAL;
+- [ ] add job leases, idempotency, recovery, and failure
+      classification.
+
+## Phase 3 — Archive audit
+
+- [x] archive inventory;
+- [x] archive-level SHA-256 coverage for 59,541 archives;
+- [x] identify 2 exact-duplicate groups;
+- [x] ComicInfo metadata inventory through the inspection pipeline;
+- [x] page inventory;
+- [x] 2,955,304 per-page SHA-256 rows recorded;
+- [x] resumable database jobs;
+- [ ] separately audit final full-library page-hash coverage;
+- [x] implement guarded exact-duplicate resolution tooling;
+- [ ] execute reviewed resolution plans for the 2 known
+      exact-duplicate groups;
+- [ ] introduce immutable archive revisions after the Version 1
+      perceptual backfill.
+
+Exact-duplicate resolution remains separate from the revision migration.
+The migration preserves distinct archive identities and shared
+byte-level hashes.
+
+## Phase 4 — Series identity
+
+- [ ] canonical series records;
+- [ ] title and alias normalization;
+- [ ] provider and filesystem observations;
+- [ ] confidence-scored identity proposals;
+- [ ] operator-confirmed merges and splits;
+- [ ] provenance for identity evidence and decisions.
+
+Do not begin structural Phase 4 work until archive revisions and the
+minimum DAL are stable.
+
+## Phase 5 — Perceptual deduplication
+
+- [x] per-page dHash and pHash Version 1 implementation;
+- [x] sampled hash blocking and decoded dimension summaries;
+- [x] conservative ordered page comparison;
+- [x] persistent review-only Tier C candidates;
+- [x] persistent `hash_archive_pages_perceptual` jobs;
+- [x] guarded production batches with preflight, reconciliation,
+      backups, and postflight integrity checks;
+- [ ] complete the Version 1 full-library perceptual-hash backfill;
+- [ ] execute the Phase 5 performance optimization sequence in Step 1A;
+- [ ] perform a final coverage and terminal-failure audit;
+- [ ] generate near-duplicate candidates at production scale;
+- [ ] add richer aggregate archive signatures;
+- [ ] support partial-overlap and compilation detection;
+- [ ] design evidence-first review cases and decisions when candidate
+      generation is real;
+- [ ] build review functionality after the evidence schema stabilizes.
+
+Candidate generation and later review must preserve measured evidence
+separately from conclusions. Do not commit prematurely to a large
+generic table topology before real candidate queries and operator
+workflows define the required relationships.
+
+## Phase 6 — Quality scoring
+
+- [ ] define versioned, explainable quality features;
+- [ ] score resolution, compression, completeness, metadata, and other
+      relevant signals;
+- [ ] retain component scores and parameters, not only a total;
+- [ ] compare quality only between appropriate candidate revisions;
+- [ ] use scores as review evidence, not automatic deletion authority.
+
+## Phase 7 — OpenCLIP and semantic evidence
+
+- [ ] define the use cases that exact and perceptual hashes do not
+      solve;
+- [ ] benchmark representative local GPU workloads;
+- [ ] version model, preprocessing, parameters, and embeddings;
+- [ ] store embeddings against immutable source revisions;
+- [ ] keep semantic evidence review-oriented until accuracy is measured.
+
+Do not build remote GPU orchestration before a local workload
+demonstrates the need.
+
+## Phase 8 — Managed resolution and publication
+
+- [ ] produce reviewable action plans;
+- [ ] require explicit confirmation for destructive or publishing
+      actions;
+- [ ] quarantine before deletion;
+- [ ] retain source, destination, revision, reason, run, and operator
+      history;
+- [ ] make filesystem and database changes recoverable and
+      reconcilable;
+- [ ] stage content before publication to Komga.
+
+## Phase 9 — Dashboard and operator control plane
+
+- [ ] define query/read models after evidence and review schemas
+      stabilize;
+- [ ] expose queue health, coverage, failures, review backlog, and
+      guarded actions;
+- [ ] use a local API only when a real remote client exists;
+- [ ] keep heavy work in the persistent job queue;
+- [ ] avoid direct remote SQLite access.
+
+An eventual small FastAPI and server-rendered/HTMX interface may fit
+the project, but it is not a current foundation requirement.
+
+## Definition of roadmap completion
+
+The roadmap is complete when:
+
+- archive and revision identity are structurally sound;
+- all derived evidence is versioned and attributable;
+- background work is idempotent and recoverable;
+- resource limits and archive mutation are guarded;
+- exact, perceptual, quality, and semantic evidence can be reproduced;
+- candidate conclusions remain reviewable;
+- resolution actions are auditable and reversible;
+- publication is staged and controlled;
+- the operator can understand system state without reading raw database
+  tables or reconstructing prior runs.

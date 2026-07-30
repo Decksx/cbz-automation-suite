@@ -2,9 +2,12 @@
 
 ## Status
 
-**Committed design direction; implementation pending.**
+**Operational core implemented through migration 009; further identity
+and provenance work is planned.**
 
-SQLite will become the authoritative operational state layer. CBZ files remain on the filesystem.
+SQLite is the authoritative operational state layer for discovery,
+inspection, hashing, persistent jobs, near-duplicate candidates, and
+quarantine history. CBZ files remain on the filesystem.
 
 Recommended local path:
 
@@ -43,6 +46,74 @@ file_events
 ```
 
 A rename or move must not create a new archive identity.
+
+## Planned archive revision model
+
+The next identity migration, after the Version 1 perceptual-hash
+backfill, separates a logical archive from each unique byte-level state
+observed for it:
+
+```text
+archive_files
+  stable logical archive identity
+
+archive_revisions
+  immutable byte-level content states for one archive
+
+file_locations
+  current and historical paths
+
+archive_observations
+  sightings of a revision at a location during a processing run
+```
+
+A revision represents a unique byte state, not an observation event.
+If previously seen bytes reappear for the same logical archive, reuse
+the revision and record a new observation.
+
+The archive row's `current_revision_id` will be the sole authoritative
+current-revision pointer. A composite foreign key or equivalent
+constraint must prevent a logical archive from pointing to another
+archive's revision.
+
+`archive_revisions.archive_sha256` is indexed but not globally unique.
+Distinct logical archives may legitimately have byte-identical
+revisions. Use archive-scoped uniqueness so the same archive cannot
+accumulate duplicate rows for the same SHA-256.
+
+The initial migration preserves a one-to-one mapping from every
+existing archive ID to one initial revision. It does not merge the two
+known exact-duplicate groups; duplicate resolution remains a separate
+guarded workflow.
+
+Revision content identity is immutable. Observation, retention, and
+operator-control metadata may be updated without rewriting a revision
+to represent different bytes.
+
+## Revision retention
+
+Retain:
+
+- each archive's current revision;
+- a defined window of recently previous revisions;
+- revisions referenced by active/recoverable jobs, open review work,
+  quarantine/resolution history, or unresolved failures;
+- operator-pinned revisions.
+
+Pruning is two-stage: first produce a read-only report/plan of
+prunable revisions, then apply that exact reviewed plan separately.
+Prefer restrictive foreign keys over broad cascading deletion.
+
+## Derived-data provenance
+
+Existing and future derived evidence should record the applicable
+source revision, algorithm and version, parameters, processing run,
+creation time, and supersession state. Use direct foreign keys and
+table-specific uniqueness constraints rather than a generic
+polymorphic provenance table.
+
+Automatic invalidation logic is deferred until its real producers and
+consumers exist.
 
 ## Planned migrations
 
@@ -190,3 +261,66 @@ During migration:
 ## Backup
 
 The separate library backup protects CBZ files but does not protect operational history. Back up SQLite independently, preferably through SQLite's online backup API or after cleanly closing writers and checkpointing WAL.
+
+## Actual implemented schema (as of migration 009)
+
+The "Planned migrations" section above describes the original committed
+design direction. The schema actually implemented in
+`comic_automation/database/migrations/` has since diverged from those
+exact table names as the service, job queue, and inspection pipeline
+were built out. The authoritative source for current schema is that
+migrations directory; this section tracks it at a summary level so this
+document doesn't go stale again.
+
+```text
+001 operational_foundation      application_settings, processing_runs,
+                                 processing_stages, processing_items,
+                                 source_batches, archive_files,
+                                 file_locations, file_events, jobs
+002 discovery_checkpoints       discovery_checkpoints
+003 archive_inspections         archive_inspections
+004 refine_inspection_status    (status refinements)
+005 job_failure_categories      jobs.failure_category
+006 archive_hashes              archive_hashes
+007 archive_page_hashes         archive_pages, page_hashes
+008 near_duplicate_candidates   archive_content_signatures,
+                                 near_duplicate_candidates
+009 archive_quarantine          archive_quarantine
+```
+
+### archive_quarantine (migration 009)
+
+Tracks permanently-broken archives (currently `corrupt_archive`; never
+`filesystem_not_found`, since there's no file to move) that have been
+explicitly approved for remediation and physically relocated out of the
+live library into a designated holding folder, pending manual
+re-download. This is deliberately separate from `file_locations`, which
+only tracks where an archive lives *within* the library --
+a quarantined archive isn't part of the library at all anymore.
+
+```text
+archive_quarantine
+  id
+  archive_id            (unique; one row per archive ever quarantined)
+  source_path            original library path
+  quarantine_path        path inside the holding folder
+  failure_category
+  job_id                 the terminal inspect_archive job that triggered this
+  status                 pending_redownload | resolved | abandoned
+  quarantined_at
+  resolved_at
+  notes
+```
+
+The move itself is additionally logged as a `quarantined` event in
+`file_events` (`source_path` / `destination_path`), consistent with how
+every other archive relocation is audited. The archive's prior
+`file_locations` row is marked `is_current = 0` rather than replaced --
+a quarantine holding folder is intentionally excluded from library
+discovery scans (`--exclude-directory`), so it should never be treated
+as a live library path.
+
+See `comic_automation/archive/quarantine_cli.py` for the guarded CLI
+(preview by default; `--confirm` + `--backup-directory` required to
+actually move files) and `comic_automation/archive/quarantine.py` for
+the underlying naming rule and repository logic.

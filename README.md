@@ -12,8 +12,14 @@ Windows-first automation for monitoring, sanitizing, organizing, reviewing, and 
 - `apps/cbz_gui.py` — graphical launcher and series-review workflow
 - `scripts/cbz_compilation_resolver.py` — page-level compilation/individual overlap resolver
 - `scripts/cbz_gap_checker.py` — missing-chapter report generator
+- `comic_automation/` — SQLite-backed discovery, archive inspection,
+  exact/perceptual hashing, guarded quarantine/duplicate resolution,
+  persistent jobs, and service foundation
 
-> The SQLite and image-recognition architecture documented under `docs/` is the committed implementation direction. It is not yet fully implemented in the current scripts.
+> The SQLite operational core and Version 1 exact/perceptual hashing
+> pipeline are implemented. The perceptual-hash library backfill is
+> running in guarded batches; series identity, quality scoring,
+> semantic embeddings, and the review dashboard remain roadmap work.
 
 ## Requirements
 
@@ -89,6 +95,7 @@ python scripts\cbz_library_maintenance.py apply-plan Logs\organize-plan.json
 - [Image deduplication](docs/image_deduplication.md)
 - [Engineering decisions](docs/engineering_decisions.md)
 - [Implementation roadmap](docs/implementation_roadmap.md)
+- [Latest development log](docs/development_log_2026-07-29.md)
 
 ## Runtime state
 
@@ -97,4 +104,9 @@ python scripts\cbz_library_maintenance.py apply-plan Logs\organize-plan.json
 - `progress_tracking/` — persistent sanitizer progress
 - `_Check/` — manual review staging where applicable
 
-The next major implementation phase moves operational state from path-keyed JSON and implicit filesystem state into SQLite.
+The immediate work is completing and auditing the Version 1
+perceptual-hash backfill, then introducing immutable archive revisions,
+revision-aware provenance, a consolidated local SQLite data-access
+layer, and job-queue lease/idempotency hardening. See the
+[implementation roadmap](docs/implementation_roadmap.md) for the
+ordered plan.
