@@ -10,12 +10,15 @@ import re
 import gc
 import json
 import time
+import zlib
 import shutil
 import fnmatch
 import zipfile
 import logging
 import threading
 import xml.etree.ElementTree as ET
+from enum import Enum
+from dataclasses import dataclass
 from dataclasses import replace as _dataclasses_replace
 from pathlib import Path
 from watchdog.observers import Observer
@@ -330,6 +333,191 @@ def wait_for_file_stable(path: Path, stable_seconds: int = 3) -> bool:
 
     log.warning(f"    File did not stabilise in time: {path.name}")
     return False
+
+
+# ─────────────────────────────────────────────
+# ZIP READINESS PROBE
+# ─────────────────────────────────────────────
+# Seconds between the two stat() samples this probe takes to confirm size and
+# mtime haven't moved. Kept short: this runs once per caller invocation (unlike
+# wait_for_file_stable's own polling loop above), so callers are expected to
+# invoke it repeatedly from their own retry/settle loop rather than block here.
+ZIP_READINESS_SETTLE_INTERVAL_SECONDS = 0.05
+ZIP_READINESS_IMAGE_EXTENSIONS = frozenset({
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jfif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+})
+
+
+class ZipReadiness(Enum):
+    """Outcome of a single readiness-probe call. Never a permanent failure —
+    RETRY_LATER always means "ask again next pass", including for a bad/
+    incomplete central directory, since a file mid-copy can look byte-for-byte
+    like a corrupt zip until the writer finishes."""
+
+    READY = "ready"
+    RETRY_LATER = "retry_later"
+
+
+@dataclass(frozen=True)
+class ZipReadinessResult:
+    """Result of probe_cbz_zip_readiness(). `reason` is a short machine-stable
+    tag (not a full log line) so callers can decide their own logging/metrics
+    without this pure helper making that decision for them."""
+
+    status: ZipReadiness
+    reason: str
+    page_count: int | None = None
+    detail: str | None = None
+
+
+def probe_cbz_zip_readiness(
+    path: Path,
+    *,
+    settle_interval: float = ZIP_READINESS_SETTLE_INTERVAL_SECONDS,
+) -> ZipReadinessResult:
+    """Single-shot, side-effect-free check: is this CBZ's central directory
+    readable right now?
+
+    Two things this deliberately does NOT do, unlike wait_for_file_stable():
+      - It never loops/retries internally — one call does one check and
+        returns. Callers (the watcher's settle timer, a future polling loop,
+        tests) decide when to call again.
+      - It takes no exclusive lock and makes no database writes. It only
+        reads the file's stat() twice and, if that looks stable, opens it
+        read-only to enumerate zipfile.ZipFile(...).infolist(). Nothing here
+        mutates the file, the queue, or any database.
+
+    Stability check: two stat() samples separated by `settle_interval`
+    seconds must agree on both size and mtime. A final sample after ZIP
+    enumeration must still match, closing the window where a writer could
+    resume during the central-directory probe. This catches the common CBZ
+    watcher case of a file that is still being written (growing size) or
+    still being finalised (mtime still ticking) even when a single stat()
+    snapshot would look plausible.
+
+    Zip probe: zipfile.ZipFile(path).infolist() is used because reading the
+    central directory is exactly what "this archive is enumerable" means for
+    a CBZ — it doesn't decompress any page content, just confirms the End Of
+    Central Directory record and directory entries are intact and parseable.
+
+    Every failure mode here is treated as RETRY_LATER, not a permanent
+    error, matching the exception vocabulary already established in
+    scripts/cbz_watcher.py and scripts/cbz_sanitizer.py for corrupt/locked
+    CBZ files on this Windows/SMB setup:
+      - FileNotFoundError / a stat() OSError -- the file vanished or a
+        transient network stat failure occurred.
+      - size/mtime disagreeing between the two samples -- still being
+        written or touched.
+      - zipfile.BadZipFile (also zlib.error/EOFError, which zipfile can
+        raise for a truncated End Of Central Directory record) -- an
+        incomplete/corrupt central directory, indistinguishable from "still
+        being written" from here.
+      - PermissionError -- a Windows/SMB sharing violation (another process
+        holds the file open).
+      - Any other OSError -- a transient SMB/network I/O error.
+    """
+    if settle_interval < 0:
+        raise ValueError("settle_interval cannot be negative")
+
+    try:
+        first_stat = path.stat()
+    except FileNotFoundError:
+        return ZipReadinessResult(ZipReadiness.RETRY_LATER, "file_not_found")
+    except OSError as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "stat_error",
+            detail=str(exc),
+        )
+
+    if settle_interval > 0:
+        time.sleep(settle_interval)
+
+    try:
+        second_stat = path.stat()
+    except FileNotFoundError:
+        return ZipReadinessResult(ZipReadiness.RETRY_LATER, "file_not_found")
+    except OSError as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "stat_error",
+            detail=str(exc),
+        )
+
+    if (
+        first_stat.st_size != second_stat.st_size
+        or first_stat.st_mtime_ns != second_stat.st_mtime_ns
+    ):
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER, "size_or_mtime_changed"
+        )
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+    except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "incomplete_central_directory",
+            detail=str(exc),
+        )
+    except PermissionError as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "sharing_violation",
+            detail=str(exc),
+        )
+    except OSError as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "transient_io_error",
+            detail=str(exc),
+        )
+
+    try:
+        final_stat = path.stat()
+    except FileNotFoundError:
+        return ZipReadinessResult(ZipReadiness.RETRY_LATER, "file_not_found")
+    except OSError as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "stat_error",
+            detail=str(exc),
+        )
+
+    if (
+        second_stat.st_size != final_stat.st_size
+        or second_stat.st_mtime_ns != final_stat.st_mtime_ns
+    ):
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "size_or_mtime_changed",
+        )
+
+    page_count = sum(
+        1
+        for entry in entries
+        if not entry.is_dir()
+        and Path(entry.filename).suffix.casefold()
+        in ZIP_READINESS_IMAGE_EXTENSIONS
+    )
+
+    return ZipReadinessResult(
+        ZipReadiness.READY,
+        "ok",
+        page_count=page_count,
+    )
 
 
 # ─────────────────────────────────────────────
