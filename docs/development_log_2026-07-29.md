@@ -433,3 +433,309 @@ satisfied archives from partial reuse and make no database changes.
 After the analysis, use the measured opportunity to decide whether
 bulk reuse and selective missing-page hashing are justified before the
 next guarded backfill batch.
+
+## 11. Read-only exact-SHA reuse opportunity analysis
+
+After merging the archive-inspection branch into `master`, created
+`feature/perceptual-hash-performance` and implemented a dedicated
+read-only command:
+
+```powershell
+python scripts\comic_perceptual_reuse_analysis.py `
+  --database G:\ComicAutomation\TestDatabase\inspection-working.db `
+  --json-output G:\ComicAutomation\logs\perceptual-hashing\
+perceptual-reuse-opportunity-20260729-203607.json
+```
+
+Database protections:
+
+- SQLite URI `mode=ro`;
+- `PRAGMA query_only = ON`;
+- no migration application;
+- no enqueueing or worker execution;
+- one consistent read transaction;
+- pre/post database size and modification-time comparison.
+
+The initial query plan exposed an inefficient nested scan of
+materialized source evidence. That read-only pass was stopped without
+producing a report. The query was then corrected to:
+
+- drive source lookup from the distinct needed SHA-256 set;
+- use the existing
+  `(algorithm, algorithm_version, digest)` index for exact probes;
+- use indexed list membership for reusable evidence;
+- replace four `COUNT(DISTINCT)` temporary trees with equivalent
+  `MIN`/`MAX` consistency checks.
+
+Focused tests confirmed full/partial classification, failed-job
+exclusion, JSON output, and byte-for-byte database preservation.
+
+Production result:
+
+```text
+eligible_archives:                         37,654
+eligible_pages:                         1,917,928
+incomplete_pages:                       1,917,928
+reusable_pages:                            16,163
+fully_satisfied_archives:                     333
+partially_satisfied_archives:                 407
+pages_still_requiring_decode:           1,901,765
+archives_still_requiring_processing:       37,321
+archives_without_reuse:                    36,914
+pages_avoided_by_full_archive_reuse:        11,539
+pages_decoded_by_current_worker:         1,906,389
+pages_avoided_with_selective_worker:        16,163
+needed_sha256_digests:                   1,841,865
+source digests with complete evidence:      12,477
+unambiguous source digests:                 12,477
+ambiguous source digests:                        0
+incomplete pages without SHA-256:                 0
+```
+
+Validation and timing:
+
+```text
+quick_check:             ok
+database metadata:       unchanged
+quick_check seconds:     4.51
+analysis seconds:       82.83
+total seconds:          87.35
+```
+
+Report:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-reuse-opportunity-20260729-203607.json
+```
+
+Decision:
+
+- full-archive reuse affects only 0.88% of eligible archives and avoids
+  0.60% of eligible page decodes;
+- selective processing would avoid 0.84% of page decodes in total,
+  only 4,624 pages more than full-archive reuse;
+- do not add production bulk-copy writes or selective worker
+  complexity for the current backfill;
+- retain the read-only analysis for future reassessment;
+- proceed to frozen Version 1 regression vectors, then immutable pHash
+  constant caching and optional phase timing.
+
+## 12. Version 1 regression vectors and pHash constant caching
+
+Before changing pHash internals, froze eight deterministic Version 1
+regression vectors with exact expected dHash and pHash strings.
+
+Coverage:
+
+- JPEG, PNG, WebP, GIF, and TIFF where supported by Pillow;
+- grayscale, RGB, RGBA, and palette image modes;
+- very small, large, wide, and tall images;
+- default 8x4 parameters;
+- non-default 4x2 and 12x3 parameters.
+
+The unchanged implementation passed all vectors before the
+optimization. The regression gate uses exact string equality rather
+than Hamming distance.
+
+Then moved cosine and normalization constant construction into a
+bounded process-local cache:
+
+```text
+cache key:     (hash_size, high_frequency_factor)
+cache size:    32
+value types:   immutable nested tuples
+```
+
+The coefficient loops, resize behavior, grayscale conversion,
+floating-point accumulation order, digest format, and Version 1 labels
+remain unchanged. Tests also confirm repeated parameter pairs reuse the
+same cached object and callers cannot mutate its contents.
+
+A checked-in benchmark preserves the former uncached Version 1 path and
+alternates it with the cached implementation:
+
+```powershell
+python scripts\benchmark_perceptual_hash_constants.py `
+  --calls-per-round 250 `
+  --rounds 7
+```
+
+Environment and median result:
+
+```text
+Python:                         3.11.3
+Pillow:                         12.3.0
+platform:                       Windows 10 build 26200
+image:                          RGB 256x384
+hash configuration:             8x4
+exact digest equality:          true
+uncached hashes/second:          122.00
+cached hashes/second:            123.37
+throughput improvement:          1.13%
+elapsed-time reduction:          1.12%
+```
+
+The measured improvement is useful but modest, confirming that the
+remaining DCT accumulation loops dominate constant construction.
+Optional worker phase timing remains the next performance step.
+
+## 13. Optional perceptual-hash phase timing
+
+Added opt-in timing to the existing perceptual-hash worker and bounded
+CLI without changing the default processing path.
+
+Enable it with:
+
+```powershell
+python scripts\comic_perceptual_hashing.py `
+  --database <database> `
+  --limit <bounded-count> `
+  --profile
+```
+
+Profiled successful archives contribute one in-memory batch aggregate:
+
+```text
+zip_open_and_inventory_seconds
+zip_entry_read_seconds
+image_open_and_decode_seconds
+dhash_seconds
+phash_seconds
+database_lookup_seconds
+database_save_seconds
+```
+
+The output also records profiled archives, pages, bytes, milliseconds
+per page, pages per timed second, phase percentages, unattributed batch
+time, and processed jobs that could not contribute a complete profile.
+There are no per-page telemetry writes and no database migration.
+
+Tests prove:
+
+- profiling disabled leaves `phase_timings` unset and omits the batch
+  profile;
+- profiled and unprofiled archive results contain identical pages and
+  exact digests;
+- phase totals reconcile with the emitted aggregate;
+- percentages reconcile to 100%;
+- timed work does not exceed the batch wall clock;
+- CLI JSON contains all seven required phases.
+
+A checked-in synthetic benchmark alternates enabled and disabled runs
+to reduce cache-order bias:
+
+```powershell
+python scripts\benchmark_perceptual_hash_profiling.py `
+  --archives 50 `
+  --pages-per-archive 4 `
+  --rounds 3
+```
+
+Environment and workload:
+
+```text
+Python:                      3.11.3
+Pillow:                      12.3.0
+platform:                    Windows 10 build 26200
+storage:                     local temporary directory
+archives per run:            50
+pages per archive:            4
+pages per run:              200
+rounds:                       3
+formats:                      PNG/JPEG/GIF/TIFF/WebP
+aggregate profiled archives: 150
+aggregate profiled pages:    600
+```
+
+Median runtime and overhead:
+
+```text
+unprofiled:                  1.808194 seconds
+profiled:                    1.803893 seconds
+observed overhead:          -0.24% (within measurement noise)
+```
+
+Aggregate timed-phase distribution:
+
+```text
+pHash:                       88.507%
+image open and decode:        5.345%
+dHash:                        3.065%
+ZIP entry read:               1.300%
+database save:                0.929%
+ZIP open and inventory:       0.634%
+database lookup:              0.220%
+```
+
+This confirms pure-Python pHash as the dominant measured phase for the
+local synthetic workload. The next guarded production batch should
+enable `--profile` to quantify SMB read and decode behavior before the
+roadmap timing step is marked fully complete.
+
+### Guarded production profiling sample
+
+Created and verified the protected backup:
+
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-profiled-sample-20260729-212747.db
+```
+
+Then processed exactly 100 eligible archives with `--profile`.
+
+Outcome:
+
+```text
+processed:                    100
+succeeded:                    100
+retry scheduled:                0
+terminally failed:              0
+profiled pages:             3,111
+profiled payload bytes: 3,833,679,369
+elapsed seconds:           276.262
+timed milliseconds/page:    79.940
+```
+
+Aggregate production phase distribution:
+
+```text
+image open and decode:       64.224%
+pHash:                       21.149%
+dHash:                       10.408%
+ZIP entry read:               3.088%
+ZIP open and inventory:       0.784%
+database save:                0.342%
+database lookup:              0.006%
+```
+
+Postflight:
+
+```text
+quick_check:                         ok
+completed jobs:                  20,631
+failed jobs:                         69
+pending / claimed / running:          0
+total jobs:                      20,700
+dHash Version 1:              1,028,793
+pHash Version 1:              1,028,793
+eligible archives remaining:      37,554
+near-duplicate candidates:             0
+protected backup unchanged:          yes
+validation passed:                   yes
+```
+
+Reports:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-profile-sample-100-20260729-212747.json
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-profile-sample-100-20260729-212747-audit.json
+```
+
+The real workload differs materially from the local synthetic sample:
+Pillow image decoding, not pHash or SMB ZIP reads, dominates elapsed
+work. The timing step is now complete. Database write batching and WAL
+checkpoint tuning remain low priority; decode-path changes remain
+deferred to Version 2 because they may alter stored hashes.

@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 import sqlite3
 import statistics
+import time
 import zipfile
 import zlib
 from dataclasses import dataclass
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
@@ -49,10 +51,143 @@ class ArchivePerceptualHashes:
     pages: tuple[PagePerceptualHash, ...]
     source_file_size: int
     source_modified_time_ns: int
+    phase_timings: PerceptualHashPhaseTimings | None = None
 
     @property
     def page_count(self) -> int:
         return len(self.pages)
+
+
+@dataclass(frozen=True)
+class PerceptualHashPhaseTimings:
+    zip_open_and_inventory_seconds: float
+    zip_entry_read_seconds: float
+    image_open_and_decode_seconds: float
+    dhash_seconds: float
+    phash_seconds: float
+
+
+@dataclass(frozen=True)
+class PerceptualHashDatabaseTimings:
+    database_lookup_seconds: float
+    database_save_seconds: float
+
+
+class PerceptualHashProfile:
+    PHASE_NAMES = (
+        "zip_open_and_inventory_seconds",
+        "zip_entry_read_seconds",
+        "image_open_and_decode_seconds",
+        "dhash_seconds",
+        "phash_seconds",
+        "database_lookup_seconds",
+        "database_save_seconds",
+    )
+
+    def __init__(self) -> None:
+        self.profiled_archives = 0
+        self.profiled_pages = 0
+        self.profiled_bytes = 0
+        self.phase_seconds = {
+            name: 0.0 for name in self.PHASE_NAMES
+        }
+
+    def record(
+        self,
+        *,
+        result: ArchivePerceptualHashes,
+        database: PerceptualHashDatabaseTimings,
+        location_lookup_seconds: float,
+    ) -> None:
+        phases = result.phase_timings
+
+        if phases is None:
+            raise ValueError(
+                "Cannot record an unprofiled perceptual-hash result."
+            )
+
+        self.profiled_archives += 1
+        self.profiled_pages += result.page_count
+        self.profiled_bytes += sum(
+            page.bytes_read for page in result.pages
+        )
+
+        for name in self.PHASE_NAMES[:5]:
+            self.phase_seconds[name] += float(
+                getattr(phases, name)
+            )
+
+        self.phase_seconds["database_lookup_seconds"] += (
+            location_lookup_seconds
+            + database.database_lookup_seconds
+        )
+        self.phase_seconds["database_save_seconds"] += (
+            database.database_save_seconds
+        )
+
+    def summary(
+        self,
+        *,
+        batch_elapsed_seconds: float,
+        processed_jobs: int,
+    ) -> dict:
+        timed_phase_seconds = sum(self.phase_seconds.values())
+        page_count = self.profiled_pages
+        phase_percentages = {
+            name: (
+                (seconds / timed_phase_seconds) * 100
+                if timed_phase_seconds > 0
+                else 0.0
+            )
+            for name, seconds in self.phase_seconds.items()
+        }
+
+        return {
+            "enabled": True,
+            "profiled_archives": self.profiled_archives,
+            "profiled_pages": page_count,
+            "profiled_bytes": self.profiled_bytes,
+            "unprofiled_jobs": max(
+                processed_jobs - self.profiled_archives,
+                0,
+            ),
+            "phase_seconds": {
+                name: round(seconds, 6)
+                for name, seconds in self.phase_seconds.items()
+            },
+            "phase_percentages": {
+                name: round(percentage, 3)
+                for name, percentage in phase_percentages.items()
+            },
+            "timed_phase_seconds": round(
+                timed_phase_seconds,
+                6,
+            ),
+            "batch_elapsed_seconds": round(
+                batch_elapsed_seconds,
+                6,
+            ),
+            "unattributed_seconds": round(
+                max(
+                    batch_elapsed_seconds - timed_phase_seconds,
+                    0.0,
+                ),
+                6,
+            ),
+            "milliseconds_per_page": (
+                round(
+                    (timed_phase_seconds / page_count) * 1000,
+                    6,
+                )
+                if page_count
+                else None
+            ),
+            "pages_per_timed_second": (
+                round(page_count / timed_phase_seconds, 6)
+                if timed_phase_seconds > 0
+                else None
+            ),
+        }
 
 
 def _bits_to_hex(bits: list[bool]) -> str:
@@ -87,6 +222,31 @@ def difference_hash(
     return _bits_to_hex(bits)
 
 
+@lru_cache(maxsize=32)
+def _perceptual_hash_constants(
+    hash_size: int,
+    high_frequency_factor: int,
+) -> tuple[tuple[tuple[float, ...], ...], tuple[float, ...]]:
+    sample_size = hash_size * high_frequency_factor
+    scale = math.pi / (2 * sample_size)
+    cosine = tuple(
+        tuple(
+            math.cos((2 * position + 1) * frequency * scale)
+            for position in range(sample_size)
+        )
+        for frequency in range(hash_size)
+    )
+    normalization = tuple(
+        (
+            math.sqrt(1 / sample_size)
+            if frequency == 0
+            else math.sqrt(2 / sample_size)
+        )
+        for frequency in range(hash_size)
+    )
+    return cosine, normalization
+
+
 def perceptual_hash(
     image: Image.Image,
     *,
@@ -106,22 +266,10 @@ def perceptual_hash(
         Image.Resampling.LANCZOS,
     )
     pixels = grayscale.tobytes()
-    scale = math.pi / (2 * sample_size)
-    cosine = [
-        [
-            math.cos((2 * position + 1) * frequency * scale)
-            for position in range(sample_size)
-        ]
-        for frequency in range(hash_size)
-    ]
-    normalization = [
-        (
-            math.sqrt(1 / sample_size)
-            if frequency == 0
-            else math.sqrt(2 / sample_size)
-        )
-        for frequency in range(hash_size)
-    ]
+    cosine, normalization = _perceptual_hash_constants(
+        hash_size,
+        high_frequency_factor,
+    )
     coefficients: list[float] = []
 
     for vertical_frequency in range(hash_size):
@@ -156,6 +304,7 @@ def calculate_perceptual_hashes(
     *,
     hash_size: int = DEFAULT_HASH_SIZE,
     high_frequency_factor: int = DEFAULT_HIGH_FREQUENCY_FACTOR,
+    profile: bool = False,
 ) -> ArchivePerceptualHashes:
     archive_path = Path(path)
 
@@ -167,8 +316,14 @@ def calculate_perceptual_hashes(
 
     before = archive_path.stat()
     pages: list[PagePerceptualHash] = []
+    zip_open_and_inventory_seconds = 0.0
+    zip_entry_read_seconds = 0.0
+    image_open_and_decode_seconds = 0.0
+    dhash_seconds = 0.0
+    phash_seconds = 0.0
 
     try:
+        phase_started = time.perf_counter() if profile else 0.0
         with zipfile.ZipFile(archive_path, mode="r") as archive:
             entries = sorted(
                 (
@@ -180,31 +335,75 @@ def calculate_perceptual_hashes(
                 ),
                 key=lambda entry: _natural_key(entry.filename),
             )
+            if profile:
+                zip_open_and_inventory_seconds += (
+                    time.perf_counter() - phase_started
+                )
 
             for page_index, entry in enumerate(entries):
+                phase_started = (
+                    time.perf_counter() if profile else 0.0
+                )
                 payload = archive.read(entry)
+                if profile:
+                    zip_entry_read_seconds += (
+                        time.perf_counter() - phase_started
+                    )
 
                 try:
+                    phase_started = (
+                        time.perf_counter() if profile else 0.0
+                    )
                     with Image.open(BytesIO(payload)) as image:
                         image.load()
+                        width = int(image.width)
+                        height = int(image.height)
+                        image_format = image.format
+                        if profile:
+                            image_open_and_decode_seconds += (
+                                time.perf_counter() - phase_started
+                            )
+
+                        phase_started = (
+                            time.perf_counter()
+                            if profile
+                            else 0.0
+                        )
+                        dhash = difference_hash(
+                            image,
+                            hash_size=hash_size,
+                        )
+                        if profile:
+                            dhash_seconds += (
+                                time.perf_counter() - phase_started
+                            )
+
+                        phase_started = (
+                            time.perf_counter()
+                            if profile
+                            else 0.0
+                        )
+                        phash = perceptual_hash(
+                            image,
+                            hash_size=hash_size,
+                            high_frequency_factor=(
+                                high_frequency_factor
+                            ),
+                        )
+                        if profile:
+                            phash_seconds += (
+                                time.perf_counter() - phase_started
+                            )
+
                         pages.append(
                             PagePerceptualHash(
                                 page_index=page_index,
                                 entry_name=entry.filename,
-                                width=int(image.width),
-                                height=int(image.height),
-                                image_format=image.format,
-                                dhash=difference_hash(
-                                    image,
-                                    hash_size=hash_size,
-                                ),
-                                phash=perceptual_hash(
-                                    image,
-                                    hash_size=hash_size,
-                                    high_frequency_factor=(
-                                        high_frequency_factor
-                                    ),
-                                ),
+                                width=width,
+                                height=height,
+                                image_format=image_format,
+                                dhash=dhash,
+                                phash=phash,
                                 bytes_read=len(payload),
                             )
                         )
@@ -248,6 +447,21 @@ def calculate_perceptual_hashes(
         pages=tuple(pages),
         source_file_size=int(after.st_size),
         source_modified_time_ns=int(after.st_mtime_ns),
+        phase_timings=(
+            PerceptualHashPhaseTimings(
+                zip_open_and_inventory_seconds=(
+                    zip_open_and_inventory_seconds
+                ),
+                zip_entry_read_seconds=zip_entry_read_seconds,
+                image_open_and_decode_seconds=(
+                    image_open_and_decode_seconds
+                ),
+                dhash_seconds=dhash_seconds,
+                phash_seconds=phash_seconds,
+            )
+            if profile
+            else None
+        ),
     )
 
 
@@ -260,11 +474,13 @@ class ArchivePerceptualHashRepository:
         *,
         archive_id: int,
         result: ArchivePerceptualHashes,
-    ) -> None:
+        profile: bool = False,
+    ) -> PerceptualHashDatabaseTimings | None:
         # Perceptual hashing runs after exact page hashing, so
         # archive_pages rows already exist; load them to match each
         # freshly-computed perceptual hash back to its page_id and to
         # sanity-check the page inventory hasn't drifted underneath us.
+        lookup_started = time.perf_counter() if profile else 0.0
         stored_pages = self.connection.execute(
             """
             SELECT id, page_index, entry_name
@@ -274,6 +490,11 @@ class ArchivePerceptualHashRepository:
             """,
             (archive_id,),
         ).fetchall()
+        database_lookup_seconds = (
+            time.perf_counter() - lookup_started
+            if profile
+            else 0.0
+        )
 
         expected = [
             (int(row["page_index"]), str(row["entry_name"]))
@@ -289,6 +510,8 @@ class ArchivePerceptualHashRepository:
                 "Stored page inventory does not match the current "
                 f"archive for archive_id={archive_id}."
             )
+
+        save_started = time.perf_counter() if profile else 0.0
 
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -365,6 +588,16 @@ class ArchivePerceptualHashRepository:
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             raise
+
+        if not profile:
+            return None
+
+        return PerceptualHashDatabaseTimings(
+            database_lookup_seconds=database_lookup_seconds,
+            database_save_seconds=(
+                time.perf_counter() - save_started
+            ),
+        )
 
     def enqueue_missing(self, *, limit: int | None = None) -> int:
         limit_clause = ""
@@ -455,17 +688,29 @@ class HashArchivePagesPerceptualHandler:
         *,
         hash_size: int = DEFAULT_HASH_SIZE,
         high_frequency_factor: int = DEFAULT_HIGH_FREQUENCY_FACTOR,
+        profile: bool = False,
     ) -> None:
         self.locations = ArchiveInspectionRepository(connection)
         self.hashes = ArchivePerceptualHashRepository(connection)
         self.hash_size = hash_size
         self.high_frequency_factor = high_frequency_factor
+        self.profile = PerceptualHashProfile() if profile else None
 
     def __call__(self, job: Job) -> None:
         if job.archive_id is None:
             raise ValueError(f"Job {job.id} has no archive_id.")
 
+        location_lookup_started = (
+            time.perf_counter()
+            if self.profile is not None
+            else 0.0
+        )
         location = self.locations.current_location(job.archive_id)
+        location_lookup_seconds = (
+            time.perf_counter() - location_lookup_started
+            if self.profile is not None
+            else 0.0
+        )
         path = Path(str(location["path"]))
 
         try:
@@ -473,6 +718,7 @@ class HashArchivePagesPerceptualHandler:
                 path,
                 hash_size=self.hash_size,
                 high_frequency_factor=self.high_frequency_factor,
+                profile=self.profile is not None,
             )
         except PermanentJobError:
             raise
@@ -492,4 +738,19 @@ class HashArchivePagesPerceptualHandler:
                 category="filesystem_io",
             ) from exc
 
-        self.hashes.save(archive_id=job.archive_id, result=result)
+        database_timings = self.hashes.save(
+            archive_id=job.archive_id,
+            result=result,
+            profile=self.profile is not None,
+        )
+
+        if self.profile is not None:
+            if database_timings is None:
+                raise RuntimeError(
+                    "Profiled repository save returned no timings."
+                )
+            self.profile.record(
+                result=result,
+                database=database_timings,
+                location_lookup_seconds=location_lookup_seconds,
+            )

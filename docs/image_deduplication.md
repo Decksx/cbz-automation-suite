@@ -23,13 +23,13 @@ Last reconciled production state on 2026-07-29:
 
 ```text
 page SHA-256 rows:            2,955,304
-perceptual job rows:             20,600
-completed:                       20,531
+perceptual job rows:             20,700
+completed:                       20,631
 terminally failed:                   69
 pending / claimed / running:          0
-dHash Version 1 rows:          1,025,682
-pHash Version 1 rows:          1,025,682
-eligible archives remaining:      37,654
+dHash Version 1 rows:          1,028,793
+pHash Version 1 rows:          1,028,793
+eligible archives remaining:      37,554
 near-duplicate candidates:             0
 ```
 
@@ -176,6 +176,93 @@ database_save_seconds
 
 See `docs/implementation_roadmap.md` Step 1A for the full requirements,
 acceptance criteria, guarded rollout, and deferred Version 2 research.
+
+### Exact-SHA reuse result
+
+The read-only production analysis completed on 2026-07-29:
+
+```text
+eligible archives:                         37,654
+eligible pages:                         1,917,928
+reusable pages:                            16,163  (0.84%)
+fully satisfied archives:                     333  (0.88%)
+partially satisfied archives:                 407
+pages avoided by full-archive reuse:        11,539  (0.60%)
+additional pages avoided selectively:       4,624  (0.24%)
+ambiguous source SHA-256 digests:                0
+```
+
+The measured opportunity is not material enough to justify production
+bulk-copy writes or a selective worker path during the current Version
+1 backfill. Retain the read-only analysis command for future
+reassessment and proceed to frozen Version 1 regression vectors and
+output-preserving pHash constant caching.
+
+### Version 1 constant-cache result
+
+Eight exact regression vectors now freeze Version 1 dHash and pHash
+outputs across the supported image formats, modes, dimensions, and
+non-default hash parameters. The pHash cosine and normalization
+constants are cached as immutable tuples by
+`(hash_size, high_frequency_factor)` without changing resize behavior,
+coefficient order, floating-point accumulation order, digest format, or
+algorithm version.
+
+The reproducible paired benchmark is:
+
+```powershell
+python scripts\benchmark_perceptual_hash_constants.py `
+  --calls-per-round 250 `
+  --rounds 7
+```
+
+On Python 3.11.3 and Pillow 12.3.0, the median result increased from
+122.00 to 123.37 hashes per second, an approximately 1.13% throughput
+gain. The result confirms that constant construction was removable
+overhead but not the dominant share of the pure-Python DCT.
+
+### Optional phase-timing result
+
+The bounded perceptual-hash runner accepts `--profile`. When enabled,
+the worker and repository aggregate these phases in memory:
+
+```text
+zip_open_and_inventory_seconds
+zip_entry_read_seconds
+image_open_and_decode_seconds
+dhash_seconds
+phash_seconds
+database_lookup_seconds
+database_save_seconds
+```
+
+The normal path does not call the timing clock inside page phases.
+Profiling adds no schema and writes no per-page telemetry.
+
+The reproducible local benchmark is:
+
+```powershell
+python scripts\benchmark_perceptual_hash_profiling.py `
+  --archives 50 `
+  --pages-per-archive 4 `
+  --rounds 3
+```
+
+Three alternating profiled/unprofiled rounds covered all five supported
+formats and found no measurable profiling overhead (`-0.24%`, within
+noise). pHash accounted for 88.51% of timed work across 600 profiled
+pages, followed by image open/decode at 5.35% and dHash at 3.07%.
+
+This establishes pHash as the measured local CPU hotspot. A guarded
+100-archive production sample then profiled 3,111 real pages from the
+SMB library. All jobs succeeded and reconciled. The real workload was
+dominated by image open/decode (64.22%), followed by pHash (21.15%),
+dHash (10.41%), and ZIP entry reads (3.09%). SQLite lookup and save
+together accounted for only 0.35%.
+
+This production result supersedes the synthetic phase ranking for
+optimization decisions. JPEG draft decoding and other decode-path
+research remain Version 2 work because they may change hash bits.
 
 ## Aggregate archive signatures
 

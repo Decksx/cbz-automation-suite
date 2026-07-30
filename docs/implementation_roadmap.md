@@ -24,18 +24,18 @@ audit.
 | Archive SHA-256 coverage | 59,541 |
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 20,600 |
-| Perceptual jobs completed | 20,531 |
+| Perceptual job rows | 20,700 |
+| Perceptual jobs completed | 20,631 |
 | Perceptual jobs failed | 69 |
 | Active perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,025,682 |
-| pHash rows, Version 1 | 1,025,682 |
-| Eligible archives remaining | 37,654 |
+| dHash rows, Version 1 | 1,028,793 |
+| pHash rows, Version 1 | 1,028,793 |
+| Eligible archives remaining | 37,554 |
 | Near-duplicate candidates | 0 |
-| Last guarded batch | 5,000 processed |
-| Last-batch terminal failures | 2 of 5,000 (0.04%) |
-| Last-batch throughput | approximately 1,124 archives/hour |
-| Estimated active processing time remaining | approximately 33.5 hours |
+| Last guarded batch | 100 processed |
+| Last-batch terminal failures | 0 of 100 (0.00%) |
+| Last-batch throughput | approximately 1,303 archives/hour |
+| Estimated active processing time remaining | approximately 28.8 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -140,6 +140,8 @@ stored Version 1 hash semantics.
 
 #### A. Read-only exact-SHA reuse analysis
 
+**Completed 2026-07-29.**
+
 Run a read-only opportunity query limited to currently eligible
 archives. A destination page is reusable only when:
 
@@ -181,7 +183,41 @@ Acceptance criteria:
 - no database rows or files are changed;
 - the report is reproducible against the same database snapshot.
 
+Measured result:
+
+```text
+eligible_archives:                         37,654
+eligible_pages:                         1,917,928
+reusable_pages:                            16,163
+fully_satisfied_archives:                     333
+partially_satisfied_archives:                 407
+pages_still_requiring_decode:           1,901,765
+archives_still_requiring_processing:       37,321
+pages_avoided_by_full_archive_reuse:        11,539
+pages_avoided_with_selective_worker:        16,163
+ambiguous_source_sha256_digests:                 0
+```
+
+The analysis completed in approximately 87 seconds, used the existing
+versioned-digest and page-ownership indexes, passed `quick_check`, and
+left database size and modification time unchanged.
+
+Decision:
+
+- full-archive reuse would avoid only 333 archives (0.88% of the
+  eligible population) and 11,539 page decodes (0.60% of eligible
+  pages);
+- selective missing-page processing would avoid 16,163 page decodes
+  in total (0.84%), only 4,624 more than full-archive reuse;
+- defer both production bulk reuse and selective missing-page hashing
+  because the measured savings do not justify their write/recovery and
+  worker-complexity cost during the Version 1 backfill;
+- retain the read-only command and rerun it if library composition or
+  the reuse population changes materially.
+
 #### B. Freeze Version 1 regression vectors
+
+**Completed 2026-07-29.**
 
 Create a small frozen regression set before changing the pHash
 implementation. Record the expected exact dHash and pHash digest
@@ -213,7 +249,16 @@ Acceptance criteria:
   every regression vector;
 - any change in a stored digest blocks deployment as Version 1.
 
+The frozen suite contains eight deterministic vectors covering JPEG,
+PNG, WebP, GIF, and TIFF; grayscale, RGB, RGBA, and palette images;
+3x5 through 1536x1024 dimensions; unusual aspect ratios; and default,
+4x2, and 12x3 hash configurations. The unchanged implementation passed
+all exact expected-digest assertions before the cache change was made.
+Real collection pages are not committed as fixtures.
+
 #### C. Implement immutable pHash constant caching
+
+**Completed 2026-07-29.**
 
 Cache the pHash cosine and normalization constants by:
 
@@ -243,7 +288,23 @@ Acceptance criteria:
 - before/after benchmark results are recorded;
 - the cached objects cannot be mutated by callers.
 
+Implementation result:
+
+- constants are stored as nested tuples in a process-local
+  `lru_cache(maxsize=32)`;
+- the existing coefficient and floating-point accumulation order is
+  unchanged;
+- all eight frozen Version 1 vectors retain exact digest equality;
+- a checked-in paired benchmark preserves the pre-cache implementation
+  as its reference path;
+- on Python 3.11.3 and Pillow 12.3.0, seven alternating rounds of 250
+  hashes measured median throughput increasing from 122.00 to 123.37
+  hashes/second (approximately 1.13%), confirming a modest gain rather
+  than a transformative one.
+
 #### D. Add optional phase timing
+
+**Completed 2026-07-29.**
 
 Timing must be captured inside `calculate_perceptual_hashes()` and the
 repository lookup/save path. The batch runner may aggregate the
@@ -286,7 +347,63 @@ Acceptance criteria:
 - benchmark inputs and configuration are recorded;
 - profiling does not change any stored hash digest.
 
+Implementation result:
+
+- `--profile` enables in-memory per-archive accumulation and one batch
+  summary; disabled runs do not call the timing clock inside page
+  phases;
+- no telemetry schema or per-page timing writes were added;
+- successful profiled work reports archive count, page count, bytes
+  read, phase seconds, phase percentages, milliseconds per page, and
+  unattributed batch time;
+- failed or retried jobs are counted explicitly as unprofiled jobs
+  rather than silently included in successful phase totals;
+- profiled and unprofiled calculations produce identical page results
+  and stored hash digests.
+
+A reproducible local benchmark processed 50 synthetic archives with
+four pages each across PNG, JPEG, GIF, TIFF, and WebP. Three alternating
+profiled/unprofiled rounds showed no measurable overhead
+(`-0.24%`, within timing noise). Across 600 profiled pages, the timed
+phase distribution was:
+
+```text
+phash:                       88.51%
+image open and decode:        5.35%
+dhash:                        3.07%
+ZIP entry read:               1.30%
+database save:                0.93%
+ZIP open and inventory:       0.63%
+database lookup:              0.22%
+```
+
+The subsequent guarded production sample processed 100 archives and
+3,111 pages from the SMB library. All 100 jobs succeeded, database
+integrity and eligibility reconciled, and the protected backup remained
+unchanged. The production phase distribution was:
+
+```text
+image open and decode:       64.22%
+phash:                       21.15%
+dhash:                       10.41%
+ZIP entry read:               3.09%
+ZIP open and inventory:       0.78%
+database save:                0.34%
+database lookup:              0.01%
+```
+
+The run processed 3.83 GB of image payload in 276.26 seconds at 79.94
+timed milliseconds per page. Unlike the local synthetic benchmark, the
+production workload is dominated by Pillow image decoding rather than
+pHash. ZIP entry reads and SQLite together remain a small share, so
+neither WAL tuning nor database write batching is a current priority.
+
 #### E. Implement bulk exact-hash reuse if material
+
+**Measured and deferred 2026-07-29.** The opportunity analysis found
+only 333 fully satisfiable archives and 11,539 page decodes avoidable
+with the current archive-level worker. Keep this design for future use,
+but do not implement production writes during the current backfill.
 
 If the read-only analysis shows meaningful savings, implement a
 version-aware bulk reuse operation on a database copy first.
@@ -328,6 +445,10 @@ Acceptance criteria:
 - database-copy validation succeeds before production use.
 
 #### F. Evaluate selective missing-page hashing
+
+**Measured and deferred 2026-07-29.** Selective processing would avoid
+only 4,624 additional page decodes beyond full-archive reuse, so the
+incremental savings do not justify a second worker path today.
 
 Implement selective missing-page hashing only if partial reuse leaves a
 material number of avoidable page decodes.
@@ -798,7 +919,14 @@ minimum DAL are stable.
 - [x] guarded production batches with preflight, reconciliation,
       backups, and postflight integrity checks;
 - [ ] complete the Version 1 full-library perceptual-hash backfill;
-- [ ] execute the Phase 5 performance optimization sequence in Step 1A;
+- [ ] execute the remaining Phase 5 performance optimization sequence
+      in Step 1A;
+- [x] measure exact-SHA reuse opportunity and decide against bulk reuse
+      and selective missing-page hashing for the current backfill;
+- [x] freeze exact Version 1 regression vectors and implement
+      output-preserving immutable pHash constant caching;
+- [x] capture optional phase timing from both a local 50-archive
+      benchmark and a guarded 100-archive SMB production sample;
 - [ ] perform a final coverage and terminal-failure audit;
 - [ ] generate near-duplicate candidates at production scale;
 - [ ] add richer aggregate archive signatures;
