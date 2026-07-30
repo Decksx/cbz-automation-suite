@@ -175,13 +175,85 @@ recovery path is:
 
 No retry or database mutation was performed during this audit.
 
-## 6. Next work
+## 6. Guarded source-drift recovery
+
+Implemented a single-job recovery command:
+
+```text
+scripts/comic_perceptual_source_drift_recovery.py
+```
+
+Default analysis is strictly read-only and reports the exact live file
+metadata that must be repeated to authorize apply mode. Apply mode:
+
+1. revalidates the pending job, prior error, remaining attempts, live
+   file, and absence of conflicting active jobs;
+2. computes the current archive SHA-256, structural inspection, page
+   inventory, and page SHA-256 evidence before writing;
+3. verifies the CBZ retained the reviewed size and mtime throughout;
+4. refreshes exact evidence and releases the existing perceptual job in
+   one database transaction;
+5. records a `source_drift_recovered` file event;
+6. leaves perceptual calculation to the existing bounded worker.
+
+Archive page-hash persistence now participates in a caller-owned
+transaction when one exists. Its normal per-archive transaction remains
+unchanged for ordinary workers. Archive-hash persistence also accepts a
+recovery-only option to suppress the redundant inspection enqueue when
+the same atomic operation is already refreshing inspection.
+
+Six focused tests include an injected mid-transaction interruption and
+prove that location metadata, archive hash, inspection, page inventory,
+page hashes, job state, and audit events all roll back together. The
+complete suite passes with 199 tests.
+
+### Production-copy validation
+
+Created and independently checked:
+
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-source-drift-test-20260730-073818.db
+```
+
+Both source and copy returned `PRAGMA quick_check = ok`. Applying the
+recovery to the copy refreshed 31 JPEG pages and left job `259622`
+pending with its attempt count preserved. The normal bounded perceptual
+worker then completed the same job on attempt 2:
+
+```text
+processed:                 1
+succeeded:                 1
+retry scheduled:           0
+terminally failed:         0
+dHash rows added:         31
+pHash rows added:         31
+remaining pending:         0
+```
+
+The validated copy ended with 25,623 completed jobs, 77 failed jobs,
+zero active perceptual jobs, and 1,279,247 rows for each perceptual
+algorithm. Its `quick_check` remained `ok`.
+
+The production database fingerprint and state remained unchanged:
+
+```text
+completed:                    25,622
+failed:                           77
+pending / claimed / running:   1 / 0 / 0
+dHash / pHash:        1,279,216 / 1,279,216
+```
+
+## 7. Next work
 
 Before starting another guarded 5,000-archive batch:
 
-- finish and merge the terminal-failure audit tooling;
-- add a guarded source-drift recovery path for archive `23258`;
-- verify the refreshed archive is eligible under the production query;
+- merge the guarded source-drift recovery tooling;
+- capture a fresh production backup;
+- apply the reviewed recovery to archive `23258`;
+- process and reconcile the released perceptual job;
+- verify the refreshed archive has complete Version 1 perceptual
+  evidence and no active job remains;
 - capture a fresh protected backup and updated preflight counts.
 
 The broader roadmap remains unchanged: complete and audit the Version 1
