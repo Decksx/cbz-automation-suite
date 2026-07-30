@@ -198,6 +198,29 @@ bulk-copy writes or a selective worker path during the current Version
 reassessment and proceed to frozen Version 1 regression vectors and
 output-preserving pHash constant caching.
 
+### Version 1 constant-cache result
+
+Eight exact regression vectors now freeze Version 1 dHash and pHash
+outputs across the supported image formats, modes, dimensions, and
+non-default hash parameters. The pHash cosine and normalization
+constants are cached as immutable tuples by
+`(hash_size, high_frequency_factor)` without changing resize behavior,
+coefficient order, floating-point accumulation order, digest format, or
+algorithm version.
+
+The reproducible paired benchmark is:
+
+```powershell
+python scripts\benchmark_perceptual_hash_constants.py `
+  --calls-per-round 250 `
+  --rounds 7
+```
+
+On Python 3.11.3 and Pillow 12.3.0, the median result increased from
+122.00 to 123.37 hashes per second, an approximately 1.13% throughput
+gain. The result confirms that constant construction was removable
+overhead but not the dominant share of the pure-Python DCT.
+
 ## Aggregate archive signatures
 
 Precompute:

@@ -520,3 +520,62 @@ Decision:
 - retain the read-only analysis for future reassessment;
 - proceed to frozen Version 1 regression vectors, then immutable pHash
   constant caching and optional phase timing.
+
+## 12. Version 1 regression vectors and pHash constant caching
+
+Before changing pHash internals, froze eight deterministic Version 1
+regression vectors with exact expected dHash and pHash strings.
+
+Coverage:
+
+- JPEG, PNG, WebP, GIF, and TIFF where supported by Pillow;
+- grayscale, RGB, RGBA, and palette image modes;
+- very small, large, wide, and tall images;
+- default 8x4 parameters;
+- non-default 4x2 and 12x3 parameters.
+
+The unchanged implementation passed all vectors before the
+optimization. The regression gate uses exact string equality rather
+than Hamming distance.
+
+Then moved cosine and normalization constant construction into a
+bounded process-local cache:
+
+```text
+cache key:     (hash_size, high_frequency_factor)
+cache size:    32
+value types:   immutable nested tuples
+```
+
+The coefficient loops, resize behavior, grayscale conversion,
+floating-point accumulation order, digest format, and Version 1 labels
+remain unchanged. Tests also confirm repeated parameter pairs reuse the
+same cached object and callers cannot mutate its contents.
+
+A checked-in benchmark preserves the former uncached Version 1 path and
+alternates it with the cached implementation:
+
+```powershell
+python scripts\benchmark_perceptual_hash_constants.py `
+  --calls-per-round 250 `
+  --rounds 7
+```
+
+Environment and median result:
+
+```text
+Python:                         3.11.3
+Pillow:                         12.3.0
+platform:                       Windows 10 build 26200
+image:                          RGB 256x384
+hash configuration:             8x4
+exact digest equality:          true
+uncached hashes/second:          122.00
+cached hashes/second:            123.37
+throughput improvement:          1.13%
+elapsed-time reduction:          1.12%
+```
+
+The measured improvement is useful but modest, confirming that the
+remaining DCT accumulation loops dominate constant construction.
+Optional worker phase timing remains the next performance step.

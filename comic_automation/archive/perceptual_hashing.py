@@ -6,6 +6,7 @@ import statistics
 import zipfile
 import zlib
 from dataclasses import dataclass
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
@@ -87,6 +88,31 @@ def difference_hash(
     return _bits_to_hex(bits)
 
 
+@lru_cache(maxsize=32)
+def _perceptual_hash_constants(
+    hash_size: int,
+    high_frequency_factor: int,
+) -> tuple[tuple[tuple[float, ...], ...], tuple[float, ...]]:
+    sample_size = hash_size * high_frequency_factor
+    scale = math.pi / (2 * sample_size)
+    cosine = tuple(
+        tuple(
+            math.cos((2 * position + 1) * frequency * scale)
+            for position in range(sample_size)
+        )
+        for frequency in range(hash_size)
+    )
+    normalization = tuple(
+        (
+            math.sqrt(1 / sample_size)
+            if frequency == 0
+            else math.sqrt(2 / sample_size)
+        )
+        for frequency in range(hash_size)
+    )
+    return cosine, normalization
+
+
 def perceptual_hash(
     image: Image.Image,
     *,
@@ -106,22 +132,10 @@ def perceptual_hash(
         Image.Resampling.LANCZOS,
     )
     pixels = grayscale.tobytes()
-    scale = math.pi / (2 * sample_size)
-    cosine = [
-        [
-            math.cos((2 * position + 1) * frequency * scale)
-            for position in range(sample_size)
-        ]
-        for frequency in range(hash_size)
-    ]
-    normalization = [
-        (
-            math.sqrt(1 / sample_size)
-            if frequency == 0
-            else math.sqrt(2 / sample_size)
-        )
-        for frequency in range(hash_size)
-    ]
+    cosine, normalization = _perceptual_hash_constants(
+        hash_size,
+        high_frequency_factor,
+    )
     coefficients: list[float] = []
 
     for vertical_frequency in range(hash_size):

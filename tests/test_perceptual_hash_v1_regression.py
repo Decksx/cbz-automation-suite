@@ -7,6 +7,7 @@ import pytest
 from PIL import Image, ImageDraw, features
 
 from comic_automation.archive.perceptual_hashing import (
+    _perceptual_hash_constants,
     difference_hash,
     perceptual_hash,
 )
@@ -206,3 +207,24 @@ def test_version_1_hash_regression(vector: Version1Vector) -> None:
         assert image.size == vector.size
         assert actual_dhash == vector.expected_dhash
         assert actual_phash == vector.expected_phash
+
+
+def test_perceptual_hash_constants_are_cached_and_immutable() -> None:
+    _perceptual_hash_constants.cache_clear()
+
+    first = _perceptual_hash_constants(8, 4)
+    second = _perceptual_hash_constants(8, 4)
+    different = _perceptual_hash_constants(4, 2)
+    cache_info = _perceptual_hash_constants.cache_info()
+
+    assert second is first
+    assert different is not first
+    assert cache_info.hits == 1
+    assert cache_info.misses == 2
+    assert isinstance(first, tuple)
+    assert isinstance(first[0], tuple)
+    assert isinstance(first[0][0], tuple)
+    assert isinstance(first[1], tuple)
+
+    with pytest.raises(TypeError):
+        first[0][0][0] = 0.0

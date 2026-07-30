@@ -217,6 +217,8 @@ Decision:
 
 #### B. Freeze Version 1 regression vectors
 
+**Completed 2026-07-29.**
+
 Create a small frozen regression set before changing the pHash
 implementation. Record the expected exact dHash and pHash digest
 strings produced by the current Version 1 implementation.
@@ -247,7 +249,16 @@ Acceptance criteria:
   every regression vector;
 - any change in a stored digest blocks deployment as Version 1.
 
+The frozen suite contains eight deterministic vectors covering JPEG,
+PNG, WebP, GIF, and TIFF; grayscale, RGB, RGBA, and palette images;
+3x5 through 1536x1024 dimensions; unusual aspect ratios; and default,
+4x2, and 12x3 hash configurations. The unchanged implementation passed
+all exact expected-digest assertions before the cache change was made.
+Real collection pages are not committed as fixtures.
+
 #### C. Implement immutable pHash constant caching
+
+**Completed 2026-07-29.**
 
 Cache the pHash cosine and normalization constants by:
 
@@ -276,6 +287,20 @@ Acceptance criteria:
 - non-default supported parameters are covered;
 - before/after benchmark results are recorded;
 - the cached objects cannot be mutated by callers.
+
+Implementation result:
+
+- constants are stored as nested tuples in a process-local
+  `lru_cache(maxsize=32)`;
+- the existing coefficient and floating-point accumulation order is
+  unchanged;
+- all eight frozen Version 1 vectors retain exact digest equality;
+- a checked-in paired benchmark preserves the pre-cache implementation
+  as its reference path;
+- on Python 3.11.3 and Pillow 12.3.0, seven alternating rounds of 250
+  hashes measured median throughput increasing from 122.00 to 123.37
+  hashes/second (approximately 1.13%), confirming a modest gain rather
+  than a transformative one.
 
 #### D. Add optional phase timing
 
@@ -845,6 +870,8 @@ minimum DAL are stable.
       in Step 1A;
 - [x] measure exact-SHA reuse opportunity and decide against bulk reuse
       and selective missing-page hashing for the current backfill;
+- [x] freeze exact Version 1 regression vectors and implement
+      output-preserving immutable pHash constant caching;
 - [ ] perform a final coverage and terminal-failure audit;
 - [ ] generate near-duplicate candidates at production scale;
 - [ ] add richer aggregate archive signatures;
