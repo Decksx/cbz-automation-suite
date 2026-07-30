@@ -2,9 +2,12 @@
 
 ## Status
 
-**Committed design direction; implementation pending.**
+**Operational core implemented through migration 009; further identity
+and provenance work is planned.**
 
-SQLite will become the authoritative operational state layer. CBZ files remain on the filesystem.
+SQLite is the authoritative operational state layer for discovery,
+inspection, hashing, persistent jobs, near-duplicate candidates, and
+quarantine history. CBZ files remain on the filesystem.
 
 Recommended local path:
 
@@ -43,6 +46,74 @@ file_events
 ```
 
 A rename or move must not create a new archive identity.
+
+## Planned archive revision model
+
+The next identity migration, after the Version 1 perceptual-hash
+backfill, separates a logical archive from each unique byte-level state
+observed for it:
+
+```text
+archive_files
+  stable logical archive identity
+
+archive_revisions
+  immutable byte-level content states for one archive
+
+file_locations
+  current and historical paths
+
+archive_observations
+  sightings of a revision at a location during a processing run
+```
+
+A revision represents a unique byte state, not an observation event.
+If previously seen bytes reappear for the same logical archive, reuse
+the revision and record a new observation.
+
+The archive row's `current_revision_id` will be the sole authoritative
+current-revision pointer. A composite foreign key or equivalent
+constraint must prevent a logical archive from pointing to another
+archive's revision.
+
+`archive_revisions.archive_sha256` is indexed but not globally unique.
+Distinct logical archives may legitimately have byte-identical
+revisions. Use archive-scoped uniqueness so the same archive cannot
+accumulate duplicate rows for the same SHA-256.
+
+The initial migration preserves a one-to-one mapping from every
+existing archive ID to one initial revision. It does not merge the two
+known exact-duplicate groups; duplicate resolution remains a separate
+guarded workflow.
+
+Revision content identity is immutable. Observation, retention, and
+operator-control metadata may be updated without rewriting a revision
+to represent different bytes.
+
+## Revision retention
+
+Retain:
+
+- each archive's current revision;
+- a defined window of recently previous revisions;
+- revisions referenced by active/recoverable jobs, open review work,
+  quarantine/resolution history, or unresolved failures;
+- operator-pinned revisions.
+
+Pruning is two-stage: first produce a read-only report/plan of
+prunable revisions, then apply that exact reviewed plan separately.
+Prefer restrictive foreign keys over broad cascading deletion.
+
+## Derived-data provenance
+
+Existing and future derived evidence should record the applicable
+source revision, algorithm and version, parameters, processing run,
+creation time, and supersession state. Use direct foreign keys and
+table-specific uniqueness constraints rather than a generic
+polymorphic provenance table.
+
+Automatic invalidation logic is deferred until its real producers and
+consumers exist.
 
 ## Planned migrations
 

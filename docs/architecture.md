@@ -8,8 +8,9 @@ Office PC
   - watcher
   - GUI
   - sanitizer and maintenance workflows
-  - future SQLite database
-  - future pHash / CLIP workers
+  - operational SQLite database
+  - exact and Version 1 perceptual-hash workers
+  - future OpenCLIP worker
 
         SMB / UNC
 
@@ -39,6 +40,14 @@ scripts/cbz_workflows.py
 cbz_watcher.py ─────────────┐
 cbz_sanitizer.py ───────────┼──► cbz_core.py
 cbz_library_maintenance.py ─┘
+
+comic_automation/
+        ├── database/       migration and connection policy
+        ├── jobs/           persistent queue and workers
+        ├── library/        discovery and checkpoints
+        ├── archive/        inspection, hashing, candidate generation,
+        │                   quarantine, duplicate resolution
+        └── service.py      long-running service runner
 ```
 
 `cbz_core.py` owns shared domain decisions. Watcher behavior, worker scheduling, archive rewriting, file movement, GUI state, logging, and routing remain in their respective tools.
@@ -79,18 +88,26 @@ Stores CBZ data.
 
 ### SQLite
 
-Will become authoritative for:
+Is authoritative for:
 
 - archive identity and path history
 - source batches
 - processing runs and stages
-- metadata observations
-- series identities and aliases
-- review cases
-- action plans and execution results
-- page hashes and embeddings
+- archive inspection
+- persistent jobs and classified failures
+- archive and page hashes
+- decoded page dimensions
+- near-duplicate candidates
+- quarantine history
+
+It will later add:
+
+- immutable archive revisions and observations
+- revision-aware provenance
+- canonical series identities and aliases
+- review cases and decisions
 - quality assessments
-- duplicate candidates and resolutions
+- OpenCLIP embeddings
 - Komga/Komf identifiers
 
 ### JSON

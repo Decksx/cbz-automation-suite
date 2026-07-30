@@ -2,9 +2,11 @@
 
 ## Status
 
-**Implementation in progress.**
+**Implementation and production backfill in progress.**
 
-The first usable system will combine exact hashes, page perceptual hashes, ordered page comparison, and quality scoring. OpenCLIP comes after candidate generation is stable.
+The progressive system combines exact hashes, page perceptual hashes,
+ordered page comparison, and later quality scoring. OpenCLIP comes
+after candidate generation is stable.
 
 Implemented foundations:
 
@@ -16,6 +18,24 @@ Implemented foundations:
 - bounded, resumable queue workers for exact and perceptual hashing;
 - conservative Tier C candidate blocking and ordered comparison;
 - persistent review-only near-duplicate candidates.
+
+Last reconciled production state on 2026-07-29:
+
+```text
+page SHA-256 rows:            2,955,304
+perceptual job rows:             20,600
+completed:                       20,531
+terminally failed:                   69
+pending / claimed / running:          0
+dHash Version 1 rows:          1,025,682
+pHash Version 1 rows:          1,025,682
+eligible archives remaining:      37,654
+near-duplicate candidates:             0
+```
+
+The two latest guarded batches processed 10,000 archives with 9,991
+successes, 9 legitimate terminal image-decoding failures, no retries,
+and exact pre/post reconciliation.
 
 ## Safety policy
 
@@ -102,6 +122,60 @@ processing jobs. No CBZ content is rewritten.
 The perceptual worker also stores decoded width, height, and image
 format. Archives hashed before that schema addition are automatically
 eligible for a bounded perceptual-hash pass to backfill those values.
+
+## Version 1 performance optimization
+
+Version 1 hash semantics are frozen during the active production
+backfill. Do not change JPEG decoding, resizing, DCT arithmetic,
+floating-point accumulation order, or stored digest format.
+
+After the active guarded batch:
+
+1. Run a read-only exact-page-SHA reuse analysis.
+2. Freeze exact Version 1 dHash/pHash regression vectors.
+3. Cache immutable pHash cosine/normalization constants by
+   `(hash_size, high_frequency_factor)`.
+4. Add optional aggregate phase timing inside the worker and
+   repository.
+5. Implement version-aware bulk exact-hash reuse if the measured
+   opportunity is material.
+6. Evaluate selective missing-page hashing if partial reuse is common.
+7. Resume guarded 5,000-archive batches after regression and
+   database-copy validation.
+
+The reuse report must distinguish:
+
+```text
+reusable_pages
+fully_satisfied_archives
+partially_satisfied_archives
+pages_still_requiring_decode
+archives_still_requiring_processing
+```
+
+This distinction matters because the current worker processes every
+image page in an eligible archive. Fully satisfied archives avoid the
+worker entirely; partial reuse does not avoid decoding unless the
+worker gains a selective missing-page path.
+
+Cached and uncached Version 1 results must satisfy exact digest
+equality, not merely zero Hamming distance.
+
+Optional profiling uses `time.perf_counter()` inside the worker and
+repository save path and aggregates, without per-page telemetry writes:
+
+```text
+zip_open_and_inventory_seconds
+zip_entry_read_seconds
+image_open_and_decode_seconds
+dhash_seconds
+phash_seconds
+database_lookup_seconds
+database_save_seconds
+```
+
+See `docs/implementation_roadmap.md` Step 1A for the full requirements,
+acceptance criteria, guarded rollout, and deferred Version 2 research.
 
 ## Aggregate archive signatures
 
