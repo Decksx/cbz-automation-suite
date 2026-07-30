@@ -343,6 +343,20 @@ def wait_for_file_stable(path: Path, stable_seconds: int = 3) -> bool:
 # wait_for_file_stable's own polling loop above), so callers are expected to
 # invoke it repeatedly from their own retry/settle loop rather than block here.
 ZIP_READINESS_SETTLE_INTERVAL_SECONDS = 0.05
+ZIP_READINESS_IMAGE_EXTENSIONS = frozenset({
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jfif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+})
 
 
 class ZipReadiness(Enum):
@@ -363,7 +377,8 @@ class ZipReadinessResult:
 
     status: ZipReadiness
     reason: str
-    page_count: int | None = None  # len(infolist()) once READY; else None
+    page_count: int | None = None
+    detail: str | None = None
 
 
 def probe_cbz_zip_readiness(
@@ -384,7 +399,9 @@ def probe_cbz_zip_readiness(
         mutates the file, the queue, or any database.
 
     Stability check: two stat() samples separated by `settle_interval`
-    seconds must agree on both size and mtime. This catches the common CBZ
+    seconds must agree on both size and mtime. A final sample after ZIP
+    enumeration must still match, closing the window where a writer could
+    resume during the central-directory probe. This catches the common CBZ
     watcher case of a file that is still being written (growing size) or
     still being finalised (mtime still ticking) even when a single stat()
     snapshot would look plausible.
@@ -410,13 +427,18 @@ def probe_cbz_zip_readiness(
         holds the file open).
       - Any other OSError -- a transient SMB/network I/O error.
     """
+    if settle_interval < 0:
+        raise ValueError("settle_interval cannot be negative")
+
     try:
         first_stat = path.stat()
     except FileNotFoundError:
         return ZipReadinessResult(ZipReadiness.RETRY_LATER, "file_not_found")
     except OSError as exc:
         return ZipReadinessResult(
-            ZipReadiness.RETRY_LATER, f"stat_error: {exc}"
+            ZipReadiness.RETRY_LATER,
+            "stat_error",
+            detail=str(exc),
         )
 
     if settle_interval > 0:
@@ -428,7 +450,9 @@ def probe_cbz_zip_readiness(
         return ZipReadinessResult(ZipReadiness.RETRY_LATER, "file_not_found")
     except OSError as exc:
         return ZipReadinessResult(
-            ZipReadiness.RETRY_LATER, f"stat_error: {exc}"
+            ZipReadiness.RETRY_LATER,
+            "stat_error",
+            detail=str(exc),
         )
 
     if (
@@ -445,19 +469,54 @@ def probe_cbz_zip_readiness(
     except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
         return ZipReadinessResult(
             ZipReadiness.RETRY_LATER,
-            f"incomplete_central_directory: {exc}",
+            "incomplete_central_directory",
+            detail=str(exc),
         )
     except PermissionError as exc:
         return ZipReadinessResult(
-            ZipReadiness.RETRY_LATER, f"sharing_violation: {exc}"
+            ZipReadiness.RETRY_LATER,
+            "sharing_violation",
+            detail=str(exc),
         )
     except OSError as exc:
         return ZipReadinessResult(
-            ZipReadiness.RETRY_LATER, f"transient_io_error: {exc}"
+            ZipReadiness.RETRY_LATER,
+            "transient_io_error",
+            detail=str(exc),
         )
 
+    try:
+        final_stat = path.stat()
+    except FileNotFoundError:
+        return ZipReadinessResult(ZipReadiness.RETRY_LATER, "file_not_found")
+    except OSError as exc:
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "stat_error",
+            detail=str(exc),
+        )
+
+    if (
+        second_stat.st_size != final_stat.st_size
+        or second_stat.st_mtime_ns != final_stat.st_mtime_ns
+    ):
+        return ZipReadinessResult(
+            ZipReadiness.RETRY_LATER,
+            "size_or_mtime_changed",
+        )
+
+    page_count = sum(
+        1
+        for entry in entries
+        if not entry.is_dir()
+        and Path(entry.filename).suffix.casefold()
+        in ZIP_READINESS_IMAGE_EXTENSIONS
+    )
+
     return ZipReadinessResult(
-        ZipReadiness.READY, "ok", page_count=len(entries)
+        ZipReadiness.READY,
+        "ok",
+        page_count=page_count,
     )
 
 

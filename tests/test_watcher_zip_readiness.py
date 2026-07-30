@@ -38,6 +38,8 @@ def test_complete_cbz_with_multiple_pages_reports_page_count(
     with zipfile.ZipFile(cbz, "w") as zf:
         for index in range(5):
             zf.writestr(f"page{index}.jpg", b"\0" * 32)
+        zf.writestr("ComicInfo.xml", "<ComicInfo />")
+        zf.writestr("nested/", b"")
 
     result = probe_cbz_zip_readiness(cbz, settle_interval=0)
 
@@ -62,7 +64,8 @@ def test_truncated_cbz_retries_later(tmp_path: Path) -> None:
     result = probe_cbz_zip_readiness(cbz, settle_interval=0)
 
     assert result.status == ZipReadiness.RETRY_LATER
-    assert result.reason.startswith("incomplete_central_directory")
+    assert result.reason == "incomplete_central_directory"
+    assert result.detail
 
 
 def test_zero_byte_cbz_retries_later(tmp_path: Path) -> None:
@@ -73,7 +76,8 @@ def test_zero_byte_cbz_retries_later(tmp_path: Path) -> None:
     result = probe_cbz_zip_readiness(cbz, settle_interval=0)
 
     assert result.status == ZipReadiness.RETRY_LATER
-    assert result.reason.startswith("incomplete_central_directory")
+    assert result.reason == "incomplete_central_directory"
+    assert result.detail
 
 
 def test_missing_file_retries_later(tmp_path: Path) -> None:
@@ -167,6 +171,44 @@ def test_mtime_change_between_probes_retries_later(
     assert result.reason == "size_or_mtime_changed"
 
 
+def test_change_during_zip_probe_retries_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cbz = tmp_path / "issue-06b.cbz"
+    _make_cbz(cbz, payload_size=200)
+
+    real_stat = Path.stat
+    call_count = {"n": 0}
+
+    def changing_after_zip_open(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        if self == cbz:
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                return os.stat_result(
+                    (
+                        result.st_mode,
+                        result.st_ino,
+                        result.st_dev,
+                        result.st_nlink,
+                        result.st_uid,
+                        result.st_gid,
+                        result.st_size + 1,
+                        result.st_atime,
+                        result.st_mtime,
+                        result.st_ctime,
+                    )
+                )
+        return result
+
+    monkeypatch.setattr(Path, "stat", changing_after_zip_open)
+
+    result = probe_cbz_zip_readiness(cbz, settle_interval=0)
+
+    assert result.status == ZipReadiness.RETRY_LATER
+    assert result.reason == "size_or_mtime_changed"
+
+
 # --- sharing violations / transient errors -------------------------------------------------
 
 
@@ -185,7 +227,8 @@ def test_permission_error_opening_zip_retries_later(
     result = probe_cbz_zip_readiness(cbz, settle_interval=0)
 
     assert result.status == ZipReadiness.RETRY_LATER
-    assert result.reason.startswith("sharing_violation")
+    assert result.reason == "sharing_violation"
+    assert result.detail
 
 
 def test_transient_os_error_opening_zip_retries_later(
@@ -202,7 +245,8 @@ def test_transient_os_error_opening_zip_retries_later(
     result = probe_cbz_zip_readiness(cbz, settle_interval=0)
 
     assert result.status == ZipReadiness.RETRY_LATER
-    assert result.reason.startswith("transient_io_error")
+    assert result.reason == "transient_io_error"
+    assert result.detail
 
 
 def test_stat_os_error_retries_later(
@@ -219,7 +263,16 @@ def test_stat_os_error_retries_later(
     result = probe_cbz_zip_readiness(cbz, settle_interval=0)
 
     assert result.status == ZipReadiness.RETRY_LATER
-    assert result.reason.startswith("stat_error")
+    assert result.reason == "stat_error"
+    assert result.detail
+
+
+def test_negative_settle_interval_is_rejected(tmp_path: Path) -> None:
+    cbz = tmp_path / "issue-09b.cbz"
+    _make_cbz(cbz, payload_size=200)
+
+    with pytest.raises(ValueError, match="settle_interval"):
+        probe_cbz_zip_readiness(cbz, settle_interval=-0.1)
 
 
 # --- purity / no side effects -------------------------------------------------
