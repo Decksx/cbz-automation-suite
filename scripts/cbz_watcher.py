@@ -1364,6 +1364,8 @@ def _log_directory_not_ready(
 def _process_directory_when_ready(
     dir_path: Path,
     tracker: "DirectorySettleTracker",
+    *,
+    readiness_generation: int | None = None,
 ) -> None:
     """
     Readiness gate in front of process_and_move_directory().
@@ -1401,14 +1403,32 @@ def _process_directory_when_ready(
         )
         return
 
+    if readiness_generation is None:
+        readiness_generation = tracker._current_readiness_generation(
+            dir_path
+        )
+
     result = probe_cbz_directory_readiness(cbz_files)
+
+    # Timer.cancel() cannot stop a callback that has already begun. A fresh
+    # filesystem event may therefore arrive while this probe is in progress.
+    # Discard that stale result instead of processing or scheduling another
+    # retry from information that predates the new event.
+    if not tracker._readiness_generation_is_current(
+        dir_path,
+        readiness_generation,
+    ):
+        return
 
     if result.status == ZipReadiness.READY:
         process_and_move_directory(dir_path)
         return
 
     _log_directory_not_ready(dir_path, result)
-    tracker._schedule_readiness_retry(dir_path)
+    tracker._schedule_readiness_retry(
+        dir_path,
+        expected_generation=readiness_generation,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -1424,6 +1444,9 @@ class DirectorySettleTracker:
         # readiness retry without disturbing the bookkeeping for the
         # normal settle cycle, and vice versa.
         self._readiness_retry_timers: dict = {}
+        # A monotonically increasing generation invalidates readiness callbacks
+        # that were already running when a newer filesystem event arrived.
+        self._readiness_generations: dict[Path, int] = {}
         self._lock = threading.Lock()
 
     def notify(self, dir_path: Path) -> None:
@@ -1441,6 +1464,9 @@ class DirectorySettleTracker:
             stale_retry = self._readiness_retry_timers.pop(dir_path, None)
             if stale_retry:
                 stale_retry.cancel()
+            self._readiness_generations[dir_path] = (
+                self._readiness_generations.get(dir_path, 0) + 1
+            )
             timer = threading.Timer(self.settle_delay, self._on_settled, args=[dir_path])
             self._timers[dir_path] = timer
             timer.start()
@@ -1464,7 +1490,23 @@ class DirectorySettleTracker:
         log.info(f"Directory ready: '{dir_path.name}' (settled + minimum age {MIN_AGE}s met)")
         self._dispatch(dir_path)
 
-    def _dispatch(self, dir_path: Path) -> None:
+    def _dispatch(
+        self,
+        dir_path: Path,
+        *,
+        expected_generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            readiness_generation = self._readiness_generations.get(
+                dir_path,
+                0,
+            )
+            if (
+                expected_generation is not None
+                and expected_generation != readiness_generation
+            ):
+                return
+
         # Guard against processing a directory already being handled by another thread.
         with _processing_dirs_lock:
             already = any(
@@ -1474,25 +1516,71 @@ class DirectorySettleTracker:
         if already:
             log.info(f"  Skipping '{dir_path.name}': already being processed.")
             return
-        _process_directory_when_ready(dir_path, self)
+        _process_directory_when_ready(
+            dir_path,
+            self,
+            readiness_generation=readiness_generation,
+        )
 
-    def _schedule_readiness_retry(self, dir_path: Path) -> None:
+    def _current_readiness_generation(self, dir_path: Path) -> int:
         with self._lock:
+            return self._readiness_generations.get(dir_path, 0)
+
+    def _readiness_generation_is_current(
+        self,
+        dir_path: Path,
+        generation: int,
+    ) -> bool:
+        with self._lock:
+            return self._readiness_generations.get(dir_path, 0) == generation
+
+    def _schedule_readiness_retry(
+        self,
+        dir_path: Path,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        with self._lock:
+            current_generation = self._readiness_generations.get(
+                dir_path,
+                0,
+            )
+            if (
+                expected_generation is not None
+                and expected_generation != current_generation
+            ):
+                return False
+
             existing = self._readiness_retry_timers.get(dir_path)
             if existing:
                 existing.cancel()
+            retry_generation = current_generation + 1
+            self._readiness_generations[dir_path] = retry_generation
             timer = threading.Timer(
                 READINESS_RETRY_DELAY_SECONDS,
                 self._on_readiness_retry,
-                args=[dir_path],
+                args=[dir_path, retry_generation],
             )
             self._readiness_retry_timers[dir_path] = timer
             timer.start()
+            return True
 
-    def _on_readiness_retry(self, dir_path: Path) -> None:
+    def _on_readiness_retry(
+        self,
+        dir_path: Path,
+        readiness_generation: int,
+    ) -> None:
         with self._lock:
+            if (
+                self._readiness_generations.get(dir_path, 0)
+                != readiness_generation
+            ):
+                return
             self._readiness_retry_timers.pop(dir_path, None)
-        self._dispatch(dir_path)
+        self._dispatch(
+            dir_path,
+            expected_generation=readiness_generation,
+        )
 
 
 # ─────────────────────────────────────────────

@@ -288,6 +288,65 @@ def test_new_event_cancels_stale_readiness_retry(
     assert comic_dir not in tracker._readiness_retry_timers
 
 
+def test_stale_retry_callback_that_already_started_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_timer(monkeypatch)
+    comic_dir = tmp_path / "Series E2"
+    comic_dir.mkdir()
+    dispatch_mock = Mock()
+
+    tracker = DirectorySettleTracker()
+    monkeypatch.setattr(tracker, "_dispatch", dispatch_mock)
+    tracker._schedule_readiness_retry(comic_dir)
+    stale_retry = FakeTimer.instances[0]
+    stale_generation = stale_retry.args[1]
+
+    # A new event invalidates the retry. Invoke the callback directly to
+    # model a real Timer whose function had already started before cancel().
+    tracker.notify(comic_dir)
+    tracker._on_readiness_retry(comic_dir, stale_generation)
+
+    dispatch_mock.assert_not_called()
+
+
+def test_new_event_during_probe_discards_stale_probe_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_timer(monkeypatch)
+    comic_dir = tmp_path / "Series E3"
+    blocked_cbz = comic_dir / "issue-01.cbz"
+    _make_cbz(blocked_cbz)
+    process_mock = Mock()
+    monkeypatch.setattr(watcher, "process_and_move_directory", process_mock)
+
+    tracker = DirectorySettleTracker()
+    initial_generation = tracker._current_readiness_generation(comic_dir)
+
+    def probe_then_notify(paths, **kwargs):
+        tracker.notify(comic_dir)
+        return _not_ready_result([], blocked_cbz)
+
+    monkeypatch.setattr(
+        watcher,
+        "probe_cbz_directory_readiness",
+        probe_then_notify,
+    )
+
+    watcher._process_directory_when_ready(
+        comic_dir,
+        tracker,
+        readiness_generation=initial_generation,
+    )
+
+    process_mock.assert_not_called()
+    # Only notify()'s fresh settle timer exists. The stale probe did not add
+    # a second readiness-retry timer after the new event.
+    assert len(FakeTimer.instances) == 1
+    assert tracker._timers[comic_dir] is FakeTimer.instances[0]
+    assert comic_dir not in tracker._readiness_retry_timers
+
+
 # --- missing/empty directory does not loop -------------------------------------------------
 
 
