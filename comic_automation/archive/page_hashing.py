@@ -159,8 +159,12 @@ class ArchivePageHashRepository:
         location_id: int,
         result: ArchivePageHashes,
     ) -> None:
+        owns_transaction = not self.connection.in_transaction
+
         try:
-            self.connection.execute("BEGIN IMMEDIATE")
+            if owns_transaction:
+                self.connection.execute("BEGIN IMMEDIATE")
+
             # Rehashing replaces the entire page inventory rather than
             # trying to diff it: delete-then-reinsert is simpler and
             # correct even if pages were added, removed, or reordered.
@@ -275,9 +279,10 @@ class ArchivePageHashRepository:
                     archive_id,
                 ),
             )
-            self.connection.execute("COMMIT")
+            if owns_transaction:
+                self.connection.execute("COMMIT")
         except Exception:
-            if self.connection.in_transaction:
+            if owns_transaction and self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             raise
 

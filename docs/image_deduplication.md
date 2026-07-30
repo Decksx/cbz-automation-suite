@@ -293,6 +293,60 @@ failures into stable categories, includes the current file location
 when available, and verifies that database size and modification time
 remain unchanged throughout the audit.
 
+### Source-drift recovery
+
+A retryable perceptual job can detect that the current CBZ page
+inventory no longer matches the exact inventory stored in SQLite. This
+usually means the archive was replaced in place after discovery.
+Retrying without refreshing its exact evidence will repeat the same
+failure.
+
+Analyze one pending job without changing SQLite:
+
+```powershell
+python scripts\comic_perceptual_source_drift_recovery.py `
+  --database G:\ComicAutomation\TestDatabase\inspection-working.db `
+  --job-id 259622 `
+  --json-output G:\ComicAutomation\logs\perceptual-hashing\source-drift.json
+```
+
+The report verifies:
+
+- the job is a pending `hash_archive_pages_perceptual` retry;
+- the previous error is the expected page-inventory mismatch;
+- attempts remain;
+- the live CBZ is readable and stable while inventoried;
+- file metadata or page inventory actually changed;
+- no other active job targets the archive;
+- the database remains unchanged during analysis.
+
+Apply mode requires the operator to repeat the exact live file size and
+mtime from the reviewed report:
+
+```powershell
+python scripts\comic_perceptual_source_drift_recovery.py `
+  --database G:\ComicAutomation\TestDatabase\inspection-working.db `
+  --job-id 259622 `
+  --apply `
+  --expected-file-size 18225427 `
+  --expected-modified-time-ns 1785343076000000000 `
+  --json-output G:\ComicAutomation\logs\perceptual-hashing\source-drift-apply.json
+```
+
+Before writing, apply mode recomputes the full archive SHA-256,
+structural inspection, exact page inventory, and page SHA-256 values
+with the production implementations. It then refreshes all exact
+evidence and releases the original pending job in one transaction.
+Any changed precondition, concurrent active job, file change, or
+database error rolls the whole transaction back. Perceptual hashing
+still runs through the normal bounded worker afterward.
+
+The apply and retry sequence was validated on a fresh production
+database copy for job `259622`: 31 JPEG pages replaced the stale WebP
+inventory, the job completed successfully on attempt 2, the copy
+passed `quick_check`, and the real production database remained
+unchanged.
+
 ## Aggregate archive signatures
 
 Precompute:

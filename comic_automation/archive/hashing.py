@@ -74,6 +74,7 @@ class ArchiveHashRepository:
         archive_id: int,
         location_id: int,
         result: ArchiveHash,
+        enqueue_reinspection: bool = True,
     ) -> None:
         # Compare against the file_size/modified_time_ns already
         # recorded for this location to detect whether the underlying
@@ -161,7 +162,7 @@ class ArchiveHashRepository:
             (result.file_size, archive_id),
         )
 
-        if metadata_changed:
+        if metadata_changed and enqueue_reinspection:
             self._enqueue_reinspection_if_absent(archive_id)
 
     def _enqueue_reinspection_if_absent(

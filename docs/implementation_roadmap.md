@@ -547,6 +547,47 @@ terminal failures as 40 corrupt archives and 37 corrupt images, with
 no missing-file, permission, unsupported-format, or unclassified
 failures.
 
+#### H. Recover in-place source drift
+
+**Implementation and database-copy validation completed 2026-07-30;
+production apply pending.**
+
+Job `259622` detected that archive `23258` changed after its exact page
+inventory was stored. Add a guarded, single-job recovery path rather
+than retrying stale evidence or issuing ad hoc SQL.
+
+Requirements:
+
+- default to strictly read-only analysis;
+- require a pending perceptual job with the expected inventory-mismatch
+  error and remaining attempts;
+- report stored and live file metadata plus page-inventory differences;
+- reject recovery when another active job targets the archive;
+- require the operator to repeat the exact reviewed live file size and
+  mtime before apply;
+- recompute archive SHA-256, structural inspection, page inventory, and
+  exact page SHA-256 with production implementations;
+- refresh all exact evidence atomically;
+- preserve the original job and its attempt history;
+- clear its stale error and make it available only after commit;
+- record a `source_drift_recovered` file event;
+- roll back on any file change, precondition change, or write failure;
+- leave perceptual hashing to the normal bounded worker.
+
+Validation result:
+
+- six focused recovery tests cover read-only analysis, apply guards,
+  atomic rollback, unrelated failures, and the full retry path;
+- the complete suite passes with 199 tests;
+- a fresh production database copy passed `quick_check` before and
+  after recovery;
+- the stale 31-page WebP inventory was replaced with the current
+  31-page JPEG inventory;
+- the normal perceptual worker completed job `259622` on attempt 2 and
+  stored 31 dHash plus 31 pHash values;
+- the real production database remained unchanged during copy
+  validation.
+
 #### Deferred Version 2 research
 
 Research these only after the Version 1 backfill:
