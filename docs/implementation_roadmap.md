@@ -20,23 +20,25 @@ audit.
 
 | Metric | Verified value |
 | --- | ---: |
-| Archives | 59,541 |
-| Archive SHA-256 coverage | 59,541 |
+| Logical archive rows | 59,688 |
+| Current file locations/archives | 59,377 |
+| Archive SHA-256 rows | 59,541 |
+| Archive content signatures | 58,437 |
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 25,700 |
-| Perceptual jobs completed | 25,623 |
-| Perceptual jobs failed | 77 |
+| Perceptual job rows | 30,700 |
+| Perceptual jobs completed | 30,618 |
+| Perceptual jobs failed | 82 |
 | Active perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,279,247 |
-| pHash rows, Version 1 | 1,279,247 |
-| Eligible archives remaining | 32,554 |
+| dHash rows, Version 1 | 1,506,084 |
+| pHash rows, Version 1 | 1,506,084 |
+| Eligible archives remaining | 27,554 |
 | Near-duplicate candidates | 0 |
 | Last guarded batch | 5,000 processed |
-| Last-batch outcomes | 4,991 succeeded, 8 terminal failures, 1 retry |
-| Last-batch terminal-failure rate | 0.16% |
-| Last-batch throughput | approximately 1,241 archives/hour |
-| Estimated active processing time remaining | approximately 26.2 hours |
+| Last-batch outcomes | 4,995 succeeded, 5 terminal failures, 0 retries |
+| Last-batch terminal-failure rate | 0.10% |
+| Last-batch throughput | 1,403.86 archives/hour |
+| Estimated active processing time remaining | approximately 19.63 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -486,12 +488,12 @@ Acceptance criteria:
 
 #### G. Resume guarded 5,000-archive backfill
 
-**First optimized production batch completed 2026-07-30.**
+**Guarded optimized production backfill resumed 2026-07-30.**
 
 Resume production batches only after the selected optimizations pass
 their regression, database-copy, and benchmark gates.
 
-For the first optimized batch:
+For each optimized batch:
 
 - capture a fresh verified backup;
 - record exact preflight counts;
@@ -507,44 +509,47 @@ For the first optimized batch:
 Do not treat a throughput improvement alone as success. Integrity,
 idempotency, Version 1 equality, and reconciliation remain mandatory.
 
-Production result:
+Latest production result:
 
 ```text
 processed:                              5,000
-succeeded:                              4,991
-terminally failed:                          8
-retry scheduled / pending:                  1
-elapsed seconds:                       14,509.332
-throughput:                    1,240.58 archives/hour
-profiled archives / pages:        4,991 / 250,423
-dHash Version 1 rows:                 1,279,216
-pHash Version 1 rows:                 1,279,216
-eligible archives remaining:             32,554
+succeeded:                              4,995
+terminally failed:                          5
+retry scheduled / pending:                  0
+elapsed seconds:                       12,821.790
+elapsed hours:                              3.562
+throughput:                    1,403.86 archives/hour
+profiled archives / pages:        4,995 / 226,837
+dHash Version 1 rows:                 1,506,084
+pHash Version 1 rows:                 1,506,084
+eligible archives remaining:             27,554
 ```
 
 The report, job outcomes, phase totals, database counts, and
 eligible-archive reduction reconciled exactly. Both the working
-database and protected backup passed `PRAGMA quick_check`; the backup
-retained its pre-batch counts; near-duplicate candidates remained zero;
-and the repository stayed clean.
+database and protected backup passed `PRAGMA quick_check`; page
+SHA-256 remained unchanged; the backup retained its pre-batch counts
+and metadata; near-duplicate candidates remained zero; and the
+repository stayed clean.
 
-Production phase distribution:
+Latest production phase distribution:
 
 ```text
-image open and decode:       51.257%
-pHash:                       29.799%
-dHash:                       13.972%
-ZIP entry read:               3.966%
-database save:                0.543%
-ZIP open and inventory:       0.436%
-database lookup:              0.027%
+image open and decode:       53.423%
+pHash:                       27.785%
+dHash:                       14.027%
+ZIP entry read:               3.764%
+database save:                0.527%
+ZIP open and inventory:       0.441%
+database lookup:              0.031%
 ```
 
-The eight new terminal failures are all classified
-`page_image_corrupt`. The full read-only audit now classifies all 77
-terminal failures as 40 corrupt archives and 37 corrupt images, with
-no missing-file, permission, unsupported-format, or unclassified
-failures.
+The five new terminal failures are legitimate page-image decoding
+defects classified as `page_image_corrupt`; no queue, database, or
+orchestration failure occurred. The cumulative perceptual terminal-
+failure population is now 82: 40 `archive_corrupt` and 42
+`page_image_corrupt`. A fresh read-only audit captured these
+classifications and verified that the database remained unchanged.
 
 #### H. Recover in-place source drift
 

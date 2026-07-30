@@ -315,14 +315,161 @@ G:\ComicAutomation\logs\perceptual-hashing\
   source-drift-retry-job-259622-20260730.json
 ```
 
-## 8. Next work
+## 8. Latest guarded 5,000-archive batch
 
-Before starting another guarded 5,000-archive batch:
+The watcher-readiness work merged through pull requests 7, 8, and 11.
+After the production checkout was frozen on the tested worker revision,
+a fresh protected backup and exact preflight were captured, followed by
+another guarded Version 1 perceptual-hash batch.
 
-- review and merge the independent watcher ZIP-readiness probe;
-- capture a fresh protected backup and exact preflight counts;
-- run the next guarded 5,000-archive perceptual batch;
-- continue terminal-failure auditing and batch reconciliation.
+Protected pre-batch backup:
+
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-perceptual-batch-20260730-075953.db
+```
+
+Batch report:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-batch-5000-20260730-080325.json
+```
+
+Batch result:
+
+```text
+processed:                    5,000
+succeeded:                    4,995
+terminally failed:                5
+retry scheduled:                  0
+remaining pending:                0
+elapsed seconds:             12,821.790
+elapsed hours:                    3.562
+throughput:              1,403.86 archives/hour
+terminal-failure rate:           0.10%
+```
+
+Independent postflight reconciliation confirmed:
+
+```text
+quick_check:                         ok
+page SHA-256 rows:            2,955,304
+dHash Version 1:              1,506,084
+pHash Version 1:              1,506,084
+completed jobs:                  30,618
+failed jobs:                         82
+pending / claimed / running:      0 / 0 / 0
+total jobs:                      30,700
+eligible archives remaining:      27,554
+near-duplicate candidates:             0
+protected backup unchanged:           yes
+```
+
+The batch added exactly 5,000 jobs. Of those, 4,995 completed and five
+became terminal failures. dHash and pHash each gained exactly 226,837
+rows, page SHA-256 remained unchanged, and eligibility fell by exactly
+5,000 archives.
+
+Production phase distribution:
+
+```text
+image open and decode:       53.423%
+pHash:                       27.785%
+dHash:                       14.027%
+ZIP entry read:               3.764%
+database save:                0.527%
+ZIP open and inventory:       0.441%
+database lookup:              0.031%
+```
+
+The five new failures were legitimate page-image decoding defects, not
+queue, database, or orchestration failures. The cumulative terminal-
+failure population is now:
+
+```text
+archive_corrupt:       40
+page_image_corrupt:    42
+total:                 82
+```
+
+At the measured throughput, the remaining 27,554 eligible archives
+represent approximately 19.63 hours of active processing.
+
+## 9. Repository synchronization and verification
+
+After batch postflight completed, local `master` was fast-forwarded
+from `b28b0dc` to `6b1f470`. The complete test suite passed:
+
+```text
+234 passed in 19.58s
+```
+
+The production metrics and latest batch results were then updated in
+`docs/implementation_roadmap.md`.
+
+## 10. Pre-next-batch failure audit and protected backup
+
+Generated a fresh read-only terminal-failure audit:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-failure-audit-20260730-133444.json
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-failure-audit-20260730-133444.csv
+```
+
+The audit classified all 82 terminal failures without any
+unclassified records:
+
+```text
+corrupt archives:       40
+corrupt page images:    42
+missing files:           0
+permissions:             0
+unsupported formats:     0
+unclassified:            0
+```
+
+The audit was verified read-only. The working database retained both
+its exact byte length and UTC modification timestamp:
+
+```text
+length:                  1,931,128,832 bytes
+LastWriteTimeUtc ticks:  639210298288983922
+unchanged:               true
+```
+
+A new protected backup was then created with SQLite's backup API:
+
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-perceptual-batch-20260730-142231.db
+```
+
+Backup verification:
+
+```text
+source quick_check before:       ok
+backup quick_check:              ok
+source quick_check after:        ok
+backup length:                   1,931,128,832 bytes
+backup LastWriteTimeUtc ticks:   639210397602202172
+source metadata unchanged:       true
+```
+
+## 11. Next work
+
+Before another guarded 5,000-archive batch:
+
+- review the complete documentation diff and run `git diff --check`;
+- commit the authoritative documentation updates and return the
+  production checkout to a clean state;
+- capture exact read-only preflight counts against both the working
+  database and the new protected backup;
+- verify repository HEAD, branch, and cleanliness;
+- do not enqueue if any active perceptual job, integrity mismatch,
+  backup mismatch, or unexpected count is present.
 
 The broader roadmap remains unchanged: complete and audit the Version 1
 backfill before introducing immutable archive revisions, provenance
