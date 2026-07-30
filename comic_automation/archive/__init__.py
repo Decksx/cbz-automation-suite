@@ -34,6 +34,10 @@ from comic_automation.archive.perceptual_hashing import (
     difference_hash,
     perceptual_hash,
 )
+from comic_automation.archive.perceptual_reuse_analysis import (
+    analyze_reuse_opportunity,
+    connect_read_only,
+)
 from comic_automation.archive.quarantine import (
     QuarantineCandidate,
     QuarantineItemResult,
@@ -78,6 +82,8 @@ __all__ = [
     "calculate_archive_hash",
     "calculate_page_hashes",
     "calculate_perceptual_hashes",
+    "analyze_reuse_opportunity",
+    "connect_read_only",
     "difference_hash",
     "perceptual_hash",
     "execute_quarantine",

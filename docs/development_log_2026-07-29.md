@@ -433,3 +433,90 @@ satisfied archives from partial reuse and make no database changes.
 After the analysis, use the measured opportunity to decide whether
 bulk reuse and selective missing-page hashing are justified before the
 next guarded backfill batch.
+
+## 11. Read-only exact-SHA reuse opportunity analysis
+
+After merging the archive-inspection branch into `master`, created
+`feature/perceptual-hash-performance` and implemented a dedicated
+read-only command:
+
+```powershell
+python scripts\comic_perceptual_reuse_analysis.py `
+  --database G:\ComicAutomation\TestDatabase\inspection-working.db `
+  --json-output G:\ComicAutomation\logs\perceptual-hashing\
+perceptual-reuse-opportunity-20260729-203607.json
+```
+
+Database protections:
+
+- SQLite URI `mode=ro`;
+- `PRAGMA query_only = ON`;
+- no migration application;
+- no enqueueing or worker execution;
+- one consistent read transaction;
+- pre/post database size and modification-time comparison.
+
+The initial query plan exposed an inefficient nested scan of
+materialized source evidence. That read-only pass was stopped without
+producing a report. The query was then corrected to:
+
+- drive source lookup from the distinct needed SHA-256 set;
+- use the existing
+  `(algorithm, algorithm_version, digest)` index for exact probes;
+- use indexed list membership for reusable evidence;
+- replace four `COUNT(DISTINCT)` temporary trees with equivalent
+  `MIN`/`MAX` consistency checks.
+
+Focused tests confirmed full/partial classification, failed-job
+exclusion, JSON output, and byte-for-byte database preservation.
+
+Production result:
+
+```text
+eligible_archives:                         37,654
+eligible_pages:                         1,917,928
+incomplete_pages:                       1,917,928
+reusable_pages:                            16,163
+fully_satisfied_archives:                     333
+partially_satisfied_archives:                 407
+pages_still_requiring_decode:           1,901,765
+archives_still_requiring_processing:       37,321
+archives_without_reuse:                    36,914
+pages_avoided_by_full_archive_reuse:        11,539
+pages_decoded_by_current_worker:         1,906,389
+pages_avoided_with_selective_worker:        16,163
+needed_sha256_digests:                   1,841,865
+source digests with complete evidence:      12,477
+unambiguous source digests:                 12,477
+ambiguous source digests:                        0
+incomplete pages without SHA-256:                 0
+```
+
+Validation and timing:
+
+```text
+quick_check:             ok
+database metadata:       unchanged
+quick_check seconds:     4.51
+analysis seconds:       82.83
+total seconds:          87.35
+```
+
+Report:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-reuse-opportunity-20260729-203607.json
+```
+
+Decision:
+
+- full-archive reuse affects only 0.88% of eligible archives and avoids
+  0.60% of eligible page decodes;
+- selective processing would avoid 0.84% of page decodes in total,
+  only 4,624 pages more than full-archive reuse;
+- do not add production bulk-copy writes or selective worker
+  complexity for the current backfill;
+- retain the read-only analysis for future reassessment;
+- proceed to frozen Version 1 regression vectors, then immutable pHash
+  constant caching and optional phase timing.

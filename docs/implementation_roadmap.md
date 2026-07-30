@@ -140,6 +140,8 @@ stored Version 1 hash semantics.
 
 #### A. Read-only exact-SHA reuse analysis
 
+**Completed 2026-07-29.**
+
 Run a read-only opportunity query limited to currently eligible
 archives. A destination page is reusable only when:
 
@@ -180,6 +182,38 @@ Acceptance criteria:
 - only currently eligible archives are included;
 - no database rows or files are changed;
 - the report is reproducible against the same database snapshot.
+
+Measured result:
+
+```text
+eligible_archives:                         37,654
+eligible_pages:                         1,917,928
+reusable_pages:                            16,163
+fully_satisfied_archives:                     333
+partially_satisfied_archives:                 407
+pages_still_requiring_decode:           1,901,765
+archives_still_requiring_processing:       37,321
+pages_avoided_by_full_archive_reuse:        11,539
+pages_avoided_with_selective_worker:        16,163
+ambiguous_source_sha256_digests:                 0
+```
+
+The analysis completed in approximately 87 seconds, used the existing
+versioned-digest and page-ownership indexes, passed `quick_check`, and
+left database size and modification time unchanged.
+
+Decision:
+
+- full-archive reuse would avoid only 333 archives (0.88% of the
+  eligible population) and 11,539 page decodes (0.60% of eligible
+  pages);
+- selective missing-page processing would avoid 16,163 page decodes
+  in total (0.84%), only 4,624 more than full-archive reuse;
+- defer both production bulk reuse and selective missing-page hashing
+  because the measured savings do not justify their write/recovery and
+  worker-complexity cost during the Version 1 backfill;
+- retain the read-only command and rerun it if library composition or
+  the reuse population changes materially.
 
 #### B. Freeze Version 1 regression vectors
 
@@ -288,6 +322,11 @@ Acceptance criteria:
 
 #### E. Implement bulk exact-hash reuse if material
 
+**Measured and deferred 2026-07-29.** The opportunity analysis found
+only 333 fully satisfiable archives and 11,539 page decodes avoidable
+with the current archive-level worker. Keep this design for future use,
+but do not implement production writes during the current backfill.
+
 If the read-only analysis shows meaningful savings, implement a
 version-aware bulk reuse operation on a database copy first.
 
@@ -328,6 +367,10 @@ Acceptance criteria:
 - database-copy validation succeeds before production use.
 
 #### F. Evaluate selective missing-page hashing
+
+**Measured and deferred 2026-07-29.** Selective processing would avoid
+only 4,624 additional page decodes beyond full-archive reuse, so the
+incremental savings do not justify a second worker path today.
 
 Implement selective missing-page hashing only if partial reuse leaves a
 material number of avoidable page decodes.
@@ -798,7 +841,10 @@ minimum DAL are stable.
 - [x] guarded production batches with preflight, reconciliation,
       backups, and postflight integrity checks;
 - [ ] complete the Version 1 full-library perceptual-hash backfill;
-- [ ] execute the Phase 5 performance optimization sequence in Step 1A;
+- [ ] execute the remaining Phase 5 performance optimization sequence
+      in Step 1A;
+- [x] measure exact-SHA reuse opportunity and decide against bulk reuse
+      and selective missing-page hashing for the current backfill;
 - [ ] perform a final coverage and terminal-failure audit;
 - [ ] generate near-duplicate candidates at production scale;
 - [ ] add richer aggregate archive signatures;

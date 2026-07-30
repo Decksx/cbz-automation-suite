@@ -177,6 +177,27 @@ database_save_seconds
 See `docs/implementation_roadmap.md` Step 1A for the full requirements,
 acceptance criteria, guarded rollout, and deferred Version 2 research.
 
+### Exact-SHA reuse result
+
+The read-only production analysis completed on 2026-07-29:
+
+```text
+eligible archives:                         37,654
+eligible pages:                         1,917,928
+reusable pages:                            16,163  (0.84%)
+fully satisfied archives:                     333  (0.88%)
+partially satisfied archives:                 407
+pages avoided by full-archive reuse:        11,539  (0.60%)
+additional pages avoided selectively:       4,624  (0.24%)
+ambiguous source SHA-256 digests:                0
+```
+
+The measured opportunity is not material enough to justify production
+bulk-copy writes or a selective worker path during the current Version
+1 backfill. Retain the read-only analysis command for future
+reassessment and proceed to frozen Version 1 regression vectors and
+output-preserving pHash constant caching.
+
 ## Aggregate archive signatures
 
 Precompute:
