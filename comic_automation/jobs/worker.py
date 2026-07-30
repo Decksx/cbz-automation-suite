@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from comic_automation.jobs.models import Job
-from comic_automation.jobs.queue import JobQueue
+from comic_automation.jobs.queue import InvalidJobTransitionError, JobQueue
 
 
 log = logging.getLogger(__name__)
 
 JobHandler = Callable[[Job], None]
+
+MISSING_HANDLER_CATEGORY = "missing_job_handler"
 
 
 class CategorizedJobError(RuntimeError):
@@ -33,6 +35,43 @@ class PermanentJobError(CategorizedJobError):
         category: str = "permanent_error",
     ) -> None:
         super().__init__(message, category=category)
+
+
+class JobWorkerStateError(RuntimeError):
+    """
+    Raised when a job failed processing and the subsequent attempt to
+    persist that failure via `JobQueue.mark_failed()` itself failed.
+
+    This happens when the job's row has moved out of a failable status
+    (for example another worker already reclaimed it) between the
+    original processing exception and the attempt to record it. Neither
+    error is safe to discard, so both are preserved:
+
+    - `processing_exception` is the original error raised by the
+      handler or by a status transition during processing.
+    - `transition_exception` is the error raised while trying to record
+      that failure (typically `InvalidJobTransitionError`).
+
+    `transition_exception` is also set as this exception's `__cause__`
+    (via `raise ... from transition_exception`), so the underlying
+    transition failure remains inspectable via the normal traceback
+    chain in addition to the explicit attribute.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        job_id: int,
+        worker_id: str,
+        processing_exception: BaseException,
+        transition_exception: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.processing_exception = processing_exception
+        self.transition_exception = transition_exception
 
 
 class WorkerOutcome(StrEnum):
@@ -109,16 +148,21 @@ class JobWorker:
 
         if handler is None:
             # This should be unreachable because claim_next() is filtered
-            # by the registered handler names.
+            # by the registered handler names. Treated as a permanent,
+            # stably-categorized failure rather than a retryable one:
+            # retrying without a handler registered can never succeed.
             self.queue.mark_failed(
                 job.id,
                 f"No handler registered for {job.job_type!r}.",
+                failure_category=MISSING_HANDLER_CATEGORY,
                 worker_id=self.worker_id,
+                permanent=True,
             )
             return WorkerResult(
                 processed=True,
                 job_id=job.id,
                 succeeded=False,
+                outcome=WorkerOutcome.TERMINALLY_FAILED,
             )
 
         try:
@@ -156,18 +200,50 @@ class JobWorker:
                 job.job_type,
             )
 
-            failed_job = self.queue.mark_failed(
-                job.id,
-                str(exc),
-                failure_category=getattr(
-                    exc,
-                    "category",
-                    "unclassified_error",
-                ),
-                retry_delay_seconds=self.retry_delay_seconds,
-                worker_id=self.worker_id,
-                permanent=isinstance(exc, PermanentJobError),
-            )
+            try:
+                failed_job = self.queue.mark_failed(
+                    job.id,
+                    str(exc),
+                    failure_category=getattr(
+                        exc,
+                        "category",
+                        "unclassified_error",
+                    ),
+                    retry_delay_seconds=self.retry_delay_seconds,
+                    worker_id=self.worker_id,
+                    permanent=isinstance(exc, PermanentJobError),
+                )
+            except InvalidJobTransitionError as transition_exc:
+                # The job already failed processing, and now recording
+                # that failure has *also* failed (for example the job's
+                # row moved out of a failable status). Neither error can
+                # be silently dropped, and we must not return a
+                # WorkerResult implying a clean succeeded/retried/failed
+                # outcome when the job's persisted state is unknown, so
+                # both are surfaced via a dedicated exception rather than
+                # a normal return.
+                log.error(
+                    "Worker %s: job %s (%s) failed processing "
+                    "(%s), and the subsequent attempt to record "
+                    "that failure also failed (%s). Job state is "
+                    "ambiguous and needs manual review. See the "
+                    "preceding log.exception() for the original "
+                    "processing traceback.",
+                    self.worker_id,
+                    job.id,
+                    job.job_type,
+                    type(exc).__name__,
+                    type(transition_exc).__name__,
+                )
+                raise JobWorkerStateError(
+                    f"Job {job.id} failed processing and its failure "
+                    "state could not be persisted "
+                    f"(worker {self.worker_id!r}).",
+                    job_id=job.id,
+                    worker_id=self.worker_id,
+                    processing_exception=exc,
+                    transition_exception=transition_exc,
+                ) from transition_exc
 
             outcome = (
                 WorkerOutcome.TERMINALLY_FAILED
