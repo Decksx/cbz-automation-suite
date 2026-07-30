@@ -46,7 +46,7 @@ Komga / Komf
   5 for current coverage and remaining gaps (aggregate signatures,
   partial-overlap detection, review UI).
 - The Version 1 perceptual-hash backfill is incomplete. The last
-  reconciled state contains 1,279,216 dHash rows and 1,279,216 pHash
+  reconciled state contains 1,279,247 dHash rows and 1,279,247 pHash
   rows, with 32,554 further archives eligible for processing.
 - Komga/Komf metadata is not yet fed back into a canonical local series identity database.
 
@@ -58,11 +58,11 @@ As of the last reconciled guarded batch on 2026-07-30:
 | --- | ---: |
 | Archives with archive SHA-256 | 59,541 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual jobs completed | 25,622 |
+| Perceptual jobs completed | 25,623 |
 | Perceptual jobs failed | 77 |
-| Pending/claimed/running perceptual jobs | 1 / 0 / 0 |
-| dHash rows, Version 1 | 1,279,216 |
-| pHash rows, Version 1 | 1,279,216 |
+| Pending/claimed/running perceptual jobs | 0 |
+| dHash rows, Version 1 | 1,279,247 |
+| pHash rows, Version 1 | 1,279,247 |
 | Eligible archives remaining | 32,554 |
 | Near-duplicate candidates | 0 |
 
@@ -78,10 +78,9 @@ pHash, 13.97% for dHash, 3.97% for ZIP entry reads, and 0.57% for
 database lookup and save combined.
 
 The read-only terminal-failure audit classifies all 77 failures as 40
-corrupt archives and 37 corrupt images. The one pending retry is a
-source-drift case: archive `23258` changed on disk after its exact-page
-inventory was recorded and requires rediscovery and exact-page
-reinspection before perceptual hashing.
+corrupt archives and 37 corrupt images. The separate source-drift case
+for archive `23258` was recovered through the guarded refresh command;
+its original perceptual job completed successfully on attempt 2.
 
 See `docs/development_log_2026-07-30.md` for the latest operational
 record and
