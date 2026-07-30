@@ -136,11 +136,14 @@ other column) while a handler is genuinely still running — a legitimately
 long-running job (longer than `abandoned_after_seconds`, default `300`) looks
 identical, from `recover_abandoned()`'s perspective, to a job whose worker
 actually crashed. This matters specifically because recovery only runs at
-service startup: if an operator restarts the service while a previous
-worker's job is still genuinely in progress and older than the cutoff,
-`recover_abandoned()` will reset it to `PENDING`, making it eligible for a
-*second* worker to claim and process concurrently with the first (see
-Missing lease/idempotency protections below).
+service startup: if a second service process is started while a worker from
+the first process is still genuinely in progress and older than the cutoff,
+`recover_abandoned()` will reset its job to `PENDING`, making it eligible for
+a *second* worker to claim and process concurrently with the first (see
+Missing lease/idempotency protections below). An ordinary restart that has
+already stopped and joined every original worker does not create this
+overlap; the risk requires overlapping processes or an otherwise still-live
+original worker.
 
 ---
 
@@ -158,20 +161,15 @@ that doesn't rely on `BEGIN IMMEDIATE` alone.
 **`mark_failed()` and `recover_abandoned()`** are each similarly wrapped in
 their own `BEGIN IMMEDIATE ... COMMIT`/`ROLLBACK` block.
 
-**`mark_running()` and `mark_completed()` are not wrapped in an explicit
-transaction** — each is a single bare `UPDATE` statement relying on SQLite's
-implicit per-statement atomicity (the connection is opened with
-`isolation_level=None` per `database/connection.py`, so each `execute()` is
-its own autocommit-style unit). This is safe for the single-statement update
-itself, but means there is no larger transaction boundary spanning, for
-example, "check current state, then update" as a single atomic unit for
-these two calls — they rely entirely on the `WHERE status = ...`
-compare-and-swap condition plus `rowcount` check for correctness, not on an
-explicit lock. In practice this is adequate because a single `UPDATE ...
-WHERE ...` is atomic in SQLite regardless of an explicit `BEGIN`, but it is
-an inconsistency in style versus `claim_next()`/`mark_failed()`/
-`recover_abandoned()`, worth noting for anyone reasoning about the code by
-transaction-boundary conventions rather than per-statement semantics.
+**`mark_running()` and `mark_completed()` are intentionally single-statement
+compare-and-swap updates.** Each uses a bare `UPDATE` with the expected
+source status and, when supplied, worker ownership in its `WHERE` clause,
+then requires `cursor.rowcount == 1`. The connection uses
+`isolation_level=None`, so each statement is its own atomic autocommit unit.
+No read-before-write transaction is needed for these transitions: the state
+check and mutation occur in the same SQLite statement. Wrapping either in
+`BEGIN IMMEDIATE` would not strengthen this invariant and would hold the
+database write lock longer.
 
 **Nested-failure gap in `JobWorker.run_once()`.** The `except Exception`
 block that calls `self.queue.mark_failed(...)` after a handler failure is
@@ -222,17 +220,16 @@ already executed the handler's actual archive I/O and database writes before
 either one reaches `mark_completed()`.
 
 **Partial mitigation at the data layer, not the queue layer.** The audited
-handlers' own repository `save()` methods are largely idempotent by
-construction — `ArchivePageHashRepository.save()` uses a
-delete-then-reinsert pattern for `archive_pages` rows, and both hashing
-repositories' signature/page tables use `INSERT ... ON CONFLICT DO UPDATE`
-upserts — so a duplicate concurrent run of the *same* handler against the
-same archive is likely to converge on the same final row values rather than
-corrupt data. This is a property of the handler/repository code (see
-`docs/archive_io_resource_audit.md`), not a guarantee provided by
-`JobQueue`/`JobWorker` themselves — the queue has no idempotency mechanism
-of its own (e.g. no idempotency key, no dedupe-on-enqueue at the schema
-level).
+handlers' repository `save()` methods use deterministic replacement/upsert
+patterns — `ArchivePageHashRepository.save()` deletes and reinserts
+`archive_pages`, while hashing signature/page tables use `INSERT ... ON
+CONFLICT DO UPDATE`. Sequential reruns therefore tend to converge on the
+same stored values. That does **not** prove concurrent duplicate executions
+safe: interleaved delete/reinsert and upsert transactions still need a
+dedicated concurrency test. In all cases this behavior belongs to the
+handler/repository layer (see `docs/archive_io_resource_audit.md`), not to
+`JobQueue`/`JobWorker`; the queue has no idempotency key or schema-level
+dedupe mechanism of its own.
 
 **No unique constraint preventing duplicate in-flight jobs.** The `jobs`
 table (`database/migrations/001_operational_foundation.sql`) has no `UNIQUE`
@@ -295,10 +292,11 @@ but the fallback path that exists for it is not itself marked permanent.
   `rowcount` check as defense-in-depth against concurrent claim races —
   correct under SQLite's locking model and doesn't rely on the transaction
   boundary alone.
-- Every state transition (`mark_running`, `mark_completed`, `mark_failed`)
-  checks `cursor.rowcount` and raises `InvalidJobTransitionError` rather
-  than silently no-op'ing on an unexpected source status or worker-ownership
-  mismatch — invalid transitions fail loudly.
+- `mark_running()` and `mark_completed()` use atomic conditional updates,
+  require `cursor.rowcount == 1`, and raise `InvalidJobTransitionError` on
+  unexpected source status or worker ownership. `mark_failed()` instead
+  acquires `BEGIN IMMEDIATE`, reads and validates status/ownership while
+  holding the write lock, and only then updates the row.
 - `mark_failed()` and `recover_abandoned()` correctly give abandoned/failed
   jobs the same "retry if attempts remain, else terminal" treatment,
   keeping the two failure paths consistent with each other.
@@ -345,15 +343,12 @@ but the fallback path that exists for it is not itself marked permanent.
 
 ### 3. Small, low-risk improvements
 
-- Wrap `mark_running()` and `mark_completed()` in explicit
-  `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` blocks purely for consistency with
-  `claim_next()`/`mark_failed()`/`recover_abandoned()`'s style, even though
-  the single-statement `UPDATE` is already atomic — this is a readability/
-  consistency change, not a correctness fix.
 - Wrap the `mark_failed()` call inside `run_once()`'s `except Exception`
-  block in its own `try`/`except InvalidJobTransitionError`, logging and
-  returning a `WorkerResult` rather than letting a nested transition failure
-  propagate uncaught.
+  block in its own `try`/`except InvalidJobTransitionError`. Log both the
+  original handler/transition exception and the failure to persist its
+  outcome, then raise a dedicated worker-state error with exception chaining.
+  Do not return a normal `WorkerResult`, because the queue outcome is unknown
+  and allowing the caller to continue would conceal inconsistent state.
 - Mark the "no handler registered" `mark_failed()` call in `run_once()` as
   `permanent=True` (or give it a dedicated non-retryable failure category),
   since retrying it can never succeed.
@@ -361,7 +356,7 @@ but the fallback path that exists for it is not itself marked permanent.
   noting that attempts are counted at claim time, not at handler-start time,
   so future readers don't assume the two are equivalent.
 
-### 4. Changes requiring benchmarks or algorithm versioning
+### 4. Changes requiring schema design or concurrency validation
 
 - Introducing a lease/fencing-token mechanism (e.g. a monotonic `lease_epoch`
   column checked by both `JobQueue` transitions and handler-level repository
