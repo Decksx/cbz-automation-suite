@@ -25,11 +25,11 @@ audit.
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
 | Perceptual job rows | 25,700 |
-| Perceptual jobs completed | 25,622 |
+| Perceptual jobs completed | 25,623 |
 | Perceptual jobs failed | 77 |
-| Active perceptual jobs | 1 pending retry |
-| dHash rows, Version 1 | 1,279,216 |
-| pHash rows, Version 1 | 1,279,216 |
+| Active perceptual jobs | 0 |
+| dHash rows, Version 1 | 1,279,247 |
+| pHash rows, Version 1 | 1,279,247 |
 | Eligible archives remaining | 32,554 |
 | Near-duplicate candidates | 0 |
 | Last guarded batch | 5,000 processed |
@@ -55,12 +55,11 @@ completion date. It varies with archive size, page count, image
 complexity, storage performance, cache opportunity, and terminal
 failures.
 
-The one pending retry is archive `23258`. The library file changed
-after its exact-page inventory was recorded: the stored 6.9 MB
-WebP-based archive is now an 18.2 MB JPEG-based archive at the same
-path. It must be rediscovered and exact-page-inspected before
-perceptual hashing; retrying the stale inventory unchanged is not
-expected to succeed.
+The source-drift recovery for archive `23258` is complete. Its stale
+6.9 MB WebP-based exact inventory was atomically replaced with the
+current 18.2 MB, 31-page JPEG inventory. The original perceptual job
+then completed successfully on attempt 2, leaving no active perceptual
+jobs.
 
 The guarded runner already reports `processed` and `elapsed_seconds`.
 Preserve those fields in future runner revisions. Before adding a
@@ -549,8 +548,8 @@ failures.
 
 #### H. Recover in-place source drift
 
-**Implementation and database-copy validation completed 2026-07-30;
-production apply pending.**
+**Implementation, database-copy validation, and production recovery
+completed 2026-07-30.**
 
 Job `259622` detected that archive `23258` changed after its exact page
 inventory was stored. Add a guarded, single-job recovery path rather
@@ -587,6 +586,21 @@ Validation result:
   stored 31 dHash plus 31 pHash values;
 - the real production database remained unchanged during copy
   validation.
+
+Production result:
+
+- a fresh protected backup passed `quick_check`;
+- the read-only analysis repeated every recovery gate immediately
+  before apply;
+- exact evidence refreshed atomically for 31 JPEG pages;
+- the normal bounded worker completed job `259622` on attempt 2;
+- dHash and pHash Version 1 counts increased to 1,279,247 each;
+- completed perceptual jobs increased to 25,623;
+- pending, claimed, and running perceptual jobs all returned to zero;
+- eligible archives remained 32,554 because the pending job had already
+  excluded this archive before its now-complete evidence was stored;
+- the working database and protected backup both passed postflight
+  `quick_check`, and the backup remained unchanged.
 
 #### Deferred Version 2 research
 

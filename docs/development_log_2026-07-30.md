@@ -244,17 +244,85 @@ pending / claimed / running:   1 / 0 / 0
 dHash / pHash:        1,279,216 / 1,279,216
 ```
 
-## 7. Next work
+## 7. Production source-drift recovery
+
+The recovery feature passed both GitHub test runs and merged through
+pull request 5. Before applying it, created and independently verified:
+
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-source-drift-recovery-20260730-074448.db
+```
+
+The working database and protected backup both returned
+`PRAGMA quick_check = ok`. The read-only analysis was repeated
+immediately before apply and confirmed:
+
+```text
+job:                          259622
+archive:                       23258
+stored file size:          6,931,965
+live file size:           18,225,427
+stored pages:                     31 WebP
+live pages:                       31 JPEG
+conflicting active jobs:           0
+recoverable:                    true
+```
+
+Apply mode refreshed archive SHA-256, structural inspection, page
+inventory, and exact page SHA-256 atomically. The original perceptual
+job was then processed through the normal bounded worker:
+
+```text
+processed:                 1
+succeeded:                 1
+retry scheduled:           0
+terminally failed:         0
+profiled pages:           31
+timed milliseconds/page: 28.989
+remaining pending:         0
+```
+
+Postflight:
+
+```text
+quick_check:                         ok
+page SHA-256 rows:            2,955,304
+dHash Version 1:              1,279,247
+pHash Version 1:              1,279,247
+completed jobs:                  25,623
+failed jobs:                         77
+pending / claimed / running:          0
+total jobs:                      25,700
+eligible archives remaining:      32,554
+near-duplicate candidates:             0
+recovery event recorded:              yes
+protected backup unchanged:           yes
+```
+
+Eligibility remained 32,554 because the pending job had already
+excluded this archive before recovery; completion replaced that
+exclusion with complete Version 1 evidence.
+
+Reports:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  source-drift-analysis-job-259622-preapply-20260730.json
+G:\ComicAutomation\logs\perceptual-hashing\
+  source-drift-apply-job-259622-20260730.json
+G:\ComicAutomation\logs\perceptual-hashing\
+  source-drift-retry-job-259622-20260730.json
+```
+
+## 8. Next work
 
 Before starting another guarded 5,000-archive batch:
 
-- merge the guarded source-drift recovery tooling;
-- capture a fresh production backup;
-- apply the reviewed recovery to archive `23258`;
-- process and reconcile the released perceptual job;
-- verify the refreshed archive has complete Version 1 perceptual
-  evidence and no active job remains;
-- capture a fresh protected backup and updated preflight counts.
+- review and merge the independent watcher ZIP-readiness probe;
+- capture a fresh protected backup and exact preflight counts;
+- run the next guarded 5,000-archive perceptual batch;
+- continue terminal-failure auditing and batch reconciliation.
 
 The broader roadmap remains unchanged: complete and audit the Version 1
 backfill before introducing immutable archive revisions, provenance

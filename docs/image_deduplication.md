@@ -24,11 +24,11 @@ Last reconciled production state on 2026-07-30:
 ```text
 page SHA-256 rows:            2,955,304
 perceptual job rows:             25,700
-completed:                       25,622
+completed:                       25,623
 terminally failed:                   77
-pending / claimed / running:      1 / 0 / 0
-dHash Version 1 rows:          1,279,216
-pHash Version 1 rows:          1,279,216
+pending / claimed / running:          0
+dHash Version 1 rows:          1,279,247
+pHash Version 1 rows:          1,279,247
 eligible archives remaining:      32,554
 near-duplicate candidates:             0
 ```
@@ -39,10 +39,9 @@ retry, and exact pre/post reconciliation. It averaged approximately
 1,241 archives/hour across 250,423 successfully profiled pages.
 
 The read-only terminal-failure audit classifies the cumulative 77
-failures as 40 corrupt archives and 37 corrupt images. The pending retry
-is not a decoding failure: its CBZ changed from a stored WebP-based
-revision to a JPEG-based revision after inventorying and must be
-rediscovered and exact-page-inspected before perceptual hashing.
+failures as 40 corrupt archives and 37 corrupt images. The separate
+source-drift retry completed successfully after the guarded command
+refreshed its stale WebP inventory to the current JPEG content.
 
 ## Safety policy
 
@@ -346,6 +345,12 @@ database copy for job `259622`: 31 JPEG pages replaced the stale WebP
 inventory, the job completed successfully on attempt 2, the copy
 passed `quick_check`, and the real production database remained
 unchanged.
+
+The same guarded sequence was then applied to production after a fresh
+verified backup. Job `259622` completed on attempt 2, stored 31 dHash
+and 31 pHash values, and left no pending, claimed, or running
+perceptual jobs. Both the working database and protected backup passed
+postflight `quick_check`.
 
 ## Aggregate archive signatures
 
