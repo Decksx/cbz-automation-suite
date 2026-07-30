@@ -221,6 +221,42 @@ On Python 3.11.3 and Pillow 12.3.0, the median result increased from
 gain. The result confirms that constant construction was removable
 overhead but not the dominant share of the pure-Python DCT.
 
+### Optional phase-timing result
+
+The bounded perceptual-hash runner accepts `--profile`. When enabled,
+the worker and repository aggregate these phases in memory:
+
+```text
+zip_open_and_inventory_seconds
+zip_entry_read_seconds
+image_open_and_decode_seconds
+dhash_seconds
+phash_seconds
+database_lookup_seconds
+database_save_seconds
+```
+
+The normal path does not call the timing clock inside page phases.
+Profiling adds no schema and writes no per-page telemetry.
+
+The reproducible local benchmark is:
+
+```powershell
+python scripts\benchmark_perceptual_hash_profiling.py `
+  --archives 50 `
+  --pages-per-archive 4 `
+  --rounds 3
+```
+
+Three alternating profiled/unprofiled rounds covered all five supported
+formats and found no measurable profiling overhead (`-0.24%`, within
+noise). pHash accounted for 88.51% of timed work across 600 profiled
+pages, followed by image open/decode at 5.35% and dHash at 3.07%.
+
+This establishes pHash as the measured local CPU hotspot. A guarded
+production batch with `--profile` is still required to quantify SMB
+read behavior.
+
 ## Aggregate archive signatures
 
 Precompute:

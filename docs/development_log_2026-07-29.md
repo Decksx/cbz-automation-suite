@@ -579,3 +579,96 @@ elapsed-time reduction:          1.12%
 The measured improvement is useful but modest, confirming that the
 remaining DCT accumulation loops dominate constant construction.
 Optional worker phase timing remains the next performance step.
+
+## 13. Optional perceptual-hash phase timing
+
+Added opt-in timing to the existing perceptual-hash worker and bounded
+CLI without changing the default processing path.
+
+Enable it with:
+
+```powershell
+python scripts\comic_perceptual_hashing.py `
+  --database <database> `
+  --limit <bounded-count> `
+  --profile
+```
+
+Profiled successful archives contribute one in-memory batch aggregate:
+
+```text
+zip_open_and_inventory_seconds
+zip_entry_read_seconds
+image_open_and_decode_seconds
+dhash_seconds
+phash_seconds
+database_lookup_seconds
+database_save_seconds
+```
+
+The output also records profiled archives, pages, bytes, milliseconds
+per page, pages per timed second, phase percentages, unattributed batch
+time, and processed jobs that could not contribute a complete profile.
+There are no per-page telemetry writes and no database migration.
+
+Tests prove:
+
+- profiling disabled leaves `phase_timings` unset and omits the batch
+  profile;
+- profiled and unprofiled archive results contain identical pages and
+  exact digests;
+- phase totals reconcile with the emitted aggregate;
+- percentages reconcile to 100%;
+- timed work does not exceed the batch wall clock;
+- CLI JSON contains all seven required phases.
+
+A checked-in synthetic benchmark alternates enabled and disabled runs
+to reduce cache-order bias:
+
+```powershell
+python scripts\benchmark_perceptual_hash_profiling.py `
+  --archives 50 `
+  --pages-per-archive 4 `
+  --rounds 3
+```
+
+Environment and workload:
+
+```text
+Python:                      3.11.3
+Pillow:                      12.3.0
+platform:                    Windows 10 build 26200
+storage:                     local temporary directory
+archives per run:            50
+pages per archive:            4
+pages per run:              200
+rounds:                       3
+formats:                      PNG/JPEG/GIF/TIFF/WebP
+aggregate profiled archives: 150
+aggregate profiled pages:    600
+```
+
+Median runtime and overhead:
+
+```text
+unprofiled:                  1.808194 seconds
+profiled:                    1.803893 seconds
+observed overhead:          -0.24% (within measurement noise)
+```
+
+Aggregate timed-phase distribution:
+
+```text
+pHash:                       88.507%
+image open and decode:        5.345%
+dHash:                        3.065%
+ZIP entry read:               1.300%
+database save:                0.929%
+ZIP open and inventory:       0.634%
+database lookup:              0.220%
+```
+
+This confirms pure-Python pHash as the dominant measured phase for the
+local synthetic workload. The next guarded production batch should
+enable `--profile` to quantify SMB read and decode behavior before the
+roadmap timing step is marked fully complete.

@@ -304,6 +304,8 @@ Implementation result:
 
 #### D. Add optional phase timing
 
+**Implemented 2026-07-29; production-storage sample pending.**
+
 Timing must be captured inside `calculate_perceptual_hashes()` and the
 repository lookup/save path. The batch runner may aggregate the
 results, but it cannot infer internal phases accurately.
@@ -344,6 +346,41 @@ Acceptance criteria:
   static operation counts alone;
 - benchmark inputs and configuration are recorded;
 - profiling does not change any stored hash digest.
+
+Implementation result:
+
+- `--profile` enables in-memory per-archive accumulation and one batch
+  summary; disabled runs do not call the timing clock inside page
+  phases;
+- no telemetry schema or per-page timing writes were added;
+- successful profiled work reports archive count, page count, bytes
+  read, phase seconds, phase percentages, milliseconds per page, and
+  unattributed batch time;
+- failed or retried jobs are counted explicitly as unprofiled jobs
+  rather than silently included in successful phase totals;
+- profiled and unprofiled calculations produce identical page results
+  and stored hash digests.
+
+A reproducible local benchmark processed 50 synthetic archives with
+four pages each across PNG, JPEG, GIF, TIFF, and WebP. Three alternating
+profiled/unprofiled rounds showed no measurable overhead
+(`-0.24%`, within timing noise). Across 600 profiled pages, the timed
+phase distribution was:
+
+```text
+phash:                       88.51%
+image open and decode:        5.35%
+dhash:                        3.07%
+ZIP entry read:               1.30%
+database save:                0.93%
+ZIP open and inventory:       0.63%
+database lookup:              0.22%
+```
+
+This confirms pure-Python pHash as the dominant measured phase on local
+storage. Enable profiling for a representative guarded production batch
+to measure the same breakdown across the SMB library before closing
+this step completely.
 
 #### E. Implement bulk exact-hash reuse if material
 
@@ -872,6 +909,8 @@ minimum DAL are stable.
       and selective missing-page hashing for the current backfill;
 - [x] freeze exact Version 1 regression vectors and implement
       output-preserving immutable pHash constant caching;
+- [ ] capture optional phase timing from a guarded production batch
+      over the SMB library (local 50-archive benchmark complete);
 - [ ] perform a final coverage and terminal-failure audit;
 - [ ] generate near-duplicate candidates at production scale;
 - [ ] add richer aggregate archive signatures;

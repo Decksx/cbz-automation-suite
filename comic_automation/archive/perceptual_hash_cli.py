@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--enqueue-missing", action="store_true")
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--json-output", type=Path)
     return parser
 
@@ -49,6 +50,7 @@ def run_perceptual_hashing(
     enqueue_missing: bool,
     report_only: bool,
     json_output: Path | None,
+    profile: bool = False,
 ) -> dict:
     if limit < 1:
         raise ValueError("--limit must be at least 1.")
@@ -71,10 +73,14 @@ def run_perceptual_hashing(
             if enqueue_missing
             else 0
         )
+        handler = HashArchivePagesPerceptualHandler(
+            connection,
+            profile=profile,
+        )
         worker = JobWorker(
             JobQueue(connection),
             {
-                JOB_TYPE: HashArchivePagesPerceptualHandler(connection)
+                JOB_TYPE: handler
             },
             worker_id=(
                 f"{socket.gethostname()}:bounded-perceptual-hash-cli"
@@ -147,6 +153,7 @@ def run_perceptual_hashing(
             (DHASH_ALGORITHM, PHASH_ALGORITHM),
         ).fetchone()[0]
 
+    elapsed_seconds = time.perf_counter() - started
     output = {
         "database": str(database),
         "processed": processed,
@@ -157,9 +164,15 @@ def run_perceptual_hashing(
         "remaining_pending": int(remaining),
         "archives_hashed": int(archive_count),
         "perceptual_hashes_stored": int(hash_count),
-        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "elapsed_seconds": round(elapsed_seconds, 6),
         "applied_migrations": migrations,
     }
+
+    if handler.profile is not None:
+        output["phase_timing"] = handler.profile.summary(
+            batch_elapsed_seconds=elapsed_seconds,
+            processed_jobs=processed,
+        )
 
     if json_output is not None:
         resolved = json_output.resolve(strict=False)
@@ -184,6 +197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             enqueue_missing=args.enqueue_missing,
             report_only=args.report_only,
             json_output=args.json_output,
+            profile=args.profile,
         )
     except Exception as exc:
         print(f"Perceptual page hashing failed: {exc}", file=sys.stderr)
@@ -200,6 +214,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{output['perceptual_hashes_stored']}"
     )
     print(f"Remaining pending:  {output['remaining_pending']}")
+
+    if output.get("phase_timing"):
+        timing = output["phase_timing"]
+        print(
+            "Profiled pages:     "
+            f"{timing['profiled_pages']}"
+        )
+        if timing["milliseconds_per_page"] is not None:
+            print(
+                "Timed ms/page:      "
+                f"{timing['milliseconds_per_page']:.3f}"
+            )
 
     if output.get("json_output"):
         print(f"JSON output:        {output['json_output']}")

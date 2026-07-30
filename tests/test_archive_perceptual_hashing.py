@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -144,6 +145,48 @@ def test_calculate_perceptual_hashes_uses_natural_order(
     assert all(len(page.phash) == 16 for page in result.pages)
 
 
+def test_profiled_hashing_preserves_results_and_records_phases(
+    tmp_path: Path,
+) -> None:
+    archive = create_cbz(
+        tmp_path / "profiled.cbz",
+        [
+            ("001.png", image_bytes(size=(80, 120))),
+            ("002.jpg", image_bytes(size=(110, 75))),
+        ],
+    )
+
+    unprofiled = calculate_perceptual_hashes(archive)
+    profiled = calculate_perceptual_hashes(
+        archive,
+        profile=True,
+    )
+
+    assert unprofiled.phase_timings is None
+    assert profiled.pages == unprofiled.pages
+    assert (
+        profiled.source_file_size
+        == unprofiled.source_file_size
+    )
+    assert (
+        profiled.source_modified_time_ns
+        == unprofiled.source_modified_time_ns
+    )
+    assert profiled.phase_timings is not None
+
+    phase_values = (
+        profiled.phase_timings
+        .zip_open_and_inventory_seconds,
+        profiled.phase_timings.zip_entry_read_seconds,
+        profiled.phase_timings
+        .image_open_and_decode_seconds,
+        profiled.phase_timings.dhash_seconds,
+        profiled.phase_timings.phash_seconds,
+    )
+    assert all(value >= 0 for value in phase_values)
+    assert sum(phase_values) > 0
+
+
 def test_invalid_image_page_is_a_permanent_failure(
     tmp_path: Path,
 ) -> None:
@@ -266,3 +309,94 @@ def test_perceptual_hash_cli_processes_a_bounded_batch(
     assert "Succeeded:          1" in captured.out
     assert "Archives hashed:    1" in captured.out
     assert "Perceptual hashes: 2" in captured.out
+    assert "Profiled pages:" not in captured.out
+
+
+def test_perceptual_hash_cli_profiles_internal_phases(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "perceptual-profile.db"
+    report = tmp_path / "profile.json"
+    archive = create_cbz(
+        tmp_path / "profiled-issue.cbz",
+        [
+            ("001.png", image_bytes(size=(80, 120))),
+            ("002.jpg", image_bytes(size=(110, 75))),
+        ],
+    )
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATIONS)
+        seed_page_inventory(connection, archive)
+
+    exit_code = main([
+        "--database",
+        str(database),
+        "--limit",
+        "1",
+        "--progress-every",
+        "1",
+        "--enqueue-missing",
+        "--profile",
+        "--json-output",
+        str(report),
+    ])
+    captured = capsys.readouterr()
+    output = json.loads(report.read_text(encoding="utf-8"))
+    timing = output["phase_timing"]
+
+    assert exit_code == 0
+    assert "Profiled pages:     2" in captured.out
+    assert timing["enabled"] is True
+    assert timing["profiled_archives"] == 1
+    assert timing["profiled_pages"] == 2
+    assert timing["profiled_bytes"] > 0
+    assert timing["unprofiled_jobs"] == 0
+    assert timing["milliseconds_per_page"] > 0
+    assert timing["pages_per_timed_second"] > 0
+    assert timing["timed_phase_seconds"] == pytest.approx(
+        sum(timing["phase_seconds"].values()),
+        abs=0.00001,
+    )
+    assert sum(timing["phase_percentages"].values()) == (
+        pytest.approx(100.0, abs=0.01)
+    )
+    assert timing["timed_phase_seconds"] <= (
+        timing["batch_elapsed_seconds"]
+    )
+    assert set(timing["phase_seconds"]) == {
+        "zip_open_and_inventory_seconds",
+        "zip_entry_read_seconds",
+        "image_open_and_decode_seconds",
+        "dhash_seconds",
+        "phash_seconds",
+        "database_lookup_seconds",
+        "database_save_seconds",
+    }
+
+
+def test_profiled_report_only_handles_an_empty_batch(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = tmp_path / "empty-profile.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATIONS)
+
+    exit_code = main([
+        "--database",
+        str(database),
+        "--limit",
+        "1",
+        "--progress-every",
+        "1",
+        "--report-only",
+        "--profile",
+    ])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Profiled pages:     0" in captured.out
+    assert "Timed ms/page:" not in captured.out
