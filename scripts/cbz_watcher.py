@@ -21,6 +21,7 @@ from enum import Enum
 from dataclasses import dataclass
 from dataclasses import replace as _dataclasses_replace
 from pathlib import Path
+from collections.abc import Iterable
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
@@ -516,6 +517,121 @@ def probe_cbz_zip_readiness(
     return ZipReadinessResult(
         ZipReadiness.READY,
         "ok",
+        page_count=page_count,
+    )
+
+
+# ─────────────────────────────────────────────
+# ZIP READINESS PROBE — DIRECTORY AGGREGATION
+# ─────────────────────────────────────────────
+@dataclass(frozen=True)
+class CbzReadinessEntry:
+    """Per-archive diagnostic record within a directory-level probe.
+
+    A direct copy of one probe_cbz_zip_readiness() call's fields, plus the
+    path it was called on, so callers can see exactly which archive(s) in a
+    directory are holding up the whole directory without re-probing.
+    """
+
+    path: Path
+    status: ZipReadiness
+    reason: str
+    detail: str | None
+    page_count: int | None
+
+
+@dataclass(frozen=True)
+class DirectoryReadinessResult:
+    """Result of probe_cbz_directory_readiness().
+
+    `status` is READY only when every archive in `entries` is READY;
+    otherwise RETRY_LATER, whether that's because one archive isn't ready
+    yet or because no archives were given at all (reason="no_cbz_files").
+    `entries` preserves the exact order paths were given in — one entry per
+    input path, in that order, regardless of how many are ready.
+    """
+
+    status: ZipReadiness
+    reason: str
+    entries: tuple[CbzReadinessEntry, ...]
+    archive_count: int
+    ready_count: int
+    page_count: int
+
+
+def probe_cbz_directory_readiness(
+    paths: Iterable[Path],
+    *,
+    settle_interval: float = ZIP_READINESS_SETTLE_INTERVAL_SECONDS,
+) -> DirectoryReadinessResult:
+    """Pure directory-level aggregation over probe_cbz_zip_readiness().
+
+    Calls probe_cbz_zip_readiness() exactly once per path, in the exact
+    order `paths` iterates in, and is READY only when every single archive
+    comes back READY -- one unreadable archive is enough to hold back the
+    whole directory. Like the single-file probe, this is entirely pure: no
+    logging, no locking, no database access, and no file mutation. It also
+    performs no filesystem discovery of its own -- the caller decides which
+    paths belong to "this directory" and passes them in.
+
+    An empty `paths` is treated as RETRY_LATER with reason="no_cbz_files"
+    rather than vacuously READY, since a directory with zero CBZs currently
+    enumerated is not a directory this probe can vouch for -- there is
+    nothing here to confirm readiness of yet.
+
+    `page_count` on the result is the sum of each READY entry's page count
+    (entries that aren't READY have page_count=None, contributing 0) -- it
+    is not meaningful as a total until every archive is READY.
+
+    This function does not decide what happens next -- it does not move
+    files, does not enqueue anything, and is not wired into
+    process_cbz_file() or directory-move logic. That integration is left
+    for a follow-up change, since an unreadable archive needing to block an
+    entire directory move is a decision that belongs at the call site, not
+    inside this pure helper.
+    """
+    ordered_paths = tuple(paths)
+
+    if not ordered_paths:
+        return DirectoryReadinessResult(
+            status=ZipReadiness.RETRY_LATER,
+            reason="no_cbz_files",
+            entries=(),
+            archive_count=0,
+            ready_count=0,
+            page_count=0,
+        )
+
+    entries: list[CbzReadinessEntry] = []
+
+    for path in ordered_paths:
+        result = probe_cbz_zip_readiness(path, settle_interval=settle_interval)
+        entries.append(
+            CbzReadinessEntry(
+                path=path,
+                status=result.status,
+                reason=result.reason,
+                detail=result.detail,
+                page_count=result.page_count,
+            )
+        )
+
+    archive_count = len(entries)
+    ready_count = sum(
+        1 for entry in entries if entry.status == ZipReadiness.READY
+    )
+    page_count = sum(entry.page_count or 0 for entry in entries)
+
+    all_ready = ready_count == archive_count
+    overall_status = ZipReadiness.READY if all_ready else ZipReadiness.RETRY_LATER
+    overall_reason = "ok" if all_ready else "not_all_ready"
+
+    return DirectoryReadinessResult(
+        status=overall_status,
+        reason=overall_reason,
+        entries=tuple(entries),
+        archive_count=archive_count,
+        ready_count=ready_count,
         page_count=page_count,
     )
 
