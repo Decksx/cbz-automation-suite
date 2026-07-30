@@ -42,10 +42,12 @@ the file.
 
 **Size limits.** `MAX_COMIC_INFO_BYTES = 1_048_576` (1 MiB), enforced twice in
 `_read_comic_info`: once against the declared `entry.file_size` before
-reading, and again against `len(payload)` after reading, so a `ZipInfo` that
-lies about its own declared size doesn't bypass the cap. No size limit exists
-for page/image entries, but none are ever read by this module in the first
-place.
+reading, and again against `len(payload)` after reading. The second check
+prevents an oversized payload from being accepted if its declared metadata
+was inaccurate, but it occurs after `archive.read(entry)` and therefore is
+not itself a guarantee against a transient oversized allocation from
+maliciously inconsistent ZIP metadata. No size limit exists for page/image
+entries, but none are ever read by this module in the first place.
 
 **Entry-count / decoded-pixel limits.** No cap on entry count — `infolist()`
 is iterated in full — but this is classification-only (filename suffix
@@ -55,10 +57,12 @@ image decoding happens in this file at all, so no pixel limit applies here.
 **ZIP-slip / path validation.** Not applicable — nothing is ever extracted
 to a filesystem path.
 
-**Memory behavior for large pages/omnibus archives.** Minimal and bounded:
-the only payload ever materialized is `ComicInfo.xml`, capped at 1 MiB.
-Page images are inspected by metadata only, never decoded. This is the
-lightest-weight component in the audit for large/omnibus archives.
+**Memory behavior for large pages/omnibus archives.** Minimal in ordinary
+operation: the only payload ever materialized is `ComicInfo.xml`, which is
+rejected when its declared or actual size exceeds 1 MiB. The post-read check
+has the allocation caveat described above. Page images are inspected by
+metadata only, never decoded. This is the lightest-weight component in the
+audit for large/omnibus archives.
 
 **Additional safeguard — XXE mitigation.** Before parsing, `_read_comic_info`
 lowercases the raw bytes and rejects the payload if `b"<!doctype"` or
@@ -129,9 +133,11 @@ with archive.open(entry, mode="r") as stream:
         bytes_read += len(chunk)
 ```
 
-`chunk_size` defaults to `DEFAULT_CHUNK_SIZE = 1024 * 1024` (1 MiB). Peak
-memory for any single page is bounded by `chunk_size`, regardless of the
-page's actual decompressed size.
+`chunk_size` defaults to `DEFAULT_CHUNK_SIZE = 1024 * 1024` (1 MiB). The
+application-level payload buffer for any single page read is bounded by
+`chunk_size`, regardless of the page's actual decompressed size. `zipfile`
+and the digest implementation may retain their own small internal buffers,
+so this is not a claim that total process memory is exactly 1 MiB per page.
 
 **Disk extraction.** None.
 
@@ -187,8 +193,10 @@ it falls into the generic `filesystem_io` bucket, indistinguishable from an
 unrelated I/O error in job diagnostics. The module itself never writes to
 the archive; `ArchivePageHashRepository.save` writes only to the database,
 wrapped in an explicit `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` transaction
-with the delete-then-reinsert pattern for `archive_pages` rows. No file
-locking is used or needed, since the archive is never written to.
+with the delete-then-reinsert pattern for `archive_pages` rows. No
+application-level file lock is used. The archive is never written by this
+module, and the before/after stat comparison detects common source drift,
+but it does not provide exclusive-read semantics.
 
 ---
 
@@ -221,12 +229,15 @@ before `archive.read(entry)`. This is a real gap relative to both
 arbitrarily large declared or actual size is read into memory in one call
 with no pre-flight guard.
 
-**Entry-count / decoded-pixel limits.** No cap on the number of pages
+**Entry-count / decoded-pixel limits.** No cap exists on the number of pages
 processed per archive. Pixel-count protection relies entirely on Pillow's
 built-in default `Image.MAX_IMAGE_PIXELS` — no override of this constant
-exists anywhere in the codebase (confirmed by search). `Image.DecompressionBombError`
-is caught and converted to a permanent, categorized failure rather than
-propagating as a crash:
+exists anywhere in the codebase (confirmed by search). In the installed
+Pillow implementation, that value is the warning threshold; images above
+twice the value raise `Image.DecompressionBombError`. Images between the
+warning and error thresholds continue processing after emitting
+`Image.DecompressionBombWarning`. The error is caught and converted to a
+permanent, categorized failure rather than propagating as a crash:
 
 ```python
 except (
@@ -246,9 +257,10 @@ except (
 This exception tuple is scoped tightly around the `Image.open`/`.load()`/
 hash calls only (nested inside the archive-level `try`), so a genuine
 zip-level `OSError` is not mis-categorized as an image-decode error. The
-practical pixel ceiling, however, is whichever value ships with the
-installed Pillow version — not a value this codebase deliberately chose,
-documented, or pinned.
+effective warning and rejection thresholds, however, are derived from
+whichever `Image.MAX_IMAGE_PIXELS` value ships with the installed Pillow
+version — not values this codebase deliberately chose, documented, or
+pinned.
 
 **ZIP-slip / path validation.** Not applicable — nothing is extracted to
 disk.
@@ -290,9 +302,10 @@ if expected != actual:
     )
 ```
 
-Database writes are wrapped in `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`. No file
-locking is used or needed, since the module never writes to the archive
-itself.
+Database writes are wrapped in `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`. No
+application-level file lock is used. The module never writes to the archive,
+and its before/after stat guard detects common source drift, but it does not
+provide exclusive-read semantics.
 
 ---
 
@@ -377,17 +390,17 @@ tmp_path.rename(cbz_path)
 bak_path.unlink(missing_ok=True)
 ```
 
-Each `Path.rename()` call is atomic individually on a local NTFS volume, but
-the three-step sequence as a whole is not; there is a window between the
-first and second rename where no file exists at the original path, and SMB
-rename-atomicity guarantees are not the same as local NTFS. No file locking
-of any kind is used. There is no verification that the source file's
-size/mtime is unchanged immediately before the rename versus what was
-originally read at the top of the function — a concurrent writer on the
-same share during the read-and-rebuild window would be silently overwritten
-with no detection. No explicit recovery step exists if the rename sequence
-fails partway (e.g. after the original has been renamed to `.bak.cbz` but
-before `tmp_path` is renamed into place).
+An individual same-volume rename is commonly atomic on local NTFS, but the
+three-step sequence as a whole is not; there is a window between the first
+and second rename where no file exists at the original path. This audit did
+not independently establish the relevant SMB server/client guarantees. No
+file locking of any kind is used. There is no verification that the source
+file's size/mtime is unchanged immediately before the rename versus what was
+originally read at the top of the function — a concurrent writer on the same
+share during the read-and-rebuild window would be silently overwritten with
+no detection. No explicit recovery step exists if the rename sequence fails
+partway (e.g. after the original has been renamed to `.bak.cbz` but before
+`tmp_path` is renamed into place).
 
 ---
 
@@ -514,19 +527,22 @@ steps.
 
 ### 1. Confirmed safeguards already present
 
-- `inspection.py` enforces a hard, double-checked 1 MiB cap on
+- `inspection.py` enforces a double-checked 1 MiB acceptance limit on
   `ComicInfo.xml` (`entry.file_size` pre-check and `len(payload)`
   post-check), plus a DTD/`ENTITY` substring rejection before
-  `ElementTree.fromstring` (XXE mitigation). This is the most defensively
-  written component in the audit.
+  `ElementTree.fromstring` (XXE mitigation). The post-check rejects
+  inconsistent oversized content but happens after allocation, as noted in
+  Section 1. This remains the most defensively written component in the
+  audit.
 - None of the six audited components ever call `.extract()`/`.extractall()`
   or write archive-member bytes to an arbitrary filesystem path derived from
   `entry.filename` — the "read into memory or copy zip-to-zip, never extract
   loose to disk" design eliminates zip-slip-via-extraction as a live vector
   across the entire audited surface.
 - `page_hashing.py` streams page content via `archive.open(entry)` in fixed
-  1 MiB chunks — the only component in the audit that bounds per-page peak
-  memory independent of the page's actual size.
+  1 MiB chunks — the only component in the audit that bounds its
+  application-level page payload buffer independently of the page's actual
+  size.
 - `page_hashing.py` and `perceptual_hashing.py` both snapshot the source
   archive's size/mtime before and after processing and abort with an
   `OSError` if either changed — a working concurrent-modification detector
@@ -559,10 +575,11 @@ steps.
   with no check on `entry.file_size`/`compress_size` beforehand, unlike
   `inspection.py`'s double-checked cap or `page_hashing.py`'s bounded
   streaming.
-- **Implicit, unpinned pixel ceiling.** No `Image.MAX_IMAGE_PIXELS` override
-  exists anywhere in the codebase; `perceptual_hashing.py`'s
-  decompression-bomb protection is entirely dependent on whatever default
-  ships with the installed Pillow version.
+- **Implicit, unpinned pixel thresholds.** No `Image.MAX_IMAGE_PIXELS`
+  override exists anywhere in the codebase. Pillow uses that value as a
+  warning threshold and raises `DecompressionBombError` only above twice
+  that value, so `perceptual_hashing.py`'s warning/rejection behavior depends
+  on whatever default ships with the installed Pillow version.
 - **Non-atomic, multi-step file replacement on every rewrite path in both
   `scripts/` files.** `_write_cbz_with_comicinfo`, `write_comicinfo`
   (original→`.bak.cbz`, tmp→original, delete `.bak.cbz`), and
@@ -594,9 +611,11 @@ steps.
 
 ### 3. Small, low-risk improvements
 
-- Add an explicit, documented `Image.MAX_IMAGE_PIXELS` value (module
-  constant or shared config) in `perceptual_hashing.py` instead of relying
-  on Pillow's implicit, version-dependent default.
+- Add an explicit, documented pixel policy in `perceptual_hashing.py`
+  instead of relying on Pillow's implicit, version-dependent default:
+  configure `Image.MAX_IMAGE_PIXELS`, document that the hard-error threshold
+  is twice that value, and decide explicitly whether warnings below the hard
+  threshold should remain non-terminal.
 - Add a pre-read `entry.file_size`/`compress_size` sanity check in
   `calculate_perceptual_hashes` before `archive.read(entry)`, mirroring
   `inspection.py`'s existing double-check pattern, to bound worst-case
