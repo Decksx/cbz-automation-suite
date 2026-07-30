@@ -151,12 +151,25 @@ def test_handler_upserts_latest_result(
         queue = JobQueue(connection)
         handler = InspectArchiveHandler(connection)
 
-        handler(
-            queue.enqueue(
-                "inspect_archive",
-                archive_id=archive_id,
-            )
+        first_job = queue.enqueue(
+            "inspect_archive",
+            archive_id=archive_id,
         )
+        handler(first_job)
+
+        # Retire the first job before enqueueing its re-inspection.
+        # This test drives the handler directly rather than through a
+        # JobWorker, so nothing else advances the job past 'pending';
+        # leaving it active while enqueueing a second job for the same
+        # (job_type, archive_id) would violate the partial unique index
+        # added in migration 010 and does not reflect a state the real
+        # pipeline produces (a worker always completes or fails a job
+        # before another for the same archive becomes active).
+        connection.execute(
+            "UPDATE jobs SET status = 'completed' WHERE id = ?",
+            (first_job.id,),
+        )
+
         handler(
             queue.enqueue(
                 "inspect_archive",

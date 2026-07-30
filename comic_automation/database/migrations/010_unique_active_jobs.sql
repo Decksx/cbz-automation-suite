@@ -1,0 +1,64 @@
+-- Migration 010: unique active jobs.
+--
+-- Enforces "at most one *active* job per (job_type, archive_id)" at the
+-- database level. Until now this was only an application-level
+-- convention: the enqueue call sites in comic_automation/library/
+-- repository.py and comic_automation/archive/{hashing,page_hashing,
+-- perceptual_hashing}.py each run their own SELECT / NOT EXISTS check
+-- before calling JobQueue.enqueue(), but none of them holds SQLite's
+-- write lock across both the check and the insert against every other
+-- enqueue path, so two callers could both pass their check and both
+-- insert. See docs/job_enqueue_idempotency_audit.md for the full
+-- call-site matrix and the specific races this closes.
+--
+-- Scope of this migration: the constraint only. It deliberately does
+-- NOT add JobQueue.enqueue_if_absent(), change any caller, harmonize
+-- the callers' differing failed-job re-enqueue policies, or touch
+-- retry/claim/completion/failure/recovery behavior. Those are separate,
+-- independently reviewable steps.
+--
+-- What the partial index does and does not constrain:
+--
+--   * 'pending', 'claimed', and 'running' are the three statuses that
+--     represent work in flight. At most one row per
+--     (job_type, archive_id) may hold any of them at a time -- so a
+--     second active row is rejected regardless of which pairing of
+--     those three statuses is involved.
+--   * Terminal rows ('completed', 'failed', 'cancelled', 'blocked')
+--     fall outside the index predicate entirely. They are never
+--     compared against each other or against an active row, so full
+--     terminal history is preserved: any number of terminal rows may
+--     coexist for the same identity, with or without one active row
+--     alongside them, and a new active row may be created once the
+--     previous one reaches a terminal status. A plain (non-partial)
+--     UNIQUE(job_type, archive_id) constraint could not do this -- it
+--     would reject a legitimate re-enqueue after completion.
+--
+-- KNOWN LIMITATION -- rows with archive_id IS NULL are not protected.
+-- SQL (and SQLite) treats every NULL as distinct from every other NULL
+-- for uniqueness purposes, including inside a partial unique index, so
+-- two simultaneously-active jobs of the same job_type with
+-- archive_id IS NULL are still allowed by this index. No job type
+-- currently enqueued in production does this -- every enqueue call site
+-- supplies a concrete archive_id -- so the index is sufficient today.
+-- If a future job type ever enqueues with a NULL archive_id, it will
+-- silently regain the duplicate-active-row problem this migration
+-- exists to prevent, and will need an expression index (for example
+-- UNIQUE(job_type, COALESCE(archive_id, -1)) over the same predicate;
+-- -1 is safe because archive_id is a positive rowid) or a per-job-type
+-- idempotency key instead.
+--
+-- This migration is additive and non-destructive: it creates an index
+-- and nothing else. It never deletes, cancels, merges, or rewrites any
+-- job row. If the database already contains duplicate active rows for
+-- the same (job_type, archive_id), SQLite refuses to build the unique
+-- index and this migration fails as a whole -- apply_migrations() wraps
+-- each migration file in BEGIN IMMEDIATE ... COMMIT, so a failure rolls
+-- back without recording version 10 and without creating the index,
+-- leaving the database exactly as it was. Resolving such pre-existing
+-- duplicates is a deliberate, human-reviewed decision (which row is
+-- canonical, and what happens to the other), not something this
+-- migration is permitted to do automatically.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_unique_active
+    ON jobs(job_type, archive_id)
+    WHERE status IN ('pending', 'claimed', 'running');
