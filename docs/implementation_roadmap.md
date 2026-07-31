@@ -30,6 +30,7 @@ audit.
 | Perceptual jobs completed | 35,590 |
 | Perceptual jobs failed | 110 |
 | Active perceptual jobs | 0 |
+| Production schema migrations | 1–10 |
 | dHash rows, Version 1 | 1,795,474 |
 | pHash rows, Version 1 | 1,795,474 |
 | Eligible archives remaining | 22,554 |
@@ -553,10 +554,14 @@ classifications and verified that the database remained unchanged.
 
 The post-batch all-job-type migration preflight found no pending,
 claimed, or running jobs, no duplicate active `(job_type, archive_id)`
-groups, and no active jobs with a null archive ID. Both the working
-database and protected backup remained at schema version 9 and passed
-`PRAGMA quick_check`, so migration 010 is data-safe to apply after its
-reviewed implementation merges.
+groups, and no active jobs with a null archive ID. After the reviewed
+implementation merged, a fresh schema-9 backup was created and verified
+independently. Migration 010 then advanced the working database to
+schema version 10 and created the exact reviewed partial unique index.
+All 272,074 job rows remained column-for-column unchanged, all
+production counts reconciled, `PRAGMA quick_check` remained `ok`, and
+the protected pre-migration backup remained unchanged at schema
+version 9.
 
 #### H. Recover in-place source drift
 
