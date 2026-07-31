@@ -34,6 +34,58 @@ PHASH_ALGORITHM_VERSION = "1"
 DEFAULT_HASH_SIZE = 8
 DEFAULT_HIGH_FREQUENCY_FACTOR = 4
 
+# Explicit, version-pinned pixel-decode policy. See
+# docs/archive_io_resource_audit.md, "Small, low-risk improvements":
+# without this, the warning/rejection thresholds below depend entirely
+# on whatever Image.MAX_IMAGE_PIXELS default ships with the installed
+# Pillow version, and could silently shift on a Pillow upgrade.
+#
+# Pillow's own default at the time this was pinned is 89,478,485 pixels
+# (~89.5 MP). That value is a *warning* threshold, not a hard limit --
+# Pillow emits Image.DecompressionBombWarning above it but only raises
+# Image.DecompressionBombError above twice that value (~179 MP). Both
+# behaviors are Pillow's, not this codebase's; pinning the base value
+# here only fixes where the line is drawn, not what happens at each
+# side of it.
+#
+# The warning side is deliberately left non-terminal: an image between
+# 89.5 MP and 179 MP only emits a Python warning and continues
+# processing normally. The error side already terminates the page
+# permanently -- Image.DecompressionBombError is caught by the
+# exception tuple below and converted into a PermanentJobError
+# (category="page_image_corrupt"), not a crash.
+#
+# This is a safety ceiling, not an operational constraint: a 600 DPI
+# 8.5x11 comic page scan is roughly 34 MP, well under the warning
+# threshold, so no legitimate archive page in this library is expected
+# to approach either bound.
+#
+# This assignment is process-wide (Image.MAX_IMAGE_PIXELS is a module
+# attribute on Pillow's Image module, not scoped to this file's calls),
+# so importing this module changes decompression-bomb behavior for any
+# other Pillow usage in the same process.
+Image.MAX_IMAGE_PIXELS = 89_478_485
+
+# Bounds the archive.read(entry) allocation below, before decoding.
+# entry.file_size is the *declared* uncompressed size from the ZIP
+# local file header; archive.read() allocates and reads that many bytes
+# into memory in one call with no size check today (see
+# docs/archive_io_resource_audit.md, "Confirmed risks in current code"
+# -- unlike inspection.py's double-checked 1 MiB ComicInfo.xml cap or
+# page_hashing.py's bounded chunk streaming). This cap closes that gap
+# for the perceptual-hashing read path specifically.
+#
+# This is independent of the pixel policy above: a page can pass this
+# raw-byte check and still be rejected after decoding if it exceeds the
+# configured pixel budget, and vice versa (a small file can still
+# decode to a large image for a sufficiently poor compression ratio,
+# which the pixel policy alone catches). 200 MiB is far beyond any
+# legitimate single comic page -- even large scans are typically a few
+# MB -- so this exists to reject a maliciously or corruptly declared
+# oversized entry before archive.read() allocates for it, not to
+# constrain normal operation.
+MAX_PAGE_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class PagePerceptualHash:
@@ -342,6 +394,16 @@ def calculate_perceptual_hashes(
                 )
 
             for page_index, entry in enumerate(entries):
+                if entry.file_size > MAX_PAGE_UNCOMPRESSED_BYTES:
+                    raise PermanentJobError(
+                        "Declared page size "
+                        f"{entry.file_size} bytes exceeds the "
+                        f"{MAX_PAGE_UNCOMPRESSED_BYTES}-byte per-page "
+                        f"cap for {entry.filename!r} in "
+                        f"{archive_path}",
+                        category="page_image_too_large",
+                    )
+
                 phase_started = (
                     time.perf_counter() if profile else 0.0
                 )

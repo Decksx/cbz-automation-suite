@@ -202,6 +202,76 @@ def test_invalid_image_page_is_a_permanent_failure(
     assert "001.jpg" in str(caught.value)
 
 
+def test_oversized_declared_page_is_rejected_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # zipfile recomputes ZipInfo.file_size from the actual written data
+    # length at write time (verified directly against the stdlib), so a
+    # real inconsistent-metadata archive can't be constructed with
+    # writestr() alone -- the declared/actual mismatch this guard exists
+    # for is exactly a ZIP whose local file header lies about size, so
+    # the only faithful way to test it here is to inject that lie at
+    # read time via infolist(), the same call calculate_perceptual_hashes
+    # itself uses to build its entry list.
+    from comic_automation.archive.perceptual_hashing import (
+        MAX_PAGE_UNCOMPRESSED_BYTES,
+    )
+
+    archive = create_cbz(
+        tmp_path / "oversized-page.cbz",
+        [("001.jpg", image_bytes())],
+    )
+
+    real_infolist = zipfile.ZipFile.infolist
+
+    def _infolist_with_inflated_declared_size(self):
+        infos = real_infolist(self)
+        for info in infos:
+            if info.filename == "001.jpg":
+                info.file_size = (
+                    MAX_PAGE_UNCOMPRESSED_BYTES + 1
+                )
+        return infos
+
+    monkeypatch.setattr(
+        zipfile.ZipFile,
+        "infolist",
+        _infolist_with_inflated_declared_size,
+    )
+
+    with pytest.raises(PermanentJobError) as caught:
+        calculate_perceptual_hashes(archive)
+
+    assert caught.value.category == "page_image_too_large"
+    assert "001.jpg" in str(caught.value)
+
+
+def test_page_within_size_cap_is_still_processed_normally(
+    tmp_path: Path,
+) -> None:
+    # A page whose declared size is comfortably under the cap must be
+    # completely unaffected by the new guard.
+    archive = create_cbz(
+        tmp_path / "normal-page.cbz",
+        [("001.png", image_bytes())],
+    )
+
+    result = calculate_perceptual_hashes(archive)
+
+    assert result.page_count == 1
+    assert result.pages[0].entry_name == "001.png"
+
+
+def test_pixel_policy_is_pinned_explicitly() -> None:
+    # Guards against a future Pillow upgrade silently changing this
+    # module's decompression-bomb behavior -- see the policy comment in
+    # perceptual_hashing.py and docs/archive_io_resource_audit.md.
+    from PIL import Image
+
+    assert Image.MAX_IMAGE_PIXELS == 89_478_485
+
+
 def test_perceptual_hash_job_persists_both_algorithms(
     tmp_path: Path,
 ) -> None:
