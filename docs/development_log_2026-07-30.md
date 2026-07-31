@@ -458,19 +458,179 @@ backup LastWriteTimeUtc ticks:   639210397602202172
 source metadata unchanged:       true
 ```
 
-## 11. Next work
+## 11. Guarded batch launch preparation
 
-Before another guarded 5,000-archive batch:
+The preceding next-work checklist was completed before launch:
 
-- review the complete documentation diff and run `git diff --check`;
-- commit the authoritative documentation updates and return the
-  production checkout to a clean state;
-- capture exact read-only preflight counts against both the working
-  database and the new protected backup;
-- verify repository HEAD, branch, and cleanliness;
-- do not enqueue if any active perceptual job, integrity mismatch,
-  backup mismatch, or unexpected count is present.
+- the authoritative documentation update was committed and pushed as
+  `292df05`;
+- the complete Windows suite passed with 234 tests;
+- the production checkout was clean and synchronized with
+  `origin/master`;
+- exact read-only preflight counts matched between the working database
+  and protected backup;
+- both databases returned `PRAGMA quick_check = ok`;
+- pending, claimed, and running perceptual jobs were all zero;
+- the protected backup's length and modification timestamp matched the
+  verified baseline immediately before launch.
 
-The broader roadmap remains unchanged: complete and audit the Version 1
-backfill before introducing immutable archive revisions, provenance
-migration, and the minimum local DAL.
+The production checkout remained frozen at `292df05` throughout the
+batch.
+
+## 12. Latest guarded 5,000-archive batch
+
+The next guarded Version 1 perceptual-hash batch used:
+
+```text
+working database:
+G:\ComicAutomation\TestDatabase\inspection-working.db
+
+protected backup:
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-perceptual-batch-20260730-142231.db
+
+batch report:
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-batch-5000-20260730-152309.json
+```
+
+Batch result:
+
+```text
+processed:                    5,000
+succeeded:                    4,972
+terminally failed:               28
+retry scheduled:                  0
+remaining pending:                0
+elapsed seconds:             12,033.728
+elapsed hours:                    3.343
+throughput:              1,495.80 archives/hour
+terminal-failure rate:           0.56%
+profiled archives:               4,972
+profiled pages:                289,390
+```
+
+The 5,000 outcomes reconcile exactly. The 28 terminal failures were
+normal permanent page-image decoding failures; no queue, database,
+worker-orchestration, or retry-persistence failure occurred.
+
+Production phase distribution:
+
+```text
+image open and decode:       50.250%
+pHash:                       31.808%
+dHash:                       12.304%
+ZIP entry read:               4.251%
+database save:                0.728%
+ZIP open and inventory:       0.615%
+database lookup:              0.043%
+```
+
+Independent read-only postflight reconciliation confirmed:
+
+```text
+quick_check:                         ok
+page SHA-256 rows:            2,955,304
+dHash Version 1:              1,795,474
+pHash Version 1:              1,795,474
+completed jobs:                  35,590
+failed jobs:                        110
+pending / claimed / running:      0 / 0 / 0
+total jobs:                      35,700
+eligible archives remaining:      22,554
+near-duplicate candidates:             0
+protected backup unchanged:           yes
+repository unchanged:                 yes
+```
+
+dHash and pHash each gained exactly 289,390 rows, matching the profiled
+page count. Page SHA-256 remained unchanged, and eligibility fell by
+exactly 5,000 archives.
+
+A fresh read-only failure audit classified all 110 terminal failures:
+
+```text
+corrupt archives:       40
+corrupt page images:    70
+missing files:           0
+permissions:             0
+unsupported formats:     0
+unclassified:            0
+```
+
+Reports:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-failure-audit-post-batch-20260730-190646.json
+G:\ComicAutomation\logs\perceptual-hashing\
+  perceptual-failure-audit-post-batch-20260730-190646.csv
+```
+
+At the measured throughput, the remaining 22,554 eligible archives
+represent approximately 15.08 hours of active processing.
+
+## 13. Queue-reliability integration and migration preflight
+
+While the batch ran, seven isolated branches were reviewed:
+
+```text
+7c79bd4  job-worker state hardening
+0375804  unique active-job index migration
+93b4b9e  atomic enqueue-if-absent helper
+80bbae6  atomic enqueue caller migration
+8990c12  abandoned-job read-only audit
+b391f05  enqueue idempotency audit
+b6936b0  duplicate-active read-only preflight
+```
+
+Before migration 010 was allowed into the integration stack, the
+duplicate-active preflight ran against both the settled working
+database and protected backup. Each database:
+
+```text
+schema versions:                    1 through 9
+quick_check:                                  ok
+active jobs, all job types:                    0
+duplicate active identity groups:              0
+active jobs with null archive_id:               0
+unique active-job index present:               no
+database changed during audit:                 no
+```
+
+The branches were then combined in dependency order. The shared
+`comic_automation.jobs` export retained both `JobWorkerStateError` and
+`EnqueueOutcome`. One integration-only test fixture was updated so
+duplicate-preflight tests explicitly exercise the schema both before
+and after migration 010; production behavior and the index predicate
+were unchanged.
+
+Integrated validation:
+
+```text
+reliability/discovery focused suites: 176 passed
+complete Windows suite:               360 passed
+git diff --check:                      clean
+```
+
+Migration 010 has not been applied to the production database by this
+integration work. The production database remains at schema version 9.
+
+## 14. Next work
+
+Before intentionally applying migration 010:
+
+- merge and synchronize the reviewed integration branch;
+- create a fresh protected post-batch database backup;
+- verify the backup independently;
+- repeat the duplicate-active preflight immediately before migration;
+- apply migration 010 under a guarded command;
+- verify schema version 10, the exact partial-index definition,
+  unchanged job rows and counts, and `PRAGMA quick_check`;
+- retain the pre-migration backup.
+
+After the migration is verified, resume bounded Version 1 backfill
+batches using the atomic enqueue path. The broader roadmap remains
+unchanged: complete and audit the Version 1 backfill before introducing
+immutable archive revisions, provenance migration, and the minimum
+local DAL.

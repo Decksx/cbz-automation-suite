@@ -26,19 +26,19 @@ audit.
 | Archive content signatures | 58,437 |
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 30,700 |
-| Perceptual jobs completed | 30,618 |
-| Perceptual jobs failed | 82 |
+| Perceptual job rows | 35,700 |
+| Perceptual jobs completed | 35,590 |
+| Perceptual jobs failed | 110 |
 | Active perceptual jobs | 0 |
-| dHash rows, Version 1 | 1,506,084 |
-| pHash rows, Version 1 | 1,506,084 |
-| Eligible archives remaining | 27,554 |
+| dHash rows, Version 1 | 1,795,474 |
+| pHash rows, Version 1 | 1,795,474 |
+| Eligible archives remaining | 22,554 |
 | Near-duplicate candidates | 0 |
 | Last guarded batch | 5,000 processed |
-| Last-batch outcomes | 4,995 succeeded, 5 terminal failures, 0 retries |
-| Last-batch terminal-failure rate | 0.10% |
-| Last-batch throughput | 1,403.86 archives/hour |
-| Estimated active processing time remaining | approximately 19.63 hours |
+| Last-batch outcomes | 4,972 succeeded, 28 terminal failures, 0 retries |
+| Last-batch terminal-failure rate | 0.56% |
+| Last-batch throughput | 1,495.80 archives/hour |
+| Estimated active processing time remaining | approximately 15.08 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -513,16 +513,16 @@ Latest production result:
 
 ```text
 processed:                              5,000
-succeeded:                              4,995
-terminally failed:                          5
+succeeded:                              4,972
+terminally failed:                         28
 retry scheduled / pending:                  0
-elapsed seconds:                       12,821.790
-elapsed hours:                              3.562
-throughput:                    1,403.86 archives/hour
-profiled archives / pages:        4,995 / 226,837
-dHash Version 1 rows:                 1,506,084
-pHash Version 1 rows:                 1,506,084
-eligible archives remaining:             27,554
+elapsed seconds:                       12,033.728
+elapsed hours:                              3.343
+throughput:                    1,495.80 archives/hour
+profiled archives / pages:        4,972 / 289,390
+dHash Version 1 rows:                 1,795,474
+pHash Version 1 rows:                 1,795,474
+eligible archives remaining:             22,554
 ```
 
 The report, job outcomes, phase totals, database counts, and
@@ -535,21 +535,28 @@ repository stayed clean.
 Latest production phase distribution:
 
 ```text
-image open and decode:       53.423%
-pHash:                       27.785%
-dHash:                       14.027%
-ZIP entry read:               3.764%
-database save:                0.527%
-ZIP open and inventory:       0.441%
-database lookup:              0.031%
+image open and decode:       50.250%
+pHash:                       31.808%
+dHash:                       12.304%
+ZIP entry read:               4.251%
+database save:                0.728%
+ZIP open and inventory:       0.615%
+database lookup:              0.043%
 ```
 
-The five new terminal failures are legitimate page-image decoding
+The 28 new terminal failures are legitimate page-image decoding
 defects classified as `page_image_corrupt`; no queue, database, or
 orchestration failure occurred. The cumulative perceptual terminal-
-failure population is now 82: 40 `archive_corrupt` and 42
+failure population is now 110: 40 `archive_corrupt` and 70
 `page_image_corrupt`. A fresh read-only audit captured these
 classifications and verified that the database remained unchanged.
+
+The post-batch all-job-type migration preflight found no pending,
+claimed, or running jobs, no duplicate active `(job_type, archive_id)`
+groups, and no active jobs with a null archive ID. Both the working
+database and protected backup remained at schema version 9 and passed
+`PRAGMA quick_check`, so migration 010 is data-safe to apply after its
+reviewed implementation merges.
 
 #### H. Recover in-place source drift
 
