@@ -613,24 +613,121 @@ complete Windows suite:               360 passed
 git diff --check:                      clean
 ```
 
-Migration 010 has not been applied to the production database by this
-integration work. The production database remains at schema version 9.
+The integration merged through pull request 12:
 
-## 14. Next work
+```text
+merge commit: 8c67cc7
+local master: 8c67cc7
+origin/master: 8c67cc7
+post-merge Windows suite: 360 passed
+```
 
-Before intentionally applying migration 010:
+## 14. Production migration 010
 
-- merge and synchronize the reviewed integration branch;
-- create a fresh protected post-batch database backup;
-- verify the backup independently;
-- repeat the duplicate-active preflight immediately before migration;
-- apply migration 010 under a guarded command;
-- verify schema version 10, the exact partial-index definition,
-  unchanged job rows and counts, and `PRAGMA quick_check`;
-- retain the pre-migration backup.
+Before applying migration 010, a fresh protected backup was created
+with SQLite's online backup API:
 
-After the migration is verified, resume bounded Version 1 backfill
-batches using the atomic enqueue path. The broader roadmap remains
-unchanged: complete and audit the Version 1 backfill before introducing
-immutable archive revisions, provenance migration, and the minimum
-local DAL.
+```text
+G:\ComicAutomation\TestDatabase\
+  inspection-working-pre-migration-010-20260730-194853.db
+```
+
+Source integrity passed before and after backup creation, the backup
+returned `PRAGMA quick_check = ok`, and source metadata did not change.
+The backup's protected baseline is:
+
+```text
+schema versions:          1 through 9
+size:              2,021,244,928 bytes
+modified_time_ns:  1,785,462,543,392,843,900
+unique index present:                no
+```
+
+The duplicate-active preflight was repeated against both source and
+backup immediately before migration. Each reported zero active jobs,
+zero duplicate active identity groups, zero active null-archive jobs,
+and `quick_check = ok`.
+
+A full pre-migration comparison covered every column of all 272,074 job
+rows. Source and backup matched:
+
+```text
+job columns:     17
+job rows:        272,074
+job snapshot:
+44ee505c3dfd704f9349f86268df7e39bbe3a6cc31d077fd29caf88eb7967377
+source/backup content equal: true
+```
+
+Preflight report:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  migration-010-preflight-20260730-194853.json
+```
+
+The guarded command verified that migration 010 was the only pending
+migration, then applied it through the project's tested
+`apply_migrations()` runner. Result:
+
+```text
+applied migrations:                         [10]
+second application:                           []
+schema versions before:              1 through 9
+schema versions after:              1 through 10
+quick_check before / after:               ok / ok
+index name:             idx_jobs_unique_active
+index unique / partial:             true / true
+index columns:          job_type, archive_id
+index predicate:        pending, claimed, running
+```
+
+The stored index SQL is:
+
+```sql
+CREATE UNIQUE INDEX idx_jobs_unique_active
+    ON jobs(job_type, archive_id)
+    WHERE status IN ('pending', 'claimed', 'running')
+```
+
+Post-migration validation confirmed:
+
+```text
+job rows before / after:       272,074 / 272,074
+job snapshot before / after:          identical
+all production counts unchanged:           true
+active jobs:                                  0
+duplicate active identity groups:            0
+active null-archive jobs:                     0
+dHash / pHash:            1,795,474 / 1,795,474
+eligible archives remaining:            22,554
+near-duplicate candidates:                   0
+protected backup unchanged:               true
+backup schema versions:             1 through 9
+backup quick_check:                          ok
+```
+
+Apply report:
+
+```text
+G:\ComicAutomation\logs\perceptual-hashing\
+  migration-010-apply-20260730-194853.json
+```
+
+An independent final read-only audit reported schema versions 1–10 and
+the unique index on the working database, while the protected backup
+remained at versions 1–9 without the index.
+
+## 15. Next work
+
+Before the next guarded perceptual-hash batch:
+
+- create and independently verify a fresh schema-10 protected backup;
+- capture exact schema-10 preflight counts;
+- require zero active jobs and a clean synchronized repository;
+- run another bounded batch through the new atomic enqueue path;
+- reconcile outcomes, hashes, eligibility, integrity, and backup state.
+
+The broader roadmap remains unchanged: complete and audit the Version 1
+backfill before introducing immutable archive revisions, provenance
+migration, and the minimum local DAL.
