@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,14 +19,23 @@ from comic_automation.database.migrations import apply_migrations
 from comic_automation.jobs import (
     InvalidJobTransitionError,
     JobQueue,
-    JobStatus,
+)
+from comic_automation.jobs.abandoned_job_audit import (
+    WORKER_LIVENESS_WARNING,
+    OutputPathCollisionError,
 )
 from comic_automation.jobs.abandoned_job_recovery import (
     MINIMUM_OLDER_THAN_SECONDS,
     RECOVERY_ERROR_MESSAGE,
+    SNAPSHOT_DIGEST_VERSION,
     ExpectedCountMismatchError,
     ExpectedCountRequiredError,
+    ExpectedSnapshotRequiredError,
+    OutputPathExistsError,
+    SnapshotMismatchError,
     UnsafeOlderThanSecondsError,
+    WorkersNotStoppedError,
+    compute_snapshot_digest,
     run_recovery,
 )
 
@@ -42,6 +54,7 @@ OLDER_THAN_SECONDS = 3600  # 1 hour -- below MINIMUM_OLDER_THAN_SECONDS,
 
 STALE = "2026-07-30 10:00:00"
 VERY_STALE = "2026-07-30 09:00:00"
+MIDDLING_STALE = "2026-07-30 10:30:00"
 FRESH = "2026-07-30 11:55:00"
 
 
@@ -94,6 +107,28 @@ def _fetch_job(database: Path, job_id: int) -> sqlite3.Row:
         return connection.execute(
             "SELECT * FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()
+
+
+def _review(
+    database: Path,
+    *,
+    older_than_seconds: int = OLDER_THAN_SECONDS,
+) -> tuple[int, str]:
+    """Replay the operator workflow: preview, then capture the guards.
+
+    Returns the (count, snapshot digest) pair an operator would read off
+    a report-only run and pass back to --confirm. Every confirming test
+    below goes through this helper, so the tests exercise the same
+    two-step review-then-confirm path a human uses rather than
+    hand-computing the attestations.
+    """
+    output = run_recovery(
+        database=database,
+        older_than_seconds=older_than_seconds,
+        allow_short_window=True,
+        now=NOW,
+    )
+    return output["would_recover_count"], output["snapshot_digest"]
 
 
 # --- report-only mode is strictly read-only ------------------------------
@@ -165,6 +200,7 @@ def test_confirm_without_expected_count_is_refused(
             older_than_seconds=OLDER_THAN_SECONDS,
             allow_short_window=True,
             confirm=True,
+            workers_stopped=True,
             now=NOW,
         )
 
@@ -180,12 +216,16 @@ def test_mutation_never_happens_without_confirm_flag(
         apply_migrations(connection, MIGRATION_DIRECTORY)
         job_id = seed_job(connection, status="claimed", claimed_at=STALE)
 
+    count, digest = _review(database)
+
     run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         now=NOW,
-        expected_count=1,
+        expected_count=count,
+        expected_snapshot=digest,
+        workers_stopped=True,
         confirm=False,
     )
 
@@ -239,6 +279,543 @@ def test_window_at_floor_does_not_require_override(
     assert output["applied"] is False
 
 
+# --- worker-liveness attestation (age is not proof of abandonment) --------
+
+
+def test_confirm_without_workers_stopped_is_refused_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """
+    Without leases or heartbeats, a stale claimed/running timestamp is
+    equally consistent with a dead worker and a legitimately slow one
+    (a large archive can take a long time to decode). The age floor is
+    a typo guard, not evidence, so confirm mode must refuse outright
+    unless the operator attests that workers are stopped -- even when
+    every other guard is satisfied.
+    """
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        job_id = seed_job(connection, status="claimed", claimed_at=STALE)
+
+    count, digest = _review(database)
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(WorkersNotStoppedError) as excinfo:
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            confirm=True,
+            expected_count=count,
+            expected_snapshot=digest,
+            now=NOW,
+        )
+
+    # The refusal must explain the limitation, not just name a flag.
+    assert "--workers-stopped" in str(excinfo.value)
+    assert WORKER_LIVENESS_WARNING in str(excinfo.value)
+
+    assert database.read_bytes() == before_bytes
+    assert _fetch_job(database, job_id)["status"] == "claimed"
+
+
+def test_liveness_warning_is_surfaced_in_preview_and_json(
+    tmp_path: Path,
+) -> None:
+    """The operator must meet the warning while deciding, not after."""
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        seed_job(connection, status="claimed", claimed_at=STALE)
+
+    json_output = tmp_path / "reports" / "preview.json"
+
+    output = run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        now=NOW,
+        json_output=json_output,
+    )
+
+    assert output["worker_liveness_warning"] == WORKER_LIVENESS_WARNING
+    assert output["workers_stopped_attested"] is False
+
+    written = json.loads(json_output.read_text(encoding="utf-8"))
+    assert written["worker_liveness_warning"] == WORKER_LIVENESS_WARNING
+    assert written["snapshot_digest"] == output["snapshot_digest"]
+
+
+# --- output path validation (a report must never clobber the database) ----
+
+
+def _seeded_database(tmp_path: Path) -> Path:
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        seed_job(connection, status="claimed", claimed_at=STALE)
+
+    return database
+
+
+def test_json_output_cannot_equal_database_path(tmp_path: Path) -> None:
+    database = _seeded_database(tmp_path)
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(OutputPathCollisionError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            now=NOW,
+            json_output=database,
+        )
+
+    assert database.read_bytes() == before_bytes
+
+
+def test_json_output_cannot_alias_database_via_hardlink(
+    tmp_path: Path,
+) -> None:
+    database = _seeded_database(tmp_path)
+    before_bytes = database.read_bytes()
+
+    alias = tmp_path / "alias.json"
+
+    try:
+        os.link(database, alias)
+    except (OSError, NotImplementedError, AttributeError) as exc:
+        pytest.skip(f"hard links unsupported on this filesystem: {exc}")
+
+    with pytest.raises(OutputPathCollisionError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            now=NOW,
+            json_output=alias,
+        )
+
+    assert database.read_bytes() == before_bytes
+
+
+def test_existing_json_output_is_refused(tmp_path: Path) -> None:
+    """
+    A recovery report is the only durable evidence a destructive run
+    happened; silently replacing a prior run's report would destroy it.
+    """
+    database = _seeded_database(tmp_path)
+
+    existing = tmp_path / "previous-run.json"
+    existing.write_text("prior evidence\n", encoding="utf-8")
+
+    with pytest.raises(OutputPathExistsError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            now=NOW,
+            json_output=existing,
+        )
+
+    assert existing.read_text(encoding="utf-8") == "prior evidence\n"
+
+
+def test_rejected_output_path_leaves_filesystem_untouched(
+    tmp_path: Path,
+) -> None:
+    """
+    Validation runs before the database is opened or fingerprinted and
+    before any parent directory is created, so a rejected run must
+    leave the filesystem byte-for-byte as it found it -- creating no
+    directories and not touching the database.
+    """
+    database = _seeded_database(tmp_path)
+    before_bytes = database.read_bytes()
+    before_entries = sorted(entry.name for entry in tmp_path.iterdir())
+
+    nested = tmp_path / "reports" / "nested" / "recovery.json"
+
+    # Confirm mode with every other guard satisfied, so the only thing
+    # that can stop this run is the output-path check -- and it must
+    # stop it before mkdir -p of the report's parent directories and
+    # before the database is opened.
+    with pytest.raises(OutputPathCollisionError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            confirm=True,
+            workers_stopped=True,
+            expected_count=1,
+            expected_snapshot="0" * 64,
+            now=NOW,
+            json_output=database,
+        )
+
+    assert not nested.parent.exists()
+    assert not (tmp_path / "reports").exists()
+    assert database.read_bytes() == before_bytes
+
+    # No directory (and nothing else) was created anywhere.
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == (
+        before_entries
+    )
+
+    # And the same holds for a nested output path that is refused for
+    # already existing.
+    nested.parent.mkdir(parents=True)
+    nested.write_text("prior evidence\n", encoding="utf-8")
+    deeper = tmp_path / "reports" / "nested" / "deeper" / "recovery.json"
+
+    with pytest.raises(OutputPathExistsError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            now=NOW,
+            json_output=nested,
+        )
+
+    assert not deeper.parent.exists()
+    assert nested.read_text(encoding="utf-8") == "prior evidence\n"
+    assert database.read_bytes() == before_bytes
+
+
+# --- snapshot digest: identity of the reviewed set ------------------------
+
+
+def test_snapshot_digest_matches_documented_serialization(
+    tmp_path: Path,
+) -> None:
+    """
+    Pins the canonical serialization documented in the module
+    docstring, so any accidental change to the field list, ordering, or
+    rendering fails loudly instead of silently invalidating digests
+    operators may already be holding.
+    """
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        job_id = seed_job(
+            connection,
+            status="claimed",
+            claimed_at=STALE,
+            attempts=1,
+            max_attempts=3,
+        )
+
+    output = run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        now=NOW,
+    )
+
+    payload = (
+        "\n".join(
+            [
+                SNAPSHOT_DIGEST_VERSION,
+                f"job_id={job_id}|status=claimed|attempts=1|"
+                f"max_attempts=3|effective_activity_at={STALE}|"
+                "projected_outcome=pending",
+            ]
+        )
+        + "\n"
+    )
+    expected = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    assert output["snapshot_digest"] == expected
+    assert output["snapshot_digest_version"] == SNAPSHOT_DIGEST_VERSION
+
+
+def test_snapshot_digest_sorts_by_job_id_not_query_order(
+    tmp_path: Path,
+) -> None:
+    """
+    collect_stale_jobs() orders by activity timestamp, which ties and
+    is therefore not a stable identity ordering. The digest sorts by
+    job_id so it is reproducible regardless of query order.
+    """
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        # Lower id, newer activity: query order is [second, first],
+        # canonical order must be [first, second].
+        first = seed_job(connection, status="claimed", claimed_at=STALE)
+        second = seed_job(
+            connection, status="claimed", claimed_at=VERY_STALE
+        )
+
+    assert first < second
+
+    output = run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        now=NOW,
+    )
+
+    assert [job["job_id"] for job in output["jobs"]] == [second, first]
+
+    payload = (
+        "\n".join(
+            [
+                SNAPSHOT_DIGEST_VERSION,
+                f"job_id={first}|status=claimed|attempts=1|"
+                f"max_attempts=3|effective_activity_at={STALE}|"
+                "projected_outcome=pending",
+                f"job_id={second}|status=claimed|attempts=1|"
+                f"max_attempts=3|effective_activity_at={VERY_STALE}|"
+                "projected_outcome=pending",
+            ]
+        )
+        + "\n"
+    )
+    assert output["snapshot_digest"] == hashlib.sha256(
+        payload.encode("utf-8")
+    ).hexdigest()
+
+
+def test_snapshot_digest_changes_when_attempts_change(
+    tmp_path: Path,
+) -> None:
+    """
+    attempts/max_attempts decide retry-versus-permanent-fail, so a
+    change there changes what recovery would *do* to an unchanged set
+    of job ids. The digest must move even though the ids do not.
+    """
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        job_id = seed_job(
+            connection,
+            status="claimed",
+            claimed_at=STALE,
+            attempts=1,
+            max_attempts=3,
+        )
+
+    _, before_digest = _review(database)
+
+    with database_connection(database) as connection:
+        connection.execute(
+            "UPDATE jobs SET attempts = 3 WHERE id = ?", (job_id,)
+        )
+
+    count_after, after_digest = _review(database)
+
+    assert count_after == 1  # the count guard sees nothing at all
+    assert after_digest != before_digest
+
+
+def test_equal_count_set_swap_is_rejected_by_digest(
+    tmp_path: Path,
+) -> None:
+    """
+    The exact scenario --expected-count cannot detect: one reviewed job
+    leaves the stale set while a different, never-reviewed job enters
+    it. The count is unchanged, so the count guard passes; only the
+    digest binds the *identity* of the reviewed set. Nothing may be
+    written.
+    """
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        reviewed_a = seed_job(
+            connection, status="claimed", claimed_at=STALE
+        )
+        reviewed_b = seed_job(
+            connection, status="claimed", claimed_at=STALE
+        )
+        # Not stale at review time, so never part of the reviewed set.
+        unreviewed = seed_job(
+            connection, status="claimed", claimed_at=FRESH
+        )
+
+    reviewed_count, reviewed_digest = _review(database)
+    assert reviewed_count == 2
+
+    # The swap: a worker completes reviewed_a (it leaves the stale
+    # set), and unreviewed crosses the age threshold (it enters).
+    with database_connection(database) as connection:
+        JobQueue(connection).mark_completed(reviewed_a, worker_id="worker-1")
+        connection.execute(
+            "UPDATE jobs SET claimed_at = ? WHERE id = ?",
+            (MIDDLING_STALE, unreviewed),
+        )
+
+    live_count, live_digest = _review(database)
+
+    # The count guard alone would have waved this through...
+    assert live_count == reviewed_count
+    # ...but the set is not the reviewed set.
+    assert live_digest != reviewed_digest
+
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(SnapshotMismatchError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            confirm=True,
+            workers_stopped=True,
+            expected_count=reviewed_count,
+            expected_snapshot=reviewed_digest,
+            now=NOW,
+        )
+
+    assert database.read_bytes() == before_bytes
+    assert _fetch_job(database, reviewed_a)["status"] == "completed"
+    assert _fetch_job(database, reviewed_b)["status"] == "claimed"
+    assert _fetch_job(database, unreviewed)["status"] == "claimed"
+
+
+def test_confirm_without_expected_snapshot_is_refused(
+    tmp_path: Path,
+) -> None:
+    database = _seeded_database(tmp_path)
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(ExpectedSnapshotRequiredError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            confirm=True,
+            workers_stopped=True,
+            expected_count=1,
+            now=NOW,
+        )
+
+    assert database.read_bytes() == before_bytes
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "",
+        "not-a-digest",
+        "abc123",
+        "0" * 63,
+        "0" * 65,
+        "z" * 64,
+    ],
+)
+def test_malformed_expected_snapshot_is_refused(
+    tmp_path: Path,
+    malformed: str,
+) -> None:
+    """
+    A truncated or mistyped digest is rejected as unusable input rather
+    than falling through to SnapshotMismatchError, which would send the
+    operator chasing a race that never happened.
+    """
+    database = _seeded_database(tmp_path)
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(ExpectedSnapshotRequiredError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            confirm=True,
+            workers_stopped=True,
+            expected_count=1,
+            expected_snapshot=malformed,
+            now=NOW,
+        )
+
+    assert database.read_bytes() == before_bytes
+
+
+def test_expected_snapshot_accepts_copy_pasted_whitespace_and_case(
+    tmp_path: Path,
+) -> None:
+    """Operators copy digests out of a terminal; be forgiving there."""
+    database = _seeded_database(tmp_path)
+
+    count, digest = _review(database)
+
+    output = run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        confirm=True,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=f"  {digest.upper()}  ",
+        now=NOW,
+    )
+
+    assert output["recovered_count"] == 1
+
+
+def test_matching_snapshot_permits_recovery(tmp_path: Path) -> None:
+    """Happy path: the reviewed set is unchanged, so recovery runs."""
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        job_id = seed_job(connection, status="claimed", claimed_at=STALE)
+
+    count, digest = _review(database)
+
+    output = run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        confirm=True,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
+        now=NOW,
+    )
+
+    assert output["applied"] is True
+    assert output["recovered_count"] == 1
+    assert output["snapshot_digest"] == digest
+    assert output["expected_snapshot"] == digest
+    assert output["workers_stopped_attested"] is True
+    assert _fetch_job(database, job_id)["status"] == "pending"
+
+
+def test_empty_stale_set_has_a_stable_digest(tmp_path: Path) -> None:
+    """
+    "There is nothing to recover" is itself a claim worth binding, so
+    the empty set has a well-defined digest rather than no digest.
+    """
+    database = tmp_path / "recovery.db"
+    build_database(database)
+
+    count, digest = _review(database)
+
+    assert count == 0
+    assert digest == compute_snapshot_digest([])
+
+    output = run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        confirm=True,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
+        now=NOW,
+    )
+
+    assert output["recovered_count"] == 0
+
+
 # --- expected-count guard protects against a changed live set -------------
 
 
@@ -251,6 +828,7 @@ def test_expected_count_mismatch_is_refused_and_nothing_changes(
         apply_migrations(connection, MIGRATION_DIRECTORY)
         seed_job(connection, status="claimed", claimed_at=STALE)
 
+    _, digest = _review(database)
     before_bytes = database.read_bytes()
 
     with pytest.raises(ExpectedCountMismatchError):
@@ -259,7 +837,9 @@ def test_expected_count_mismatch_is_refused_and_nothing_changes(
             older_than_seconds=OLDER_THAN_SECONDS,
             allow_short_window=True,
             confirm=True,
+            workers_stopped=True,
             expected_count=2,  # wrong: only one stale job exists
+            expected_snapshot=digest,
             now=NOW,
         )
 
@@ -282,13 +862,8 @@ def test_confirm_refuses_when_job_completed_after_review(
         job_one = seed_job(connection, status="claimed", claimed_at=STALE)
         job_two = seed_job(connection, status="claimed", claimed_at=STALE)
 
-    preview = run_recovery(
-        database=database,
-        older_than_seconds=OLDER_THAN_SECONDS,
-        allow_short_window=True,
-        now=NOW,
-    )
-    assert preview["would_recover_count"] == 2
+    count, digest = _review(database)
+    assert count == 2
 
     # A worker completes job_one between the preview and the confirm
     # call -- exactly the race this guard exists to catch.
@@ -301,7 +876,9 @@ def test_confirm_refuses_when_job_completed_after_review(
             older_than_seconds=OLDER_THAN_SECONDS,
             allow_short_window=True,
             confirm=True,
-            expected_count=2,  # stale count reviewed a moment ago
+            workers_stopped=True,
+            expected_count=count,  # stale count reviewed a moment ago
+            expected_snapshot=digest,
             now=NOW,
         )
 
@@ -340,12 +917,16 @@ def test_recovery_recovers_retryable_and_exhausted_jobs(
             max_attempts=3,
         )
 
+    count, digest = _review(database)
+
     output = run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         confirm=True,
-        expected_count=2,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
         now=NOW,
     )
 
@@ -373,12 +954,17 @@ def test_fresh_jobs_are_never_recovered(tmp_path: Path) -> None:
         apply_migrations(connection, MIGRATION_DIRECTORY)
         seed_job(connection, status="claimed", claimed_at=FRESH)
 
+    count, digest = _review(database)
+    assert count == 0
+
     output = run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         confirm=True,
-        expected_count=0,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
         now=NOW,
     )
 
@@ -401,12 +987,16 @@ def test_attempts_are_never_reset_by_recovery(tmp_path: Path) -> None:
             max_attempts=5,
         )
 
+    count, digest = _review(database)
+
     run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         confirm=True,
-        expected_count=1,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
         now=NOW,
     )
 
@@ -445,12 +1035,16 @@ def test_error_message_is_already_null_before_recovery(
     before_row = _fetch_job(database, job_id)
     assert before_row["error_message"] is None
 
+    count, digest = _review(database)
+
     run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         confirm=True,
-        expected_count=1,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
         now=NOW,
     )
 
@@ -477,30 +1071,31 @@ def test_second_immediate_run_recovers_nothing_new(
             max_attempts=3,
         )
 
+    count, digest = _review(database)
+
     first = run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         confirm=True,
-        expected_count=1,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
         now=NOW,
     )
     assert first["recovered_count"] == 1
 
-    preview_again = run_recovery(
-        database=database,
-        older_than_seconds=OLDER_THAN_SECONDS,
-        allow_short_window=True,
-        now=NOW,
-    )
-    assert preview_again["would_recover_count"] == 0
+    second_count, second_digest = _review(database)
+    assert second_count == 0
 
     second = run_recovery(
         database=database,
         older_than_seconds=OLDER_THAN_SECONDS,
         allow_short_window=True,
         confirm=True,
-        expected_count=0,
+        workers_stopped=True,
+        expected_count=second_count,
+        expected_snapshot=second_digest,
         now=NOW,
     )
     assert second["recovered_count"] == 0
@@ -509,6 +1104,48 @@ def test_second_immediate_run_recovers_nothing_new(
     # Still pending from the first recovery; the second run did not
     # touch it again (it is no longer claimed/running).
     assert row["status"] == "pending"
+
+
+def test_stale_digest_from_before_a_recovery_is_refused(
+    tmp_path: Path,
+) -> None:
+    """
+    Re-running an old --confirm command line after a successful
+    recovery must not silently become a no-op "success": the digest
+    from before the recovery no longer describes the live set.
+    """
+    database = tmp_path / "recovery.db"
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        seed_job(connection, status="claimed", claimed_at=STALE)
+
+    count, digest = _review(database)
+
+    run_recovery(
+        database=database,
+        older_than_seconds=OLDER_THAN_SECONDS,
+        allow_short_window=True,
+        confirm=True,
+        workers_stopped=True,
+        expected_count=count,
+        expected_snapshot=digest,
+        now=NOW,
+    )
+
+    # The stale set is now empty, so the count guard catches this one
+    # first; the digest would too.
+    with pytest.raises(ExpectedCountMismatchError):
+        run_recovery(
+            database=database,
+            older_than_seconds=OLDER_THAN_SECONDS,
+            allow_short_window=True,
+            confirm=True,
+            workers_stopped=True,
+            expected_count=count,
+            expected_snapshot=digest,
+            now=NOW,
+        )
 
 
 # --- rollback is all-or-nothing for the batch ------------------------------
@@ -545,6 +1182,8 @@ def test_exception_mid_batch_rolls_back_every_row(
             max_attempts=3,
         )
 
+    count, digest = _review(database)
+
     import comic_automation.jobs.abandoned_job_recovery as recovery_module
 
     original = recovery_module._apply_recovery_row
@@ -566,7 +1205,9 @@ def test_exception_mid_batch_rolls_back_every_row(
             older_than_seconds=OLDER_THAN_SECONDS,
             allow_short_window=True,
             confirm=True,
-            expected_count=2,
+            workers_stopped=True,
+            expected_count=count,
+            expected_snapshot=digest,
             now=NOW,
         )
 
