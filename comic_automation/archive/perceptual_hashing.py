@@ -600,7 +600,19 @@ class ArchivePerceptualHashRepository:
             ),
         )
 
-    def enqueue_missing(self, *, limit: int | None = None) -> int:
+    def _eligible_archive_rows(
+        self, *, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        """The literal eligibility predicate `enqueue_missing()` uses.
+
+        Extracted to a single read-only SELECT so any caller that only
+        needs to *count* or inspect eligible archives -- notably a
+        strictly read-only postflight audit -- can reuse the exact
+        production predicate without going anywhere near
+        `enqueue_missing()`'s write path (`JobQueue.enqueue_if_absent`).
+        Issuing only this SELECT is safe on a connection opened with
+        SQLite's `mode=ro` URI flag plus `PRAGMA query_only = ON`.
+        """
         limit_clause = ""
         parameters: list[int] = []
 
@@ -631,7 +643,7 @@ class ArchivePerceptualHashRepository:
         # knows about active statuses and would happily create a new
         # job after a failure, so this clause -- not the helper -- is
         # what preserves that policy.
-        rows = self.connection.execute(
+        return self.connection.execute(
             f"""
             SELECT acs.archive_id
             FROM archive_content_signatures AS acs
@@ -683,6 +695,9 @@ class ArchivePerceptualHashRepository:
                 *parameters,
             ],
         ).fetchall()
+
+    def enqueue_missing(self, *, limit: int | None = None) -> int:
+        rows = self._eligible_archive_rows(limit=limit)
         queue = JobQueue(self.connection)
         created = 0
 
@@ -699,6 +714,17 @@ class ArchivePerceptualHashRepository:
         # Count rows actually inserted, not candidates considered (see
         # ArchiveHashRepository.enqueue_missing for the reasoning).
         return created
+
+    def count_eligible(self) -> int:
+        """Read-only count of archives `enqueue_missing()` would enqueue.
+
+        Uses the exact same eligibility predicate as `enqueue_missing()`
+        (`_eligible_archive_rows`) but issues only a SELECT, so it is
+        safe to call on a connection opened with SQLite's `mode=ro` URI
+        flag plus `PRAGMA query_only = ON` -- unlike `enqueue_missing()`
+        itself, which writes new job rows.
+        """
+        return len(self._eligible_archive_rows(limit=None))
 
 
 class HashArchivePagesPerceptualHandler:
