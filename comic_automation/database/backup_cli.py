@@ -18,14 +18,24 @@ tested command:
   mid-backup, and the backup cannot be trusted as a clean snapshot;
 - `PRAGMA quick_check` is run against the source both before and after
   the backup, and against the freshly written backup file;
-- applied `schema_migrations` versions, the full set of index names
-  (including the exact predicate of the unique active-job index), and
-  row counts for the core tables are compared between source and
-  backup;
+- the schema being verified is *discovered from the source database
+  itself*, never from a list maintained by hand: every user table in
+  `sqlite_master` has its row count compared, and every row of
+  `sqlite_master` (tables, indexes, views, triggers) has its `type`,
+  `name`, `tbl_name` and full `sql` text compared verbatim. A table
+  added by a future migration is therefore compared the day it
+  appears, with no code change here -- the failure mode this replaced
+  was a hard-coded table list silently going stale and letting a
+  backup differ from its source in an uncompared table while still
+  being reported as verified;
+- applied `schema_migrations` versions are compared as well (the
+  `schema_migrations` table is treated as an ordinary user table for
+  row-count purposes, and additionally has its contents compared);
 - every check is recorded, with an overall `verified` flag, in a
-  durable JSON report -- and the report path (like the backup path) is
-  validated against the source database before anything is written,
-  so it can never clobber either database.
+  durable JSON report -- and the report path (like the backup path)
+  must not already exist and is validated against both databases
+  before anything is written, so it can neither clobber a database
+  nor destroy the evidence of an earlier verification run.
 """
 
 from __future__ import annotations
@@ -41,38 +51,6 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 
-# The core tables this tool compares row counts for by default. Names
-# come directly from `comic_automation/database/migrations/*.sql`:
-#   001_operational_foundation.sql: application_settings,
-#       processing_runs, processing_stages, processing_items,
-#       source_batches, archive_files, file_locations, file_events, jobs
-#   002_discovery_checkpoints.sql: discovery_checkpoints
-#   003_archive_inspections.sql: archive_inspections
-#   006_archive_hashes.sql: archive_hashes
-#   007_archive_page_hashes.sql: archive_pages, page_hashes,
-#       archive_content_signatures
-#   008_near_duplicate_candidates.sql: near_duplicate_candidates
-#   009_archive_quarantine.sql: archive_quarantine
-DEFAULT_TABLES: tuple[str, ...] = (
-    "application_settings",
-    "processing_runs",
-    "processing_stages",
-    "processing_items",
-    "source_batches",
-    "archive_files",
-    "file_locations",
-    "file_events",
-    "jobs",
-    "discovery_checkpoints",
-    "archive_inspections",
-    "archive_hashes",
-    "archive_pages",
-    "page_hashes",
-    "archive_content_signatures",
-    "near_duplicate_candidates",
-    "archive_quarantine",
-)
-
 # Migration 010's partial unique index -- see
 # comic_automation/database/migrations/010_unique_active_jobs.sql:
 #
@@ -81,11 +59,31 @@ DEFAULT_TABLES: tuple[str, ...] = (
 #       WHERE status IN ('pending', 'claimed', 'running');
 #
 # The handoff doc requires confirming this index "exists on both
-# copies with the exact production predicate", so its `sqlite_master`
-# SQL text (not just its name) is compared between source and backup.
+# copies with the exact production predicate", so it gets its own
+# named checks in the report for operator clarity.
+#
+# It is *not* how schema drift is caught: the verbatim whole-schema
+# comparison (`schema_objects()`) already proves this index's SQL text
+# -- predicate included -- is byte-identical on both copies, along
+# with every other schema object. Naming this one index is a
+# readability affordance for whoever reads the report, nothing more.
 UNIQUE_ACTIVE_INDEX_NAME = "idx_jobs_unique_active"
 
+# Caller-supplied `--table` overrides are held to plain-identifier
+# syntax. Names discovered from `sqlite_master` are quoted instead
+# (see `_quote_identifier`), because SQLite happily permits table
+# names this pattern would reject and discovery must never refuse to
+# compare a table that actually exists.
 _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# `sqlite_master` rows SQLite maintains for itself: `sqlite_sequence`
+# (AUTOINCREMENT bookkeeping), `sqlite_stat1` (ANALYZE output),
+# `sqlite_autoindex_*` (implicit UNIQUE/PK indexes). They are excluded
+# from *table discovery* -- they are not user data and some are not
+# even selectable -- but deliberately left in the whole-schema
+# comparison, where their presence and definitions still have to agree
+# between source and backup.
+_SQLITE_INTERNAL_PREFIX = "sqlite_"
 
 
 class BackupError(RuntimeError):
@@ -119,6 +117,20 @@ class BackupDestinationExistsError(FileExistsError):
 
     This tool never overwrites an existing file -- a caller that wants
     to replace a previous backup must remove or rename it first.
+    """
+
+
+class ReportDestinationExistsError(FileExistsError):
+    """Raised when the requested `--json-output` path already exists.
+
+    A verification report is the durable evidence that some earlier
+    backup was a faithful copy; the handoff doc's read-only audit
+    rules say to "always use new output paths and keep reports outside
+    the repository" for exactly that reason. Silently overwriting one
+    destroys that evidence, so a report path that already exists is
+    refused up front -- alongside the backup-destination check, before
+    any backup work is done -- rather than at write time, after the
+    expensive part already ran.
     """
 
 
@@ -219,6 +231,113 @@ def applied_schema_versions(connection: sqlite3.Connection) -> list[int]:
     ]
 
 
+def discover_user_tables(connection: sqlite3.Connection) -> list[str]:
+    """Every user table in this database, read from `sqlite_master`.
+
+    This is the tool's source of truth for *what to compare*. It is
+    deliberately not a list kept in this file: a hand-maintained list
+    goes stale the moment a migration adds a table, and a stale list
+    means an uncompared table can differ between source and backup
+    while the run still reports `verified: true`. For a tool whose
+    only job is proving a backup is a faithful copy, that is the one
+    hole that must not exist.
+
+    `sqlite_`-prefixed names are SQLite's own bookkeeping (see
+    `_SQLITE_INTERNAL_PREFIX`) and are excluded. `schema_migrations`
+    is *not* special-cased: it is a user table like any other and its
+    row count is compared like any other (its contents are compared
+    too, by `applied_schema_versions`).
+    """
+    rows = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+        ORDER BY name
+        """
+    ).fetchall()
+
+    return [
+        str(row["name"])
+        for row in rows
+        if not str(row["name"]).startswith(_SQLITE_INTERNAL_PREFIX)
+    ]
+
+
+def schema_objects(
+    connection: sqlite3.Connection,
+) -> list[dict[str, str | None]]:
+    """The complete `sqlite_master` contents, normalised for comparison.
+
+    Every schema object -- tables, indexes, views, triggers, including
+    SQLite's implicit `sqlite_autoindex_*` entries -- with its `type`,
+    `name`, `tbl_name` and full `sql` text exactly as stored. Comparing
+    this list verbatim between source and backup is what actually
+    proves the two schemas are identical; it subsumes any targeted
+    per-object check, because a differing partial-index predicate, a
+    renamed trigger, a missing view or a dropped table all show up
+    here as a difference in the list.
+
+    Rows are ordered by `(type, name, tbl_name)` so the comparison does
+    not depend on `sqlite_master`'s physical row order, which the
+    online backup API is not obliged to preserve.
+    """
+    rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, sql
+        FROM sqlite_master
+        ORDER BY type, name, tbl_name
+        """
+    ).fetchall()
+
+    return [
+        {
+            "type": str(row["type"]),
+            "name": str(row["name"]),
+            "tbl_name": str(row["tbl_name"]),
+            "sql": row["sql"],
+        }
+        for row in rows
+    ]
+
+
+def schema_object_differences(
+    source: Sequence[dict[str, str | None]],
+    backup: Sequence[dict[str, str | None]],
+) -> dict[str, list]:
+    """Explain *how* two `schema_objects()` listings differ.
+
+    The boolean check is the gate; this is what an operator reads when
+    the gate fails, so the report says which object drifted rather
+    than only that something did.
+    """
+    source_by_key = {(item["type"], item["name"]): item for item in source}
+    backup_by_key = {(item["type"], item["name"]): item for item in backup}
+
+    only_in_source = sorted(set(source_by_key) - set(backup_by_key))
+    only_in_backup = sorted(set(backup_by_key) - set(source_by_key))
+    differing = [
+        {
+            "type": key[0],
+            "name": key[1],
+            "source": source_by_key[key],
+            "backup": backup_by_key[key],
+        }
+        for key in sorted(set(source_by_key) & set(backup_by_key))
+        if source_by_key[key] != backup_by_key[key]
+    ]
+
+    return {
+        "only_in_source": [
+            {"type": key[0], "name": key[1]} for key in only_in_source
+        ],
+        "only_in_backup": [
+            {"type": key[0], "name": key[1]} for key in only_in_backup
+        ],
+        "differing": differing,
+    }
+
+
 def index_definitions(connection: sqlite3.Connection) -> dict[str, str | None]:
     """Every index name and its `sqlite_master` SQL text.
 
@@ -227,6 +346,10 @@ def index_definitions(connection: sqlite3.Connection) -> dict[str, str | None]:
     included here by name so index *presence* still compares correctly
     between source and backup, even though their definition text is
     not directly inspectable.
+
+    Kept as a legible index inventory for the report and as a
+    narrower, independently-failing check; the authoritative schema
+    comparison is `schema_objects()`, which covers these rows too.
     """
     rows = connection.execute(
         "SELECT name, sql FROM sqlite_master WHERE type = 'index' ORDER BY name"
@@ -242,6 +365,22 @@ def index_sql(connection: sqlite3.Connection, name: str) -> str | None:
     return row["sql"] if row is not None else None
 
 
+def _quote_identifier(name: str) -> str:
+    """Quote a table name for interpolation into a COUNT(*) query.
+
+    Table names come from `sqlite_master`, not from user input, but
+    they are still interpolated as text (SQLite has no parameter slot
+    for an identifier), so they are double-quoted with embedded quotes
+    doubled -- the standard SQL escape. A NUL byte cannot be quoted at
+    all and is refused outright.
+    """
+    if "\x00" in name:
+        raise ValueError(f"Not a usable table name: {name!r}")
+
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
 def table_counts(
     connection: sqlite3.Connection,
     tables: Sequence[str],
@@ -249,11 +388,8 @@ def table_counts(
     counts: dict[str, int] = {}
 
     for table in tables:
-        if not _VALID_IDENTIFIER.match(table):
-            raise ValueError(f"Not a valid table name: {table!r}")
-
         row = connection.execute(
-            f"SELECT COUNT(*) AS row_count FROM {table}"
+            f"SELECT COUNT(*) AS row_count FROM {_quote_identifier(table)}"
         ).fetchone()
         counts[table] = int(row["row_count"])
 
@@ -310,9 +446,30 @@ def validate_backup_paths(
                 f"file as --backup ({backup})."
             )
 
+        # Checked here, with the other destination checks, rather than
+        # at write time: the report is written last, so a late check
+        # would let a run do the whole backup and only then fail --
+        # and a *failure*-path report would have overwritten the older
+        # evidence before anyone noticed. Refusing up front means a
+        # run that cannot record its result never starts.
+        if json_output.exists():
+            raise ReportDestinationExistsError(
+                f"--json-output ({json_output}) already exists; refusing "
+                "to overwrite a previous verification report."
+            )
+
 
 def _write_json(path: Path, payload: object) -> Path:
     resolved = path.resolve(strict=False)
+
+    # Belt-and-braces against the up-front check in
+    # `validate_backup_paths`: if something created this path between
+    # validation and now, the report is still not clobbered.
+    if resolved.exists():
+        raise ReportDestinationExistsError(
+            f"Refusing to overwrite an existing report: {resolved}"
+        )
+
     resolved.parent.mkdir(parents=True, exist_ok=True)
     resolved.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -327,10 +484,18 @@ def run_backup(
     database: Path,
     backup: Path,
     json_output: Path | None = None,
-    tables: Sequence[str] = DEFAULT_TABLES,
+    tables: Sequence[str] | None = None,
     unique_active_index_name: str = UNIQUE_ACTIVE_INDEX_NAME,
 ) -> dict:
     """Create and verify a guarded online backup of `database`.
+
+    `tables` is an optional override restricting the row-count
+    comparison to the named tables. It exists for callers who
+    knowingly want a narrower check; leaving it `None` (the default,
+    and what the CLI does unless `--table` is passed) compares every
+    user table discovered in the source. Whole-schema comparison and
+    table-set comparison are unconditional -- the override narrows
+    row counting only, never what counts as schema drift.
 
     Returns the verification report on full success. Raises (and, if
     `json_output` was given, still writes a best-effort report
@@ -338,15 +503,19 @@ def run_backup(
     on any failure:
 
     - `FileNotFoundError` if the source database does not exist;
-    - `OutputPathCollisionError` / `BackupDestinationExistsError` if
-      the destination paths are unsafe (raised before anything is
-      written -- no partial report in this case);
+    - `OutputPathCollisionError` / `BackupDestinationExistsError` /
+      `ReportDestinationExistsError` if the destination paths are
+      unsafe or already occupied (raised before anything is opened or
+      written -- no partial report and no backup file in this case);
+    - `ValueError` if a `tables` override names something that is not
+      a discovered user table in the source;
     - `DatabaseIntegrityError` if `PRAGMA quick_check` fails for the
       source (before or after the backup) or for the backup itself;
     - `DatabaseMutatedError` if the source's `PRAGMA data_version` or
       file fingerprint changed during the backup;
-    - `SchemaMismatchError` if the backup's schema, indexes, or table
-      counts do not match the source.
+    - `SchemaMismatchError` if the backup's discovered table set,
+      schema objects, indexes, applied migrations or row counts do
+      not match the source.
     """
     database = Path(database).resolve(strict=False)
 
@@ -354,17 +523,35 @@ def run_backup(
         raise FileNotFoundError(f"Database does not exist: {database}")
 
     backup = Path(backup).resolve(strict=False)
-    tables = list(tables)
+
+    table_override: list[str] | None = None
+    if tables is not None:
+        table_override = list(tables)
+
+        if not table_override:
+            raise ValueError(
+                "tables override is empty; pass None to compare every "
+                "discovered user table."
+            )
+
+        for table in table_override:
+            if not _VALID_IDENTIFIER.match(table):
+                raise ValueError(f"Not a valid table name: {table!r}")
 
     # Checked before anything is opened or created: a rejected run
-    # must leave the filesystem untouched.
+    # must leave the filesystem untouched. Note this call sits outside
+    # the try/except below on purpose -- a run rejected here must not
+    # write the very report file it just refused.
     validate_backup_paths(database, backup, json_output=json_output)
 
     checks: dict[str, bool] = {}
     report: dict = {
         "source_database": str(database),
         "backup_database": str(backup),
-        "tables_compared": tables,
+        "table_selection": (
+            "explicit_override" if table_override is not None
+            else "discovered_from_source"
+        ),
         "unique_active_index_name": unique_active_index_name,
     }
 
@@ -384,17 +571,40 @@ def run_backup(
                 source_quick_check_before = quick_check(connection)
 
                 if source_quick_check_before == "ok":
+                    # Discovery happens here, inside the same read
+                    # transaction as the counts it selects, so the
+                    # table list and the row counts describe one
+                    # consistent view of the source.
+                    source_tables = discover_user_tables(connection)
+                    source_schema = schema_objects(connection)
                     source_schema_versions = applied_schema_versions(
                         connection
                     )
                     source_indexes = index_definitions(connection)
-                    source_counts = table_counts(connection, tables)
+
+                    if table_override is not None:
+                        unknown = sorted(
+                            set(table_override) - set(source_tables)
+                        )
+                        if unknown:
+                            raise ValueError(
+                                "tables override names tables that do not "
+                                f"exist in the source: {unknown}"
+                            )
+                        compared_tables = list(table_override)
+                    else:
+                        compared_tables = list(source_tables)
+
+                    source_counts = table_counts(connection, compared_tables)
                     source_unique_index_sql = index_sql(
                         connection, unique_active_index_name
                     )
                 else:
+                    source_tables = []
+                    source_schema = []
                     source_schema_versions = []
                     source_indexes = {}
+                    compared_tables = []
                     source_counts = {}
                     source_unique_index_sql = None
             finally:
@@ -492,13 +702,41 @@ def run_backup(
                     f"Backup failed PRAGMA quick_check: {backup_quick_check}"
                 )
 
+            backup_tables = discover_user_tables(backup_connection)
+            backup_schema = schema_objects(backup_connection)
             backup_schema_versions = applied_schema_versions(
                 backup_connection
             )
             backup_indexes = index_definitions(backup_connection)
-            backup_counts = table_counts(backup_connection, tables)
+            # Counted only for tables the backup actually has: a table
+            # missing from the backup must surface as a *mismatch* in
+            # the report (both in `tables_match` and as a missing key
+            # here), not as an OperationalError that aborts the run
+            # before any of the comparisons are recorded.
+            backup_present = set(backup_tables)
+            backup_counts = table_counts(
+                backup_connection,
+                [table for table in compared_tables if table in backup_present],
+            )
             backup_unique_index_sql = index_sql(
                 backup_connection, unique_active_index_name
+            )
+
+        report["source_tables"] = source_tables
+        report["backup_tables"] = backup_tables
+        report["tables_compared"] = compared_tables
+
+        # A source with no user tables at all means discovery found
+        # nothing to compare -- "verified" would then be vacuous.
+        checks["source_tables_discovered"] = bool(source_tables)
+        checks["tables_match"] = source_tables == backup_tables
+
+        report["source_schema_objects"] = source_schema
+        report["backup_schema_objects"] = backup_schema
+        checks["schema_objects_match"] = source_schema == backup_schema
+        if not checks["schema_objects_match"]:
+            report["schema_object_differences"] = schema_object_differences(
+                source_schema, backup_schema
             )
 
         report["source_schema_versions"] = source_schema_versions
@@ -517,6 +755,10 @@ def run_backup(
         report["backup_table_counts"] = backup_counts
         checks["table_counts_match"] = source_counts == backup_counts
 
+        # Redundant with `schema_objects_match` above by construction
+        # -- kept because the handoff doc calls this index out by name,
+        # so an operator reading the report should see it named rather
+        # than have to grep the schema dump for it.
         report["source_unique_active_index_sql"] = source_unique_index_sql
         report["backup_unique_active_index_sql"] = backup_unique_index_sql
         checks["unique_active_index_present_in_source"] = (
@@ -568,6 +810,10 @@ def print_summary(report: dict) -> None:
           f"(before) / {report['source_quick_check_after']} (after)")
     print(f"Backup quick_check:  {report['backup_quick_check']}")
     print(f"Schema versions:     {report['source_schema_versions']}")
+    print(f"Tables compared:     {len(report['tables_compared'])} "
+          f"({report['table_selection']})")
+    print(f"Schema objects:      {len(report['source_schema_objects'])} "
+          "compared verbatim")
     print(f"Verified:            {report['verified']}")
 
     if report.get("json_output"):
@@ -578,10 +824,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Guarded, verified SQLite backup. Refuses to overwrite an "
-            "existing destination, copies with SQLite's online backup "
-            "API, and verifies quick_check, PRAGMA data_version and "
-            "file fingerprint stability on the source, and schema/"
-            "index/table-count agreement between source and backup."
+            "existing backup or verification report, copies with "
+            "SQLite's online backup API, and verifies quick_check, "
+            "PRAGMA data_version and file fingerprint stability on the "
+            "source, plus verbatim whole-schema and row-count "
+            "agreement between source and backup for every table "
+            "discovered in the source."
         )
     )
     parser.add_argument(
@@ -601,15 +849,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json-output",
         type=Path,
-        help="Optional path for the JSON verification report.",
+        help=(
+            "Optional path for the JSON verification report. Must not "
+            "already exist -- an earlier report is evidence, not "
+            "scratch space."
+        ),
     )
     parser.add_argument(
         "--table",
         dest="tables",
         action="append",
         help=(
-            "Table to include in the row-count comparison (repeatable). "
-            "Defaults to this schema's core tables."
+            "Restrict the row-count comparison to this table "
+            "(repeatable). By default every user table found in the "
+            "source is compared; this only ever narrows that. Schema "
+            "comparison is unaffected."
         ),
     )
     return parser
@@ -617,7 +871,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    tables = args.tables if args.tables else list(DEFAULT_TABLES)
+    # No --table means full discovery from the source, not a fallback
+    # list: there is no fallback list any more.
+    tables = args.tables if args.tables else None
 
     try:
         report = run_backup(

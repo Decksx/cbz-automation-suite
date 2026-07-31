@@ -11,8 +11,10 @@ from comic_automation.database.backup_cli import (
     DatabaseIntegrityError,
     DatabaseMutatedError,
     OutputPathCollisionError,
+    ReportDestinationExistsError,
     SchemaMismatchError,
     UNIQUE_ACTIVE_INDEX_NAME,
+    _write_json,
     run_backup,
 )
 from comic_automation.database.connection import database_connection
@@ -385,3 +387,377 @@ def test_detects_table_count_mismatch(
 
     with pytest.raises(SchemaMismatchError):
         run_backup(database=database, backup=backup)
+
+
+# --- schema discovery ------------------------------------------------------
+#
+# The comparison set must come from the source database at runtime. A
+# hand-maintained table list goes stale the moment a migration adds a
+# table, and a table nobody compares can differ between source and
+# backup while the run still reports itself verified.
+
+
+def damage_backup_after_copy(
+    monkeypatch: pytest.MonkeyPatch, backup: Path, statements: list[str]
+) -> None:
+    """Let the real online backup run, then mutate the backup's schema.
+
+    Simulates a backup whose schema drifted from the source (a
+    partially-migrated copy, a restore from the wrong generation)
+    without having to corrupt bytes on disk -- the resulting file is a
+    perfectly healthy database that simply is not a faithful copy.
+    """
+    import comic_automation.database.backup_cli as backup_cli
+
+    real_perform_backup = backup_cli._perform_backup
+
+    def damaging_perform_backup(source_connection, destination_connection):
+        real_perform_backup(source_connection, destination_connection)
+        destination_connection.commit()
+        writable = sqlite3.connect(backup)
+        try:
+            for statement in statements:
+                writable.execute(statement)
+            writable.commit()
+        finally:
+            writable.close()
+
+    monkeypatch.setattr(
+        backup_cli, "_perform_backup", damaging_perform_backup
+    )
+
+
+def test_discovers_tables_not_present_in_any_hard_coded_list(
+    tmp_path: Path,
+) -> None:
+    """A table this module has never heard of is still compared.
+
+    Stands in for "migration 011 adds a table": nothing in backup_cli
+    names `future_migration_table`, so if it is discovered and counted,
+    discovery is genuinely reading the source's schema.
+    """
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    build_database(database)
+
+    with database_connection(database) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            CREATE TABLE future_migration_table (
+                id INTEGER PRIMARY KEY,
+                note TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO future_migration_table (note) VALUES ('kept')"
+        )
+        connection.execute(
+            "INSERT INTO future_migration_table (note) VALUES ('also kept')"
+        )
+        connection.execute("COMMIT")
+
+    report = run_backup(database=database, backup=backup)
+
+    assert report["verified"] is True
+    assert "future_migration_table" in report["source_tables"]
+    assert "future_migration_table" in report["tables_compared"]
+    assert report["source_table_counts"]["future_migration_table"] == 2
+    assert report["backup_table_counts"]["future_migration_table"] == 2
+    assert report["table_selection"] == "discovered_from_source"
+
+
+def test_discovered_tables_cover_every_migration_table(
+    tmp_path: Path,
+) -> None:
+    """Discovery finds every table the migrations create, including
+    `schema_migrations`, which is compared like any other user table."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    build_database(database)
+
+    raw = sqlite3.connect(database)
+    try:
+        expected = {
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if not row[0].startswith("sqlite_")
+        }
+    finally:
+        raw.close()
+
+    report = run_backup(database=database, backup=backup)
+
+    assert set(report["source_tables"]) == expected
+    assert set(report["tables_compared"]) == expected
+    assert "schema_migrations" in report["tables_compared"]
+    assert report["source_table_counts"]["schema_migrations"] == 10
+
+
+def test_excludes_sqlite_internal_tables_from_discovery(
+    tmp_path: Path,
+) -> None:
+    """`sqlite_sequence`, `sqlite_stat1` and friends are SQLite's own
+    bookkeeping: excluded from table discovery, but still present in
+    the whole-schema comparison."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    build_database(database)
+
+    with database_connection(database) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        # AUTOINCREMENT forces SQLite to create `sqlite_sequence`.
+        connection.execute(
+            """
+            CREATE TABLE autoincrementing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                value TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO autoincrementing (value) VALUES ('x')"
+        )
+        connection.execute("COMMIT")
+        # ANALYZE creates `sqlite_stat1`.
+        connection.execute("ANALYZE")
+
+    report = run_backup(database=database, backup=backup)
+
+    assert report["verified"] is True
+    assert not [
+        name for name in report["source_tables"] if name.startswith("sqlite_")
+    ]
+    assert not [
+        name for name in report["tables_compared"] if name.startswith("sqlite_")
+    ]
+    assert "autoincrementing" in report["tables_compared"]
+
+    # ...but they are still part of the verbatim schema comparison.
+    schema_names = {item["name"] for item in report["source_schema_objects"]}
+    assert "sqlite_sequence" in schema_names
+    assert "sqlite_stat1" in schema_names
+
+
+def test_detects_table_missing_from_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backup missing a table entirely must fail loudly."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    json_output = tmp_path / "report.json"
+    build_database(database)
+
+    damage_backup_after_copy(
+        monkeypatch, backup, ["DROP TABLE archive_quarantine"]
+    )
+
+    with pytest.raises(SchemaMismatchError):
+        run_backup(database=database, backup=backup, json_output=json_output)
+
+    on_disk = json.loads(json_output.read_text(encoding="utf-8"))
+    assert on_disk["verified"] is False
+    assert on_disk["checks"]["tables_match"] is False
+    assert on_disk["checks"]["schema_objects_match"] is False
+    assert "archive_quarantine" in on_disk["source_tables"]
+    assert "archive_quarantine" not in on_disk["backup_tables"]
+    # The missing table shows up as a difference, not as a crash.
+    assert on_disk["checks"]["table_counts_match"] is False
+
+
+def test_detects_altered_index_sql_in_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backup whose index definition text differs is caught by the
+    verbatim whole-schema comparison, with no per-index special case."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    json_output = tmp_path / "report.json"
+    build_database(database)
+
+    damage_backup_after_copy(
+        monkeypatch,
+        backup,
+        [
+            f"DROP INDEX {UNIQUE_ACTIVE_INDEX_NAME}",
+            # Same name, same columns -- only the partial predicate
+            # differs, which a name-only comparison would miss.
+            f"""
+            CREATE UNIQUE INDEX {UNIQUE_ACTIVE_INDEX_NAME}
+                ON jobs(job_type, archive_id)
+                WHERE status IN ('pending', 'claimed')
+            """,
+        ],
+    )
+
+    with pytest.raises(SchemaMismatchError):
+        run_backup(database=database, backup=backup, json_output=json_output)
+
+    on_disk = json.loads(json_output.read_text(encoding="utf-8"))
+    assert on_disk["verified"] is False
+    assert on_disk["checks"]["schema_objects_match"] is False
+    # Index *names* still match -- only the SQL text drifted.
+    assert on_disk["checks"]["index_names_match"] is True
+    differing = on_disk["schema_object_differences"]["differing"]
+    assert [item["name"] for item in differing] == [UNIQUE_ACTIVE_INDEX_NAME]
+
+
+def test_detects_extra_schema_object_in_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Schema drift in either direction fails, including objects the
+    backup has but the source does not (e.g. a stray view or trigger)."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    json_output = tmp_path / "report.json"
+    build_database(database)
+
+    damage_backup_after_copy(
+        monkeypatch,
+        backup,
+        ["CREATE VIEW stray_view AS SELECT id FROM jobs"],
+    )
+
+    with pytest.raises(SchemaMismatchError):
+        run_backup(database=database, backup=backup, json_output=json_output)
+
+    on_disk = json.loads(json_output.read_text(encoding="utf-8"))
+    assert on_disk["checks"]["schema_objects_match"] is False
+    assert [
+        item["name"]
+        for item in on_disk["schema_object_differences"]["only_in_backup"]
+    ] == ["stray_view"]
+
+
+# --- optional --tables override ---------------------------------------------
+
+
+def test_table_override_narrows_row_counts_only(tmp_path: Path) -> None:
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    build_database(database)
+
+    report = run_backup(
+        database=database, backup=backup, tables=["jobs"]
+    )
+
+    assert report["verified"] is True
+    assert report["table_selection"] == "explicit_override"
+    assert report["tables_compared"] == ["jobs"]
+    assert report["source_table_counts"] == {"jobs": 2}
+    # Discovery still ran: the full table set is reported and compared,
+    # and the whole schema is compared regardless of the override.
+    assert "archive_files" in report["source_tables"]
+    assert report["source_tables"] == report["backup_tables"]
+    assert report["source_schema_objects"] == report["backup_schema_objects"]
+
+
+def test_table_override_rejects_unknown_table(tmp_path: Path) -> None:
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    build_database(database)
+
+    with pytest.raises(ValueError, match="do not exist in the source"):
+        run_backup(
+            database=database, backup=backup, tables=["not_a_real_table"]
+        )
+
+
+# --- the verification report is evidence, not scratch space -----------------
+
+
+def test_rejects_pre_existing_json_output_before_doing_any_work(
+    tmp_path: Path,
+) -> None:
+    """A prior report proves an earlier backup was sound; overwriting it
+    destroys the audit trail. The rejection must happen before the
+    backup is made, not at write time."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    json_output = tmp_path / "report.json"
+    build_database(database)
+    json_output.write_text("earlier evidence\n", encoding="utf-8")
+
+    with pytest.raises(ReportDestinationExistsError):
+        run_backup(database=database, backup=backup, json_output=json_output)
+
+    # No backup work happened, and the old report is untouched.
+    assert not backup.exists()
+    assert json_output.read_text(encoding="utf-8") == "earlier evidence\n"
+
+
+def test_rejects_pre_existing_json_output_before_creating_directories(
+    tmp_path: Path,
+) -> None:
+    """The rejection lands before any filesystem mutation at all: the
+    backup's parent directory must not have been created."""
+    database = tmp_path / "source.db"
+    backup = tmp_path / "not_yet_created" / "backup.db"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    json_output = reports / "report.json"
+    build_database(database)
+    json_output.write_text("earlier evidence\n", encoding="utf-8")
+
+    with pytest.raises(ReportDestinationExistsError):
+        run_backup(database=database, backup=backup, json_output=json_output)
+
+    assert not backup.parent.exists()
+    assert json_output.read_text(encoding="utf-8") == "earlier evidence\n"
+
+
+def test_write_json_refuses_to_overwrite_an_existing_file(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "report.json"
+    existing.write_text("earlier evidence\n", encoding="utf-8")
+
+    with pytest.raises(ReportDestinationExistsError):
+        _write_json(existing, {"verified": True})
+
+    assert existing.read_text(encoding="utf-8") == "earlier evidence\n"
+
+
+def test_failure_path_report_cannot_clobber_a_file_created_mid_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The best-effort failure report is still not allowed to overwrite.
+
+    Simulates the narrow race the up-front check cannot cover: the
+    report path is free at validation time but occupied by the time the
+    failing run tries to write. The original failure must still be what
+    surfaces, and the file must survive.
+    """
+    database = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    json_output = tmp_path / "report.json"
+    build_database(database)
+
+    import comic_automation.database.backup_cli as backup_cli
+
+    real_fingerprint = backup_cli.fingerprint_database
+    calls = {"count": 0}
+
+    def racing_fingerprint(path):
+        calls["count"] += 1
+        fingerprint = real_fingerprint(path)
+        if calls["count"] == 2:
+            # Someone else claims the report path mid-run...
+            json_output.write_text("earlier evidence\n", encoding="utf-8")
+            # ...and the source appears to have been written to, so the
+            # run fails and reaches the best-effort report writer.
+            fingerprint = backup_cli.DatabaseFingerprint(
+                size_bytes=fingerprint.size_bytes + 4096,
+                modified_time_ns=fingerprint.modified_time_ns,
+            )
+        return fingerprint
+
+    monkeypatch.setattr(backup_cli, "fingerprint_database", racing_fingerprint)
+
+    with pytest.raises(DatabaseMutatedError):
+        run_backup(database=database, backup=backup, json_output=json_output)
+
+    assert json_output.read_text(encoding="utf-8") == "earlier evidence\n"
