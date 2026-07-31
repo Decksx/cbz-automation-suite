@@ -1,6 +1,6 @@
 # Implementation Roadmap
 
-## Status as of 2026-07-30
+## Status as of 2026-07-31
 
 The project has moved beyond a collection of standalone scripts into a
 SQLite-backed automation platform for discovering, inspecting, hashing,
@@ -26,20 +26,20 @@ audit.
 | Archive content signatures | 58,437 |
 | Exact duplicate groups | 2 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 35,700 |
-| Perceptual jobs completed | 35,590 |
-| Perceptual jobs failed | 110 |
+| Perceptual job rows | 40,700 |
+| Perceptual jobs completed | 40,581 |
+| Perceptual jobs failed | 119 |
 | Active perceptual jobs | 0 |
 | Production schema migrations | 1–10 |
-| dHash rows, Version 1 | 1,795,474 |
-| pHash rows, Version 1 | 1,795,474 |
-| Eligible archives remaining | 22,554 |
+| dHash rows, Version 1 | 2,075,992 |
+| pHash rows, Version 1 | 2,075,992 |
+| Eligible archives remaining | 17,554 |
 | Near-duplicate candidates | 0 |
 | Last guarded batch | 5,000 processed |
-| Last-batch outcomes | 4,972 succeeded, 28 terminal failures, 0 retries |
-| Last-batch terminal-failure rate | 0.56% |
-| Last-batch throughput | 1,495.80 archives/hour |
-| Estimated active processing time remaining | approximately 15.08 hours |
+| Last-batch outcomes | 4,991 succeeded, 9 terminal failures, 0 retries |
+| Last-batch terminal-failure rate | 0.18% |
+| Last-batch throughput | 1,222.13 archives/hour |
+| Estimated active processing time remaining | approximately 14.36 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -514,16 +514,16 @@ Latest production result:
 
 ```text
 processed:                              5,000
-succeeded:                              4,972
-terminally failed:                         28
+succeeded:                              4,991
+terminally failed:                          9
 retry scheduled / pending:                  0
-elapsed seconds:                       12,033.728
-elapsed hours:                              3.343
-throughput:                    1,495.80 archives/hour
-profiled archives / pages:        4,972 / 289,390
-dHash Version 1 rows:                 1,795,474
-pHash Version 1 rows:                 1,795,474
-eligible archives remaining:             22,554
+elapsed seconds:                       14,728.333
+elapsed hours:                              4.091
+throughput:                    1,222.13 archives/hour
+profiled archives / pages:        4,991 / 280,518
+dHash Version 1 rows:                 2,075,992
+pHash Version 1 rows:                 2,075,992
+eligible archives remaining:             17,554
 ```
 
 The report, job outcomes, phase totals, database counts, and
@@ -536,19 +536,19 @@ repository stayed clean.
 Latest production phase distribution:
 
 ```text
-image open and decode:       50.250%
-pHash:                       31.808%
-dHash:                       12.304%
-ZIP entry read:               4.251%
-database save:                0.728%
-ZIP open and inventory:       0.615%
-database lookup:              0.043%
+image open and decode:       54.827%
+pHash:                       28.211%
+dHash:                       11.535%
+ZIP entry read:               4.204%
+database save:                0.666%
+ZIP open and inventory:       0.506%
+database lookup:              0.051%
 ```
 
-The 28 new terminal failures are legitimate page-image decoding
+The 9 new terminal failures are legitimate page-image decoding
 defects classified as `page_image_corrupt`; no queue, database, or
 orchestration failure occurred. The cumulative perceptual terminal-
-failure population is now 110: 40 `archive_corrupt` and 70
+failure population is now 119: 40 `archive_corrupt` and 79
 `page_image_corrupt`. A fresh read-only audit captured these
 classifications and verified that the database remained unchanged.
 
@@ -562,6 +562,22 @@ All 272,074 job rows remained column-for-column unchanged, all
 production counts reconciled, `PRAGMA quick_check` remained `ok`, and
 the protected pre-migration backup remained unchanged at schema
 version 9.
+
+The guarded operations tooling and the subsequent reliability hardening
+merged through pull requests 15 and 16. Read-only audits now obtain all
+report inputs from one deferred transaction bracketed by
+`PRAGMA data_version`; main-file and WAL-sidecar fingerprints are
+diagnostic evidence, not the concurrency gate. Service startup no longer
+recovers age-stale jobs automatically, because the queue has no leases or
+heartbeats with which to distinguish a dead worker from legitimate
+long-running work. Recovery is an explicit guarded operator action.
+
+The full-library coverage audit now reports the 17,554 eligible archives
+with no job history as the expected never-enqueued backlog during the
+bounded backfill. Its strict `--expect-backfill-complete` mode verifies
+that both `incomplete` and `stale` populations are zero and exits 2 while
+work remains; it cannot pass merely because all remaining archives have
+job history.
 
 #### H. Recover in-place source drift
 
