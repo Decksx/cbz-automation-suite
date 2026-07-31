@@ -111,9 +111,15 @@ from comic_automation.archive.perceptual_hashing import (
     PHASH_ALGORITHM_VERSION,
     ArchivePerceptualHashRepository,
 )
+from comic_automation.database.read_guards import (
+    fingerprint_database_files,
+    fingerprint_report_fields,
+    read_consistent_snapshot,
+)
 from comic_automation.jobs.active_job_duplicate_audit import (
     DatabaseChangedError,
     DatabaseIntegrityError,
+    DatabaseMutatedError,
     fingerprint_database,
     quick_check,
     readonly_database_connection,
@@ -401,117 +407,117 @@ def _read_repository_state(repository: Path) -> GitRepositoryState:
 def _snapshot_working_database(database: Path) -> dict[str, Any]:
     """One consistent read-only snapshot of every DB-derived gate input.
 
-    Follows the exact template in active_job_duplicate_audit.py: sample
-    `PRAGMA data_version` before opening the transaction that
+    Delegates to `read_guards.read_consistent_snapshot`, which is the
+    shared implementation of the sequence this module used to inline:
+    sample `PRAGMA data_version` before opening the transaction that
     encompasses every read (including quick_check), then again after,
-    and raise if either that or the file fingerprint changed. Every
-    number that a gate compares against an expected value therefore
-    comes from a single instant, so gates can never disagree with each
-    other because a writer landed between two of this module's own
-    queries.
+    and raise `DatabaseChangedError` if it moved. Every number that a
+    gate compares against an expected value therefore comes from a
+    single instant, so gates can never disagree with each other because
+    a writer landed between two of this module's own queries.
+
+    The file fingerprint is still taken and still raises on a change,
+    but it is the weaker detector and is checked second: under WAL a
+    concurrent commit lands in the `-wal` sidecar and can leave the
+    main file byte-identical, so it can never be the gate.
     """
     resolved = Path(database).resolve(strict=True)
     fingerprint_before = fingerprint_database(resolved)
 
-    with readonly_database_connection(resolved) as connection:
-        data_version_before = int(
-            connection.execute("PRAGMA data_version").fetchone()[0]
-        )
+    files_before = fingerprint_database_files(resolved)
 
-        connection.execute("BEGIN")
-        try:
-            integrity = quick_check(connection)
+    def read(connection: sqlite3.Connection) -> dict[str, Any]:
+        active_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE job_type = ?
+              AND status IN (
+                  {",".join("?" for _ in UNEXPECTED_ACTIVE_STATUSES)}
+              )
+            """,
+            (JOB_TYPE, *UNEXPECTED_ACTIVE_STATUSES),
+        ).fetchone()[0]
 
-            if integrity != "ok":
-                raise DatabaseIntegrityError(
-                    f"PRAGMA quick_check failed for {resolved}: {integrity}"
-                )
+        total_job_population = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_type = ?",
+            (JOB_TYPE,),
+        ).fetchone()[0]
 
-            active_count = connection.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM jobs
-                WHERE job_type = ?
-                  AND status IN (
-                      {",".join("?" for _ in UNEXPECTED_ACTIVE_STATUSES)}
-                  )
-                """,
-                (JOB_TYPE, *UNEXPECTED_ACTIVE_STATUSES),
-            ).fetchone()[0]
+        completed_count = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_type = ? AND status = 'completed'",
+            (JOB_TYPE,),
+        ).fetchone()[0]
 
-            total_job_population = connection.execute(
-                "SELECT COUNT(*) FROM jobs WHERE job_type = ?",
-                (JOB_TYPE,),
-            ).fetchone()[0]
+        failed_count = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE job_type = ? AND status = 'failed'",
+            (JOB_TYPE,),
+        ).fetchone()[0]
 
-            completed_count = connection.execute(
-                "SELECT COUNT(*) FROM jobs WHERE job_type = ? AND status = 'completed'",
-                (JOB_TYPE,),
-            ).fetchone()[0]
+        eligible_remaining = ArchivePerceptualHashRepository(
+            connection
+        ).count_eligible()
 
-            failed_count = connection.execute(
-                "SELECT COUNT(*) FROM jobs WHERE job_type = ? AND status = 'failed'",
-                (JOB_TYPE,),
-            ).fetchone()[0]
+        dhash_count = connection.execute(
+            "SELECT COUNT(*) FROM page_hashes WHERE algorithm = ? AND algorithm_version = ?",
+            (DHASH_ALGORITHM, DHASH_ALGORITHM_VERSION),
+        ).fetchone()[0]
 
-            eligible_remaining = ArchivePerceptualHashRepository(
-                connection
-            ).count_eligible()
+        phash_count = connection.execute(
+            "SELECT COUNT(*) FROM page_hashes WHERE algorithm = ? AND algorithm_version = ?",
+            (PHASH_ALGORITHM, PHASH_ALGORITHM_VERSION),
+        ).fetchone()[0]
 
-            dhash_count = connection.execute(
-                "SELECT COUNT(*) FROM page_hashes WHERE algorithm = ? AND algorithm_version = ?",
-                (DHASH_ALGORITHM, DHASH_ALGORITHM_VERSION),
-            ).fetchone()[0]
+        page_sha256_count = connection.execute(
+            "SELECT COUNT(*) FROM page_hashes WHERE algorithm = ? AND algorithm_version = ?",
+            (PAGE_HASH_ALGORITHM, PAGE_HASH_ALGORITHM_VERSION),
+        ).fetchone()[0]
 
-            phash_count = connection.execute(
-                "SELECT COUNT(*) FROM page_hashes WHERE algorithm = ? AND algorithm_version = ?",
-                (PHASH_ALGORITHM, PHASH_ALGORITHM_VERSION),
-            ).fetchone()[0]
+        near_duplicate_count = connection.execute(
+            "SELECT COUNT(*) FROM near_duplicate_candidates"
+        ).fetchone()[0]
 
-            page_sha256_count = connection.execute(
-                "SELECT COUNT(*) FROM page_hashes WHERE algorithm = ? AND algorithm_version = ?",
-                (PAGE_HASH_ALGORITHM, PAGE_HASH_ALGORITHM_VERSION),
-            ).fetchone()[0]
+        return {
+            "active_job_count": int(active_count),
+            "total_job_population": int(total_job_population),
+            "completed_count": int(completed_count),
+            "failed_count": int(failed_count),
+            "eligible_remaining": int(eligible_remaining),
+            "dhash_v1_count": int(dhash_count),
+            "phash_v1_count": int(phash_count),
+            "page_sha256_count": int(page_sha256_count),
+            "near_duplicate_count": int(near_duplicate_count),
+        }
 
-            near_duplicate_count = connection.execute(
-                "SELECT COUNT(*) FROM near_duplicate_candidates"
-            ).fetchone()[0]
-        finally:
-            connection.execute("END")
-
-        data_version_after = int(
-            connection.execute("PRAGMA data_version").fetchone()[0]
-        )
+    snapshot = read_consistent_snapshot(
+        resolved,
+        read,
+        context="postflight",
+        integrity_check=quick_check,
+    )
 
     fingerprint_after = fingerprint_database(resolved)
+    files_after = fingerprint_database_files(resolved)
 
-    if data_version_before != data_version_after:
-        raise DatabaseChangedError(
-            "Another connection committed to the working database during "
-            f"postflight (data_version {data_version_before} -> "
-            f"{data_version_after}); the report is not trustworthy."
-        )
-
+    # Checked after the data_version gate inside the helper, which is
+    # the stronger detector. This one only catches a checkpoint or this
+    # process touching the file; it cannot see a WAL commit.
     if fingerprint_before != fingerprint_after:
-        raise DatabaseChangedError(
+        raise DatabaseMutatedError(
             "Working database file changed during postflight: "
             f"before={fingerprint_before} after={fingerprint_after}."
         )
 
     return {
         "database": str(resolved),
-        "quick_check": integrity,
-        "active_job_count": int(active_count),
-        "total_job_population": int(total_job_population),
-        "completed_count": int(completed_count),
-        "failed_count": int(failed_count),
-        "eligible_remaining": int(eligible_remaining),
-        "dhash_v1_count": int(dhash_count),
-        "phash_v1_count": int(phash_count),
-        "page_sha256_count": int(page_sha256_count),
-        "near_duplicate_count": int(near_duplicate_count),
+        "quick_check": snapshot.quick_check,
+        **snapshot.result,
         "fingerprint_before": fingerprint_before,
         "fingerprint_after": fingerprint_after,
+        "files_before": files_before,
+        "files_after": files_after,
+        "data_version_before": snapshot.data_version_before,
+        "data_version_after": snapshot.data_version_after,
     }
 
 
@@ -665,6 +671,10 @@ def run_postflight(
         snapshot = {
             "database": str(database),
             "quick_check": None,
+            "data_version_before": None,
+            "data_version_after": None,
+            "files_before": fingerprint_database_files(database),
+            "files_after": fingerprint_database_files(database),
             "active_job_count": None,
             "total_job_population": None,
             "completed_count": None,
@@ -1123,8 +1133,19 @@ def run_postflight(
         "gates": gates,
         "database_fingerprint_before": asdict(snapshot["fingerprint_before"]),
         "database_fingerprint_after": asdict(snapshot["fingerprint_after"]),
-        "database_unchanged": (
-            snapshot["fingerprint_before"] == snapshot["fingerprint_after"]
+        "data_version_before": snapshot["data_version_before"],
+        "data_version_after": snapshot["data_version_after"],
+        # `database_unchanged` keeps its historical name and value, but
+        # is emitted through the shared helper so it always travels
+        # with the note explaining that it is diagnostic evidence only:
+        # the concurrency gate for every DB-derived number above is the
+        # data_version pair, enforced inside
+        # `_snapshot_working_database`.
+        **fingerprint_report_fields(
+            fingerprint_before=snapshot["fingerprint_before"],
+            fingerprint_after=snapshot["fingerprint_after"],
+            files_before=snapshot["files_before"],
+            files_after=snapshot["files_after"],
         ),
     }
 

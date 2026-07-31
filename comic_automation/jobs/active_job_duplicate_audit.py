@@ -28,10 +28,22 @@ import json
 import sqlite3
 import sys
 from collections import Counter
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
+
+from comic_automation.database.read_guards import (
+    DatabaseChangedError,
+    DatabaseFingerprint,
+    DatabaseIntegrityError,
+    DatabaseMutatedError,
+    ReadGuardError as PreflightError,
+    fingerprint_database,
+    fingerprint_database_files,
+    fingerprint_report_fields,
+    quick_check,
+    read_consistent_snapshot,
+    readonly_database_connection,
+)
 
 
 # The statuses migration 010's partial index predicate covers. Rows in
@@ -55,93 +67,20 @@ EXIT_FAILURE = 1
 EXIT_BLOCKING_DUPLICATES = 2
 
 
-class PreflightError(RuntimeError):
-    """Base class for conditions that invalidate a preflight run."""
-
-
-class DatabaseChangedError(PreflightError):
-    """Another connection committed while the audit was reading.
-
-    The report would then mix pre- and post-change observations, so the
-    run is rejected rather than reported as trustworthy.
-    """
-
-
-class DatabaseIntegrityError(PreflightError):
-    """`PRAGMA quick_check` did not return 'ok'."""
-
-
-@dataclass(frozen=True)
-class DatabaseFingerprint:
-    size_bytes: int
-    modified_time_ns: int
-
-
-def fingerprint_database(database_path: str | Path) -> DatabaseFingerprint:
-    stat = Path(database_path).stat()
-    return DatabaseFingerprint(
-        size_bytes=stat.st_size,
-        modified_time_ns=stat.st_mtime_ns,
-    )
-
-
-@contextmanager
-def readonly_database_connection(
-    database_path: str | Path,
-) -> Iterator[sqlite3.Connection]:
-    """Open `database_path` strictly read-only.
-
-    Two independent safeguards, deliberately layered:
-
-    - The `mode=ro` URI flag opens the connection read-only at the
-      VFS level and refuses to create the file if it does not already
-      exist (unlike a plain `sqlite3.connect`, which would silently
-      create an empty database).
-    - `PRAGMA query_only = ON` rejects any statement that would modify
-      the database at the statement level, in case a future edit to
-      this module accidentally introduces a write.
-
-    No migrations are applied and no schema is created: the database is
-    read exactly as found.
-    """
-    path = Path(database_path)
-
-    # Checked before touching SQLite at all, so a missing path can
-    # never result in a created file or directory.
-    if not path.is_file():
-        raise FileNotFoundError(f"Database does not exist: {path}")
-
-    resolved = path.resolve(strict=True)
-    uri = f"{resolved.as_uri()}?mode=ro"
-    connection = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=30.0,
-        # Transaction boundaries are managed explicitly below so the
-        # report reads from one deferred snapshot.
-        isolation_level=None,
-    )
-    connection.row_factory = sqlite3.Row
-
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        yield connection
-    finally:
-        connection.close()
-
-
-def _data_version(connection: sqlite3.Connection) -> int:
-    """SQLite's counter of commits made by *other* connections.
-
-    A change between the reading before and after the snapshot means
-    someone else wrote to the database mid-audit.
-    """
-    return int(connection.execute("PRAGMA data_version").fetchone()[0])
-
-
-def quick_check(connection: sqlite3.Connection) -> str:
-    rows = connection.execute("PRAGMA quick_check").fetchall()
-    return "\n".join(str(row[0]) for row in rows)
+# The consistent-snapshot machinery this module pioneered now lives in
+# `comic_automation/database/read_guards.py` so every read-only audit
+# shares one implementation (there used to be five near-copies of
+# `readonly_database_connection` alone, already drifted on
+# `isolation_level`). The names below stay importable from this module
+# because `comic_automation/jobs/batch_postflight.py` and the tests
+# import them from here:
+#
+# - `PreflightError` is `read_guards.ReadGuardError`, so
+#   `DatabaseChangedError` and `DatabaseIntegrityError` remain its
+#   subclasses exactly as before;
+# - `DatabaseMutatedError` (a `DatabaseChangedError` subclass) is
+#   re-exported for callers that catch the weaker file-fingerprint
+#   detector by name.
 
 
 def applied_schema_versions(
@@ -307,9 +246,12 @@ def run_preflight(*, database: Path) -> dict:
     """Produce the read-only duplicate-active preflight report.
 
     Raises `FileNotFoundError` if the database does not exist,
-    `DatabaseIntegrityError` if `PRAGMA quick_check` fails, and
+    `DatabaseIntegrityError` if `PRAGMA quick_check` fails,
     `DatabaseChangedError` if another connection committed during the
-    run or the file's size/mtime changed.
+    run (the authoritative gate, via `PRAGMA data_version`), and its
+    `DatabaseMutatedError` subclass if the main database file's
+    size/mtime changed -- a diagnostic that, under WAL, cannot see a
+    concurrent commit at all.
     """
     path = Path(database)
 
@@ -318,56 +260,44 @@ def run_preflight(*, database: Path) -> dict:
 
     resolved = path.resolve(strict=True)
     fingerprint_before = fingerprint_database(resolved)
+    files_before = fingerprint_database_files(resolved)
 
-    with readonly_database_connection(resolved) as connection:
-        # data_version is sampled *outside* and around the whole
-        # transaction, so the change-detection window covers every read
-        # the report depends on -- including quick_check. Sampling it
-        # after quick_check would leave that read outside the window,
-        # and a WAL commit landing there would go undetected: a WAL
-        # write can touch only the -wal file, leaving the main
-        # database's size and mtime identical, so the fingerprint
-        # comparison below cannot be relied on to catch it either.
-        data_version_before = _data_version(connection)
+    def read(connection: sqlite3.Connection) -> dict:
+        # Every name below is looked up on the module at call time, so
+        # the WAL regression tests can wrap any one of them to commit
+        # from another connection mid-snapshot.
+        return {
+            "schema_versions": applied_schema_versions(connection),
+            "index_exists": unique_active_index_exists(connection),
+            "blocking_groups": collect_blocking_groups(connection),
+            "null_archive": collect_null_archive_active_jobs(connection),
+            "active_by_status": _counts_by(connection, "status"),
+            "active_by_job_type": _counts_by(connection, "job_type"),
+        }
 
-        # One deferred read transaction: every observation below comes
-        # from the same snapshot, so totals cannot disagree with each
-        # other because a writer landed between two queries.
-        connection.execute("BEGIN")
-
-        try:
-            integrity = quick_check(connection)
-
-            if integrity != "ok":
-                raise DatabaseIntegrityError(
-                    "PRAGMA quick_check failed for "
-                    f"{resolved}: {integrity}"
-                )
-
-            schema_versions = applied_schema_versions(connection)
-            index_exists = unique_active_index_exists(connection)
-            blocking_groups = collect_blocking_groups(connection)
-            null_archive = collect_null_archive_active_jobs(connection)
-            active_by_status = _counts_by(connection, "status")
-            active_by_job_type = _counts_by(connection, "job_type")
-        finally:
-            # A read transaction still has to be ended; END is not a
-            # write and is permitted under query_only.
-            connection.execute("END")
-
-        data_version_after = _data_version(connection)
+    # One deferred read transaction, bracketed by PRAGMA data_version
+    # readings taken outside it, so the change-detection window covers
+    # every read the report depends on -- including quick_check. See
+    # `read_guards.read_consistent_snapshot`, which is where this
+    # module's original sequence now lives.
+    snapshot = read_consistent_snapshot(
+        resolved,
+        read,
+        context="preflight",
+        integrity_check=quick_check,
+    )
+    reads = snapshot.result
+    blocking_groups = reads["blocking_groups"]
+    active_by_status = reads["active_by_status"]
 
     fingerprint_after = fingerprint_database(resolved)
+    files_after = fingerprint_database_files(resolved)
 
-    if data_version_before != data_version_after:
-        raise DatabaseChangedError(
-            "Another connection committed to the database during the "
-            f"preflight (data_version {data_version_before} -> "
-            f"{data_version_after}); the report is not trustworthy."
-        )
-
+    # Diagnostic, checked after the data_version gate above: under WAL
+    # this comparison cannot see another connection's commit at all, so
+    # it only catches this process (or a checkpoint) touching the file.
     if fingerprint_before != fingerprint_after:
-        raise DatabaseChangedError(
+        raise DatabaseMutatedError(
             "Database file changed during the preflight: "
             f"before={fingerprint_before} after={fingerprint_after}."
         )
@@ -380,29 +310,24 @@ def run_preflight(*, database: Path) -> dict:
     return {
         "database": str(resolved),
         "audited_statuses": list(ACTIVE_STATUSES),
-        "quick_check": integrity,
-        "applied_schema_versions": schema_versions,
-        "unique_active_index_exists": index_exists,
+        "applied_schema_versions": reads["schema_versions"],
+        "unique_active_index_exists": reads["index_exists"],
         "unique_active_index_name": UNIQUE_ACTIVE_INDEX_NAME,
         "total_active_jobs": total_active,
         "active_by_status": active_by_status,
-        "active_by_job_type": active_by_job_type,
+        "active_by_job_type": reads["active_by_job_type"],
         "blocking_group_count": len(blocking_groups),
         "blocking_row_count": blocking_row_total,
         "blocking_groups": blocking_groups,
-        "null_archive_active_jobs": null_archive,
+        "null_archive_active_jobs": reads["null_archive"],
         "migration_blocked": bool(blocking_groups),
-        "database_size_bytes_before": fingerprint_before.size_bytes,
-        "database_size_bytes_after": fingerprint_after.size_bytes,
-        "database_modified_time_ns_before": (
-            fingerprint_before.modified_time_ns
+        **snapshot.report_fields(),
+        **fingerprint_report_fields(
+            fingerprint_before=fingerprint_before,
+            fingerprint_after=fingerprint_after,
+            files_before=files_before,
+            files_after=files_after,
         ),
-        "database_modified_time_ns_after": (
-            fingerprint_after.modified_time_ns
-        ),
-        "database_unchanged": fingerprint_after == fingerprint_before,
-        "data_version_before": data_version_before,
-        "data_version_after": data_version_after,
     }
 
 

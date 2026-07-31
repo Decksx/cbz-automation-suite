@@ -12,6 +12,15 @@ processing, whereas this module's whole purpose is to be safe to point
 at a protected backup file, so it opens the database with SQLite's
 `mode=ro` URI flag plus `PRAGMA query_only = ON` and never applies
 migrations against it.
+
+Reads go through `comic_automation/database/read_guards.py`'s
+`read_consistent_snapshot`: one deferred read transaction bracketed by
+`PRAGMA data_version` readings taken outside it, which is the only
+guard that holds under WAL. A commit by another connection in WAL mode
+lands in the `-wal` sidecar and can leave the main database file's size
+and mtime byte-identical, so the file fingerprints this report carries
+are diagnostic evidence only -- never the concurrency gate. See
+`read_guards.FINGERPRINT_DIAGNOSTIC_NOTE`.
 """
 
 from __future__ import annotations
@@ -23,10 +32,21 @@ import sqlite3
 import sys
 import time
 from collections import Counter
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
+
+from comic_automation.database.read_guards import (
+    DatabaseChangedError,
+    DatabaseFingerprint,
+    DatabaseIntegrityError,
+    DatabaseMutatedError,
+    fingerprint_database,
+    fingerprint_database_files,
+    fingerprint_report_fields,
+    quick_check,
+    read_consistent_snapshot,
+    readonly_database_connection,
+)
 
 
 JOB_TYPE = "hash_archive_pages_perceptual"
@@ -75,65 +95,16 @@ def stable_category(raw_category: str | None) -> str:
     return _RAW_CATEGORY_TO_STABLE.get(raw, "unclassified")
 
 
-class DatabaseMutatedError(RuntimeError):
-    """Raised when a database changed size or mtime during an audit run.
-
-    This audit is read-only by construction (mode=ro + query_only),
-    but this check is defense in depth: if the underlying file was
-    touched by *anything* (this process or another) while the audit
-    ran, the run is treated as untrustworthy rather than silently
-    reporting a possibly-inconsistent snapshot.
-    """
-
-
-@dataclass(frozen=True)
-class DatabaseFingerprint:
-    size_bytes: int
-    modified_time_ns: int
-
-
-def fingerprint_database(database_path: str | Path) -> DatabaseFingerprint:
-    stat = Path(database_path).stat()
-    return DatabaseFingerprint(
-        size_bytes=stat.st_size,
-        modified_time_ns=stat.st_mtime_ns,
-    )
-
-
-@contextmanager
-def readonly_database_connection(
-    database_path: str | Path,
-) -> Iterator[sqlite3.Connection]:
-    """Open `database_path` strictly read-only.
-
-    Two independent safeguards, deliberately layered:
-
-    - The `mode=ro` SQLite URI flag opens the connection itself
-      read-only at the OS/VFS level and refuses to create the file if
-      it doesn't already exist (unlike a plain sqlite3.connect, which
-      would silently create an empty database).
-    - `PRAGMA query_only = ON` rejects any statement that would modify
-      the database *at the statement level*, in case a future edit to
-      this module accidentally introduces a write.
-
-    Neither PRAGMA foreign_keys nor PRAGMA journal_mode is set here:
-    both would either be no-ops or require write access, and this
-    connection never runs a statement that depends on either.
-    """
-    path = Path(database_path).resolve(strict=False)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Database does not exist: {path}")
-
-    uri = f"{path.as_uri()}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=30.0)
-    connection.row_factory = sqlite3.Row
-
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        yield connection
-    finally:
-        connection.close()
+# `DatabaseFingerprint`, `fingerprint_database`,
+# `readonly_database_connection`, `DatabaseChangedError`,
+# `DatabaseIntegrityError` and `DatabaseMutatedError` are re-exported
+# from `comic_automation.database.read_guards` above. They used to be
+# defined here (one of five near-identical copies across the read-only
+# audits, which had already drifted on `isolation_level` -- this copy
+# omitted it, which silently made an explicit BEGIN/END impossible).
+# The names stay importable from this module because
+# `comic_automation/archive/source_drift_recovery.py` and the tests
+# import them from here.
 
 
 def collect_failures(connection: sqlite3.Connection) -> list[dict]:
@@ -259,6 +230,16 @@ def run_audit(
     json_output: Path | None = None,
     csv_output: Path | None = None,
 ) -> dict:
+    """Produce the read-only terminal-failure report.
+
+    Raises `FileNotFoundError` if the database does not exist,
+    `DatabaseIntegrityError` if `PRAGMA quick_check` fails,
+    `DatabaseChangedError` if another connection committed during the
+    run (the authoritative gate, via `PRAGMA data_version`), and its
+    `DatabaseMutatedError` subclass if the main database file's size or
+    mtime changed -- defense in depth against *this* process touching
+    the file, not a concurrency guarantee.
+    """
     database = Path(database).resolve(strict=False)
 
     if not database.is_file():
@@ -266,16 +247,30 @@ def run_audit(
 
     started = time.perf_counter()
     fingerprint_before = fingerprint_database(database)
+    files_before = fingerprint_database_files(database)
 
-    with readonly_database_connection(database) as connection:
-        failures = collect_failures(connection)
+    def read(connection: sqlite3.Connection) -> list[dict]:
+        # Looked up on the module at call time, so the WAL regression
+        # test can wrap it to commit from another connection while this
+        # snapshot is open.
+        return collect_failures(connection)
 
-    # Re-stat *after* closing the connection: if opening read-only or
+    snapshot = read_consistent_snapshot(
+        database,
+        read,
+        context="audit",
+        integrity_check=quick_check,
+    )
+    failures = snapshot.result
+
+    # Re-stat *after* the connection is closed: if opening read-only or
     # running the SELECT touched the file (it shouldn't -- mode=ro
     # plus query_only forbid it, but this is the actual guarantee the
     # audit promises), this run is not trustworthy and must not be
-    # reported as if it were.
+    # reported as if it were. Checked *after* the data_version gate,
+    # which is the stronger detector.
     fingerprint_after = fingerprint_database(database)
+    files_after = fingerprint_database_files(database)
 
     if fingerprint_after != fingerprint_before:
         raise DatabaseMutatedError(
@@ -300,13 +295,12 @@ def run_audit(
             )
         ),
         "failures": failures,
-        "database_size_bytes_before": fingerprint_before.size_bytes,
-        "database_size_bytes_after": fingerprint_after.size_bytes,
-        "database_modified_time_ns_before": (
-            fingerprint_before.modified_time_ns
-        ),
-        "database_modified_time_ns_after": (
-            fingerprint_after.modified_time_ns
+        **snapshot.report_fields(),
+        **fingerprint_report_fields(
+            fingerprint_before=fingerprint_before,
+            fingerprint_after=fingerprint_after,
+            files_before=files_before,
+            files_after=files_after,
         ),
         "elapsed_seconds": round(elapsed, 6),
     }
@@ -360,10 +354,17 @@ def print_summary(output: dict) -> None:
     for category, count in output["stable_category_counts"].items():
         print(f"  {category}: {count}")
 
+    print(f"Integrity check:     {output['quick_check']}")
     print(
-        "Database unchanged:  "
+        "Snapshot data_version: "
+        f"{output['data_version_before']} -> "
+        f"{output['data_version_after']} (authoritative guard)"
+    )
+    print(
+        "DB file (diagnostic): "
         f"size={output['database_size_bytes_before']} bytes, "
-        f"mtime_ns={output['database_modified_time_ns_before']}"
+        f"mtime_ns={output['database_modified_time_ns_before']}, "
+        f"unchanged={output['database_file_unchanged']}"
     )
 
     if output.get("json_output"):

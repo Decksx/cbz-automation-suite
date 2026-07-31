@@ -45,10 +45,16 @@ import json
 import re
 import sqlite3
 import sys
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
+
+from comic_automation.database.read_guards import (
+    DatabaseFingerprint,
+    data_version as _data_version,
+    fingerprint_database,
+    quick_check,
+    readonly_database_connection,
+)
 
 
 # Migration 010's partial unique index -- see
@@ -134,67 +140,25 @@ class ReportDestinationExistsError(FileExistsError):
     """
 
 
-@dataclass(frozen=True)
-class DatabaseFingerprint:
-    size_bytes: int
-    modified_time_ns: int
-
-
-def fingerprint_database(database_path: str | Path) -> DatabaseFingerprint:
-    stat = Path(database_path).stat()
-    return DatabaseFingerprint(
-        size_bytes=stat.st_size,
-        modified_time_ns=stat.st_mtime_ns,
-    )
-
-
-@contextmanager
-def readonly_database_connection(
-    database_path: str | Path,
-) -> Iterator[sqlite3.Connection]:
-    """Open `database_path` strictly read-only.
-
-    Same two-layer guard used throughout this codebase's audits: the
-    `mode=ro` URI flag opens the connection read-only at the VFS level
-    (and refuses to create the file if it doesn't exist), and
-    `PRAGMA query_only = ON` rejects any statement that would modify
-    the database at the statement level.
-    """
-    path = Path(database_path)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Database does not exist: {path}")
-
-    resolved = path.resolve(strict=True)
-    uri = f"{resolved.as_uri()}?mode=ro"
-    connection = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=30.0,
-        isolation_level=None,
-    )
-    connection.row_factory = sqlite3.Row
-
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        yield connection
-    finally:
-        connection.close()
-
-
-def _data_version(connection: sqlite3.Connection) -> int:
-    return int(connection.execute("PRAGMA data_version").fetchone()[0])
-
-
-def quick_check(connection: sqlite3.Connection) -> str:
-    # A sufficiently corrupted database can make PRAGMA quick_check
-    # itself raise (rather than return a non-"ok" row); either outcome
-    # must be treated as an integrity failure, not an unhandled crash.
-    try:
-        rows = connection.execute("PRAGMA quick_check").fetchall()
-    except sqlite3.DatabaseError as exc:
-        return f"error: {exc}"
-    return "\n".join(str(row[0]) for row in rows)
+# `DatabaseFingerprint`, `fingerprint_database`,
+# `readonly_database_connection`, `quick_check` and `_data_version`
+# are re-exported from `comic_automation.database.read_guards` above;
+# they used to be defined here, one of five near-identical copies
+# across the read-only tooling. The names stay importable from this
+# module because the tests monkeypatch/construct them from here.
+#
+# `run_backup`'s *sequence* is deliberately NOT replaced by
+# `read_consistent_snapshot`: this module samples `data_version` around
+# the entire backup operation -- source read transaction, the online
+# backup API call, then a second read transaction for the post-backup
+# quick_check -- which is a strictly wider change-detection window than
+# a single transaction. Folding it into the shared helper would narrow
+# it and weaken the guarantee that the backup is a clean snapshot, so
+# it stays as it is.
+#
+# `DatabaseMutatedError` and `DatabaseIntegrityError` also stay local:
+# they are `BackupError` subclasses, and callers distinguish "the
+# backup run failed" from "an audit read failed".
 
 
 def _perform_backup(

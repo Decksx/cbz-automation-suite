@@ -123,12 +123,22 @@ import sqlite3
 import sys
 import time
 from collections import Counter
-from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
 
+from comic_automation.database.read_guards import (
+    DatabaseChangedError,
+    DatabaseFingerprint,
+    DatabaseIntegrityError,
+    DatabaseMutatedError,
+    fingerprint_database,
+    fingerprint_database_files,
+    fingerprint_report_fields,
+    quick_check,
+    read_consistent_snapshot,
+    readonly_database_connection,
+)
 from comic_automation.archive.perceptual_failure_audit import (
     JOB_TYPE,
     STABLE_CATEGORY_ORDER,
@@ -216,47 +226,16 @@ EXIT_FAILURE = 1
 EXIT_BLOCKING_UNEXPLAINED_GAPS = 2
 
 
-class DatabaseChangedError(RuntimeError):
-    """Raised when another connection committed while the audit read.
-
-    Detected via ``PRAGMA data_version``, which counts commits made by
-    *other* connections. This is the guard that actually holds under
-    WAL: a WAL commit can be entirely contained in the ``-wal`` file,
-    leaving the main database file's size and mtime untouched, so the
-    fingerprint check below can miss it completely. If the counter
-    moved, the report may mix pre- and post-change observations -- and
-    a mixed snapshot silently breaks this audit's headline guarantee
-    that the five populations partition the library -- so the run is
-    rejected instead of reported as trustworthy.
-    """
-
-
-class DatabaseMutatedError(DatabaseChangedError):
-    """Raised when a database changed size or mtime during an audit run.
-
-    This audit is read-only by construction (mode=ro + query_only),
-    but this check is defense in depth: if the underlying file was
-    touched by *anything* (this process or another) while the audit
-    ran, the run is treated as untrustworthy rather than silently
-    reporting a possibly-inconsistent snapshot.
-
-    It is a subclass of `DatabaseChangedError` because it reports the
-    same class of problem through a weaker detector: callers who want
-    "the database did not change under me" can catch the base class and
-    get both guards. `run_audit` checks `data_version` *first*, so a
-    concurrent commit is always reported as the more precise
-    `DatabaseChangedError` even when the file also happened to change.
-    """
-
-
-class DatabaseIntegrityError(RuntimeError):
-    """Raised when ``PRAGMA quick_check`` did not return 'ok'.
-
-    Classifying archives out of a structurally damaged database would
-    produce populations that look authoritative but are not, so the run
-    is abandoned. Matches `active_job_duplicate_audit.py` and the other
-    read-only audits.
-    """
+# `DatabaseChangedError`, `DatabaseMutatedError`,
+# `DatabaseIntegrityError`, `DatabaseFingerprint`,
+# `fingerprint_database` and `readonly_database_connection` are
+# re-exported from `comic_automation.database.read_guards` above; they
+# used to be defined here, one of five near-identical copies across the
+# read-only audits. `DatabaseMutatedError` is still a subclass of
+# `DatabaseChangedError`, so catching the base class still gets both
+# the authoritative data_version guard and the weaker file-fingerprint
+# diagnostic, exactly as before. The names stay importable from this
+# module because the tests import them from here.
 
 
 class OutputPathCollisionError(ValueError):
@@ -273,85 +252,6 @@ class OutputPathCollisionError(ValueError):
     database is even opened, so no directory is created and nothing
     is written once a collision is detected.
     """
-
-
-@dataclass(frozen=True)
-class DatabaseFingerprint:
-    size_bytes: int
-    modified_time_ns: int
-
-
-def fingerprint_database(database_path: str | Path) -> DatabaseFingerprint:
-    stat = Path(database_path).stat()
-    return DatabaseFingerprint(
-        size_bytes=stat.st_size,
-        modified_time_ns=stat.st_mtime_ns,
-    )
-
-
-@contextmanager
-def readonly_database_connection(
-    database_path: str | Path,
-) -> Iterator[sqlite3.Connection]:
-    """Open `database_path` strictly read-only.
-
-    Two independent safeguards, deliberately layered:
-
-    - The `mode=ro` SQLite URI flag opens the connection itself
-      read-only at the OS/VFS level and refuses to create the file if
-      it doesn't already exist (unlike a plain sqlite3.connect, which
-      would silently create an empty database).
-    - `PRAGMA query_only = ON` rejects any statement that would modify
-      the database *at the statement level*, in case a future edit to
-      this module accidentally introduces a write.
-
-    This helper is module-local by design (each read-only audit owns its
-    own copy) and is only imported by this module and its tests.
-    """
-    path = Path(database_path).resolve(strict=False)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Database does not exist: {path}")
-
-    uri = f"{path.as_uri()}?mode=ro"
-    connection = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=30.0,
-        # Disable pysqlite's implicit transaction handling so the
-        # explicit BEGIN/END in `run_audit` are the only transaction
-        # boundaries in play; with the default isolation_level the
-        # driver's own bookkeeping would fight them.
-        isolation_level=None,
-    )
-    connection.row_factory = sqlite3.Row
-
-    try:
-        connection.execute("PRAGMA query_only = ON")
-        yield connection
-    finally:
-        connection.close()
-
-
-def _data_version(connection: sqlite3.Connection) -> int:
-    """SQLite's counter of commits made by *other* connections.
-
-    Frozen for the duration of a read transaction, which is precisely
-    why `run_audit` samples it outside and around the transaction: a
-    difference between the two readings means someone else committed
-    while the audit was reading.
-    """
-    return int(connection.execute("PRAGMA data_version").fetchone()[0])
-
-
-def quick_check(connection: sqlite3.Connection) -> str:
-    """`PRAGMA quick_check` output, joined into a single string.
-
-    'ok' means the database passed. Anything else is the error text
-    SQLite produced, reported verbatim.
-    """
-    rows = connection.execute("PRAGMA quick_check").fetchall()
-    return "\n".join(str(row[0]) for row in rows)
 
 
 def _same_file(first: Path, second: Path) -> bool:
@@ -765,65 +665,45 @@ def run_audit(
 
     started = time.perf_counter()
     fingerprint_before = fingerprint_database(database)
+    files_before = fingerprint_database_files(database)
 
-    with readonly_database_connection(database) as connection:
-        # data_version is sampled *outside* and around the whole
-        # transaction, so the change-detection window covers every read
-        # the report depends on -- including quick_check. Sampling it
-        # after quick_check would leave that read outside the window,
-        # and a WAL commit landing there would go undetected: a WAL
-        # write can touch only the -wal file, leaving the main
-        # database's size and mtime identical, so the fingerprint
-        # comparison below cannot be relied on to catch it either.
-        data_version_before = _data_version(connection)
+    def read(connection: sqlite3.Connection) -> list[dict]:
+        # Looked up on the module at call time, so the WAL regression
+        # tests can wrap an internal query to commit from another
+        # connection mid-classification.
+        return classify_archives(
+            connection,
+            stale_older_than_seconds=stale_older_than_seconds,
+            now=effective_now,
+        )
 
-        # One deferred read transaction: the structural, page-coverage,
-        # job, failure and staleness queries inside classify_archives
-        # all read from the same snapshot, so the population counts
-        # cannot disagree with each other because a writer landed
-        # between two of them. Without this, the partition invariant
-        # this audit reports would be an assertion about no single
-        # state of the library.
-        connection.execute("BEGIN")
+    # One deferred read transaction, bracketed by PRAGMA data_version
+    # readings taken outside it (see
+    # `read_guards.read_consistent_snapshot`, which is where this
+    # sequence now lives): the structural, page-coverage, job, failure
+    # and staleness queries inside classify_archives all read from the
+    # same snapshot, so the population counts cannot disagree with each
+    # other because a writer landed between two of them. Without this,
+    # the partition invariant this audit reports would be an assertion
+    # about no single state of the library.
+    snapshot = read_consistent_snapshot(
+        database,
+        read,
+        context="audit",
+        integrity_check=quick_check,
+    )
+    archives = snapshot.result
 
-        try:
-            integrity = quick_check(connection)
-
-            if integrity != "ok":
-                raise DatabaseIntegrityError(
-                    "PRAGMA quick_check failed for "
-                    f"{database}: {integrity}"
-                )
-
-            archives = classify_archives(
-                connection,
-                stale_older_than_seconds=stale_older_than_seconds,
-                now=effective_now,
-            )
-        finally:
-            # A read transaction still has to be ended; END is not a
-            # write and is permitted under query_only.
-            connection.execute("END")
-
-        data_version_after = _data_version(connection)
-
-    # Re-stat *after* closing the connection: if opening read-only or
+    # Re-stat *after* the connection is closed: if opening read-only or
     # running any SELECT touched the file (it shouldn't -- mode=ro
     # plus query_only forbid it, but this is the actual guarantee the
     # audit promises), this run is not trustworthy and must not be
-    # reported as if it were.
+    # reported as if it were. Checked *after* the data_version gate,
+    # which is the stronger of the two detectors, so a concurrent
+    # commit is reported as exactly that and not as an ambiguous "the
+    # file moved".
     fingerprint_after = fingerprint_database(database)
-
-    # Checked before the fingerprint, because it is the stronger of the
-    # two detectors: a concurrent commit is reported as exactly that,
-    # not as an ambiguous "the file moved".
-    if data_version_before != data_version_after:
-        raise DatabaseChangedError(
-            "Another connection committed to the database during the "
-            f"audit (data_version {data_version_before} -> "
-            f"{data_version_after}); the classification would mix pre- "
-            "and post-change observations and is not trustworthy."
-        )
+    files_after = fingerprint_database_files(database)
 
     if fingerprint_after != fingerprint_before:
         raise DatabaseMutatedError(
@@ -850,7 +730,6 @@ def run_audit(
     output = {
         "database": str(database),
         "job_type": JOB_TYPE,
-        "quick_check": integrity,
         "stale_older_than_seconds": stale_older_than_seconds,
         "total_archive_count": total_archive_count,
         "population_counts": counts,
@@ -881,17 +760,13 @@ def run_audit(
             BLOCKING_UNEXPLAINED_GAP_EXPLANATION
         ),
         "archives": archives,
-        "database_size_bytes_before": fingerprint_before.size_bytes,
-        "database_size_bytes_after": fingerprint_after.size_bytes,
-        "database_modified_time_ns_before": (
-            fingerprint_before.modified_time_ns
+        **snapshot.report_fields(),
+        **fingerprint_report_fields(
+            fingerprint_before=fingerprint_before,
+            fingerprint_after=fingerprint_after,
+            files_before=files_before,
+            files_after=files_after,
         ),
-        "database_modified_time_ns_after": (
-            fingerprint_after.modified_time_ns
-        ),
-        "database_unchanged": fingerprint_after == fingerprint_before,
-        "data_version_before": data_version_before,
-        "data_version_after": data_version_after,
         "elapsed_seconds": round(elapsed, 6),
     }
 
@@ -1072,11 +947,15 @@ def print_summary(output: dict) -> None:
     _print_never_enqueued_section(output)
 
     print(f"Integrity check:       {output['quick_check']}")
-    print(f"Database unchanged:    {output['database_unchanged']}")
     print(
         "Snapshot data_version: "
         f"{output['data_version_before']} -> "
-        f"{output['data_version_after']}"
+        f"{output['data_version_after']} (authoritative guard)"
+    )
+    print(
+        "DB file unchanged:     "
+        f"{output['database_file_unchanged']} (diagnostic only; a WAL "
+        "commit can leave the main file identical)"
     )
 
     if output.get("json_output"):
