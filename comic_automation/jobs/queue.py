@@ -342,6 +342,16 @@ class JobQueue:
             # "AND status = ?" guards against a lost race even though
             # BEGIN IMMEDIATE already serializes writers; rowcount is
             # checked below rather than trusted implicitly.
+            #
+            # attempts is incremented here, at claim time, not later in
+            # JobWorker.run_once() when the handler actually starts (or
+            # in mark_failed()). This means a claim always counts as an
+            # attempt even if the worker crashes before mark_running()
+            # or the handler ever executes -- claiming and "having
+            # tried" are not the same event, but this queue treats them
+            # as one for max_attempts accounting. See
+            # docs/jobs_worker_retry_audit.md, "Confirmed risks in
+            # current code".
             cursor = self.connection.execute(
                 """
                 UPDATE jobs
