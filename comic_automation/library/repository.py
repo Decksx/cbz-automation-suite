@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from comic_automation.jobs import JobQueue
+from comic_automation.jobs import EnqueueOutcome, JobQueue
 from comic_automation.library.discovery import (
     DEFAULT_ARCHIVE_EXTENSIONS,
     DiscoveredArchive,
@@ -425,28 +425,25 @@ class LibraryRepository:
     ) -> bool:
         # Avoid piling up duplicate inspect_archive jobs for the same
         # archive if one is already pending/claimed/running.
-        existing = self.connection.execute(
-            """
-            SELECT id
-            FROM jobs
-            WHERE archive_id = ?
-              AND job_type = 'inspect_archive'
-              AND status IN ('pending', 'claimed', 'running')
-            LIMIT 1
-            """,
-            (archive_id,),
-        ).fetchone()
-
-        if existing is not None:
-            return False
-
-        self.queue.enqueue(
+        #
+        # The separate "does an active job exist?" SELECT this method
+        # used to run has been removed in favor of
+        # JobQueue.enqueue_if_absent(), which performs the check and the
+        # insert as one atomic statement. The old check-then-insert
+        # could be raced by any enqueue path that does not hold this
+        # method's caller-owned transaction -- notably
+        # ArchiveHashRepository._enqueue_reinspection_if_absent(), which
+        # targets the same job_type from a worker handler. The return
+        # contract is unchanged: True when this call created the job,
+        # False when one was already active.
+        outcome = self.queue.enqueue_if_absent(
             "inspect_archive",
             archive_id=archive_id,
             payload={"path": path},
             priority=100,
         )
-        return True
+
+        return outcome is EnqueueOutcome.CREATED
 
     def _record_event(
         self,
