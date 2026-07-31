@@ -102,6 +102,67 @@ save path, aggregated per archive/batch without per-page telemetry
 writes. Static operation counts identify hypotheses; recorded phase
 timings establish actual bottlenecks.
 
+## Resource limits are explicit and pinned
+
+Decode and read limits belong in this codebase, not in whatever default
+a dependency happens to ship. `Image.MAX_IMAGE_PIXELS` is pinned
+explicitly in `perceptual_hashing.py` so a Pillow upgrade cannot
+silently move the decompression-bomb threshold, and a declared-size cap
+(`MAX_PAGE_UNCOMPRESSED_BYTES`) bounds the per-page `archive.read()`
+allocation before decoding.
+
+The two limits are independent and both are needed: a small compressed
+file can still decode to a huge image, and a page can pass the pixel
+check while its declared size is implausible. Caps are safety ceilings
+set well above any legitimate library page, not operational tuning.
+
+Where a limit's enforcement behavior belongs to the dependency rather
+than to us — Pillow warns above the pinned value but only errors above
+twice it — say so in the comment rather than implying we chose it.
+
+## Staleness is re-checked before every destructive step
+
+Any operation that reads a file, builds a replacement, and then
+overwrites the original must snapshot size/mtime before the read and
+re-verify immediately before the destructive step. This is the same
+before/after `stat()` pattern the read-only hashing path already used;
+it now also guards `_write_cbz_with_comicinfo`, `write_comicinfo`, and
+`pack_image_folder`.
+
+Detection behavior follows each module's existing error model rather
+than imposing a new one: the sanitizer routes drift into its retry
+loop, while library maintenance — which has no retry logic anywhere —
+abandons the operation and counts an error. Consistency of *detection*
+matters; uniformity of *recovery* does not.
+
+This detects drift. It does not make replacement atomic. Collapsing the
+multi-step backup/rename/unlink sequences into a single `os.replace()`
+stays deferred until SMB rename semantics are validated directly, not
+inferred from local NTFS behavior.
+
+## Retry policy for one failure class is uniform within a module
+
+A "file locked" `OSError` is one condition and gets one policy. The
+sanitizer's two retry loops previously used 0.5s and 5s for the same
+transient SMB condition; both now share module-level constants. Longer
+backoff was preferred: a held lock is likelier to clear after seconds
+than milliseconds, and repeatedly hammering a network share is worse
+than waiting.
+
+Modules may still differ from each other where that difference is
+deliberate.
+
+## Audits record evidence; fixes record resolution
+
+Audit documents are preserved unedited as the evidence record of the
+code at audit time. When a finding is closed, annotate it inline and
+add a resolution log at the top — never rewrite the original finding to
+describe current code, which would destroy the record of what was
+actually observed and why.
+
+A resolution log states what landed, what was deliberately not done and
+on what authority, and what remains open.
+
 ## Deletion is delayed
 
 Use quarantine and review before permanent deletion even though a separate library backup exists.

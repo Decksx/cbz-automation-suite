@@ -1,9 +1,106 @@
 # Archive I/O & Resource-Limit Audit
 
-**Status:** evidence-only audit. No production code was changed as part of this
-document. Findings reference function names, not line numbers, since line
-numbers drift with every edit; every claim below was verified by reading the
-actual source referenced.
+**Status:** originally an evidence-only audit; the Section 3 "small, low-risk
+improvements" have since been implemented. See **Resolution log** immediately
+below for what landed, what deliberately did not, and what remains open.
+Findings reference function names, not line numbers, since line numbers drift
+with every edit; every claim below was verified by reading the actual source
+referenced.
+
+The findings text in Sections 1-6 is preserved unedited as the original
+evidence record. Where a finding has since been closed it is marked inline as
+**[RESOLVED 2026-07-31]**; the surrounding description still describes the code
+as it was at audit time, not as it is now.
+
+---
+
+## Resolution log
+
+### Implemented 2026-07-31
+
+All four items below come from Section 3, "Small, low-risk improvements". Each
+was implemented with tests; the full suite passed at 542 tests (up from 530;
+2 pre-existing `test_series_detection.py` failures are unrelated Windows-UNC
+path assertions that fail under Linux `pathlib`).
+
+1. **Explicit pixel policy** — `comic_automation/archive/perceptual_hashing.py`
+   now pins `Image.MAX_IMAGE_PIXELS = 89_478_485` with a documented rationale
+   rather than inheriting whatever default the installed Pillow ships. The
+   warning band (89.5 MP to ~179 MP) is deliberately left non-terminal; the
+   hard `DecompressionBombError` above ~179 MP continues to be caught and
+   converted to `PermanentJobError(category="page_image_corrupt")`. Note the
+   assignment is process-wide, not scoped to this module's calls.
+   Test: `test_pixel_policy_is_pinned_explicitly`.
+
+2. **Pre-read size cap** — `calculate_perceptual_hashes()` now checks
+   `entry.file_size` against a new `MAX_PAGE_UNCOMPRESSED_BYTES`
+   (200 MiB) *before* `archive.read(entry)`, raising
+   `PermanentJobError(category="page_image_too_large")`. This closes the gap
+   flagged in Section 4 versus `inspection.py`'s double-checked 1 MiB
+   `ComicInfo.xml` cap and `page_hashing.py`'s bounded chunk streaming.
+   Tests: `test_oversized_declared_page_is_rejected_before_read`,
+   `test_page_within_size_cap_is_still_processed_normally`.
+
+3. **Normalized file-locked retry policy** — `scripts/cbz_sanitizer.py` now
+   defines `FILE_LOCK_RETRY_ATTEMPTS = 5` and
+   `FILE_LOCK_RETRY_DELAY_SECONDS = 5.0`, used by both retry loops. Previously
+   `_write_cbz_with_comicinfo()` retried at 0.5s while `process_comicinfo()`
+   retried the same underlying condition at 5s. 5s was chosen over 0.5s: a
+   lock held by another process or a transient SMB blip is likelier to have
+   cleared after seconds than milliseconds, and backing off less aggressively
+   is safer for a network share.
+
+4. **Pre-rename staleness re-checks** — all three rewrite paths now snapshot
+   the target's size/mtime and re-verify it immediately before the destructive
+   step, reusing the before/after `stat()` pattern already proven in
+   `page_hashing.py`/`perceptual_hashing.py`:
+
+   | Function | Behavior on detected drift |
+   | --- | --- |
+   | `cbz_sanitizer._write_cbz_with_comicinfo` | raises `OSError`, which routes into that module's existing retry loop, so the next attempt re-reads the now-current file |
+   | `cbz_library_maintenance.write_comicinfo` | raises `OSError`, caught by the function's own broad handler: rewrite abandoned, temp cleaned up, original intact, `False` returned. This module has no retry loop anywhere, so drift is *not* retried |
+   | `cbz_library_maintenance.pack_image_folder` | raises `OSError`, counted into `stats.errors`; the existing archive is never unlinked |
+
+   Tests: `tests/test_sanitizer_comicinfo_rewrite.py` (3),
+   `tests/test_library_maintenance_rewrite.py` (6).
+
+Additionally, an in-code comment was added at each unsanitized entry-name
+pass-through site (`_write_cbz_with_comicinfo`, `write_comicinfo`) recording
+that `ZipInfo.filename` values are round-tripped unvalidated, so a future
+contributor adding an extraction feature does not assume names are already
+safe. This was the fifth Section 3 item; it is documentation only, by design.
+
+### Deliberately not implemented
+
+- **Atomic single-step replacement.** The multi-step
+  backup/rename/unlink sequences in all three rewrite paths remain multi-step.
+  Section 4 classes collapsing them into one `os.replace()` as a
+  correctness-sensitive change to the mutation path requiring validation
+  against SMB rename semantics, not just local NTFS. A comment in
+  `pack_image_folder` now records this explicitly so the remaining
+  non-atomicity is not mistaken for an oversight.
+- **Streaming rewrite paths.** Whole-archive materialization in
+  `_write_cbz_with_comicinfo`/`write_comicinfo` is unchanged — Section 4 requires
+  benchmarking and partial-failure/rollback test coverage first.
+- **Chunked reads in `perceptual_hashing.py`.** Still `archive.read(entry)`
+  per page; Section 4 requires benchmarking against the existing
+  `PerceptualHashProfile` instrumentation, since it changes the exact
+  read-phase cost that profiling was built to measure. The new size cap bounds
+  the worst case in the meantime.
+
+### Still open
+
+Everything in Section 5, "Deferred work", is untouched:
+`scripts/cbz_compilation_resolver.py` has still had no I/O audit;
+encrypted-archive handling is still untraced end-to-end; and the SMB-specific
+behavior claims throughout this document still rest on code inspection rather
+than fault-injection testing.
+
+`comic_automation/jobs/worker.py`'s retry/backoff policy, listed as out of
+scope here, was separately audited in `docs/jobs_worker_retry_audit.md` and its
+own low-risk items are now closed (see that document).
+
+---
 
 **Scope:** six components involved in reading, hashing, or rewriting CBZ
 (zip) archives:
@@ -571,11 +668,14 @@ steps.
   compilation-range patch, or title repair — not an edge case — and has no
   size guard.
 - **No pre-read size check in `perceptual_hashing.py`.**
+  **[RESOLVED 2026-07-31 — see Resolution log item 2.]**
   `calculate_perceptual_hashes` calls `archive.read(entry)` for each page
   with no check on `entry.file_size`/`compress_size` beforehand, unlike
   `inspection.py`'s double-checked cap or `page_hashing.py`'s bounded
   streaming.
-- **Implicit, unpinned pixel thresholds.** No `Image.MAX_IMAGE_PIXELS`
+- **Implicit, unpinned pixel thresholds.**
+  **[RESOLVED 2026-07-31 — see Resolution log item 1.]**
+  No `Image.MAX_IMAGE_PIXELS`
   override exists anywhere in the codebase. Pillow uses that value as a
   warning threshold and raises `DecompressionBombError` only above twice
   that value, so `perceptual_hashing.py`'s warning/rejection behavior depends
@@ -587,6 +687,7 @@ steps.
   `Path.rename()`/`unlink()` calls rather than one atomic replace, with a
   window where no file exists at the target path if interrupted.
 - **No pre-rename staleness check in any `scripts/` rewrite function.**
+  **[RESOLVED 2026-07-31 — see Resolution log item 4.]**
   Unlike `page_hashing.py`/`perceptual_hashing.py`'s before/after `stat()`
   guard, none of `_write_cbz_with_comicinfo`, `write_comicinfo`, or
   `pack_image_folder` re-verify the target's size/mtime immediately before
@@ -596,12 +697,20 @@ steps.
 - **No file locking anywhere** across either `scripts/` file for archive
   rewrites; the only protection against a locked/in-use file is
   retry-after-`OSError` where retry exists at all.
-- **Unsanitized entry-name pass-through.** Both `scripts/` files copy
+- **Unsanitized entry-name pass-through.**
+  **[DOCUMENTED 2026-07-31 — in-code comments added at both sites; the
+  pass-through behavior itself is unchanged by design.]**
+  Both `scripts/` files copy
   original `ZipInfo.filename` values unchanged into rewritten archives, with
   no `".."`/traversal validation. Not an active vulnerability in these two
   files (neither extracts to disk), but a maliciously-crafted entry name
   would silently survive "sanitization" and be reintroduced into the corpus.
 - **Inconsistent retry behavior for the identical failure condition.**
+  **[PARTIALLY RESOLVED 2026-07-31 — see Resolution log item 3.]** The two
+  differing intervals inside `cbz_sanitizer.py` are now unified on shared
+  constants. The cross-file difference stands: `cbz_library_maintenance.py`
+  still has no retry logic at all, which remains an intentional design
+  difference rather than a defect.
   `cbz_sanitizer.py` retries a "file locked" `OSError` in 2 of 5 read/write
   call sites, at two different intervals (0.5s and 5s, both ×5 attempts),
   and has no retry in the other 3. `cbz_library_maintenance.py` has zero

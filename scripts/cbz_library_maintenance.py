@@ -526,7 +526,35 @@ def pack_image_folder(folder: Path, dry_run: bool) -> MaintenanceStats:
                 zf.write(item, arcname=item.name)
 
         if cbz_path.exists():
-            if tmp_path.stat().st_size > cbz_path.stat().st_size:
+            # Capture the exact stat the replace decision is made from, then
+            # re-verify it immediately before unlinking. Without this, a
+            # writer that replaces cbz_path between the size comparison and
+            # the unlink would have its file deleted on the strength of a
+            # measurement that no longer describes it. The window is narrow
+            # (the two calls are adjacent), so this is a smaller gap than the
+            # read-rebuild window guarded in write_comicinfo() above -- but it
+            # is the same class of unchecked-staleness bug and is closed the
+            # same way. See docs/archive_io_resource_audit.md, "Small,
+            # low-risk improvements".
+            #
+            # NOTE: this does not make the replacement atomic. The
+            # unlink-then-rename below still leaves a window in which no file
+            # exists at cbz_path. Collapsing that into a single atomic
+            # os.replace() is deliberately NOT done here: the audit classes it
+            # as a correctness-sensitive change to the mutation path that must
+            # be validated against SMB rename semantics (not just local NTFS)
+            # before rollout, unlike this check.
+            existing_stat = cbz_path.stat()
+            if tmp_path.stat().st_size > existing_stat.st_size:
+                current_stat = cbz_path.stat()
+                if (
+                    current_stat.st_size != existing_stat.st_size
+                    or current_stat.st_mtime_ns != existing_stat.st_mtime_ns
+                ):
+                    raise OSError(
+                        f"{cbz_path.name} changed on disk while packing a "
+                        "replacement; abandoning the replace."
+                    )
                 cbz_path.unlink()
                 tmp_path.rename(cbz_path)
                 log.info("  Packed image folder and replaced smaller archive: %s", cbz_path.name)
@@ -1620,9 +1648,26 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
     tmp_path = cbz_path.with_suffix(".tmp.cbz")
     bak_path = cbz_path.with_suffix(".bak.cbz")
     try:
+        # Snapshot size/mtime before reading, so a concurrent writer that
+        # touches cbz_path during the read-rebuild window below can be
+        # detected immediately before the destructive rename rather than
+        # silently overwritten. Mirrors the before/after stat() pattern
+        # already used by comic_automation/archive/{page_hashing,
+        # perceptual_hashing}.py for the read-only hashing path, and now
+        # by cbz_sanitizer._write_cbz_with_comicinfo(). See
+        # docs/archive_io_resource_audit.md, "Small, low-risk improvements".
+        before_stat = cbz_path.stat()
         entries: list[tuple[zipfile.ZipInfo, bytes]] = []
         with zipfile.ZipFile(cbz_path, "r") as zin:
             for info in zin.infolist():
+                # info.filename is round-tripped unchanged into the rewritten
+                # archive below. Nothing here extracts to a real filesystem
+                # path, so an unsafe ("..", absolute, or otherwise traversing)
+                # member name is not exploitable in this function -- but it is
+                # silently preserved into the output rather than rejected, and
+                # would be inherited by any downstream tool that later performs
+                # a naive extraction. See docs/archive_io_resource_audit.md,
+                # "Confirmed risks in current code".
                 entries.append((info, zin.read(info.filename)))
 
         with zipfile.ZipFile(tmp_path, "w") as zout:
@@ -1635,6 +1680,24 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
                     zout.writestr(info, data, compress_type=info.compress_type)
             if not wrote:
                 zout.writestr("ComicInfo.xml", xml.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
+
+        # Re-check immediately before the destructive rename: if cbz_path
+        # changed since before_stat was captured, another writer touched it
+        # during the read-rebuild window above and replacing it now would
+        # discard that writer's output undetected. Unlike cbz_sanitizer,
+        # this module has no retry loop, so this raise is caught by the
+        # broad "except Exception" below: the rewrite is abandoned, the
+        # temp file is cleaned up, the original is left untouched, and the
+        # caller counts it as an error.
+        after_stat = cbz_path.stat()
+        if (
+            before_stat.st_size != after_stat.st_size
+            or before_stat.st_mtime_ns != after_stat.st_mtime_ns
+        ):
+            raise OSError(
+                f"{cbz_path.name} changed on disk while its ComicInfo.xml "
+                "was being rewritten; abandoning the rewrite."
+            )
 
         bak_path.unlink(missing_ok=True)  # remove any stale backup before renaming
         cbz_path.rename(bak_path)

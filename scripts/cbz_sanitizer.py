@@ -109,6 +109,21 @@ COMICINFO_TEMPLATE = """<ComicInfo
 # ─────────────────────────────────────────────
 # MODULE-LEVEL CONSTANTS
 # ─────────────────────────────────────────────
+# File-locked retry policy, shared by every "file locked" OSError retry
+# loop in this module. Previously _write_cbz_with_comicinfo() retried at
+# 0.5s while process_comicinfo() retried the same underlying condition
+# (a locked/in-use CBZ, typically an SMB share blip) at 5s -- both for
+# 5 attempts -- so identical failures behaved differently depending on
+# which function happened to hit them. See
+# docs/archive_io_resource_audit.md, "Small, low-risk improvements".
+# 5s/5 attempts was chosen over 0.5s/5 attempts: a lock held by another
+# process (or a transient SMB blip) is more likely to have cleared after
+# a few seconds than a few hundred milliseconds, and backing off less
+# aggressively is safer for a network share than hammering it five
+# times in under three seconds.
+FILE_LOCK_RETRY_ATTEMPTS = 5
+FILE_LOCK_RETRY_DELAY_SECONDS = 5.0
+
 _TITLE_OVERWRITE_RES = [
     re.compile(r"manga_chapter",          re.IGNORECASE),
     re.compile(r"^#\s*english",           re.IGNORECASE),
@@ -401,11 +416,31 @@ def _write_cbz_with_comicinfo(
 ) -> None:
     tmp_path = cbz_path.with_suffix(".tmp.cbz")
     action   = "updated" if replace_entry else "injected"
-    for attempt in range(5):
+    for attempt in range(FILE_LOCK_RETRY_ATTEMPTS):
         try:
+            # Snapshot the source archive's size/mtime before reading it, so
+            # a concurrent writer touching cbz_path during this
+            # read-rebuild-rename sequence can be detected immediately
+            # before the destructive rename below, instead of silently
+            # overwriting whatever the other writer produced. Mirrors the
+            # before/after stat() pattern already used by
+            # comic_automation/archive/{page_hashing,perceptual_hashing}.py
+            # for the read-only hashing path; see
+            # docs/archive_io_resource_audit.md, "Small, low-risk
+            # improvements".
+            before_stat = cbz_path.stat()
             zip_entries: list[tuple] = []
             with zipfile.ZipFile(cbz_path, "r") as zin:
                 for item in zin.infolist():
+                    # item.filename is carried through unchanged into the
+                    # rewritten archive below. This function never extracts to
+                    # a real filesystem path, so an unsafe (".." or absolute)
+                    # member name is not itself exploitable here -- but it is
+                    # silently reproduced into the "sanitized" output rather
+                    # than rejected, and would be inherited by any downstream
+                    # tool that later performs a naive extraction. See
+                    # docs/archive_io_resource_audit.md, "Confirmed risks in
+                    # current code".
                     zip_entries.append((item, zin.read(item.filename)))
             with zipfile.ZipFile(tmp_path, "w") as zout:
                 for item, data in zip_entries:
@@ -419,6 +454,22 @@ def _write_cbz_with_comicinfo(
                         new_xml.encode("utf-8"),
                         compress_type=zipfile.ZIP_DEFLATED
                     )
+            # Re-check immediately before the destructive rename below: if
+            # cbz_path changed since before_stat was captured, another writer
+            # touched it during the read-rebuild window above, and replacing
+            # it now would silently discard that writer's output with no
+            # detection. Raising OSError here routes into the existing
+            # "file locked" retry branch, so the next attempt re-reads the
+            # now-current file instead of proceeding on stale data.
+            after_stat = cbz_path.stat()
+            if (
+                before_stat.st_size != after_stat.st_size
+                or before_stat.st_mtime_ns != after_stat.st_mtime_ns
+            ):
+                raise OSError(
+                    f"{cbz_path.name} changed on disk while its ComicInfo.xml "
+                    "was being rewritten."
+                )
             bak_path = cbz_path.with_suffix(".bak.cbz")
             cbz_path.rename(bak_path)
             tmp_path.rename(cbz_path)
@@ -426,16 +477,19 @@ def _write_cbz_with_comicinfo(
             log.info(f"    comicinfo.xml {action} successfully.")
             return
         except OSError as e:
-            log.warning(f"    File locked (attempt {attempt + 1}/5), retrying in 0.5s... ({e})")
+            log.warning(
+                f"    File locked (attempt {attempt + 1}/{FILE_LOCK_RETRY_ATTEMPTS}), "
+                f"retrying in {FILE_LOCK_RETRY_DELAY_SECONDS}s... ({e})"
+            )
             if tmp_path.exists():
                 tmp_path.unlink()
-            time.sleep(0.5)
+            time.sleep(FILE_LOCK_RETRY_DELAY_SECONDS)
         except Exception as e:
             log.error(f"    Failed to write comicinfo.xml: {e}")
             if tmp_path.exists():
                 tmp_path.unlink()
             return
-    log.error(f"    Gave up writing comicinfo.xml after 5 attempts: {cbz_path.name}")
+    log.error(f"    Gave up writing comicinfo.xml after {FILE_LOCK_RETRY_ATTEMPTS} attempts: {cbz_path.name}")
 
 def _rewrite_comicinfo(cbz_path: Path, xml_entry_name: str, new_xml: str) -> None:
     _write_cbz_with_comicinfo(cbz_path, new_xml, replace_entry=xml_entry_name)
@@ -573,7 +627,7 @@ def process_comicinfo(
     filename_stem = cbz_path.stem
     if "leading_nums"  in rules: filename_stem = NUMBER_PREFIX_RE.sub("", filename_stem).strip()
     if "trailing_junk" in rules: filename_stem = TRAILING_JUNK_RE.sub("", filename_stem).strip()
-    for attempt in range(5):
+    for attempt in range(FILE_LOCK_RETRY_ATTEMPTS):
         try:
             if prefetched_xml is not None:
                 real_name, xml_text = prefetched_xml
@@ -711,12 +765,15 @@ def process_comicinfo(
                 return
 
         except OSError:
-            log.warning(f"    File locked reading zip (attempt {attempt + 1}/5), retrying in 5s...")
-            time.sleep(5)
+            log.warning(
+                f"    File locked reading zip (attempt {attempt + 1}/{FILE_LOCK_RETRY_ATTEMPTS}), "
+                f"retrying in {FILE_LOCK_RETRY_DELAY_SECONDS}s..."
+            )
+            time.sleep(FILE_LOCK_RETRY_DELAY_SECONDS)
         except zipfile.BadZipFile:
             log.error(f"    Cannot open {cbz_path.name} - bad zip file, skipping.")
             return
-    log.error(f"    Gave up reading {cbz_path.name} after 5 attempts.")
+    log.error(f"    Gave up reading {cbz_path.name} after {FILE_LOCK_RETRY_ATTEMPTS} attempts.")
 
 
 def _process_comicinfo_with_core(
