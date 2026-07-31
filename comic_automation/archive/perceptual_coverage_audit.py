@@ -219,11 +219,13 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 # Distinct from EXIT_FAILURE so an operator (or a wrapper script) can
 # tell "the audit could not run / crashed" apart from "the audit ran
-# cleanly and found blocking gaps". Mirrors
+# cleanly and proved the backfill is not complete". Mirrors
 # jobs/active_job_duplicate_audit.py's EXIT_BLOCKING_DUPLICATES. Only
-# reachable in final-audit mode: mid-backfill the same finding is
-# expected work and must not fail a pipeline.
-EXIT_BLOCKING_UNEXPLAINED_GAPS = 2
+# reachable in final-audit mode: mid-backfill remaining work is expected
+# and must not fail a pipeline.  Keep the original name as an alias for
+# callers written against the first coverage-audit release.
+EXIT_BACKFILL_INCOMPLETE = 2
+EXIT_BLOCKING_UNEXPLAINED_GAPS = EXIT_BACKFILL_INCOMPLETE
 
 
 # `DatabaseChangedError`, `DatabaseMutatedError`,
@@ -628,14 +630,12 @@ def run_audit(
 ) -> dict:
     """Produce the read-only, full-library coverage-audit report.
 
-    `expect_backfill_complete` is the operator's assertion that Version
-    1 eligibility has already reached zero (the handoff document's
-    "Remaining project sequence" step 3). It changes no classification
-    and no query: the never-enqueued population is identical either
-    way. It only decides how that population is *reported* -- as
-    expected remaining backlog (default) or as blocking unexplained
-    gaps that a missed enqueue or orchestration bug would explain
-    (final-audit mode). See the module docstring.
+    `expect_backfill_complete` selects the handoff document's strict
+    final-audit mode. It changes no classification and no query. Instead,
+    it verifies the claimed end state: both the `incomplete` and `stale`
+    populations must be zero. The never-enqueued population is identical
+    in both modes, but final mode additionally describes that subset as
+    blocking unexplained gaps.
 
     Never mutates `database`. `json_output`/`csv_output` are validated
     against `database` (and against each other) *before* the database
@@ -726,6 +726,13 @@ def run_audit(
     never_enqueued_archive_ids = [
         archive["archive_id"] for archive in never_enqueued
     ]
+    blocking_incomplete_count = (
+        counts["incomplete"] if expect_backfill_complete else 0
+    )
+    blocking_stale_count = counts["stale"] if expect_backfill_complete else 0
+    blocking_backfill_work_count = (
+        blocking_incomplete_count + blocking_stale_count
+    )
 
     output = {
         "database": str(database),
@@ -739,6 +746,18 @@ def run_audit(
         ),
         "failed_stable_category_counts": failed_category_counts(archives),
         "expect_backfill_complete": expect_backfill_complete,
+        # Final mode verifies its own premise.  A nonzero incomplete or
+        # stale population means Version 1 work remains, even when every
+        # such archive has job history and therefore none qualifies as a
+        # never-enqueued unexplained gap.
+        "backfill_complete_gate_passed": (
+            blocking_backfill_work_count == 0
+            if expect_backfill_complete
+            else None
+        ),
+        "blocking_incomplete_count": blocking_incomplete_count,
+        "blocking_stale_count": blocking_stale_count,
+        "blocking_backfill_work_count": blocking_backfill_work_count,
         "never_enqueued_backlog_count": len(never_enqueued),
         "never_enqueued_backlog_archive_ids": never_enqueued_archive_ids,
         "never_enqueued_backlog_explanation": (
@@ -788,8 +807,9 @@ def build_parser() -> argparse.ArgumentParser:
             "separately reports eligible archives with zero coverage "
             "and no job history at all as the never-enqueued backlog "
             "(expected remaining work while the backfill is running; "
-            "pass --expect-backfill-complete to treat them as blocking "
-            "unexplained gaps instead). Never enqueues, retries, "
+            "pass --expect-backfill-complete to require incomplete and "
+            "stale populations to be zero and treat any never-enqueued "
+            "subset as blocking unexplained gaps). Never enqueues, retries, "
             "quarantines, or moves anything; safe to point at a "
             "protected backup."
         )
@@ -828,13 +848,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-backfill-complete",
         action="store_true",
         help=(
-            "Final-audit mode. Assert that Version 1 eligibility has "
-            "already reached zero, so an eligible archive that never "
-            "had a hash_archive_pages_perceptual job is a blocking "
-            "unexplained gap (missed enqueue / orchestration bug) "
-            "rather than remaining backlog. Changes no classification "
-            "-- only the interpretation, the console framing, and the "
-            "exit code (2 when any are found). Use this for step 3 of "
+            "Final-audit mode. Verify that Version 1 work is complete by "
+            "requiring both incomplete and stale populations to be zero. "
+            "Any eligible archive that never had a "
+            "hash_archive_pages_perceptual job is additionally reported "
+            "as a blocking unexplained gap (missed enqueue / orchestration "
+            "bug). Changes no classification; exits 2 whenever incomplete "
+            "or stale work remains. Use this for step 3 of "
             "the handoff document's remaining project sequence; leave "
             "it off while the backfill is still running."
         ),
@@ -946,6 +966,14 @@ def print_summary(output: dict) -> None:
 
     _print_never_enqueued_section(output)
 
+    if output.get("expect_backfill_complete"):
+        print(
+            "Final backfill gate:    "
+            f"{output['backfill_complete_gate_passed']} "
+            f"(incomplete={output['blocking_incomplete_count']:,}, "
+            f"stale={output['blocking_stale_count']:,})"
+        )
+
     print(f"Integrity check:       {output['quick_check']}")
     print(
         "Snapshot data_version: "
@@ -981,12 +1009,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print_summary(output)
 
-    # Only final-audit mode can fail the run. Mid-backfill the same
-    # population is the work queue itself, and exiting non-zero on it
-    # would fail every scheduled run until the backfill finished --
-    # which is exactly how a real gap ends up ignored.
-    if output["blocking_unexplained_gap_count"] > 0:
-        return EXIT_BLOCKING_UNEXPLAINED_GAPS
+    # Only final-audit mode can fail the run. It verifies its own premise:
+    # all incomplete and stale work must be gone. The never-enqueued gap
+    # population is a diagnostic subset of incomplete, not the whole gate.
+    if output["blocking_backfill_work_count"] > 0:
+        return EXIT_BACKFILL_INCOMPLETE
 
     return EXIT_OK
 

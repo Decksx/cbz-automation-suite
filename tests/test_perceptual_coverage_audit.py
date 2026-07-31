@@ -11,6 +11,7 @@ from comic_automation.archive.perceptual_coverage_audit import (
     DatabaseChangedError,
     DatabaseIntegrityError,
     DatabaseMutatedError,
+    EXIT_BACKFILL_INCOMPLETE,
     EXIT_BLOCKING_UNEXPLAINED_GAPS,
     EXIT_OK,
     MAX_PRINTED_ARCHIVE_IDS,
@@ -1029,6 +1030,10 @@ def test_final_audit_mode_reports_blocking_gaps_and_exits_nonzero(
 
     payload = json.loads(json_output.read_text(encoding="utf-8"))
     assert payload["expect_backfill_complete"] is True
+    assert payload["backfill_complete_gate_passed"] is False
+    assert payload["blocking_incomplete_count"] == 2
+    assert payload["blocking_stale_count"] == 1
+    assert payload["blocking_backfill_work_count"] == 3
     assert payload["blocking_unexplained_gap_count"] == 1
     assert payload["blocking_unexplained_gap_archive_ids"] == [
         ids["never_enqueued_backlog"]
@@ -1090,6 +1095,82 @@ def test_final_audit_on_fully_backfilled_database_passes_cleanly(
     )
     assert "must be investigated" not in captured.out
     assert "ARCHIVE IDS" not in captured.out
+    assert "Final backfill gate:    True (incomplete=0, stale=0)" in captured.out
+
+
+def test_final_audit_blocks_incomplete_work_even_with_job_history(
+    tmp_path: Path,
+) -> None:
+    """Final mode verifies completion, not merely absence of missed enqueue."""
+    database = tmp_path / "audit.db"
+    (archive_id,) = build_never_enqueued_database(database, count=1)
+
+    with database_connection(database) as connection:
+        seed_job(
+            connection,
+            archive_id=archive_id,
+            status="completed",
+            completed_at="2026-07-30T09:00:00",
+        )
+
+    json_output = tmp_path / "coverage.json"
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+            "--expect-backfill-complete",
+        ]
+    )
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert result == EXIT_BACKFILL_INCOMPLETE
+    assert payload["never_enqueued_backlog_count"] == 0
+    assert payload["blocking_unexplained_gap_count"] == 0
+    assert payload["blocking_incomplete_count"] == 1
+    assert payload["blocking_stale_count"] == 0
+    assert payload["blocking_backfill_work_count"] == 1
+    assert payload["backfill_complete_gate_passed"] is False
+
+
+def test_final_audit_blocks_stale_work_without_unexplained_gap(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "audit.db"
+    (archive_id,) = build_never_enqueued_database(database, count=1)
+
+    with database_connection(database) as connection:
+        seed_job(
+            connection,
+            archive_id=archive_id,
+            status="claimed",
+            claimed_at="2000-01-01 00:00:00",
+        )
+
+    json_output = tmp_path / "coverage.json"
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+            "--expect-backfill-complete",
+        ]
+    )
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert result == EXIT_BACKFILL_INCOMPLETE
+    assert payload["never_enqueued_backlog_count"] == 0
+    assert payload["blocking_unexplained_gap_count"] == 0
+    assert payload["blocking_incomplete_count"] == 0
+    assert payload["blocking_stale_count"] == 1
+    assert payload["blocking_backfill_work_count"] == 1
+    assert payload["backfill_complete_gate_passed"] is False
 
 
 # --- bounded console output, full machine-readable output -------------------

@@ -507,18 +507,24 @@ run, and the distinction matters operationally:
   work, and never affect the exit code. At the 2026-07-30 baseline this
   is roughly 17,554 archives -- the reconciled remaining eligible
   population, not a defect.
-- **After the backfill is complete (`--expect-backfill-complete`).**
-  Step 3 of the remaining project sequence runs this audit only once
-  Version 1 eligibility has reached zero. With no un-enqueued batch left
-  to explain a missing job, the same archives are blocking unexplained
-  gaps -- evidence of a missed enqueue or an orchestration bug -- and are
-  additionally reported as `blocking_unexplained_gap_count` /
+- **After the backfill is expected to be complete
+  (`--expect-backfill-complete`).** Step 3 of the remaining project
+  sequence uses this strict mode. It verifies the expectation instead of
+  trusting it: both the `incomplete` and `stale` populations must be zero,
+  otherwise the audit exits 2 and reports `blocking_incomplete_count`,
+  `blocking_stale_count`, and `blocking_backfill_work_count`. With no
+  un-enqueued batch left to explain a missing job, any never-enqueued
+  subset is additionally reported as a blocking unexplained gap --
+  evidence of a missed enqueue or an orchestration bug -- under
+  `blocking_unexplained_gap_count` /
   `blocking_unexplained_gap_archive_ids`.
 
 The flag changes no classification and no query: the population is
-identical in both modes. Only the interpretation, the console framing,
-and the exit code change. Exit codes are `0` clean, `1` the audit could
-not run, `2` final-audit mode found blocking unexplained gaps.
+identical in both modes. It changes the completion gate, interpretation,
+console framing, and exit code. Exit codes are `0` clean, `1` the audit
+could not run, `2` final-audit mode proved that incomplete or stale work
+remains. Ordinary terminal failures remain a separately audited,
+non-blocking defect population.
 
 The console summary prints at most 20 archive ids for any list, always
 followed by an explicit count of how many were omitted. The JSON and
