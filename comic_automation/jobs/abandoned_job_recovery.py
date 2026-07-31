@@ -1,16 +1,19 @@
 """Guarded, operator-facing recovery of stale claimed/running jobs.
 
-`JobQueue.recover_abandoned()` (`comic_automation/jobs/queue.py`) already
-runs unattended and unconditionally from
-`ComicAutomationService.initialize()` every time the service starts, with
-a 300-second staleness window. That call has no operator confirmation,
-no minimum-age guard beyond its own `older_than_seconds >= 0` check, and
-no report of *which* jobs it touched -- it just returns a count. That is
-appropriate for an unattended startup hook, but it is not something a
-human should be able to trigger against a live database by accident.
+`JobQueue.recover_abandoned()` (`comic_automation/jobs/queue.py`) used to
+run unattended and unconditionally from
+`ComicAutomationService.initialize()` every time the service started,
+with a 300-second staleness window. That call had no operator
+confirmation, no minimum-age guard beyond its own
+`older_than_seconds >= 0` check, and no report of *which* jobs it
+touched -- it just returned a count. It has since been removed: startup
+now only *detects* stale jobs read-only and logs a warning pointing
+here, because age cannot distinguish a dead worker from a slow one (see
+"Guard 3" below). `recover_abandoned()` itself remains in `queue.py`,
+but this module is now the only supported way to recover jobs.
 
-This module is the deliberate, human-run counterpart, distinct from
-that implicit startup call. By default it is strictly report-only: it
+This module is the deliberate, human-run counterpart. By default it is
+strictly report-only: it
 reuses `comic_automation.jobs.abandoned_job_audit.collect_stale_jobs()`
 (the same helper `abandoned_job_audit.run_audit()` uses) and returns
 exactly what recovery *would* do, without writing anything. Only when
@@ -146,9 +149,11 @@ from comic_automation.jobs.abandoned_job_audit import (
 )
 
 
-# recover_abandoned()'s unattended caller (ComicAutomationService
-# .initialize()) uses a 300-second staleness window. That production
-# value is the floor here: anything shorter is very likely to catch
+# 300 seconds was the staleness window recover_abandoned()'s former
+# unattended caller (ComicAutomationService.initialize()) used, and is
+# still the threshold that service's read-only startup detection
+# reports on. That production value is the floor here: anything
+# shorter is very likely to catch
 # jobs that are merely slow, not abandoned by a dead worker. Note that
 # the floor is a typo guard, not evidence of abandonment -- see the
 # module docstring's "Guard 3" section and WORKER_LIVENESS_WARNING.

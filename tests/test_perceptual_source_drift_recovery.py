@@ -27,13 +27,18 @@ from comic_automation.archive.repository import (
 )
 from comic_automation.archive.source_drift_recovery import (
     JOB_TYPE,
+    DatabaseChangedError,
+    DatabaseIntegrityError,
     RecoveryPreconditionError,
     analyze_source_drift,
     apply_source_drift_recovery,
     fingerprint_database,
     main,
 )
-from comic_automation.database.connection import database_connection
+from comic_automation.database.connection import (
+    connect_database,
+    database_connection,
+)
 from comic_automation.database.migrations import apply_migrations
 from comic_automation.jobs import JobQueue, JobWorker, WorkerOutcome
 
@@ -561,3 +566,210 @@ def test_cli_requires_apply_guards(
 
     assert exit_code == 1
     assert "--apply requires" in captured.err
+
+
+# --- WAL-aware consistent-snapshot guards -------------------------------
+
+
+def test_wal_commit_can_leave_the_file_fingerprint_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Documents the hazard the data_version guard exists to cover.
+
+    In WAL mode a committed write is appended to the ``-wal`` sidecar;
+    the main database file is only rewritten later, at checkpoint. So
+    size + mtime of the database itself can be byte-for-byte identical
+    across another connection's commit, and the fingerprint check this
+    module already had could never have detected one.
+    """
+    database, _archive, archive_id, _job_id = build_drift_case(tmp_path)
+
+    before = fingerprint_database(database)
+
+    # The writer is deliberately left open across the second stat:
+    # closing it would checkpoint the WAL back into the main file and
+    # change the fingerprint after the fact. The hazard is about what
+    # is observable *at the moment of the commit*.
+    writer = connect_database(database)
+    try:
+        assert (
+            writer.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            == "wal"
+        )
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            """
+            INSERT INTO file_events (archive_id, event_type, source_path)
+            VALUES (?, 'observed', 'x')
+            """,
+            (archive_id,),
+        )
+        writer.execute("COMMIT")
+
+        after = fingerprint_database(database)
+        assert (database.parent / (database.name + "-wal")).is_file()
+    finally:
+        writer.close()
+
+    assert before == after
+
+
+def test_external_wal_commit_mid_analysis_invalidates_the_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A commit landing between two analysis queries is rejected.
+
+    `analyze_source_drift` reads the job/location row, the stored page
+    inventory and any conflicting active jobs separately, and the apply
+    path uses the combined result as its optimistic-concurrency
+    baseline. A writer committing between two of those queries would
+    produce a baseline that never described one database state.
+
+    The commit is injected inside `_stored_inventory`, i.e. after the
+    job/location query and before the conflict query -- squarely in the
+    middle, which is exactly where the fingerprint-only guard was
+    blind.
+    """
+    database, _archive, archive_id, job_id = build_drift_case(tmp_path)
+
+    import comic_automation.archive.source_drift_recovery as recovery_module
+
+    real_stored_inventory = recovery_module._stored_inventory
+    fingerprint_at_commit: dict[str, object] = {}
+
+    def inventory_then_external_commit(connection, archive):
+        result = real_stored_inventory(connection, archive)
+
+        before = fingerprint_database(database)
+
+        # A *different* connection commits while the analysis is
+        # mid-read. database_connection() opens in WAL mode, so this
+        # commit can land entirely in the -wal file.
+        with database_connection(database) as other:
+            other.execute(
+                """
+                INSERT INTO file_events (
+                    archive_id, event_type, source_path
+                )
+                VALUES (?, 'observed', 'x')
+                """,
+                (archive_id,),
+            )
+
+        fingerprint_at_commit["before"] = before
+        fingerprint_at_commit["after"] = fingerprint_database(database)
+
+        return result
+
+    monkeypatch.setattr(
+        recovery_module, "_stored_inventory", inventory_then_external_commit
+    )
+
+    with pytest.raises(DatabaseChangedError) as raised:
+        analyze_source_drift(database=database, job_id=job_id)
+
+    # Specifically the data_version guard, not the fingerprint fallback:
+    # DatabaseMutatedError is a *subclass* of DatabaseChangedError, so
+    # the exact type is what distinguishes which detector fired.
+    assert type(raised.value) is DatabaseChangedError
+    assert "data_version" in str(raised.value)
+
+    # The commit really did happen...
+    with database_connection(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM file_events WHERE event_type = 'observed'"
+            ).fetchone()[0]
+            == 1
+        )
+
+    # ...and this is *why* data_version is required: at the moment of
+    # the commit the main database file's size and mtime were entirely
+    # unchanged, so the fingerprint comparison could not have raised.
+    assert fingerprint_at_commit["before"] == fingerprint_at_commit["after"]
+
+
+def test_apply_refuses_when_the_analysis_snapshot_was_invalidated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The apply path inherits the guard: no recovery on a mixed read."""
+    database, archive, archive_id, job_id = build_drift_case(tmp_path)
+    live = archive.stat()
+
+    import comic_automation.archive.source_drift_recovery as recovery_module
+
+    real_stored_inventory = recovery_module._stored_inventory
+
+    def inventory_then_external_commit(connection, archive_arg):
+        result = real_stored_inventory(connection, archive_arg)
+
+        with database_connection(database) as other:
+            other.execute(
+                """
+                INSERT INTO file_events (
+                    archive_id, event_type, source_path
+                )
+                VALUES (?, 'observed', 'x')
+                """,
+                (archive_id,),
+            )
+
+        return result
+
+    monkeypatch.setattr(
+        recovery_module, "_stored_inventory", inventory_then_external_commit
+    )
+
+    with pytest.raises(DatabaseChangedError):
+        apply_source_drift_recovery(
+            database=database,
+            job_id=job_id,
+            expected_file_size=live.st_size,
+            expected_modified_time_ns=live.st_mtime_ns,
+        )
+
+    # Nothing was recovered: the job still carries its drift error.
+    with database_connection(database) as connection:
+        row = connection.execute(
+            "SELECT status, error_message FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+
+    assert row["status"] == "pending"
+    assert row["error_message"] is not None
+
+
+def test_quick_check_failure_raises_integrity_error(tmp_path: Path) -> None:
+    """A structurally damaged database must abort the analysis."""
+    database, _archive, _archive_id, job_id = build_drift_case(tmp_path)
+
+    # Clobber the final page. The schema stays readable, so the
+    # database still opens and the analysis gets far enough to run
+    # quick_check -- which is the point: the integrity guard, not
+    # sqlite3's own open-time errors, is what must fire.
+    page_size = 4096
+    data = bytearray(database.read_bytes())
+    assert len(data) > page_size * 2
+    data[-page_size:] = bytes([0x5A]) * page_size
+    database.write_bytes(bytes(data))
+
+    with pytest.raises(DatabaseIntegrityError) as raised:
+        analyze_source_drift(database=database, job_id=job_id)
+
+    assert "quick_check" in str(raised.value)
+
+
+def test_analysis_surfaces_the_snapshot_boundary(tmp_path: Path) -> None:
+    """The analysis states the guarantee it actually has."""
+    database, _archive, _archive_id, job_id = build_drift_case(tmp_path)
+
+    output = analyze_source_drift(database=database, job_id=job_id)
+
+    assert output["quick_check"] == "ok"
+    assert output["data_version_before"] == output["data_version_after"]
+    assert output["concurrent_commit_detected"] is False
+    assert output["database_file_unchanged"] is True
+    assert output["database_unchanged_is_diagnostic_only"] is True
+    assert "data_version" in output["fingerprint_diagnostic_note"]

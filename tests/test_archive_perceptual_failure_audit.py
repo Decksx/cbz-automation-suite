@@ -8,6 +8,8 @@ import pytest
 
 from comic_automation.archive.perceptual_failure_audit import (
     JOB_TYPE,
+    DatabaseChangedError,
+    DatabaseIntegrityError,
     DatabaseMutatedError,
     category_counts,
     collect_failures,
@@ -18,7 +20,10 @@ from comic_automation.archive.perceptual_failure_audit import (
     run_audit,
     stable_category,
 )
-from comic_automation.database.connection import database_connection
+from comic_automation.database.connection import (
+    connect_database,
+    database_connection,
+)
 from comic_automation.database.migrations import apply_migrations
 
 
@@ -370,3 +375,146 @@ def test_run_audit_raises_if_database_mutated_mid_run(
 def test_missing_database_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         run_audit(database=tmp_path / "does-not-exist.db")
+
+
+# --- WAL-aware consistent-snapshot guards -------------------------------
+
+
+def test_wal_commit_can_leave_the_file_fingerprint_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Documents the hazard the data_version guard exists to cover.
+
+    In WAL mode a committed write is appended to the ``-wal`` sidecar;
+    the main database file is only rewritten later, at checkpoint. So
+    size + mtime of the database itself can be byte-for-byte identical
+    across another connection's commit, and this audit's old
+    fingerprint-only check would have reported a mixed snapshot as
+    clean.
+    """
+    database = tmp_path / "audit.db"
+    build_populated_database(database)
+
+    before = fingerprint_database(database)
+
+    # The writer is deliberately left open across the second stat:
+    # closing it would checkpoint the WAL back into the main file and
+    # change the fingerprint after the fact. The hazard is about what
+    # is observable *at the moment of the commit*.
+    writer = connect_database(database)
+    try:
+        assert (
+            writer.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            == "wal"
+        )
+        writer.execute("BEGIN IMMEDIATE")
+        archive_id = seed_archive(
+            writer, path=r"X:\Comics\Series Z\issue-99.cbz"
+        )
+        seed_failed_job(
+            writer,
+            archive_id=archive_id,
+            failure_category="archive_corrupt",
+            error_message="Invalid or corrupt CBZ archive",
+        )
+        writer.execute("COMMIT")
+
+        after = fingerprint_database(database)
+        assert (database.parent / "audit.db-wal").is_file()
+    finally:
+        writer.close()
+
+    assert before == after
+
+
+def test_external_wal_commit_mid_audit_invalidates_the_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A commit from another connection mid-read must be rejected."""
+    database = tmp_path / "audit.db"
+    build_populated_database(database)
+
+    import comic_automation.archive.perceptual_failure_audit as audit_module
+
+    real_collect = audit_module.collect_failures
+    fingerprint_at_commit: dict[str, object] = {}
+
+    def collect_then_external_commit(connection):
+        result = real_collect(connection)
+
+        before = fingerprint_database(database)
+
+        # A *different* connection commits while the audit is mid-read.
+        # database_connection() opens in WAL mode, so this commit can
+        # land entirely in the -wal file.
+        with database_connection(database) as other:
+            archive_id = seed_archive(
+                other, path=r"X:\Comics\Series Z\issue-99.cbz"
+            )
+            seed_failed_job(
+                other,
+                archive_id=archive_id,
+                failure_category="archive_corrupt",
+                error_message="Invalid or corrupt CBZ archive",
+            )
+
+        fingerprint_at_commit["before"] = before
+        fingerprint_at_commit["after"] = fingerprint_database(database)
+
+        return result
+
+    monkeypatch.setattr(
+        audit_module, "collect_failures", collect_then_external_commit
+    )
+
+    with pytest.raises(DatabaseChangedError) as raised:
+        run_audit(database=database)
+
+    # Specifically the data_version guard, not the fingerprint fallback:
+    # DatabaseMutatedError is a *subclass* of DatabaseChangedError, so
+    # the exact type is what distinguishes which detector fired.
+    assert type(raised.value) is DatabaseChangedError
+    assert "data_version" in str(raised.value)
+
+    # ...and this is *why* data_version is required: at the moment of
+    # the commit the main database file's size and mtime were entirely
+    # unchanged, so the fingerprint comparison could not have raised.
+    assert fingerprint_at_commit["before"] == fingerprint_at_commit["after"]
+
+
+def test_quick_check_failure_raises_integrity_error(tmp_path: Path) -> None:
+    """A structurally damaged database must abort the audit."""
+    database = tmp_path / "audit.db"
+    build_populated_database(database)
+
+    # Clobber the final page. The schema stays readable, so the
+    # database still opens and the audit gets far enough to run
+    # quick_check -- which is the point: the integrity guard, not
+    # sqlite3's own open-time errors, is what must fire.
+    page_size = 4096
+    data = bytearray(database.read_bytes())
+    assert len(data) > page_size * 2
+    data[-page_size:] = bytes([0x5A]) * page_size
+    database.write_bytes(bytes(data))
+
+    with pytest.raises(DatabaseIntegrityError) as raised:
+        run_audit(database=database)
+
+    assert "quick_check" in str(raised.value)
+
+
+def test_report_surfaces_the_snapshot_boundary(tmp_path: Path) -> None:
+    """The report states the guarantee it actually has."""
+    database = tmp_path / "audit.db"
+    build_populated_database(database)
+
+    output = run_audit(database=database)
+
+    assert output["quick_check"] == "ok"
+    assert output["data_version_before"] == output["data_version_after"]
+    assert output["concurrent_commit_detected"] is False
+    assert output["database_unchanged"] is True
+    assert output["database_file_unchanged"] is True
+    assert output["database_unchanged_is_diagnostic_only"] is True
+    assert "data_version" in output["fingerprint_diagnostic_note"]

@@ -12,6 +12,18 @@ cleared and it is made immediately available only after all refreshed
 exact evidence commits successfully. Perceptual hashes are not
 calculated by this module; the normal bounded worker performs that next
 step.
+
+`analyze_source_drift` issues several separate queries (the job and its
+location, the stored page inventory, conflicting active jobs) and the
+apply path uses their combined result as its baseline, so they must all
+describe one database state. They therefore run through
+`comic_automation/database/read_guards.py`'s `read_consistent_snapshot`:
+one deferred read transaction bracketed by `PRAGMA data_version`
+readings taken outside it. That is the only guard that holds here --
+this database runs in WAL mode, where another connection's commit lands
+in the `-wal` sidecar and can leave the main file's size and mtime
+byte-identical, so the file fingerprint this module already took could
+never have detected a writer landing between two of those queries.
 """
 
 from __future__ import annotations
@@ -39,15 +51,21 @@ from comic_automation.archive.page_hashing import (
     _natural_key,
     calculate_page_hashes,
 )
-from comic_automation.archive.perceptual_failure_audit import (
-    DatabaseMutatedError,
-    fingerprint_database,
-    readonly_database_connection,
-)
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
 from comic_automation.database.connection import database_connection
+from comic_automation.database.read_guards import (
+    DatabaseChangedError,
+    DatabaseIntegrityError,
+    DatabaseMutatedError,
+    fingerprint_database,
+    fingerprint_database_files,
+    fingerprint_report_fields,
+    quick_check,
+    read_consistent_snapshot,
+    readonly_database_connection,
+)
 
 
 JOB_TYPE = "hash_archive_pages_perceptual"
@@ -230,7 +248,15 @@ def analyze_source_drift(
     job_id: int,
     json_output: Path | None = None,
 ) -> dict:
-    """Analyze one pending perceptual job without changing SQLite."""
+    """Analyze one pending perceptual job without changing SQLite.
+
+    All three database reads come from one consistent snapshot and are
+    gated on `PRAGMA data_version`, so a commit by another connection
+    mid-analysis raises `DatabaseChangedError` rather than producing a
+    baseline that mixes pre- and post-change rows -- which matters
+    doubly here, because `apply_source_drift_recovery` uses this
+    baseline as its optimistic-concurrency reference.
+    """
     database = Path(database).resolve(strict=False)
 
     if not database.is_file():
@@ -238,8 +264,12 @@ def analyze_source_drift(
 
     started = time.perf_counter()
     fingerprint_before = fingerprint_database(database)
+    files_before = fingerprint_database_files(database)
 
-    with readonly_database_connection(database) as connection:
+    def read(connection: sqlite3.Connection) -> dict:
+        # Every name below is looked up on the module at call time, so
+        # the WAL regression test can wrap one of them to commit from
+        # another connection between two of these queries.
         candidate = _job_and_location(connection, job_id)
         archive_id = candidate["archive_id"]
 
@@ -248,15 +278,28 @@ def analyze_source_drift(
                 f"Job {job_id} has no archive_id."
             )
 
-        stored_inventory = _stored_inventory(
-            connection,
-            int(archive_id),
-        )
-        conflicts = _active_conflicts(
-            connection,
-            archive_id=int(archive_id),
-            target_job_id=job_id,
-        )
+        return {
+            "candidate": candidate,
+            "stored_inventory": _stored_inventory(
+                connection,
+                int(archive_id),
+            ),
+            "conflicts": _active_conflicts(
+                connection,
+                archive_id=int(archive_id),
+                target_job_id=job_id,
+            ),
+        }
+
+    snapshot = read_consistent_snapshot(
+        database,
+        read,
+        context="source-drift analysis",
+        integrity_check=quick_check,
+    )
+    candidate = snapshot.result["candidate"]
+    stored_inventory = snapshot.result["stored_inventory"]
+    conflicts = snapshot.result["conflicts"]
 
     current_path = candidate["current_path"]
 
@@ -275,7 +318,12 @@ def analyze_source_drift(
             live_inventory = []
             live_error = f"{type(exc).__name__}: {exc}"
 
+    # Diagnostic, and checked after the data_version gate inside
+    # `read_consistent_snapshot`: under WAL this comparison cannot see
+    # another connection's commit at all, so it only catches this
+    # process (or a checkpoint) touching the file.
     fingerprint_after = fingerprint_database(database)
+    files_after = fingerprint_database_files(database)
 
     if fingerprint_after != fingerprint_before:
         raise DatabaseMutatedError(
@@ -346,9 +394,17 @@ def analyze_source_drift(
             "drift_detected": metadata_drift or not inventory_matches,
         },
         "recoverable": recoverable,
+        # Retained verbatim: existing consumers key off these two.
         "database_size_bytes": fingerprint_before.size_bytes,
         "database_modified_time_ns": (
             fingerprint_before.modified_time_ns
+        ),
+        **snapshot.report_fields(),
+        **fingerprint_report_fields(
+            fingerprint_before=fingerprint_before,
+            fingerprint_after=fingerprint_after,
+            files_before=files_before,
+            files_after=files_after,
         ),
         "elapsed_seconds": round(time.perf_counter() - started, 6),
     }

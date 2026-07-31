@@ -11,6 +11,10 @@ from comic_automation.archive.perceptual_coverage_audit import (
     DatabaseChangedError,
     DatabaseIntegrityError,
     DatabaseMutatedError,
+    EXIT_BACKFILL_INCOMPLETE,
+    EXIT_BLOCKING_UNEXPLAINED_GAPS,
+    EXIT_OK,
+    MAX_PRINTED_ARCHIVE_IDS,
     OutputPathCollisionError,
     POPULATION_ORDER,
     classify_archives,
@@ -198,7 +202,7 @@ def seed_job(
 
 
 def build_populated_database(database: Path) -> dict[str, int]:
-    """Builds one archive for every population, plus one unexplained gap.
+    """One archive per population, plus one never-enqueued archive.
 
     Returns a name -> archive_id map so tests can assert on specific
     archives by role rather than by position.
@@ -256,7 +260,9 @@ def build_populated_database(database: Path) -> dict[str, int]:
         seed_job(connection, archive_id=incomplete_id, status="pending")
         ids["incomplete"] = incomplete_id
 
-        # unexplained gap: eligible, zero coverage, *no* job ever.
+        # never enqueued: eligible, zero coverage, *no* job ever. Read
+        # as remaining backlog by default and as a blocking unexplained
+        # gap only under --expect-backfill-complete.
         gap_id = seed_archive(connection, path=r"X:\Comics\C\gap.cbz")
         seed_content_signature(connection, archive_id=gap_id, page_count=1)
         seed_page(
@@ -267,7 +273,7 @@ def build_populated_database(database: Path) -> dict[str, int]:
             phash=False,
             dimensions=False,
         )
-        ids["unexplained_gap"] = gap_id
+        ids["never_enqueued_backlog"] = gap_id
 
         # failed (corrupt_archives): eligible, terminal failure.
         failed_archive_id = seed_archive(
@@ -370,7 +376,7 @@ def test_complete_archive_is_classified_complete(tmp_path: Path) -> None:
     by_id = {a["archive_id"]: a for a in archives}
     assert by_id[ids["complete"]]["population"] == "complete"
     assert by_id[ids["complete"]]["pages_missing"] == 0
-    assert by_id[ids["complete"]]["unexplained_gap"] is False
+    assert by_id[ids["complete"]]["never_enqueued_backlog"] is False
 
 
 def test_incomplete_archive_is_classified_incomplete(tmp_path: Path) -> None:
@@ -387,10 +393,12 @@ def test_incomplete_archive_is_classified_incomplete(tmp_path: Path) -> None:
     assert entry["population"] == "incomplete"
     assert entry["pages_missing"] == 1
     assert entry["has_any_job"] is True
-    assert entry["unexplained_gap"] is False
+    assert entry["never_enqueued_backlog"] is False
 
 
-def test_unexplained_gap_is_incomplete_and_flagged(tmp_path: Path) -> None:
+def test_never_enqueued_archive_is_incomplete_and_flagged(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "audit.db"
     ids = build_populated_database(database)
 
@@ -400,9 +408,9 @@ def test_unexplained_gap_is_incomplete_and_flagged(tmp_path: Path) -> None:
         )
 
     by_id = {a["archive_id"]: a for a in archives}
-    entry = by_id[ids["unexplained_gap"]]
+    entry = by_id[ids["never_enqueued_backlog"]]
     assert entry["population"] == "incomplete"
-    assert entry["unexplained_gap"] is True
+    assert entry["never_enqueued_backlog"] is True
     assert entry["has_any_job"] is False
     assert entry["pages_covered"] == 0
 
@@ -525,7 +533,7 @@ def test_run_audit_reports_matching_partition(tmp_path: Path) -> None:
     assert (
         output["population_partition_sum"] == output["total_archive_count"]
     )
-    assert output["unexplained_gap_count"] == 1
+    assert output["never_enqueued_backlog_count"] == 1
 
 
 # --- output generation -----------------------------------------------------
@@ -553,7 +561,7 @@ def test_run_audit_generates_json_and_csv(tmp_path: Path) -> None:
     assert csv_output.is_file()
     csv_text = csv_output.read_text(encoding="utf-8-sig")
     header = csv_text.splitlines()[0]
-    assert header.startswith("archive_id,population,unexplained_gap")
+    assert header.startswith("archive_id,population,never_enqueued_backlog")
     # Header + one row per archive.
     assert len(csv_text.splitlines()) == 1 + output["total_archive_count"]
 
@@ -746,7 +754,7 @@ def test_external_commit_mid_classification_invalidates_the_report(
         with database_connection(database) as other:
             seed_job(
                 other,
-                archive_id=ids["unexplained_gap"],
+                archive_id=ids["never_enqueued_backlog"],
                 status="pending",
             )
 
@@ -779,7 +787,7 @@ def test_external_commit_mid_classification_invalidates_the_report(
         assert (
             connection.execute(
                 "SELECT COUNT(*) FROM jobs WHERE archive_id = ?",
-                (ids["unexplained_gap"],),
+                (ids["never_enqueued_backlog"],),
             ).fetchone()[0]
             == 1
         )
@@ -864,3 +872,425 @@ def test_missing_database_raises(tmp_path: Path) -> None:
             database=tmp_path / "does-not-exist.db",
             stale_older_than_seconds=3600,
         )
+
+
+# --- backlog vs. blocking unexplained gap -----------------------------------
+#
+# The population is computed identically in both modes; only the
+# interpretation, the console framing and the exit code differ. Each
+# mode is therefore asserted separately and explicitly, against the
+# same fixtures.
+
+
+def build_never_enqueued_database(database: Path, *, count: int) -> list[int]:
+    """`count` eligible archives with zero coverage and no job at all.
+
+    This is the shape a mid-backfill production database has for every
+    archive whose guarded batch has not come up yet -- the case that
+    used to be reported as an unexplained gap.
+    """
+    archive_ids: list[int] = []
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATIONS)
+
+        for index in range(count):
+            archive_id = seed_archive(
+                connection, path=rf"X:\Comics\Backlog\{index:04d}.cbz"
+            )
+            seed_content_signature(
+                connection, archive_id=archive_id, page_count=1
+            )
+            seed_page(
+                connection,
+                archive_id=archive_id,
+                page_index=0,
+                dhash=False,
+                phash=False,
+                dimensions=False,
+            )
+            archive_ids.append(archive_id)
+
+    return archive_ids
+
+
+def build_fully_backfilled_database(database: Path) -> dict[str, int]:
+    """A library where the backfill genuinely finished.
+
+    Every structurally eligible archive is fully covered, and the only
+    other archive is ineligible (no content signature), which was never
+    expected to gain coverage. Nothing is left never-enqueued, so a
+    final audit must pass cleanly.
+    """
+    ids: dict[str, int] = {}
+
+    with database_connection(database) as connection:
+        apply_migrations(connection, MIGRATIONS)
+
+        complete_id = seed_archive(connection, path=r"X:\Comics\A\done.cbz")
+        seed_content_signature(connection, archive_id=complete_id, page_count=1)
+        seed_page(
+            connection,
+            archive_id=complete_id,
+            page_index=0,
+            dhash=True,
+            phash=True,
+            dimensions=True,
+        )
+        seed_job(
+            connection,
+            archive_id=complete_id,
+            status="completed",
+            completed_at="2026-07-30T09:00:00",
+        )
+        ids["complete"] = complete_id
+
+        ineligible_id = seed_archive(
+            connection, path=r"X:\Comics\B\no-signature.cbz"
+        )
+        ids["ineligible_no_signature"] = ineligible_id
+
+    return ids
+
+
+def printed_id_sample(stdout: str) -> list[int]:
+    """The archive-id list literal the console summary printed, if any."""
+    for line in stdout.splitlines():
+        start = line.find("[")
+        if start != -1 and line.rstrip().endswith("]"):
+            return json.loads(line[start:].strip())
+
+    return []
+
+
+def test_intermediate_mode_reports_backlog_neutrally_and_exits_zero(
+    tmp_path: Path, capsys
+) -> None:
+    """Default mode: never-enqueued archives are expected work.
+
+    Mid-backfill this population is the remaining queue, so it must not
+    be called an unexplained gap and must not fail the run.
+    """
+    database = tmp_path / "audit.db"
+    build_populated_database(database)
+    json_output = tmp_path / "coverage.json"
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == EXIT_OK
+    assert "Never-enqueued backlog" in captured.out
+    assert "unexplained gap" not in captured.out.lower()
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert payload["expect_backfill_complete"] is False
+    assert payload["never_enqueued_backlog_count"] == 1
+    assert payload["blocking_unexplained_gap_count"] == 0
+    assert payload["blocking_unexplained_gap_archive_ids"] == []
+
+
+def test_final_audit_mode_reports_blocking_gaps_and_exits_nonzero(
+    tmp_path: Path, capsys
+) -> None:
+    """Same database, final-audit mode: now it is a blocking finding.
+
+    Once eligibility is asserted to be zero there is no un-enqueued
+    batch left to explain a missing job, so the identical archive is
+    reported loudly and the exit code says so.
+    """
+    database = tmp_path / "audit.db"
+    ids = build_populated_database(database)
+    json_output = tmp_path / "coverage.json"
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+            "--expect-backfill-complete",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == EXIT_BLOCKING_UNEXPLAINED_GAPS
+    assert EXIT_BLOCKING_UNEXPLAINED_GAPS != EXIT_OK
+    assert "BLOCKING UNEXPLAINED GAPS" in captured.out
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert payload["expect_backfill_complete"] is True
+    assert payload["backfill_complete_gate_passed"] is False
+    assert payload["blocking_incomplete_count"] == 2
+    assert payload["blocking_stale_count"] == 1
+    assert payload["blocking_backfill_work_count"] == 3
+    assert payload["blocking_unexplained_gap_count"] == 1
+    assert payload["blocking_unexplained_gap_archive_ids"] == [
+        ids["never_enqueued_backlog"]
+    ]
+    # The neutral keys keep reporting the same population, unchanged.
+    assert payload["never_enqueued_backlog_count"] == 1
+    assert payload["never_enqueued_backlog_archive_ids"] == [
+        ids["never_enqueued_backlog"]
+    ]
+
+
+def test_both_modes_classify_the_identical_population(tmp_path: Path) -> None:
+    """The flag changes interpretation only -- never classification."""
+    database = tmp_path / "audit.db"
+    build_populated_database(database)
+
+    intermediate = run_audit(
+        database=database, stale_older_than_seconds=3600, now=FIXED_NOW
+    )
+    final = run_audit(
+        database=database,
+        stale_older_than_seconds=3600,
+        now=FIXED_NOW,
+        expect_backfill_complete=True,
+    )
+
+    assert intermediate["archives"] == final["archives"]
+    assert intermediate["population_counts"] == final["population_counts"]
+    assert (
+        intermediate["never_enqueued_backlog_archive_ids"]
+        == final["never_enqueued_backlog_archive_ids"]
+    )
+    assert intermediate["blocking_unexplained_gap_count"] == 0
+    assert final["blocking_unexplained_gap_count"] == (
+        final["never_enqueued_backlog_count"]
+    )
+
+
+def test_final_audit_on_fully_backfilled_database_passes_cleanly(
+    tmp_path: Path, capsys
+) -> None:
+    database = tmp_path / "audit.db"
+    build_fully_backfilled_database(database)
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--expect-backfill-complete",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == EXIT_OK
+    assert "BLOCKING UNEXPLAINED GAPS (eligible, zero coverage, no job " in (
+        captured.out
+    )
+    assert "must be investigated" not in captured.out
+    assert "ARCHIVE IDS" not in captured.out
+    assert "Final backfill gate:    True (incomplete=0, stale=0)" in captured.out
+
+
+def test_final_audit_blocks_incomplete_work_even_with_job_history(
+    tmp_path: Path,
+) -> None:
+    """Final mode verifies completion, not merely absence of missed enqueue."""
+    database = tmp_path / "audit.db"
+    (archive_id,) = build_never_enqueued_database(database, count=1)
+
+    with database_connection(database) as connection:
+        seed_job(
+            connection,
+            archive_id=archive_id,
+            status="completed",
+            completed_at="2026-07-30T09:00:00",
+        )
+
+    json_output = tmp_path / "coverage.json"
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+            "--expect-backfill-complete",
+        ]
+    )
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert result == EXIT_BACKFILL_INCOMPLETE
+    assert payload["never_enqueued_backlog_count"] == 0
+    assert payload["blocking_unexplained_gap_count"] == 0
+    assert payload["blocking_incomplete_count"] == 1
+    assert payload["blocking_stale_count"] == 0
+    assert payload["blocking_backfill_work_count"] == 1
+    assert payload["backfill_complete_gate_passed"] is False
+
+
+def test_final_audit_blocks_stale_work_without_unexplained_gap(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "audit.db"
+    (archive_id,) = build_never_enqueued_database(database, count=1)
+
+    with database_connection(database) as connection:
+        seed_job(
+            connection,
+            archive_id=archive_id,
+            status="claimed",
+            claimed_at="2000-01-01 00:00:00",
+        )
+
+    json_output = tmp_path / "coverage.json"
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+            "--expect-backfill-complete",
+        ]
+    )
+
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert result == EXIT_BACKFILL_INCOMPLETE
+    assert payload["never_enqueued_backlog_count"] == 0
+    assert payload["blocking_unexplained_gap_count"] == 0
+    assert payload["blocking_incomplete_count"] == 0
+    assert payload["blocking_stale_count"] == 1
+    assert payload["blocking_backfill_work_count"] == 1
+    assert payload["backfill_complete_gate_passed"] is False
+
+
+# --- bounded console output, full machine-readable output -------------------
+
+
+def test_console_caps_printed_ids_and_states_the_omitted_count(
+    tmp_path: Path, capsys
+) -> None:
+    """A production run found 17,554 of these; the console must not
+    print them all, and must say how many it left out.
+    """
+    total = MAX_PRINTED_ARCHIVE_IDS + 5
+    database = tmp_path / "audit.db"
+    archive_ids = build_never_enqueued_database(database, count=total)
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == EXIT_OK
+
+    printed = printed_id_sample(captured.out)
+    assert len(printed) == MAX_PRINTED_ARCHIVE_IDS
+    assert printed == archive_ids[:MAX_PRINTED_ARCHIVE_IDS]
+
+    # Truncation is never silent: the omitted count is always shown.
+    assert f"... and {total - MAX_PRINTED_ARCHIVE_IDS:,} more" in captured.out
+    assert "see JSON/CSV for the full list" in captured.out
+    assert f"of {total:,}" in captured.out
+
+
+def test_final_audit_console_is_capped_too(tmp_path: Path, capsys) -> None:
+    total = MAX_PRINTED_ARCHIVE_IDS + 7
+    database = tmp_path / "audit.db"
+    build_never_enqueued_database(database, count=total)
+
+    result = main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--expect-backfill-complete",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert result == EXIT_BLOCKING_UNEXPLAINED_GAPS
+    assert len(printed_id_sample(captured.out)) == MAX_PRINTED_ARCHIVE_IDS
+    assert f"... and {total - MAX_PRINTED_ARCHIVE_IDS:,} more" in captured.out
+
+
+def test_short_id_list_is_printed_without_an_omitted_count(
+    tmp_path: Path, capsys
+) -> None:
+    total = MAX_PRINTED_ARCHIVE_IDS - 5
+    database = tmp_path / "audit.db"
+    archive_ids = build_never_enqueued_database(database, count=total)
+
+    main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert printed_id_sample(captured.out) == archive_ids
+    assert "more (see JSON/CSV" not in captured.out
+
+
+def test_json_and_csv_keep_the_full_id_list_when_console_truncates(
+    tmp_path: Path, capsys
+) -> None:
+    """Only the console is capped: the artefacts stay complete."""
+    total = MAX_PRINTED_ARCHIVE_IDS + 13
+    database = tmp_path / "audit.db"
+    archive_ids = build_never_enqueued_database(database, count=total)
+
+    json_output = tmp_path / "coverage.json"
+    csv_output = tmp_path / "coverage.csv"
+
+    main(
+        [
+            "--database",
+            str(database),
+            "--stale-older-than-seconds",
+            "3600",
+            "--json-output",
+            str(json_output),
+            "--csv-output",
+            str(csv_output),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    # The console really did truncate...
+    assert len(printed_id_sample(captured.out)) == MAX_PRINTED_ARCHIVE_IDS
+
+    # ...while the JSON kept every id, in full.
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert payload["never_enqueued_backlog_count"] == total
+    assert len(payload["never_enqueued_backlog_archive_ids"]) == total
+    assert payload["never_enqueued_backlog_archive_ids"] == archive_ids
+
+    # ...and so did the CSV, one flagged row per archive.
+    csv_lines = csv_output.read_text(encoding="utf-8-sig").splitlines()
+    header = csv_lines[0].split(",")
+    flag_column = header.index("never_enqueued_backlog")
+    flagged = [
+        int(line.split(",")[0])
+        for line in csv_lines[1:]
+        if line.split(",")[flag_column] == "True"
+    ]
+    assert flagged == archive_ids
