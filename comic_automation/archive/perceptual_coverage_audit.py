@@ -63,6 +63,21 @@ database with SQLite's ``mode=ro`` URI flag plus
 ``PRAGMA query_only = ON``, applies no migrations, and fingerprints
 the database file before and after the run to detect any mutation
 (by this process or another) during the audit.
+
+The headline guarantee here is stronger than "nothing was written":
+the five populations are claimed to *provably partition* the library,
+so every count in the report has to describe one and the same library.
+Classification issues several separate queries (structural facts, page
+coverage, jobs, terminal failures, stale jobs), so this module reads
+them all inside a single deferred transaction bracketed by
+``PRAGMA data_version`` readings taken outside it -- exactly the
+pattern ``comic_automation/jobs/active_job_duplicate_audit.py`` uses,
+and for exactly the reason documented there: under WAL a commit by
+another connection can touch only the ``-wal`` file, leaving the main
+database's size and mtime *identical*, so the file fingerprint alone
+cannot detect a writer landing between two of the classification
+queries. Such a writer would otherwise produce a report that mixes
+pre- and post-change observations while still looking clean.
 """
 
 from __future__ import annotations
@@ -125,7 +140,22 @@ UNEXPLAINED_GAP_EXPLANATION = (
 )
 
 
-class DatabaseMutatedError(RuntimeError):
+class DatabaseChangedError(RuntimeError):
+    """Raised when another connection committed while the audit read.
+
+    Detected via ``PRAGMA data_version``, which counts commits made by
+    *other* connections. This is the guard that actually holds under
+    WAL: a WAL commit can be entirely contained in the ``-wal`` file,
+    leaving the main database file's size and mtime untouched, so the
+    fingerprint check below can miss it completely. If the counter
+    moved, the report may mix pre- and post-change observations -- and
+    a mixed snapshot silently breaks this audit's headline guarantee
+    that the five populations partition the library -- so the run is
+    rejected instead of reported as trustworthy.
+    """
+
+
+class DatabaseMutatedError(DatabaseChangedError):
     """Raised when a database changed size or mtime during an audit run.
 
     This audit is read-only by construction (mode=ro + query_only),
@@ -133,6 +163,23 @@ class DatabaseMutatedError(RuntimeError):
     touched by *anything* (this process or another) while the audit
     ran, the run is treated as untrustworthy rather than silently
     reporting a possibly-inconsistent snapshot.
+
+    It is a subclass of `DatabaseChangedError` because it reports the
+    same class of problem through a weaker detector: callers who want
+    "the database did not change under me" can catch the base class and
+    get both guards. `run_audit` checks `data_version` *first*, so a
+    concurrent commit is always reported as the more precise
+    `DatabaseChangedError` even when the file also happened to change.
+    """
+
+
+class DatabaseIntegrityError(RuntimeError):
+    """Raised when ``PRAGMA quick_check`` did not return 'ok'.
+
+    Classifying archives out of a structurally damaged database would
+    produce populations that look authoritative but are not, so the run
+    is abandoned. Matches `active_job_duplicate_audit.py` and the other
+    read-only audits.
     """
 
 
@@ -181,6 +228,9 @@ def readonly_database_connection(
     - `PRAGMA query_only = ON` rejects any statement that would modify
       the database *at the statement level*, in case a future edit to
       this module accidentally introduces a write.
+
+    This helper is module-local by design (each read-only audit owns its
+    own copy) and is only imported by this module and its tests.
     """
     path = Path(database_path).resolve(strict=False)
 
@@ -188,7 +238,16 @@ def readonly_database_connection(
         raise FileNotFoundError(f"Database does not exist: {path}")
 
     uri = f"{path.as_uri()}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=30.0)
+    connection = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=30.0,
+        # Disable pysqlite's implicit transaction handling so the
+        # explicit BEGIN/END in `run_audit` are the only transaction
+        # boundaries in play; with the default isolation_level the
+        # driver's own bookkeeping would fight them.
+        isolation_level=None,
+    )
     connection.row_factory = sqlite3.Row
 
     try:
@@ -196,6 +255,27 @@ def readonly_database_connection(
         yield connection
     finally:
         connection.close()
+
+
+def _data_version(connection: sqlite3.Connection) -> int:
+    """SQLite's counter of commits made by *other* connections.
+
+    Frozen for the duration of a read transaction, which is precisely
+    why `run_audit` samples it outside and around the transaction: a
+    difference between the two readings means someone else committed
+    while the audit was reading.
+    """
+    return int(connection.execute("PRAGMA data_version").fetchone()[0])
+
+
+def quick_check(connection: sqlite3.Connection) -> str:
+    """`PRAGMA quick_check` output, joined into a single string.
+
+    'ok' means the database passed. Anything else is the error text
+    SQLite produced, reported verbatim.
+    """
+    rows = connection.execute("PRAGMA quick_check").fetchall()
+    return "\n".join(str(row[0]) for row in rows)
 
 
 def _same_file(first: Path, second: Path) -> bool:
@@ -568,6 +648,13 @@ def run_audit(
     Never mutates `database`. `json_output`/`csv_output` are validated
     against `database` (and against each other) *before* the database
     is opened or any directory is created.
+
+    Raises `FileNotFoundError` if the database does not exist,
+    `OutputPathCollisionError` if an output path could clobber it,
+    `DatabaseIntegrityError` if `PRAGMA quick_check` fails, and
+    `DatabaseChangedError` (or its `DatabaseMutatedError` subclass) if
+    another connection committed during the run or the file's
+    size/mtime changed.
     """
     database = Path(database).resolve(strict=False)
 
@@ -588,11 +675,45 @@ def run_audit(
     fingerprint_before = fingerprint_database(database)
 
     with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection,
-            stale_older_than_seconds=stale_older_than_seconds,
-            now=effective_now,
-        )
+        # data_version is sampled *outside* and around the whole
+        # transaction, so the change-detection window covers every read
+        # the report depends on -- including quick_check. Sampling it
+        # after quick_check would leave that read outside the window,
+        # and a WAL commit landing there would go undetected: a WAL
+        # write can touch only the -wal file, leaving the main
+        # database's size and mtime identical, so the fingerprint
+        # comparison below cannot be relied on to catch it either.
+        data_version_before = _data_version(connection)
+
+        # One deferred read transaction: the structural, page-coverage,
+        # job, failure and staleness queries inside classify_archives
+        # all read from the same snapshot, so the population counts
+        # cannot disagree with each other because a writer landed
+        # between two of them. Without this, the partition invariant
+        # this audit reports would be an assertion about no single
+        # state of the library.
+        connection.execute("BEGIN")
+
+        try:
+            integrity = quick_check(connection)
+
+            if integrity != "ok":
+                raise DatabaseIntegrityError(
+                    "PRAGMA quick_check failed for "
+                    f"{database}: {integrity}"
+                )
+
+            archives = classify_archives(
+                connection,
+                stale_older_than_seconds=stale_older_than_seconds,
+                now=effective_now,
+            )
+        finally:
+            # A read transaction still has to be ended; END is not a
+            # write and is permitted under query_only.
+            connection.execute("END")
+
+        data_version_after = _data_version(connection)
 
     # Re-stat *after* closing the connection: if opening read-only or
     # running any SELECT touched the file (it shouldn't -- mode=ro
@@ -600,6 +721,17 @@ def run_audit(
     # audit promises), this run is not trustworthy and must not be
     # reported as if it were.
     fingerprint_after = fingerprint_database(database)
+
+    # Checked before the fingerprint, because it is the stronger of the
+    # two detectors: a concurrent commit is reported as exactly that,
+    # not as an ambiguous "the file moved".
+    if data_version_before != data_version_after:
+        raise DatabaseChangedError(
+            "Another connection committed to the database during the "
+            f"audit (data_version {data_version_before} -> "
+            f"{data_version_after}); the classification would mix pre- "
+            "and post-change observations and is not trustworthy."
+        )
 
     if fingerprint_after != fingerprint_before:
         raise DatabaseMutatedError(
@@ -620,6 +752,7 @@ def run_audit(
     output = {
         "database": str(database),
         "job_type": JOB_TYPE,
+        "quick_check": integrity,
         "stale_older_than_seconds": stale_older_than_seconds,
         "total_archive_count": total_archive_count,
         "population_counts": counts,
@@ -643,6 +776,8 @@ def run_audit(
             fingerprint_after.modified_time_ns
         ),
         "database_unchanged": fingerprint_after == fingerprint_before,
+        "data_version_before": data_version_before,
+        "data_version_after": data_version_after,
         "elapsed_seconds": round(elapsed, 6),
     }
 
@@ -731,7 +866,13 @@ def print_summary(output: dict) -> None:
             f"{output['unexplained_gap_archive_ids']}"
         )
 
+    print(f"Integrity check:       {output['quick_check']}")
     print(f"Database unchanged:    {output['database_unchanged']}")
+    print(
+        "Snapshot data_version: "
+        f"{output['data_version_before']} -> "
+        f"{output['data_version_after']}"
+    )
 
     if output.get("json_output"):
         print(f"JSON output:           {output['json_output']}")
