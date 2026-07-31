@@ -485,6 +485,33 @@ Both tools open the database with SQLite `mode=ro` and
 `PRAGMA query_only = ON`. Always use new output paths and keep reports
 outside the repository.
 
+`scripts\comic_batch_postflight.py` automates steps 1-14 above in one
+read-only run. It is strict by default: the protected backup
+(`--backup-database`) together with `--expected-backup-size-bytes` and
+`--expected-backup-modified-time-ns` is required, and a repository
+state git cannot determine is a gate failure. Pass `--production` to
+have the command additionally refuse any relaxation flag. Omitting a
+required input does not quietly downgrade the run: each gate carries an
+explicit `status` of `pass`, `fail`, or `skipped`, `overall_pass` is
+false whenever a required gate was skipped, and the top-level `summary`
+block lists `failed_gates`, `skipped_gates`, and
+`required_gates_skipped`. Exit codes are `0` pass, `1` error, `2` a
+gate failed, `3` a required gate was skipped.
+
+Development-only reconciliation against a scratch database with no
+protected backup must opt out explicitly and per concern with
+`--allow-missing-backup` and `--allow-undeterminable-repository`. Never
+use either flag to clear a production batch.
+
+Every path the command touches -- working database, backup, batch
+report, failure-audit JSON/CSV, and its own `--json-output` -- is
+cross-validated against every other before any database is opened or
+any directory is created. An output that is the same file as an input,
+an output that collides with another output, and an output path that
+already exists are all refused outright, so a postflight run can never
+overwrite the batch report it reconciles against or a previous run's
+preserved evidence.
+
 ## Remaining project sequence
 
 At the last measured throughput, the 22,554 pre-batch eligible
