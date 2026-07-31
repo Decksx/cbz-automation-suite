@@ -481,7 +481,51 @@ python scripts\comic_perceptual_failure_audit.py `
   --csv-output <new-csv-path>
 ```
 
-Both tools open the database with SQLite `mode=ro` and
+The full-library Version 1 coverage audit is:
+
+```powershell
+python scripts\comic_perceptual_coverage_audit.py `
+  --database G:\ComicAutomation\TestDatabase\inspection-working.db `
+  --stale-older-than-seconds 3600 `
+  --json-output <new-json-path> `
+  --csv-output <new-csv-path>
+```
+
+It classifies every archive into exactly one of `complete`,
+`incomplete`, `failed`, `stale`, `ineligible`, and separately reports
+the eligible archives that have zero Version 1 coverage and no
+`hash_archive_pages_perceptual` job of any status. That sub-population
+is reported under two different names depending on when the audit is
+run, and the distinction matters operationally:
+
+- **While the backfill is still running (default).** These archives are
+  simply the remaining backlog: `enqueue_missing()` enqueues one guarded
+  batch at a time, so an archive whose batch has not come up yet has no
+  job history by design. They are reported as
+  `never_enqueued_backlog_count` /
+  `never_enqueued_backlog_archive_ids`, described as expected remaining
+  work, and never affect the exit code. At the 2026-07-30 baseline this
+  is roughly 17,554 archives -- the reconciled remaining eligible
+  population, not a defect.
+- **After the backfill is complete (`--expect-backfill-complete`).**
+  Step 3 of the remaining project sequence runs this audit only once
+  Version 1 eligibility has reached zero. With no un-enqueued batch left
+  to explain a missing job, the same archives are blocking unexplained
+  gaps -- evidence of a missed enqueue or an orchestration bug -- and are
+  additionally reported as `blocking_unexplained_gap_count` /
+  `blocking_unexplained_gap_archive_ids`.
+
+The flag changes no classification and no query: the population is
+identical in both modes. Only the interpretation, the console framing,
+and the exit code change. Exit codes are `0` clean, `1` the audit could
+not run, `2` final-audit mode found blocking unexplained gaps.
+
+The console summary prints at most 20 archive ids for any list, always
+followed by an explicit count of how many were omitted. The JSON and
+CSV outputs always contain the complete, untruncated list; the per-
+archive CSV column for this flag is `never_enqueued_backlog`.
+
+All three tools open the database with SQLite `mode=ro` and
 `PRAGMA query_only = ON`. Always use new output paths and keep reports
 outside the repository.
 
@@ -525,7 +569,10 @@ The immediate sequence remains:
 1. finish and reconcile the active batch;
 2. repeat the guarded backup, preflight, batch, audit, and postflight
    cycle until Version 1 eligibility reaches zero;
-3. perform a full-library Version 1 coverage audit;
+3. perform a full-library Version 1 coverage audit, and only at this
+   point run it with `--expect-backfill-complete`, which is what turns
+   a never-enqueued eligible archive from expected backlog into a
+   blocking unexplained gap (exit code 2);
 4. resolve or explicitly disposition all terminal failures;
 5. create and independently verify a final database backup;
 6. only then begin immutable archive revisions, provenance migration,

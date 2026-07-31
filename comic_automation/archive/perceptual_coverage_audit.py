@@ -32,10 +32,10 @@ exclusive populations:
   pending or in-progress work" bucket -- it includes archives with a
   live (non-stale) active job, archives with partial per-page
   coverage, and archives with zero coverage and no job history at
-  all. That last case is additionally flagged as an
-  ``unexplained_gap`` (see below): it is reported as a count and an
-  archive-id list distinct from the plain ``incomplete`` count, but it
-  remains counted inside ``incomplete`` for the partition invariant
+  all. That last case is additionally flagged as
+  ``never_enqueued_backlog`` (see below): it is reported as a count and
+  an archive-id list distinct from the plain ``incomplete`` count, but
+  it remains counted inside ``incomplete`` for the partition invariant
   (``complete + incomplete + failed + stale + ineligible ==
   total_archive_count``) rather than being a sixth bucket.
 - ``ineligible``: falls outside
@@ -47,16 +47,50 @@ exclusive populations:
   exact page hashing ran). These archives were never expected to gain
   Version 1 coverage and are not gaps.
 
-An "unexplained gap" -- eligible, zero coverage, and *no* job of this
-type ever recorded (not pending, not claimed, not running, not
-failed, not completed) -- is the signal the production handoff
-document calls out specifically: ordinary terminal failures are
-"legitimate archive or image defects... not evidence of queue,
-database, or orchestration failure", but an archive that was eligible
-work and simply never got a job at all suggests a missed enqueue or a
-bug, and is surfaced loudly via ``unexplained_gap_count`` /
-``unexplained_gap_archive_ids`` rather than being silently folded into
-the ordinary "still pending" story.
+Backlog vs. unexplained gap: the same population, two readings
+-------------------------------------------------------------
+
+``never_enqueued_backlog`` is the sub-population of ``incomplete``
+that is structurally eligible, has zero Version 1 coverage, and has
+*no* ``hash_archive_pages_perceptual`` job of any status on record
+(not pending, not claimed, not running, not failed, not completed).
+
+That set is computed identically no matter how the audit is invoked.
+What changes with ``--expect-backfill-complete`` is only the
+*interpretation*, because the same observation means opposite things
+at two points in the project:
+
+- **Mid-backfill (the default).** The Version 1 backfill runs in
+  guarded batches (docs/production_handoff_2026-07-30.md, "Remaining
+  project sequence" steps 1-2), and ``enqueue_missing()`` only ever
+  enqueues the next batch, not the whole library. Archives that have
+  not had their batch yet therefore have no job history *by design*.
+  Calling them "unexplained gaps" would label the entire remaining
+  workload -- tens of thousands of archives at the time this audit
+  was written -- a defect, which trains operators to ignore the field
+  that is supposed to catch a real missed enqueue. So they are
+  reported neutrally, as expected work remaining, and never affect
+  the exit code.
+- **Post-backfill (``--expect-backfill-complete``).** Step 3 of that
+  same sequence runs this audit only *after* eligibility has reached
+  zero. At that moment there is no un-enqueued batch left to explain
+  the absence of a job, so an eligible archive with no job history is
+  evidence of a missed enqueue or an orchestration bug. Only then are
+  these reported as blocking unexplained gaps and only then do they
+  drive a distinct non-zero exit code
+  (``EXIT_BLOCKING_UNEXPLAINED_GAPS``).
+
+The production handoff calls out the underlying distinction: ordinary
+terminal failures are "legitimate archive or image defects... not
+evidence of queue, database, or orchestration failure". An archive
+that was eligible work and never got a job at all is a different kind
+of finding -- but only once every eligible archive was supposed to
+have been enqueued already.
+
+Both modes always emit the complete, untruncated archive-id list to
+the JSON and CSV outputs. Only the human-facing console summary is
+capped (``MAX_PRINTED_ARCHIVE_IDS``), and it never truncates silently:
+the omitted count is always printed alongside the sample.
 
 Like the audits it builds on, this module never writes: it opens the
 database with SQLite's ``mode=ro`` URI flag plus
@@ -126,18 +160,60 @@ POPULATION_ORDER = (
     "ineligible",
 )
 
-UNEXPLAINED_GAP_EXPLANATION = (
+# The membership rule for the never-enqueued population. Deliberately
+# free of any judgement about whether membership is good or bad: that
+# depends entirely on whether the backfill is still running, which this
+# audit cannot infer from the database and must be told
+# (--expect-backfill-complete).
+NEVER_ENQUEUED_BACKLOG_EXPLANATION = (
     "An archive lands here only when it is structurally eligible for "
     "Version 1 perceptual hashing (current file location, a matching "
     "content signature, at least one page), has zero Version 1 "
     "dHash/pHash coverage, and has never had a "
     "hash_archive_pages_perceptual job of any status (pending, "
-    "claimed, running, failed, or completed). Ordinary terminal "
-    "failures are legitimate archive/image defects and are not "
-    "unexplained gaps; an eligible archive with no job history at all "
-    "is evidence of a missed enqueue or an orchestration bug, not a "
-    "normal backlog item."
+    "claimed, running, failed, or completed). While the backfill is "
+    "still running this is simply the remaining work: enqueue_missing() "
+    "enqueues one guarded batch at a time, so archives whose batch has "
+    "not come up yet legitimately have no job history. It becomes a "
+    "blocking unexplained gap only under --expect-backfill-complete."
 )
+
+# The same population, read after the backfill was declared finished.
+# Kept as a separate constant (rather than one string with an "if")
+# because these are two distinct operational claims, and only this one
+# asks for investigation.
+BLOCKING_UNEXPLAINED_GAP_EXPLANATION = (
+    "Reported only under --expect-backfill-complete, which asserts that "
+    "Version 1 eligibility has already reached zero. Under that "
+    "assertion there is no un-enqueued batch left to explain an "
+    "eligible archive with zero coverage and no job history of any "
+    "status, so each of these is evidence of a missed enqueue or an "
+    "orchestration bug and must be investigated. Ordinary terminal "
+    "failures are legitimate archive/image defects and are never "
+    "counted here. Outside final-audit mode this list is empty by "
+    "construction and the identical population is reported neutrally "
+    "as never_enqueued_backlog."
+)
+
+# Console-only cap on how many archive ids are printed for any one
+# list. A production run of this audit mid-backfill legitimately found
+# 17,554 never-enqueued archives; printing them all buried the rest of
+# the summary (populations, partition check, integrity, snapshot
+# boundary) under a wall of ids. The full list always remains in the
+# JSON and CSV outputs, and the omitted count is always printed, so
+# nothing is ever hidden -- only relocated to the machine-readable
+# artefacts that are built to hold it.
+MAX_PRINTED_ARCHIVE_IDS = 20
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+# Distinct from EXIT_FAILURE so an operator (or a wrapper script) can
+# tell "the audit could not run / crashed" apart from "the audit ran
+# cleanly and found blocking gaps". Mirrors
+# jobs/active_job_duplicate_audit.py's EXIT_BLOCKING_DUPLICATES. Only
+# reachable in final-audit mode: mid-backfill the same finding is
+# expected work and must not fail a pipeline.
+EXIT_BLOCKING_UNEXPLAINED_GAPS = 2
 
 
 class DatabaseChangedError(RuntimeError):
@@ -541,7 +617,13 @@ def classify_archives(
         else:
             population = "incomplete"
 
-        is_unexplained_gap = (
+        # Membership only; deliberately mode-independent. Whether this
+        # flag means "expected remaining work" or "blocking unexplained
+        # gap" is decided once, in `run_audit`, from
+        # `expect_backfill_complete` -- classification must not shift
+        # under the operator's claim about backfill state, or the two
+        # modes would no longer be describing the same population.
+        is_never_enqueued_backlog = (
             population == "incomplete"
             and not has_any_job
             and page_stats["pages_covered"] == 0
@@ -553,7 +635,7 @@ def classify_archives(
             {
                 "archive_id": archive_id,
                 "population": population,
-                "unexplained_gap": is_unexplained_gap,
+                "never_enqueued_backlog": is_never_enqueued_backlog,
                 "structural_eligible": structural_eligible,
                 "current_path": info["current_path"],
                 "total_pages": page_stats["total_pages"],
@@ -607,7 +689,7 @@ def _write_json(path: Path, payload: object) -> Path:
 _CSV_FIELDNAMES = [
     "archive_id",
     "population",
-    "unexplained_gap",
+    "never_enqueued_backlog",
     "structural_eligible",
     "current_path",
     "total_pages",
@@ -642,8 +724,18 @@ def run_audit(
     now: datetime | None = None,
     json_output: Path | None = None,
     csv_output: Path | None = None,
+    expect_backfill_complete: bool = False,
 ) -> dict:
     """Produce the read-only, full-library coverage-audit report.
+
+    `expect_backfill_complete` is the operator's assertion that Version
+    1 eligibility has already reached zero (the handoff document's
+    "Remaining project sequence" step 3). It changes no classification
+    and no query: the never-enqueued population is identical either
+    way. It only decides how that population is *reported* -- as
+    expected remaining backlog (default) or as blocking unexplained
+    gaps that a missed enqueue or orchestration bug would explain
+    (final-audit mode). See the module docstring.
 
     Never mutates `database`. `json_output`/`csv_output` are validated
     against `database` (and against each other) *before* the database
@@ -745,8 +837,14 @@ def run_audit(
     counts = population_counts(archives)
     total_archive_count = len(archives)
     partition_sum = sum(counts.values())
-    unexplained_gaps = [
-        archive for archive in archives if archive["unexplained_gap"]
+    never_enqueued = [
+        archive for archive in archives if archive["never_enqueued_backlog"]
+    ]
+    # Full fidelity, always: the console may sample this list, but the
+    # JSON and CSV artefacts are the record of what the audit actually
+    # found and must never be abridged.
+    never_enqueued_archive_ids = [
+        archive["archive_id"] for archive in never_enqueued
     ]
 
     output = {
@@ -761,11 +859,27 @@ def run_audit(
             partition_sum == total_archive_count
         ),
         "failed_stable_category_counts": failed_category_counts(archives),
-        "unexplained_gap_count": len(unexplained_gaps),
-        "unexplained_gap_archive_ids": [
-            archive["archive_id"] for archive in unexplained_gaps
-        ],
-        "unexplained_gap_explanation": UNEXPLAINED_GAP_EXPLANATION,
+        "expect_backfill_complete": expect_backfill_complete,
+        "never_enqueued_backlog_count": len(never_enqueued),
+        "never_enqueued_backlog_archive_ids": never_enqueued_archive_ids,
+        "never_enqueued_backlog_explanation": (
+            NEVER_ENQUEUED_BACKLOG_EXPLANATION
+        ),
+        # Same archives, reported under the blocking keys only when the
+        # operator asserted the backfill is finished. Both keys are
+        # always present (empty by default) so downstream parsers can
+        # read one stable schema and simply check the count.
+        "blocking_unexplained_gap_count": (
+            len(never_enqueued) if expect_backfill_complete else 0
+        ),
+        "blocking_unexplained_gap_archive_ids": (
+            list(never_enqueued_archive_ids)
+            if expect_backfill_complete
+            else []
+        ),
+        "blocking_unexplained_gap_explanation": (
+            BLOCKING_UNEXPLAINED_GAP_EXPLANATION
+        ),
         "archives": archives,
         "database_size_bytes_before": fingerprint_before.size_bytes,
         "database_size_bytes_after": fingerprint_after.size_bytes,
@@ -796,10 +910,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Read-only, full-library Version 1 perceptual-hash coverage "
             "audit. Classifies every archive into exactly one of "
             "complete / incomplete / failed / stale / ineligible, and "
-            "separately flags eligible archives with zero coverage and "
-            "no job history at all as unexplained gaps. Never enqueues, "
-            "retries, quarantines, or moves anything; safe to point at "
-            "a protected backup."
+            "separately reports eligible archives with zero coverage "
+            "and no job history at all as the never-enqueued backlog "
+            "(expected remaining work while the backfill is running; "
+            "pass --expect-backfill-complete to treat them as blocking "
+            "unexplained gaps instead). Never enqueues, retries, "
+            "quarantines, or moves anything; safe to point at a "
+            "protected backup."
         )
     )
     parser.add_argument(
@@ -832,7 +949,104 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional path for the per-archive CSV classification.",
     )
+    parser.add_argument(
+        "--expect-backfill-complete",
+        action="store_true",
+        help=(
+            "Final-audit mode. Assert that Version 1 eligibility has "
+            "already reached zero, so an eligible archive that never "
+            "had a hash_archive_pages_perceptual job is a blocking "
+            "unexplained gap (missed enqueue / orchestration bug) "
+            "rather than remaining backlog. Changes no classification "
+            "-- only the interpretation, the console framing, and the "
+            "exit code (2 when any are found). Use this for step 3 of "
+            "the handoff document's remaining project sequence; leave "
+            "it off while the backfill is still running."
+        ),
+    )
     return parser
+
+
+def print_archive_id_sample(
+    archive_ids: Sequence[int],
+    *,
+    indent: str = "  ",
+    label: str = "ARCHIVE IDS",
+    limit: int = MAX_PRINTED_ARCHIVE_IDS,
+) -> None:
+    """Print at most `limit` ids, plus an explicit omitted count.
+
+    Truncation is never silent: when the list is longer than `limit`
+    the header states how many of how many are shown and a following
+    line names the exact number omitted and where the full list lives.
+    An operator who sees only part of a list must be able to tell that
+    from the console alone -- otherwise a capped summary is worse than
+    no summary, because it looks complete.
+    """
+    total = len(archive_ids)
+
+    if total == 0:
+        return
+
+    shown = list(archive_ids[:limit])
+    omitted = total - len(shown)
+
+    if omitted:
+        print(f"{indent}{label} (first {len(shown):,} of {total:,}): {shown}")
+        print(
+            f"{indent}... and {omitted:,} more "
+            "(see JSON/CSV for the full list)"
+        )
+    else:
+        print(f"{indent}{label} ({total:,}): {shown}")
+
+
+def _print_never_enqueued_section(output: dict) -> None:
+    """The one part of the summary whose wording depends on the mode.
+
+    Identical population, two framings -- see the module docstring.
+    """
+    archive_ids = output["never_enqueued_backlog_archive_ids"]
+
+    if output.get("expect_backfill_complete"):
+        count = output["blocking_unexplained_gap_count"]
+        print(
+            "BLOCKING UNEXPLAINED GAPS (eligible, zero coverage, no job "
+            f"ever): {count:,}"
+        )
+
+        if count:
+            print(
+                "  Final-audit mode asserted the backfill is complete, so "
+                "these indicate a missed enqueue or an orchestration bug "
+                "and must be investigated before the backfill is signed "
+                "off."
+            )
+            print_archive_id_sample(
+                output["blocking_unexplained_gap_archive_ids"]
+            )
+
+        return
+
+    count = output["never_enqueued_backlog_count"]
+    print(
+        "Never-enqueued backlog (eligible, zero coverage, not yet "
+        f"enqueued): {count:,}"
+    )
+
+    if count:
+        # Deliberately free of the word "gap": mid-backfill this is the
+        # work queue, and an operator scanning the summary should not
+        # read the remaining workload as a defect. The pointer to
+        # --expect-backfill-complete is how they get the strict reading
+        # once it is actually the right one.
+        print(
+            "  Expected remaining work while the Version 1 backfill is in "
+            "progress -- not an anomaly. Once eligibility reaches zero, "
+            "re-run with --expect-backfill-complete for the strict "
+            "post-backfill check."
+        )
+        print_archive_id_sample(archive_ids, label="Sample archive IDs")
 
 
 def print_summary(output: dict) -> None:
@@ -855,16 +1069,7 @@ def print_summary(output: dict) -> None:
     for category, count in output["failed_stable_category_counts"].items():
         print(f"  {category}: {count}")
 
-    print(
-        "Unexplained gaps (eligible, zero coverage, no job ever): "
-        f"{output['unexplained_gap_count']}"
-    )
-
-    if output["unexplained_gap_count"] > 0:
-        print(
-            "  ARCHIVE IDS: "
-            f"{output['unexplained_gap_archive_ids']}"
-        )
+    _print_never_enqueued_section(output)
 
     print(f"Integrity check:       {output['quick_check']}")
     print(f"Database unchanged:    {output['database_unchanged']}")
@@ -889,13 +1094,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             stale_older_than_seconds=args.stale_older_than_seconds,
             json_output=args.json_output,
             csv_output=args.csv_output,
+            expect_backfill_complete=args.expect_backfill_complete,
         )
     except Exception as exc:
         print(f"Perceptual coverage audit failed: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_FAILURE
 
     print_summary(output)
-    return 0
+
+    # Only final-audit mode can fail the run. Mid-backfill the same
+    # population is the work queue itself, and exiting non-zero on it
+    # would fail every scheduled run until the backfill finished --
+    # which is exactly how a real gap ends up ignored.
+    if output["blocking_unexplained_gap_count"] > 0:
+        return EXIT_BLOCKING_UNEXPLAINED_GAPS
+
+    return EXIT_OK
 
 
 if __name__ == "__main__":
