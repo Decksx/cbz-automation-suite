@@ -61,3 +61,6 @@ routing.json
 
 # ── Large binary dependencies (exceeds GitHub's 100MB limit) ──
 komga-1.24.4-fork-0.1.5.jar
+
+# ── Claude Code local state (per-machine permission grants) ───
+.claude/settings.local.json
