@@ -7,6 +7,7 @@ touches a production database, backup, report, or archive path.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -37,18 +38,30 @@ MIGRATIONS = (
 
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "blocked")
 
-UNIQUE_ACTIVE_INDEX_SQL = f"""
-CREATE UNIQUE INDEX IF NOT EXISTS {UNIQUE_ACTIVE_INDEX_NAME}
-    ON jobs(job_type, archive_id)
-    WHERE status IN ('pending', 'claimed', 'running')
-"""
 
-
-def migrated(tmp_path: Path, name: str = "preflight.db") -> Path:
+def migrated(
+    tmp_path: Path,
+    name: str = "preflight.db",
+    *,
+    through_version: int = 9,
+) -> Path:
     database = tmp_path / name
+    selected_migrations = (
+        tmp_path / f"{database.stem}-migrations-through-{through_version}"
+    )
+    selected_migrations.mkdir()
+
+    for migration in sorted(MIGRATIONS.glob("[0-9][0-9][0-9]_*.sql")):
+        version = int(migration.stem.split("_", 1)[0])
+
+        if version <= through_version:
+            shutil.copyfile(
+                migration,
+                selected_migrations / migration.name,
+            )
 
     with database_connection(database) as connection:
-        apply_migrations(connection, MIGRATIONS)
+        apply_migrations(connection, selected_migrations)
 
     return database
 
@@ -615,7 +628,7 @@ def test_external_wal_commit_during_quick_check_is_detected(
 def test_works_after_the_unique_index_already_exists(
     tmp_path: Path,
 ) -> None:
-    database = migrated(tmp_path)
+    database = migrated(tmp_path, through_version=10)
 
     with database_connection(database) as connection:
         archive_id = seed_archive(connection)
@@ -626,10 +639,10 @@ def test_works_after_the_unique_index_already_exists(
             status="completed",
             archive_id=archive_id,
         )
-        connection.execute(UNIQUE_ACTIVE_INDEX_SQL)
 
     report = run_preflight(database=database)
 
+    assert report["applied_schema_versions"] == list(range(1, 11))
     assert report["unique_active_index_exists"] is True
     assert report["migration_blocked"] is False
     assert report["total_active_jobs"] == 1
