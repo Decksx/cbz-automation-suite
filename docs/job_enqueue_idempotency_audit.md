@@ -1,6 +1,37 @@
 # Job Enqueue & Idempotency Audit
 
-**Status:** evidence-only audit. No production code, tests, schemas, or
+**Status:** originally an evidence-only audit; its recommended sequence
+(Section 7) is now implemented in full. Verified against `master` @ `fe8897b`
+on 2026-07-31:
+
+- **Step 1 — partial unique index.** Shipped as migration
+  `010_unique_active_jobs.sql`, exactly the predicate recommended here
+  (`UNIQUE(job_type, archive_id) WHERE status IN ('pending','claimed',
+  'running')`), including the NULL-`archive_id` caveat written into the
+  migration's own comment. Applied to the production database on 2026-07-30
+  (see `docs/development_log_2026-07-30.md`, section 14): all 272,074 job rows
+  verified column-for-column unchanged, `quick_check` `ok` before and after.
+- **Step 2 — `enqueue_if_absent()`.** Implemented on `JobQueue` using the
+  preferred `INSERT ... ON CONFLICT ... DO NOTHING` form (not error-message or
+  index-name matching), returning an `EnqueueOutcome` enum, requiring a
+  non-NULL `archive_id`, and deliberately not returning the conflicting row.
+  All five call sites migrated onto it; no direct `JobQueue.enqueue()` call
+  sites remain outside the queue module itself.
+- **Step 3 — `calculate_archive_hash` terminal-failure inconsistency.**
+  Resolved as option (b): the existing retry-via-re-enqueue behavior is kept
+  and now documented in-code as intentional, with the differing policy carried
+  by each repository's own advisory candidate filter rather than by the shared
+  helper.
+- **Step 4 — lease/fencing tokens.** Correctly still deferred; unchanged.
+
+All six deterministic tests required by Section 9 exist and pass, across
+`tests/test_active_job_uniqueness.py`, `tests/test_atomic_enqueue_callers.py`,
+and `tests/test_enqueue_if_absent.py` (72 tests total).
+
+The audit text below is preserved unedited as the original evidence record and
+describes the code as it was before any of the above landed.
+
+**Original status:** evidence-only audit. No production code, tests, schemas, or
 migrations were changed as part of this document. Every claim below
 references function names and stable code locations (module + function/class
 name), not line numbers, and was verified by reading the actual source. No

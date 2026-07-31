@@ -1,8 +1,26 @@
 # Job Queue & Worker Retry-Lifecycle Audit
 
-**Status:** evidence-only audit. No production code was changed as part of
-this document. Findings reference function names, not line numbers; every
-claim below was verified by reading the actual source referenced.
+**Status:** originally an evidence-only audit; its Section 3 "small, low-risk
+improvements" are now all implemented. Findings reference function names, not
+line numbers; every claim below was verified by reading the actual source
+referenced.
+
+The findings text below is preserved unedited as the original evidence record
+and describes the code as it was at audit time. Resolution status:
+
+| Section 3 item | Status |
+| --- | --- |
+| Guard the nested `mark_failed()` call inside `run_once()`'s `except Exception` | **Resolved.** `JobWorkerStateError` now carries both the original `processing_exception` and the `transition_exception`, logs both, and raises rather than returning a `WorkerResult` that would imply a known outcome. |
+| Mark the "no handler registered" failure as `permanent=True` | **Resolved.** Uses `permanent=True` with a dedicated `MISSING_HANDLER_CATEGORY` rather than defaulting to a retryable `unclassified_error`. |
+| Comment `claim_next()`'s attempt-counting timing | **Resolved 2026-07-31.** `queue.py` now documents inline that a claim counts as an attempt even if the worker dies before `mark_running()` or the handler runs. |
+
+The Section 4 items (lease/fencing tokens, heartbeats, per-category or
+exponential backoff) and the Section 5 deferred work remain open and unchanged.
+The one Section 4 item that *was* implemented separately — a partial unique
+index preventing duplicate *active* job rows — closes a different problem
+(duplicate rows) than the fencing gap described here (one row processed twice);
+see `docs/job_enqueue_idempotency_audit.md` Section 5 for why the two are not
+interchangeable.
 
 **Scope:**
 
