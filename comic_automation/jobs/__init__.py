@@ -1,5 +1,6 @@
 from comic_automation.jobs.models import Job, JobStatus
 from comic_automation.jobs.queue import (
+    EnqueueOutcome,
     InvalidJobTransitionError,
     JobNotFoundError,
     JobQueue,
@@ -15,6 +16,7 @@ from comic_automation.jobs.worker import (
 )
 
 __all__ = [
+    "EnqueueOutcome",
     "InvalidJobTransitionError",
     "CategorizedJobError",
     "Job",

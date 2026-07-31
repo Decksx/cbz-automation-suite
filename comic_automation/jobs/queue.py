@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from typing import Any
 
 from comic_automation.jobs.models import (
@@ -18,6 +19,20 @@ class JobNotFoundError(LookupError):
 
 class InvalidJobTransitionError(RuntimeError):
     pass
+
+
+class EnqueueOutcome(StrEnum):
+    """Result of `JobQueue.enqueue_if_absent()`.
+
+    CREATED: a new job row was inserted.
+    ALREADY_ACTIVE: an active ('pending'/'claimed'/'running') job for
+        the same (job_type, archive_id) already existed, so nothing was
+        inserted. The existing row is deliberately not looked up or
+        returned -- see `enqueue_if_absent()` for why.
+    """
+
+    CREATED = "created"
+    ALREADY_ACTIVE = "already_active"
 
 
 def _utc_sql_timestamp(
@@ -116,6 +131,112 @@ class JobQueue:
         )
 
         return self.get(int(cursor.lastrowid))
+
+    def enqueue_if_absent(
+        self,
+        job_type: str,
+        *,
+        archive_id: int,
+        payload: Mapping[str, Any] | None = None,
+        priority: int = 100,
+        max_attempts: int = 3,
+        available_at: datetime | None = None,
+    ) -> EnqueueOutcome:
+        """Enqueue a job unless an active one already exists for it.
+
+        "Active" means status in ('pending', 'claimed', 'running') --
+        exactly the predicate of the `idx_jobs_unique_active` partial
+        unique index added by migration 010. Terminal history
+        ('completed'/'failed'/'cancelled'/'blocked') never blocks a new
+        job here: a caller that additionally wants to refuse
+        re-enqueueing after, say, a permanent failure must apply that
+        policy itself, on top of this call.
+
+        Unlike a caller-side "SELECT ... NOT EXISTS then INSERT"
+        sequence, the check and the insert are a *single* statement, so
+        two connections racing cannot both observe "no active job" and
+        both insert. The database decides, not the caller.
+
+        `archive_id` is required and must not be None. SQL treats every
+        NULL as distinct for uniqueness purposes, so the partial unique
+        index cannot deduplicate NULL-archive rows -- accepting None
+        here would silently return CREATED every time and give a false
+        impression of protection.
+
+        Returns `EnqueueOutcome.CREATED` if a row was inserted, or
+        `EnqueueOutcome.ALREADY_ACTIVE` if an active job already
+        existed. The conflicting row is deliberately *not* fetched or
+        returned: this method issues no transaction control of its own,
+        so a follow-up SELECT would run outside any lock this method
+        holds and could observe the row after it had already left the
+        active-status set. Callers needing the row must fetch it
+        themselves within their own transaction.
+
+        Transaction handling is entirely the caller's: this method never
+        issues BEGIN/COMMIT/ROLLBACK, so it composes inside a
+        caller-owned transaction (for example `scan_library()`'s
+        `BEGIN IMMEDIATE` batch) as well as in autocommit mode.
+
+        Only the active-duplicate conflict is handled. Every other
+        integrity failure -- a FOREIGN KEY violation from an unknown
+        `archive_id`, or any constraint added in future -- propagates
+        unchanged rather than being misreported as ALREADY_ACTIVE.
+        """
+        normalized_type = job_type.strip()
+
+        if not normalized_type:
+            raise ValueError("job_type cannot be empty.")
+
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1.")
+
+        if archive_id is None:
+            raise ValueError(
+                "archive_id is required by enqueue_if_absent(); "
+                "duplicate detection cannot work for a NULL archive_id."
+            )
+
+        # The ON CONFLICT target repeats the partial index's own
+        # predicate so SQLite resolves the conflict against
+        # idx_jobs_unique_active specifically, rather than against any
+        # other constraint on this table. DO NOTHING makes the
+        # already-active case a no-op instead of an error, so no
+        # exception has to be caught and inspected (and therefore no
+        # unrelated IntegrityError can be swallowed by mistake).
+        cursor = self.connection.execute(
+            """
+            INSERT INTO jobs (
+                job_type,
+                status,
+                priority,
+                archive_id,
+                payload_json,
+                max_attempts,
+                available_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_type, archive_id)
+            WHERE status IN ('pending', 'claimed', 'running')
+            DO NOTHING
+            """,
+            (
+                normalized_type,
+                JobStatus.PENDING.value,
+                priority,
+                archive_id,
+                encode_payload(payload),
+                max_attempts,
+                _utc_sql_timestamp(available_at),
+            ),
+        )
+
+        # rowcount, not lastrowid: on a DO NOTHING no-op lastrowid keeps
+        # whatever value it had from a previous insert on this
+        # connection, so it cannot distinguish the two outcomes.
+        if cursor.rowcount == 1:
+            return EnqueueOutcome.CREATED
+
+        return EnqueueOutcome.ALREADY_ACTIVE
 
     def get(self, job_id: int) -> Job:
         # Simple primary-key lookup; used internally after every
