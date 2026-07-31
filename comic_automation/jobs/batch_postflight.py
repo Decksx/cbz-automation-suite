@@ -22,9 +22,67 @@ enqueue eligibility -- this module imports and calls it directly rather
 than re-deriving an approximation that could drift from production
 behavior.
 
-The output is one JSON report with a top-level `overall_pass: bool` and
-a `gates` mapping of `gate_name -> {"pass": bool, "detail": ...}`, so a
-human or another script can see exactly which automated gate(s) failed.
+Gate status model
+-----------------
+
+Every gate reports an explicit tri-state `status` of `"pass"`,
+`"fail"`, or `"skipped"`, plus a `required` boolean saying whether the
+current mode demands that gate be evaluated at all. The legacy
+`pass: bool` key is retained for readability but is derived strictly
+from the status (`status == "pass"`), so a gate that could not be
+evaluated is *never* reported as passing. This is the whole point of
+the tri-state: an earlier revision of this module encoded "no backup
+was supplied, so the backup half of this gate was skipped" as a passing
+gate, which let a run with no backup and no git access report
+`overall_pass: true` -- exactly the outcome this tool exists to
+prevent.
+
+`overall_pass` is therefore *not* `all(gate["pass"])`. It is true only
+when no gate failed **and** no gate that the current mode requires was
+skipped. A top-level `summary` block carries pass/fail/skip counts plus
+`failed_gates`, `skipped_gates`, and `required_gates_skipped` lists, so
+an operator can see at a glance why a run did not pass.
+
+Production mode
+---------------
+
+The command is strict by default, because it exists specifically to
+gate production batches and a postflight that quietly grades itself on
+a subset of the checklist is worse than no postflight at all. In the
+default (production) mode:
+
+* `--backup-database` plus `--expected-backup-size-bytes` and
+  `--expected-backup-modified-time-ns` are required; omitting them
+  leaves the backup gates skipped-but-required, which forces
+  `overall_pass: false`.
+* An undeterminable repository state (git missing, not a checkout,
+  subprocess failure) is a gate *failure*, not a warning.
+
+Non-production callers -- a developer reconciling a scratch batch on a
+machine with no protected backup -- opt out explicitly and per concern
+with `--allow-missing-backup` and `--allow-undeterminable-repository`.
+Those flags downgrade only the affected gates to not-required; every
+other gate stays strict. `--production` is available as an explicit
+affirmation of intent and is mutually exclusive with both opt-outs, so
+a production runbook can encode "refuse any relaxation" in the command
+line itself.
+
+Exit codes distinguish the two ways a run can fail to pass:
+`EXIT_GATE_FAILURE` when a gate actively failed, and
+`EXIT_REQUIRED_GATE_SKIPPED` when the run was merely incomplete.
+
+Path safety
+-----------
+
+Every input and output path -- working database, backup database,
+batch report, failure-audit JSON/CSV, and this command's own JSON
+report -- is cross-validated against every other one *before* any
+database is opened and before any directory is created. No output may
+be the same file as an input (a failure-audit output equal to the batch
+report would overwrite the very input being reconciled against), no two
+outputs may collide, and no output may already exist: consistent with
+the handoff document's read-only audit rule ("Always use new output
+paths"), this command never silently replaces historical evidence.
 """
 
 from __future__ import annotations
@@ -86,6 +144,36 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_GATE_FAILURE = 2
+# A run can fail to pass for two structurally different reasons, and an
+# operator (or a wrapping script) has to be able to tell them apart
+# without parsing the JSON: EXIT_GATE_FAILURE means a gate was
+# evaluated and disagreed with reality, EXIT_REQUIRED_GATE_SKIPPED
+# means the run was simply not complete enough to grade -- e.g. it was
+# invoked in production mode without the protected backup. The former
+# demands investigation of the batch; the latter demands re-running the
+# postflight with the missing inputs.
+EXIT_REQUIRED_GATE_SKIPPED = 3
+
+# Gate statuses. "skipped" exists so that "this gate was not evaluated"
+# can never be confused with "this gate was evaluated and passed".
+GATE_PASS = "pass"
+GATE_FAIL = "fail"
+GATE_SKIPPED = "skipped"
+
+BACKUP_NOT_SUPPLIED_REASON = (
+    "No --backup-database was supplied, so this gate could not be "
+    "evaluated. Step 10-12 of the required postflight checklist cover "
+    "the protected backup; in production mode this leaves the run "
+    "incomplete and overall_pass false."
+)
+
+BACKUP_FINGERPRINT_MISSING_REASON = (
+    "--backup-database, --expected-backup-size-bytes and "
+    "--expected-backup-modified-time-ns must all be supplied to verify "
+    "the protected backup fingerprint (checklist step 12). In "
+    "production mode this leaves the run incomplete and overall_pass "
+    "false."
+)
 
 # Exceptions that mean "this database (or connection) could not be read
 # trustworthily right now" -- a corrupt file, a mid-run write, a missing
@@ -109,7 +197,18 @@ class PostflightError(RuntimeError):
 
 
 class OutputPathCollisionError(PostflightError):
-    """A requested output path could clobber a database or another output."""
+    """A requested output path could clobber an input or another output."""
+
+
+class OutputPathExistsError(PostflightError):
+    """A requested output path already exists.
+
+    Refused rather than overwritten. Postflight artifacts are the
+    evidence that a batch reconciled; the handoff document's read-only
+    audit section instructs operators to "Always use new output paths",
+    and silently replacing a previous run's report would destroy the
+    record of what the previous run saw.
+    """
 
 
 def _same_file(first: Path, second: Path) -> bool:
@@ -125,33 +224,108 @@ def _same_file(first: Path, second: Path) -> bool:
     return False
 
 
-def _validate_output_paths(
+def _validate_paths(
     *,
-    databases: Sequence[Path],
-    outputs: Sequence[Path | None],
+    inputs: Sequence[tuple[str, Path | None]],
+    outputs: Sequence[tuple[str, Path | None]],
 ) -> None:
-    """Reject any output path that could collide with a database or
-    another output, before anything is opened or written."""
-    resolved_outputs = [path for path in outputs if path is not None]
+    """Cross-validate every input and output path this run will touch.
 
-    for output in resolved_outputs:
-        for database in databases:
-            if _same_file(output, database):
+    Called before any database is opened, any report is read, and any
+    directory is created, so a rejected run leaves the filesystem
+    exactly as it found it.
+
+    Three rules, each labelled with the CLI flag that supplied the path
+    so the error names the actual mistake:
+
+    1. No output may be the same file as any input. The working
+       database and protected backup are the obvious cases, but the
+       batch report matters just as much: a failure-audit JSON path
+       equal to `--batch-report` would overwrite the very input this
+       command reconciles against, and the resulting report would be
+       "reconciled" against its own output.
+    2. No two outputs may be the same file, or the second write would
+       silently discard the first.
+    3. No output may already exist. See `OutputPathExistsError`.
+    """
+    resolved_inputs = [
+        (label, path) for label, path in inputs if path is not None
+    ]
+    resolved_outputs = [
+        (label, path) for label, path in outputs if path is not None
+    ]
+
+    for output_label, output in resolved_outputs:
+        for input_label, source in resolved_inputs:
+            if _same_file(output, source):
                 raise OutputPathCollisionError(
-                    f"Output path ({output}) must not be the same file "
-                    f"as a database being audited ({database})."
+                    f"Output path {output_label} ({output}) must not be "
+                    f"the same file as the input {input_label} "
+                    f"({source})."
                 )
 
-    for index, first in enumerate(resolved_outputs):
-        for second in resolved_outputs[index + 1 :]:
+    for index, (first_label, first) in enumerate(resolved_outputs):
+        for second_label, second in resolved_outputs[index + 1 :]:
             if _same_file(first, second):
                 raise OutputPathCollisionError(
-                    f"Output paths must not collide: {first} == {second}."
+                    f"Output paths must not collide: {first_label} "
+                    f"({first}) == {second_label} ({second})."
                 )
 
+    for output_label, output in resolved_outputs:
+        if output.exists():
+            raise OutputPathExistsError(
+                f"Output path {output_label} ({output}) already exists. "
+                "This command never overwrites an existing report: "
+                "always use a new output path so previous evidence is "
+                "preserved."
+            )
 
-def _gate(name: str, passed: bool, detail: dict[str, Any]) -> dict[str, Any]:
-    return {"name": name, "pass": bool(passed), "detail": detail}
+
+def _gate(
+    name: str,
+    status: str,
+    detail: dict[str, Any],
+    *,
+    required: bool = True,
+) -> dict[str, Any]:
+    """Build one gate entry.
+
+    `pass` is derived from `status` and kept only for readability of
+    the rendered JSON; it is deliberately impossible to construct a
+    gate that was skipped yet reports `pass: True`.
+
+    `required` records whether the *current mode* demands this gate be
+    evaluated, so `overall_pass` can distinguish "skipped and that is
+    fine" from "skipped and that invalidates the run" without
+    re-deriving the mode rules at the bottom of the function.
+    """
+    if status not in (GATE_PASS, GATE_FAIL, GATE_SKIPPED):
+        raise ValueError(f"Unknown gate status: {status!r}")
+
+    return {
+        "name": name,
+        "status": status,
+        "pass": status == GATE_PASS,
+        "required": bool(required),
+        "detail": detail,
+    }
+
+
+def _boolean_gate(
+    name: str,
+    passed: bool,
+    detail: dict[str, Any],
+    *,
+    required: bool = True,
+) -> dict[str, Any]:
+    """A gate that was actually evaluated and either passed or failed."""
+    return _gate(
+        name,
+        GATE_PASS if passed else GATE_FAIL,
+        detail,
+        required=required,
+    )
 
 
 def load_batch_report(path: Path) -> dict:
@@ -363,29 +537,90 @@ def run_postflight(
     repository: Path | None = None,
     failure_audit_json_output: Path | None = None,
     failure_audit_csv_output: Path | None = None,
+    report_json_output: Path | None = None,
+    allow_missing_backup: bool = False,
+    allow_undeterminable_repository: bool = False,
 ) -> dict[str, Any]:
-    database = Path(database).resolve(strict=False)
+    """Run every automated postflight gate and return one JSON report.
 
-    if not database.is_file():
-        raise FileNotFoundError(f"Database does not exist: {database}")
+    Strict (production) by default: see the module docstring for what
+    `allow_missing_backup` and `allow_undeterminable_repository`
+    relax and why the defaults are the way round they are.
+
+    `report_json_output` is not written here -- `main` writes it after
+    this function returns -- but it is accepted so that it can be
+    cross-validated against every other path *before* any database is
+    opened. Validating it in `main` after the run would be too late:
+    the failure audit would already have written its own outputs.
+    """
+    database = Path(database).resolve(strict=False)
 
     resolved_backup = (
         Path(backup_database).resolve(strict=False)
         if backup_database is not None
         else None
     )
+    resolved_batch_report = Path(batch_report).resolve(strict=False)
+    resolved_failure_audit_json = (
+        Path(failure_audit_json_output).resolve(strict=False)
+        if failure_audit_json_output is not None
+        else None
+    )
+    resolved_failure_audit_csv = (
+        Path(failure_audit_csv_output).resolve(strict=False)
+        if failure_audit_csv_output is not None
+        else None
+    )
+    resolved_report_json = (
+        Path(report_json_output).resolve(strict=False)
+        if report_json_output is not None
+        else None
+    )
 
-    output_paths = [failure_audit_json_output, failure_audit_csv_output]
-    databases = [database] + ([resolved_backup] if resolved_backup else [])
-    _validate_output_paths(databases=databases, outputs=output_paths)
+    # First thing this function does, before any stat-for-existence,
+    # any database open, and any directory creation: prove that no path
+    # this run touches can clobber another.
+    _validate_paths(
+        inputs=[
+            ("--database", database),
+            ("--backup-database", resolved_backup),
+            ("--batch-report", resolved_batch_report),
+        ],
+        outputs=[
+            ("--failure-audit-json-output", resolved_failure_audit_json),
+            ("--failure-audit-csv-output", resolved_failure_audit_csv),
+            ("--json-output", resolved_report_json),
+        ],
+    )
 
-    report = load_batch_report(batch_report)
+    if not database.is_file():
+        raise FileNotFoundError(f"Database does not exist: {database}")
+
+    # A backup path that was supplied but does not exist is an operator
+    # error, not a gate result: the run cannot check what it was told
+    # to check. (Omitting the backup entirely is different -- that is
+    # reported as skipped-and-required, see the backup gates below.)
+    if resolved_backup is not None and not resolved_backup.is_file():
+        raise FileNotFoundError(
+            f"Backup database does not exist: {resolved_backup}"
+        )
+
+    # Mode. Requiredness is decided once, here, and then handed to each
+    # gate, so the rules live in one place instead of being re-derived
+    # where overall_pass is computed.
+    backup_gates_required = not allow_missing_backup
+    repository_determinable_required = not allow_undeterminable_repository
+    production_mode = (
+        backup_gates_required and repository_determinable_required
+    )
+
+    report = load_batch_report(resolved_batch_report)
 
     gates: dict[str, dict[str, Any]] = {}
 
     # --- Gate 1: processed count -------------------------------------
     reported_processed = report.get("processed")
-    gates["batch_report_processed"] = _gate(
+    gates["batch_report_processed"] = _boolean_gate(
         "batch_report_processed",
         reported_processed == expected_processed,
         {
@@ -403,7 +638,7 @@ def run_postflight(
     if None not in (succeeded, terminally_failed, retry_scheduled):
         outcome_sum = succeeded + terminally_failed + retry_scheduled
 
-    gates["batch_report_outcome_reconciliation"] = _gate(
+    gates["batch_report_outcome_reconciliation"] = _boolean_gate(
         "batch_report_outcome_reconciliation",
         outcome_sum is not None and outcome_sum == reported_processed,
         {
@@ -453,7 +688,7 @@ def run_postflight(
     enqueue_gate_pass = reported_enqueued == expected_enqueued and (
         snapshot["total_job_population"] == expected_population_after
     )
-    gates["enqueue_and_population"] = _gate(
+    gates["enqueue_and_population"] = _boolean_gate(
         "enqueue_and_population",
         enqueue_gate_pass,
         {
@@ -476,7 +711,7 @@ def run_postflight(
             snapshot["completed_count"] == expected_completed_after
             and snapshot["failed_count"] == expected_failed_after
         )
-    gates["cumulative_outcome_reconciliation"] = _gate(
+    gates["cumulative_outcome_reconciliation"] = _boolean_gate(
         "cumulative_outcome_reconciliation",
         cumulative_pass,
         {
@@ -493,7 +728,7 @@ def run_postflight(
     allowed_active = (
         (retry_scheduled or 0) if acknowledge_retry_scheduled else 0
     )
-    gates["no_unexpected_active_jobs"] = _gate(
+    gates["no_unexpected_active_jobs"] = _boolean_gate(
         "no_unexpected_active_jobs",
         snapshot["active_job_count"] == allowed_active,
         {
@@ -507,7 +742,7 @@ def run_postflight(
     )
 
     # --- Gate 6: eligibility recount ----------------------------------
-    gates["eligibility_recount"] = _gate(
+    gates["eligibility_recount"] = _boolean_gate(
         "eligibility_recount",
         snapshot["eligible_remaining"] == expected_eligible_remaining,
         {
@@ -550,7 +785,7 @@ def run_postflight(
                 dhash_delta == profiled_pages and phash_delta == profiled_pages
             )
 
-    gates["hash_alignment"] = _gate(
+    gates["hash_alignment"] = _boolean_gate(
         "hash_alignment",
         aligned and delta_pass,
         {
@@ -562,7 +797,7 @@ def run_postflight(
     )
 
     # --- Gate 8: page SHA-256 row count --------------------------------
-    gates["page_sha256_count"] = _gate(
+    gates["page_sha256_count"] = _boolean_gate(
         "page_sha256_count",
         snapshot["page_sha256_count"] == expected_page_sha256_count,
         {
@@ -572,7 +807,7 @@ def run_postflight(
     )
 
     # --- Gate 9: near-duplicate candidates ------------------------------
-    gates["near_duplicate_candidates"] = _gate(
+    gates["near_duplicate_candidates"] = _boolean_gate(
         "near_duplicate_candidates",
         snapshot["near_duplicate_count"] == expected_near_duplicate_count,
         {
@@ -581,135 +816,164 @@ def run_postflight(
         },
     )
 
-    # --- Gate 10: quick_check on working DB (+ backup) -----------------
+    # --- Gate 10a: quick_check on the working database -----------------
+    # Checklist step 10 covers two databases, and they are reported as
+    # two gates rather than one. A single gate could only carry one
+    # status, which is precisely how "the backup half was skipped"
+    # previously hid inside a passing gate.
     quick_check_detail: dict[str, Any] = {
-        "working": {
-            "database": str(database),
-            "quick_check": snapshot["quick_check"],
-        }
+        "database": str(database),
+        "quick_check": snapshot["quick_check"],
     }
     if snapshot_error is not None:
-        quick_check_detail["working"]["error"] = snapshot_error
-    quick_check_pass = snapshot["quick_check"] == "ok"
+        quick_check_detail["error"] = snapshot_error
 
-    if resolved_backup is not None:
-        if not resolved_backup.is_file():
-            raise FileNotFoundError(
-                f"Backup database does not exist: {resolved_backup}"
-            )
+    gates["quick_check"] = _boolean_gate(
+        "quick_check", snapshot["quick_check"] == "ok", quick_check_detail
+    )
+
+    # --- Gate 10b: quick_check on the protected backup -----------------
+    if resolved_backup is None:
+        gates["backup_quick_check"] = _gate(
+            "backup_quick_check",
+            GATE_SKIPPED,
+            {"reason": BACKUP_NOT_SUPPLIED_REASON},
+            required=backup_gates_required,
+        )
+    else:
         try:
             with readonly_database_connection(resolved_backup) as connection:
                 backup_integrity = quick_check(connection)
-            quick_check_detail["backup"] = {
-                "database": str(resolved_backup),
-                "quick_check": backup_integrity,
-            }
-            quick_check_pass = quick_check_pass and backup_integrity == "ok"
+            gates["backup_quick_check"] = _boolean_gate(
+                "backup_quick_check",
+                backup_integrity == "ok",
+                {
+                    "database": str(resolved_backup),
+                    "quick_check": backup_integrity,
+                },
+            )
         except READ_FAILURE_EXCEPTIONS as exc:
-            quick_check_detail["backup"] = {
-                "database": str(resolved_backup),
-                "quick_check": None,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            quick_check_pass = False
-    else:
-        quick_check_detail["backup"] = {"skipped": True}
+            gates["backup_quick_check"] = _boolean_gate(
+                "backup_quick_check",
+                False,
+                {
+                    "database": str(resolved_backup),
+                    "quick_check": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
-    gates["quick_check"] = _gate("quick_check", quick_check_pass, quick_check_detail)
-
-    # --- Gate 11: active-job duplicate audit on both databases --------
-    duplicate_detail: dict[str, Any] = {}
-    duplicate_pass = True
-
+    # --- Gate 11a: active-job duplicate audit on the working DB -------
     try:
         working_duplicate_report = run_duplicate_active_preflight(
             database=database
         )
-        duplicate_detail["working"] = {
-            "database": str(database),
-            "blocking_group_count": working_duplicate_report[
-                "blocking_group_count"
-            ],
-            "unique_active_index_exists": working_duplicate_report[
-                "unique_active_index_exists"
-            ],
-        }
-        duplicate_pass = (
+        gates["active_job_duplicate_audit"] = _boolean_gate(
+            "active_job_duplicate_audit",
             working_duplicate_report["blocking_group_count"] == 0
-            and working_duplicate_report["unique_active_index_exists"]
+            and working_duplicate_report["unique_active_index_exists"],
+            {
+                "database": str(database),
+                "blocking_group_count": working_duplicate_report[
+                    "blocking_group_count"
+                ],
+                "unique_active_index_exists": working_duplicate_report[
+                    "unique_active_index_exists"
+                ],
+            },
         )
     except READ_FAILURE_EXCEPTIONS as exc:
-        duplicate_detail["working"] = {
-            "database": str(database),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-        duplicate_pass = False
+        gates["active_job_duplicate_audit"] = _boolean_gate(
+            "active_job_duplicate_audit",
+            False,
+            {
+                "database": str(database),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
 
-    if resolved_backup is not None:
+    # --- Gate 11b: active-job duplicate audit on the backup -----------
+    if resolved_backup is None:
+        gates["backup_active_job_duplicate_audit"] = _gate(
+            "backup_active_job_duplicate_audit",
+            GATE_SKIPPED,
+            {"reason": BACKUP_NOT_SUPPLIED_REASON},
+            required=backup_gates_required,
+        )
+    else:
         try:
             backup_duplicate_report = run_duplicate_active_preflight(
                 database=resolved_backup
             )
-            duplicate_detail["backup"] = {
-                "database": str(resolved_backup),
-                "blocking_group_count": backup_duplicate_report[
-                    "blocking_group_count"
-                ],
-                "unique_active_index_exists": backup_duplicate_report[
-                    "unique_active_index_exists"
-                ],
-            }
-            duplicate_pass = duplicate_pass and (
+            gates["backup_active_job_duplicate_audit"] = _boolean_gate(
+                "backup_active_job_duplicate_audit",
                 backup_duplicate_report["blocking_group_count"] == 0
-                and backup_duplicate_report["unique_active_index_exists"]
+                and backup_duplicate_report["unique_active_index_exists"],
+                {
+                    "database": str(resolved_backup),
+                    "blocking_group_count": backup_duplicate_report[
+                        "blocking_group_count"
+                    ],
+                    "unique_active_index_exists": backup_duplicate_report[
+                        "unique_active_index_exists"
+                    ],
+                },
             )
         except READ_FAILURE_EXCEPTIONS as exc:
-            duplicate_detail["backup"] = {
-                "database": str(resolved_backup),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            duplicate_pass = False
-    else:
-        duplicate_detail["backup"] = {"skipped": True}
-
-    gates["active_job_duplicate_audit"] = _gate(
-        "active_job_duplicate_audit", duplicate_pass, duplicate_detail
-    )
+            gates["backup_active_job_duplicate_audit"] = _boolean_gate(
+                "backup_active_job_duplicate_audit",
+                False,
+                {
+                    "database": str(resolved_backup),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
     # --- Gate 12: backup fingerprint -----------------------------------
+    # Needs all three inputs to mean anything: the backup itself plus
+    # both expected values from the handoff document. With any of them
+    # missing the gate is skipped, never assumed good.
     if (
         resolved_backup is not None
         and expected_backup_size_bytes is not None
         and expected_backup_modified_time_ns is not None
     ):
         actual_backup_fingerprint = fingerprint_database(resolved_backup)
-        backup_fingerprint_pass = (
+        gates["backup_fingerprint"] = _boolean_gate(
+            "backup_fingerprint",
             actual_backup_fingerprint.size_bytes == expected_backup_size_bytes
             and actual_backup_fingerprint.modified_time_ns
-            == expected_backup_modified_time_ns
+            == expected_backup_modified_time_ns,
+            {
+                "database": str(resolved_backup),
+                "actual_size_bytes": actual_backup_fingerprint.size_bytes,
+                "expected_size_bytes": expected_backup_size_bytes,
+                "actual_modified_time_ns": (
+                    actual_backup_fingerprint.modified_time_ns
+                ),
+                "expected_modified_time_ns": (
+                    expected_backup_modified_time_ns
+                ),
+            },
         )
-        backup_fingerprint_detail = {
-            "skipped": False,
-            "actual_size_bytes": actual_backup_fingerprint.size_bytes,
-            "expected_size_bytes": expected_backup_size_bytes,
-            "actual_modified_time_ns": (
-                actual_backup_fingerprint.modified_time_ns
-            ),
-            "expected_modified_time_ns": expected_backup_modified_time_ns,
-        }
     else:
-        backup_fingerprint_pass = True
-        backup_fingerprint_detail = {
-            "skipped": True,
-            "reason": (
-                "backup_database and/or expected fingerprint values "
-                "were not provided."
-            ),
-        }
-
-    gates["backup_fingerprint"] = _gate(
-        "backup_fingerprint", backup_fingerprint_pass, backup_fingerprint_detail
-    )
+        gates["backup_fingerprint"] = _gate(
+            "backup_fingerprint",
+            GATE_SKIPPED,
+            {
+                "reason": BACKUP_FINGERPRINT_MISSING_REASON,
+                "backup_database": (
+                    str(resolved_backup)
+                    if resolved_backup is not None
+                    else None
+                ),
+                "expected_size_bytes": expected_backup_size_bytes,
+                "expected_modified_time_ns": (
+                    expected_backup_modified_time_ns
+                ),
+            },
+            required=backup_gates_required,
+        )
 
     # --- Gate 13: repository (git) state --------------------------------
     repository_path = (
@@ -720,27 +984,40 @@ def run_postflight(
     git_state = _read_repository_state(repository_path)
 
     if not git_state.determinable:
-        repository_gate_pass = True  # "cannot determine" is a warning.
-        repository_detail: dict[str, Any] = {
-            "determinable": False,
-            "warning": git_state.warning,
-            "repository": str(repository_path),
-        }
-    else:
-        repository_gate_pass = git_state.clean is True and (
-            expected_commit is None or git_state.head == expected_commit
+        # "Cannot determine" means checklist step 13 was not performed.
+        # In production mode that is a failure: a production postflight
+        # that cannot see whether the deployed tree is clean and at the
+        # expected revision has not verified the thing step 13 asks
+        # about, and treating that as a pass is how an unreviewed
+        # working-tree change rides along with a "reconciled" batch.
+        # Outside production mode the same condition is a skip with a
+        # warning, since a developer may legitimately be running this
+        # against a checkout git cannot read.
+        gates["repository_state"] = _gate(
+            "repository_state",
+            GATE_FAIL if repository_determinable_required else GATE_SKIPPED,
+            {
+                "determinable": False,
+                "warning": git_state.warning,
+                "repository": str(repository_path),
+            },
+            required=repository_determinable_required,
         )
-        repository_detail = {
-            "determinable": True,
-            "repository": str(repository_path),
-            "clean": git_state.clean,
-            "head": git_state.head,
-            "expected_commit": expected_commit,
-        }
-
-    gates["repository_state"] = _gate(
-        "repository_state", repository_gate_pass, repository_detail
-    )
+    else:
+        gates["repository_state"] = _boolean_gate(
+            "repository_state",
+            git_state.clean is True
+            and (
+                expected_commit is None or git_state.head == expected_commit
+            ),
+            {
+                "determinable": True,
+                "repository": str(repository_path),
+                "clean": git_state.clean,
+                "head": git_state.head,
+                "expected_commit": expected_commit,
+            },
+        )
 
     # --- Gate 14: fresh perceptual-failure audit ------------------------
     try:
@@ -755,7 +1032,7 @@ def run_postflight(
             for category in CATEGORIES_REQUIRING_INVESTIGATION
             if stable_counts.get(category, 0) > 0
         }
-        gates["perceptual_failure_audit"] = _gate(
+        gates["perceptual_failure_audit"] = _boolean_gate(
             "perceptual_failure_audit",
             len(needs_investigation) == 0,
             {
@@ -772,7 +1049,7 @@ def run_postflight(
             },
         )
     except READ_FAILURE_EXCEPTIONS as exc:
-        gates["perceptual_failure_audit"] = _gate(
+        gates["perceptual_failure_audit"] = _boolean_gate(
             "perceptual_failure_audit",
             False,
             {"error": f"{type(exc).__name__}: {exc}"},
@@ -793,18 +1070,56 @@ def run_postflight(
             "page_sha256_count",
             "near_duplicate_candidates",
         ):
+            gates[name]["status"] = GATE_FAIL
             gates[name]["pass"] = False
             gates[name]["detail"]["snapshot_error"] = snapshot_error
 
-    overall_pass = all(gate["pass"] for gate in gates.values())
+    # overall_pass is deliberately NOT all(gate["pass"]). A gate that
+    # was never evaluated must not be able to contribute to a passing
+    # run when the current mode required it, and it must not silently
+    # sink a run when the operator explicitly opted out of it.
+    failed_gates = sorted(
+        name for name, gate in gates.items() if gate["status"] == GATE_FAIL
+    )
+    skipped_gates = sorted(
+        name for name, gate in gates.items() if gate["status"] == GATE_SKIPPED
+    )
+    required_gates_skipped = sorted(
+        name for name in skipped_gates if gates[name]["required"]
+    )
+    passed_gates = sorted(
+        name for name, gate in gates.items() if gate["status"] == GATE_PASS
+    )
+    overall_pass = not failed_gates and not required_gates_skipped
+
+    summary = {
+        "gate_count": len(gates),
+        "passed_count": len(passed_gates),
+        "failed_count": len(failed_gates),
+        "skipped_count": len(skipped_gates),
+        "failed_gates": failed_gates,
+        "skipped_gates": skipped_gates,
+        # The single most important line for an operator staring at a
+        # false overall_pass with no failed gate: these are the gates
+        # the run was supposed to evaluate and could not.
+        "required_gates_skipped": required_gates_skipped,
+    }
 
     return {
         "database": str(database),
         "backup_database": (
             str(resolved_backup) if resolved_backup is not None else None
         ),
-        "batch_report_path": str(Path(batch_report).resolve(strict=False)),
+        "batch_report_path": str(resolved_batch_report),
+        "mode": {
+            "production": production_mode,
+            "allow_missing_backup": bool(allow_missing_backup),
+            "allow_undeterminable_repository": bool(
+                allow_undeterminable_repository
+            ),
+        },
         "overall_pass": overall_pass,
+        "summary": summary,
         "gates": gates,
         "database_fingerprint_before": asdict(snapshot["fingerprint_before"]),
         "database_fingerprint_after": asdict(snapshot["fingerprint_after"]),
@@ -825,7 +1140,11 @@ def build_parser() -> argparse.ArgumentParser:
             "completed hash_archive_pages_perceptual batch. Automates "
             "steps 1-14 of docs/production_handoff_2026-07-30.md's "
             "'Required postflight' checklist. Never enqueues, retries, "
-            "migrates, or otherwise mutates any database."
+            "migrates, or otherwise mutates any database. Strict "
+            "(production) by default: the protected backup and its "
+            "expected fingerprint are required, and an undeterminable "
+            "repository state is a failure. Relax individual gates "
+            "only with the explicit --allow-* flags below."
         )
     )
     parser.add_argument("--database", type=Path, required=True)
@@ -870,11 +1189,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--failure-audit-json-output", type=Path, default=None)
     parser.add_argument("--failure-audit-csv-output", type=Path, default=None)
     parser.add_argument("--json-output", type=Path, default=None)
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help=(
+            "Explicitly affirm that this is a production postflight. "
+            "Strict behavior is already the default; passing this flag "
+            "additionally makes the command refuse any --allow-* "
+            "relaxation, so a runbook can encode that intent in the "
+            "command line itself."
+        ),
+    )
+    parser.add_argument(
+        "--allow-missing-backup",
+        action="store_true",
+        help=(
+            "Non-production only. Treat the protected-backup gates "
+            "(quick_check, duplicate audit, fingerprint) as optional "
+            "rather than required, so omitting --backup-database "
+            "reports them as skipped without forcing overall_pass "
+            "false. Never use this to gate a production batch."
+        ),
+    )
+    parser.add_argument(
+        "--allow-undeterminable-repository",
+        action="store_true",
+        help=(
+            "Non-production only. Treat an undeterminable git "
+            "repository state (git missing, not a checkout) as a "
+            "skipped gate with a warning instead of a failure."
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # --production is an assertion, not a mode switch (strict is the
+    # default), so combining it with a relaxation is a contradiction
+    # the operator has to resolve rather than something to silently
+    # rank one way or the other.
+    if args.production and (
+        args.allow_missing_backup or args.allow_undeterminable_repository
+    ):
+        parser.error(
+            "--production cannot be combined with --allow-missing-backup "
+            "or --allow-undeterminable-repository."
+        )
 
     try:
         report = run_postflight(
@@ -904,6 +1267,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             repository=args.repository,
             failure_audit_json_output=args.failure_audit_json_output,
             failure_audit_csv_output=args.failure_audit_csv_output,
+            # Passed for cross-validation only; written below, after
+            # every gate has run and the path has been proven not to
+            # collide with any input or other output.
+            report_json_output=args.json_output,
+            allow_missing_backup=args.allow_missing_backup,
+            allow_undeterminable_repository=(
+                args.allow_undeterminable_repository
+            ),
         )
     except Exception as exc:
         payload = {"error": type(exc).__name__, "message": str(exc)}
@@ -919,8 +1290,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(rendered)
 
-    if not report["overall_pass"]:
+    # An actively failing gate outranks an incomplete run: if something
+    # disagreed with reality the operator needs to know that first,
+    # even if the run was also missing an input.
+    if report["summary"]["failed_gates"]:
         return EXIT_GATE_FAILURE
+
+    if report["summary"]["required_gates_skipped"]:
+        return EXIT_REQUIRED_GATE_SKIPPED
 
     return EXIT_OK
 

@@ -27,6 +27,12 @@ from comic_automation.jobs.batch_postflight import (
     EXIT_FAILURE,
     EXIT_GATE_FAILURE,
     EXIT_OK,
+    EXIT_REQUIRED_GATE_SKIPPED,
+    GATE_FAIL,
+    GATE_PASS,
+    GATE_SKIPPED,
+    OutputPathCollisionError,
+    OutputPathExistsError,
     main,
     run_postflight,
 )
@@ -209,6 +215,35 @@ def seed_all_pass_scenario(database: Path) -> None:
             add_page_hash(connection, page_id=page_id, algorithm="phash")
 
 
+def make_git_repository(path: Path) -> Path:
+    """A clean, committed git repository for repository_state gate tests."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    (path / "file.txt").write_text("hello", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "file.txt"], cwd=path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
 def run_all_pass(
     tmp_path: Path,
     database: Path,
@@ -216,6 +251,15 @@ def run_all_pass(
     backup_database: Path | None = None,
     **overrides,
 ) -> dict:
+    """Non-production baseline run: every gate that *can* be evaluated
+    from a single working database passes.
+
+    The two relaxations are explicit, which is exactly the point of the
+    strict-by-default design: no backup is supplied and `tmp_path` is
+    not a git checkout, so a production-mode run of this same scenario
+    would (correctly) not pass. Tests that care about production mode
+    use `run_production_pass` instead.
+    """
     report_path = write_batch_report(
         tmp_path / "batch-report.json", base_batch_report()
     )
@@ -232,20 +276,81 @@ def run_all_pass(
         expected_eligible_remaining=0,
         expected_page_sha256_count=5,
         expected_near_duplicate_count=0,
-        repository=tmp_path,  # not a git repo: "cannot determine" warning
+        repository=tmp_path,  # not a git repo: undeterminable
+        allow_missing_backup=True,
+        allow_undeterminable_repository=True,
     )
     kwargs.update(overrides)
     return run_postflight(**kwargs)
 
 
-def assert_all_gates_pass(report: dict, *, except_for: tuple[str, ...] = ()) -> None:
+def run_production_pass(tmp_path: Path, database: Path, **overrides) -> dict:
+    """A production-mode run with every required input present.
+
+    Supplies a protected backup plus its real fingerprint and a clean
+    git checkout, so no gate is skipped and no relaxation flag is used.
+    """
+    backup = tmp_path / "production-backup.db"
+    shutil.copyfile(database, backup)
+    backup_fingerprint = fingerprint_database(backup)
+    repository = make_git_repository(tmp_path / "production-repo")
+
+    kwargs = dict(
+        backup_database=backup,
+        expected_backup_size_bytes=backup_fingerprint.size_bytes,
+        expected_backup_modified_time_ns=(
+            backup_fingerprint.modified_time_ns
+        ),
+        repository=repository,
+        allow_missing_backup=False,
+        allow_undeterminable_repository=False,
+    )
+    kwargs.update(overrides)
+    return run_all_pass(tmp_path, database, **kwargs)
+
+
+def assert_no_gate_failed(report: dict, *, except_for: tuple[str, ...] = ()) -> None:
+    """No gate has status "fail" (skipped gates are tolerated here).
+
+    Also enforces the invariant that makes the tri-state worth having:
+    a gate is reported as `pass: True` if and only if its status is
+    exactly "pass", so a skipped gate can never masquerade as a passing
+    one.
+    """
     for name, gate in report["gates"].items():
+        assert gate["pass"] is (gate["status"] == GATE_PASS), (
+            f"gate {name} has inconsistent status/pass: {gate}"
+        )
+
         if name in except_for:
             continue
-        assert gate["pass"], f"gate {name} unexpectedly failed: {gate['detail']}"
+
+        assert gate["status"] != GATE_FAIL, (
+            f"gate {name} unexpectedly failed: {gate['detail']}"
+        )
 
 
 # --- all-pass scenario -------------------------------------------------
+
+
+ALL_GATE_NAMES = {
+    "batch_report_processed",
+    "batch_report_outcome_reconciliation",
+    "enqueue_and_population",
+    "cumulative_outcome_reconciliation",
+    "no_unexpected_active_jobs",
+    "eligibility_recount",
+    "hash_alignment",
+    "page_sha256_count",
+    "near_duplicate_candidates",
+    "quick_check",
+    "backup_quick_check",
+    "active_job_duplicate_audit",
+    "backup_active_job_duplicate_audit",
+    "backup_fingerprint",
+    "repository_state",
+    "perceptual_failure_audit",
+}
 
 
 def test_all_gates_pass_on_a_clean_reconciled_batch(tmp_path: Path) -> None:
@@ -258,23 +363,44 @@ def test_all_gates_pass_on_a_clean_reconciled_batch(tmp_path: Path) -> None:
 
     assert before == after
     assert report["overall_pass"] is True
-    assert_all_gates_pass(report)
-    assert set(report["gates"]) == {
-        "batch_report_processed",
-        "batch_report_outcome_reconciliation",
-        "enqueue_and_population",
-        "cumulative_outcome_reconciliation",
-        "no_unexpected_active_jobs",
-        "eligibility_recount",
-        "hash_alignment",
-        "page_sha256_count",
-        "near_duplicate_candidates",
-        "quick_check",
-        "active_job_duplicate_audit",
+    assert_no_gate_failed(report)
+    assert set(report["gates"]) == ALL_GATE_NAMES
+    # Non-production run: the backup gates are honestly skipped, and
+    # the operator opted out of requiring them.
+    assert report["summary"]["required_gates_skipped"] == []
+    assert set(report["summary"]["skipped_gates"]) == {
+        "backup_quick_check",
+        "backup_active_job_duplicate_audit",
         "backup_fingerprint",
         "repository_state",
-        "perceptual_failure_audit",
     }
+
+
+def test_production_run_with_every_required_input_passes(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+
+    before = fingerprint_database(database)
+    report = run_production_pass(tmp_path, database)
+    after = fingerprint_database(database)
+
+    assert before == after
+    assert report["mode"]["production"] is True
+    assert report["overall_pass"] is True
+    assert_no_gate_failed(report)
+    assert set(report["gates"]) == ALL_GATE_NAMES
+    # Nothing skipped at all: every gate in the checklist was actually
+    # evaluated, which is the only shape a production postflight may
+    # report as passing.
+    assert report["summary"]["skipped_gates"] == []
+    assert report["summary"]["required_gates_skipped"] == []
+    assert report["summary"]["failed_gates"] == []
+    assert report["summary"]["passed_count"] == len(ALL_GATE_NAMES)
+    assert all(
+        gate["status"] == GATE_PASS for gate in report["gates"].values()
+    )
 
 
 def test_cli_exits_zero_on_all_pass(
@@ -308,12 +434,15 @@ def test_cli_exits_zero_on_all_pass(
             "5",
             "--repository",
             str(tmp_path),
+            "--allow-missing-backup",
+            "--allow-undeterminable-repository",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == EXIT_OK
     assert payload["overall_pass"] is True
+    assert payload["mode"]["production"] is False
 
 
 # --- individual gate failures -------------------------------------------
@@ -332,7 +461,7 @@ def test_mismatched_processed_count_fails_gate_only(tmp_path: Path) -> None:
     assert before == after
     assert report["overall_pass"] is False
     assert report["gates"]["batch_report_processed"]["pass"] is False
-    assert_all_gates_pass(
+    assert_no_gate_failed(
         report, except_for=("batch_report_processed",)
     )
 
@@ -405,10 +534,10 @@ def test_blocking_active_duplicate_group_fails_its_gate(
     assert before == after
     assert report["overall_pass"] is False
     assert report["gates"]["active_job_duplicate_audit"]["pass"] is False
-    detail = report["gates"]["active_job_duplicate_audit"]["detail"]["working"]
+    detail = report["gates"]["active_job_duplicate_audit"]["detail"]
     assert detail["blocking_group_count"] == 1
     assert detail["unique_active_index_exists"] is False
-    assert_all_gates_pass(
+    assert_no_gate_failed(
         report, except_for=("active_job_duplicate_audit",)
     )
 
@@ -453,7 +582,7 @@ def test_dhash_phash_misalignment_fails_hash_alignment_gate(
     assert report["gates"]["hash_alignment"]["pass"] is False
     detail = report["gates"]["hash_alignment"]["detail"]
     assert detail["dhash_v1_count"] != detail["phash_v1_count"]
-    assert_all_gates_pass(report, except_for=("hash_alignment",))
+    assert_no_gate_failed(report, except_for=("hash_alignment",))
 
 
 def test_unclassified_failure_category_flags_investigation_gate(
@@ -492,7 +621,7 @@ def test_unclassified_failure_category_flags_investigation_gate(
     assert gate["detail"]["categories_needing_investigation_now"][
         "unclassified"
     ] == 1
-    assert_all_gates_pass(report, except_for=("perceptual_failure_audit",))
+    assert_no_gate_failed(report, except_for=("perceptual_failure_audit",))
 
 
 def test_missing_permissions_and_unsupported_categories_also_flag(
@@ -564,10 +693,10 @@ def test_backup_fingerprint_mismatch_fails_only_that_gate(
     assert backup_before == backup_after
     assert report["overall_pass"] is False
     assert report["gates"]["backup_fingerprint"]["pass"] is False
-    assert_all_gates_pass(report, except_for=("backup_fingerprint",))
+    assert_no_gate_failed(report, except_for=("backup_fingerprint",))
 
 
-def test_backup_quick_check_failure_fails_quick_check_gate(
+def test_backup_quick_check_failure_fails_only_the_backup_gate(
     tmp_path: Path,
 ) -> None:
     database = migrated(tmp_path)
@@ -580,10 +709,18 @@ def test_backup_quick_check_failure_fails_quick_check_gate(
     report = run_all_pass(tmp_path, database, backup_database=backup)
 
     assert report["overall_pass"] is False
-    assert report["gates"]["quick_check"]["pass"] is False
-    assert report["gates"]["quick_check"]["detail"]["working"][
-        "quick_check"
-    ] == "ok"
+    # The working database is fine; only the backup's own gate fails.
+    # Reporting the two databases as separate gates is what makes this
+    # distinguishable at all.
+    assert report["gates"]["quick_check"]["status"] == GATE_PASS
+    assert report["gates"]["quick_check"]["detail"]["quick_check"] == "ok"
+    assert report["gates"]["backup_quick_check"]["status"] == GATE_FAIL
+    # The corrupt backup is also unreadable by the duplicate audit; no
+    # working-database gate is affected either way.
+    assert "quick_check" not in report["summary"]["failed_gates"]
+    assert "active_job_duplicate_audit" not in report["summary"][
+        "failed_gates"
+    ]
 
 
 def test_dirty_git_tree_fails_repository_state_gate(
@@ -592,31 +729,7 @@ def test_dirty_git_tree_fails_repository_state_gate(
     database = migrated(tmp_path)
     seed_all_pass_scenario(database)
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    (repo / "file.txt").write_text("hello", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "file.txt"], cwd=repo, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
+    repo = make_git_repository(tmp_path / "repo")
 
     # Clean and committed: gate should pass.
     clean_report = run_all_pass(tmp_path, database, repository=repo)
@@ -632,51 +745,41 @@ def test_dirty_git_tree_fails_repository_state_gate(
     assert (
         dirty_report["gates"]["repository_state"]["detail"]["clean"] is False
     )
-    assert_all_gates_pass(dirty_report, except_for=("repository_state",))
+    assert_no_gate_failed(dirty_report, except_for=("repository_state",))
 
 
-def test_non_git_directory_is_a_warning_not_a_failure(
+def test_undeterminable_repository_is_a_skip_when_explicitly_allowed(
     tmp_path: Path,
 ) -> None:
     database = migrated(tmp_path)
     seed_all_pass_scenario(database)
 
-    report = run_all_pass(tmp_path, database, repository=tmp_path)
+    report = run_all_pass(
+        tmp_path,
+        database,
+        repository=tmp_path,
+        allow_undeterminable_repository=True,
+    )
 
-    assert report["gates"]["repository_state"]["pass"] is True
-    assert report["gates"]["repository_state"]["detail"]["determinable"] is False
-    assert report["gates"]["repository_state"]["detail"]["warning"]
+    gate = report["gates"]["repository_state"]
+    # Explicitly opted out, so it does not sink the run -- but it is
+    # still recorded as skipped, never as a pass.
+    assert gate["status"] == GATE_SKIPPED
+    assert gate["pass"] is False
+    assert gate["required"] is False
+    assert gate["detail"]["determinable"] is False
+    assert gate["detail"]["warning"]
+    assert "repository_state" in report["summary"]["skipped_gates"]
+    assert "repository_state" not in report["summary"][
+        "required_gates_skipped"
+    ]
 
 
 def test_expected_commit_mismatch_fails_gate(tmp_path: Path) -> None:
     database = migrated(tmp_path)
     seed_all_pass_scenario(database)
 
-    repo = tmp_path / "repo2"
-    repo.mkdir()
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    (repo / "file.txt").write_text("hello", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "file.txt"], cwd=repo, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
+    repo = make_git_repository(tmp_path / "repo2")
 
     report = run_all_pass(
         tmp_path,
@@ -699,7 +802,7 @@ def test_eligibility_recount_mismatch_fails_its_gate(tmp_path: Path) -> None:
 
     assert report["overall_pass"] is False
     assert report["gates"]["eligibility_recount"]["pass"] is False
-    assert_all_gates_pass(report, except_for=("eligibility_recount",))
+    assert_no_gate_failed(report, except_for=("eligibility_recount",))
 
 
 def test_page_sha256_mismatch_fails_its_gate(tmp_path: Path) -> None:
@@ -712,7 +815,7 @@ def test_page_sha256_mismatch_fails_its_gate(tmp_path: Path) -> None:
 
     assert report["overall_pass"] is False
     assert report["gates"]["page_sha256_count"]["pass"] is False
-    assert_all_gates_pass(report, except_for=("page_sha256_count",))
+    assert_no_gate_failed(report, except_for=("page_sha256_count",))
 
 
 def test_near_duplicate_mismatch_fails_its_gate(tmp_path: Path) -> None:
@@ -739,7 +842,7 @@ def test_near_duplicate_mismatch_fails_its_gate(tmp_path: Path) -> None:
 
     assert report["overall_pass"] is False
     assert report["gates"]["near_duplicate_candidates"]["pass"] is False
-    assert_all_gates_pass(report, except_for=("near_duplicate_candidates",))
+    assert_no_gate_failed(report, except_for=("near_duplicate_candidates",))
 
 
 def test_unexpected_active_job_fails_its_gate_unless_acknowledged(
@@ -762,7 +865,7 @@ def test_unexpected_active_job_fails_its_gate_unless_acknowledged(
 
     assert report["overall_pass"] is False
     assert report["gates"]["no_unexpected_active_jobs"]["pass"] is False
-    assert_all_gates_pass(
+    assert_no_gate_failed(
         report, except_for=("no_unexpected_active_jobs",)
     )
 
@@ -914,12 +1017,15 @@ def test_cli_exits_gate_failure_code_when_a_gate_fails(
             "5",
             "--repository",
             str(tmp_path),
+            "--allow-missing-backup",
+            "--allow-undeterminable-repository",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == EXIT_GATE_FAILURE
     assert payload["overall_pass"] is False
+    assert payload["summary"]["failed_gates"] == ["batch_report_processed"]
 
 
 def test_output_path_colliding_with_database_is_rejected(
@@ -933,7 +1039,7 @@ def test_output_path_colliding_with_database_is_rejected(
 
     before_bytes = database.read_bytes()
 
-    with pytest.raises(Exception):
+    with pytest.raises(OutputPathCollisionError):
         run_postflight(
             database=database,
             batch_report=report_path,
@@ -949,3 +1055,594 @@ def test_output_path_colliding_with_database_is_rejected(
         )
 
     assert database.read_bytes() == before_bytes
+
+
+# --- production mode: required gates may never be silently skipped ------
+
+
+def test_production_mode_without_backup_does_not_pass(tmp_path: Path) -> None:
+    """The defect this mode exists to prevent: a run with no protected
+    backup used to report overall_pass true because every backup gate
+    was recorded as `{"skipped": True}` alongside `pass: True`."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    repository = make_git_repository(tmp_path / "repo")
+
+    before = fingerprint_database(database)
+    report = run_all_pass(
+        tmp_path,
+        database,
+        repository=repository,
+        allow_missing_backup=False,
+        allow_undeterminable_repository=False,
+    )
+    after = fingerprint_database(database)
+
+    assert before == after
+    assert report["mode"]["production"] is True
+    assert report["overall_pass"] is False
+    # Nothing actively disagreed with reality; the run is simply not
+    # complete enough to grade, and the report says so explicitly.
+    assert report["summary"]["failed_gates"] == []
+    assert report["summary"]["required_gates_skipped"] == [
+        "backup_active_job_duplicate_audit",
+        "backup_fingerprint",
+        "backup_quick_check",
+    ]
+
+    for name in report["summary"]["required_gates_skipped"]:
+        gate = report["gates"][name]
+        assert gate["status"] == GATE_SKIPPED
+        assert gate["pass"] is False
+        assert gate["required"] is True
+        assert gate["detail"]["reason"]
+
+
+def test_production_mode_without_backup_fingerprint_values_does_not_pass(
+    tmp_path: Path,
+) -> None:
+    """Supplying the backup file but not its expected size/mtime is
+    still an incomplete production postflight: checklist step 12 was
+    not performed."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    backup = tmp_path / "backup.db"
+    shutil.copyfile(database, backup)
+    repository = make_git_repository(tmp_path / "repo")
+
+    report = run_all_pass(
+        tmp_path,
+        database,
+        backup_database=backup,
+        repository=repository,
+        allow_missing_backup=False,
+        allow_undeterminable_repository=False,
+    )
+
+    assert report["overall_pass"] is False
+    assert report["summary"]["failed_gates"] == []
+    assert report["summary"]["required_gates_skipped"] == [
+        "backup_fingerprint"
+    ]
+    assert report["gates"]["backup_quick_check"]["status"] == GATE_PASS
+
+
+def test_production_mode_with_undeterminable_repository_fails(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    backup = tmp_path / "backup.db"
+    shutil.copyfile(database, backup)
+    backup_fingerprint = fingerprint_database(backup)
+
+    report = run_all_pass(
+        tmp_path,
+        database,
+        backup_database=backup,
+        expected_backup_size_bytes=backup_fingerprint.size_bytes,
+        expected_backup_modified_time_ns=(
+            backup_fingerprint.modified_time_ns
+        ),
+        repository=tmp_path,  # not a git checkout
+        allow_missing_backup=False,
+        allow_undeterminable_repository=False,
+    )
+
+    assert report["mode"]["production"] is True
+    assert report["overall_pass"] is False
+    gate = report["gates"]["repository_state"]
+    # A failure, not a warning: in production the state was required
+    # and could not be established.
+    assert gate["status"] == GATE_FAIL
+    assert gate["pass"] is False
+    assert gate["detail"]["determinable"] is False
+    assert gate["detail"]["warning"]
+    assert report["summary"]["failed_gates"] == ["repository_state"]
+    assert report["summary"]["required_gates_skipped"] == []
+
+
+def test_no_backup_and_no_git_never_reports_overall_pass(
+    tmp_path: Path,
+) -> None:
+    """The exact regression: no backup + no git access must not pass."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+
+    report = run_all_pass(
+        tmp_path,
+        database,
+        repository=tmp_path,
+        allow_missing_backup=False,
+        allow_undeterminable_repository=False,
+    )
+
+    assert report["overall_pass"] is False
+    assert report["summary"]["failed_gates"] == ["repository_state"]
+    assert report["summary"]["required_gates_skipped"] == [
+        "backup_active_job_duplicate_audit",
+        "backup_fingerprint",
+        "backup_quick_check",
+    ]
+
+
+def test_skipped_gates_are_never_reported_as_passing(tmp_path: Path) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+
+    for relaxed in (True, False):
+        report = run_all_pass(
+            tmp_path,
+            database,
+            repository=tmp_path,
+            allow_missing_backup=relaxed,
+            allow_undeterminable_repository=relaxed,
+        )
+
+        assert report["summary"]["skipped_count"] > 0
+
+        for name, gate in report["gates"].items():
+            assert gate["status"] in (GATE_PASS, GATE_FAIL, GATE_SKIPPED)
+
+            if gate["status"] == GATE_SKIPPED:
+                assert gate["pass"] is False, (
+                    f"skipped gate {name} reported as passing"
+                )
+
+        counts = report["summary"]
+        assert (
+            counts["passed_count"]
+            + counts["failed_count"]
+            + counts["skipped_count"]
+            == counts["gate_count"]
+            == len(report["gates"])
+        )
+
+
+def test_non_production_mode_still_fails_real_gate_failures(
+    tmp_path: Path,
+) -> None:
+    """Relaxations are per-concern: opting out of the backup and
+    repository gates must not soften anything else."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+
+    report = run_all_pass(tmp_path, database, expected_page_sha256_count=999)
+
+    assert report["mode"]["production"] is False
+    assert report["overall_pass"] is False
+    assert report["summary"]["failed_gates"] == ["page_sha256_count"]
+
+
+def test_cli_exits_required_gate_skipped_code_in_production_mode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    repository = make_git_repository(tmp_path / "repo")
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+
+    exit_code = main(
+        [
+            "--database",
+            str(database),
+            "--batch-report",
+            str(report_path),
+            "--expected-processed",
+            "4",
+            "--expected-enqueued",
+            "4",
+            "--expected-job-population-before",
+            "0",
+            "--expected-completed-before",
+            "0",
+            "--expected-failed-before",
+            "0",
+            "--expected-eligible-remaining",
+            "0",
+            "--expected-page-sha256-count",
+            "5",
+            "--repository",
+            str(repository),
+            "--production",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    # Distinct from EXIT_GATE_FAILURE: nothing failed, the run was
+    # incomplete.
+    assert exit_code == EXIT_REQUIRED_GATE_SKIPPED
+    assert exit_code != EXIT_GATE_FAILURE
+    assert payload["overall_pass"] is False
+    assert payload["summary"]["failed_gates"] == []
+    assert payload["summary"]["required_gates_skipped"]
+
+
+def test_cli_production_run_with_every_input_exits_ok(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    backup = tmp_path / "backup.db"
+    shutil.copyfile(database, backup)
+    backup_fingerprint = fingerprint_database(backup)
+    repository = make_git_repository(tmp_path / "repo")
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+
+    exit_code = main(
+        [
+            "--database",
+            str(database),
+            "--backup-database",
+            str(backup),
+            "--batch-report",
+            str(report_path),
+            "--expected-processed",
+            "4",
+            "--expected-enqueued",
+            "4",
+            "--expected-job-population-before",
+            "0",
+            "--expected-completed-before",
+            "0",
+            "--expected-failed-before",
+            "0",
+            "--expected-eligible-remaining",
+            "0",
+            "--expected-page-sha256-count",
+            "5",
+            "--expected-backup-size-bytes",
+            str(backup_fingerprint.size_bytes),
+            "--expected-backup-modified-time-ns",
+            str(backup_fingerprint.modified_time_ns),
+            "--repository",
+            str(repository),
+            "--production",
+            "--json-output",
+            str(tmp_path / "reports" / "postflight.json"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_OK
+    assert payload["overall_pass"] is True
+    assert payload["summary"]["skipped_gates"] == []
+    assert (tmp_path / "reports" / "postflight.json").is_file()
+
+
+def test_cli_rejects_production_combined_with_a_relaxation(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--database",
+                str(database),
+                "--batch-report",
+                str(report_path),
+                "--expected-processed",
+                "4",
+                "--expected-enqueued",
+                "4",
+                "--expected-job-population-before",
+                "0",
+                "--expected-completed-before",
+                "0",
+                "--expected-failed-before",
+                "0",
+                "--expected-eligible-remaining",
+                "0",
+                "--expected-page-sha256-count",
+                "5",
+                "--production",
+                "--allow-missing-backup",
+            ]
+        )
+
+
+# --- unified input/output path validation -------------------------------
+
+
+def _postflight_kwargs(database: Path, report_path: Path, **overrides) -> dict:
+    kwargs = dict(
+        database=database,
+        batch_report=report_path,
+        expected_processed=4,
+        expected_enqueued=4,
+        expected_job_population_before=0,
+        expected_completed_before=0,
+        expected_failed_before=0,
+        expected_eligible_remaining=0,
+        expected_page_sha256_count=5,
+        repository=database.parent,
+        allow_missing_backup=True,
+        allow_undeterminable_repository=True,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_output_path_colliding_with_batch_report_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """The genuine gap in the first revision: the batch report was not
+    in the collision set, so a failure-audit output could overwrite the
+    very input being reconciled against."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    report_bytes_before = report_path.read_bytes()
+
+    with pytest.raises(OutputPathCollisionError) as excinfo:
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                failure_audit_json_output=report_path,
+            )
+        )
+
+    assert "--batch-report" in str(excinfo.value)
+    assert report_path.read_bytes() == report_bytes_before
+
+
+def test_csv_output_colliding_with_batch_report_is_rejected(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    report_bytes_before = report_path.read_bytes()
+
+    with pytest.raises(OutputPathCollisionError):
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                failure_audit_csv_output=report_path,
+            )
+        )
+
+    assert report_path.read_bytes() == report_bytes_before
+
+
+def test_output_path_colliding_with_backup_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Already correct before this change; asserted so it stays that
+    way."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    backup = tmp_path / "backup.db"
+    shutil.copyfile(database, backup)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    backup_bytes_before = backup.read_bytes()
+
+    with pytest.raises(OutputPathCollisionError) as excinfo:
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                backup_database=backup,
+                failure_audit_json_output=backup,
+            )
+        )
+
+    assert "--backup-database" in str(excinfo.value)
+    assert backup.read_bytes() == backup_bytes_before
+
+
+def test_postflight_report_output_colliding_with_an_input_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """The command's own --json-output is validated too, and before any
+    database is opened -- validating it in main() after the run would
+    be too late, the failure audit would already have written."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    database_bytes_before = database.read_bytes()
+
+    with pytest.raises(OutputPathCollisionError) as excinfo:
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                report_json_output=database,
+            )
+        )
+
+    assert "--json-output" in str(excinfo.value)
+    assert database.read_bytes() == database_bytes_before
+
+
+def test_two_outputs_colliding_with_each_other_are_rejected(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    shared = tmp_path / "audit-output"
+
+    with pytest.raises(OutputPathCollisionError):
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                failure_audit_json_output=shared,
+                failure_audit_csv_output=shared,
+            )
+        )
+
+    assert not shared.exists()
+
+
+def test_existing_output_path_is_refused_rather_than_overwritten(
+    tmp_path: Path,
+) -> None:
+    """"Always use new output paths": a previous run's evidence is
+    never silently replaced."""
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    existing = tmp_path / "previous-failure-audit.json"
+    existing.write_text('{"previous": "run"}', encoding="utf-8")
+
+    with pytest.raises(OutputPathExistsError):
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                failure_audit_json_output=existing,
+            )
+        )
+
+    assert json.loads(existing.read_text(encoding="utf-8")) == {
+        "previous": "run"
+    }
+
+
+def test_rejected_output_path_creates_no_file_or_directory(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    # A valid output whose parent does not exist yet, paired with an
+    # invalid one. Validation runs before any mkdir, so the valid
+    # output's directory must not be created either.
+    valid_output = tmp_path / "new-reports" / "audit.json"
+
+    with pytest.raises(OutputPathCollisionError):
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                failure_audit_json_output=valid_output,
+                failure_audit_csv_output=report_path,
+            )
+        )
+
+    assert not valid_output.exists()
+    assert not valid_output.parent.exists()
+
+
+def test_databases_are_byte_identical_after_a_rejected_run(
+    tmp_path: Path,
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    backup = tmp_path / "backup.db"
+    shutil.copyfile(database, backup)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+
+    database_bytes = database.read_bytes()
+    backup_bytes = backup.read_bytes()
+    database_fingerprint = fingerprint_database(database)
+    backup_fingerprint = fingerprint_database(backup)
+
+    with pytest.raises(OutputPathCollisionError):
+        run_postflight(
+            **_postflight_kwargs(
+                database,
+                report_path,
+                backup_database=backup,
+                failure_audit_json_output=report_path,
+            )
+        )
+
+    assert database.read_bytes() == database_bytes
+    assert backup.read_bytes() == backup_bytes
+    assert fingerprint_database(database) == database_fingerprint
+    assert fingerprint_database(backup) == backup_fingerprint
+
+
+def test_cli_rejects_json_output_colliding_with_batch_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = migrated(tmp_path)
+    seed_all_pass_scenario(database)
+    report_path = write_batch_report(
+        tmp_path / "batch-report.json", base_batch_report()
+    )
+    report_bytes_before = report_path.read_bytes()
+
+    exit_code = main(
+        [
+            "--database",
+            str(database),
+            "--batch-report",
+            str(report_path),
+            "--expected-processed",
+            "4",
+            "--expected-enqueued",
+            "4",
+            "--expected-job-population-before",
+            "0",
+            "--expected-completed-before",
+            "0",
+            "--expected-failed-before",
+            "0",
+            "--expected-eligible-remaining",
+            "0",
+            "--expected-page-sha256-count",
+            "5",
+            "--repository",
+            str(tmp_path),
+            "--allow-missing-backup",
+            "--allow-undeterminable-repository",
+            "--json-output",
+            str(report_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_FAILURE
+    assert payload["error"] == "OutputPathCollisionError"
+    assert report_path.read_bytes() == report_bytes_before
