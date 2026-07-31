@@ -8,7 +8,12 @@ from pathlib import Path
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
-from comic_automation.jobs import CategorizedJobError, Job, JobQueue
+from comic_automation.jobs import (
+    CategorizedJobError,
+    EnqueueOutcome,
+    Job,
+    JobQueue,
+)
 
 
 HASH_ALGORITHM = "sha256"
@@ -173,27 +178,23 @@ class ArchiveHashRepository:
         # the stored structural inspection (page count, ComicInfo,
         # etc.) may now be stale, so schedule a fresh inspect_archive
         # job -- unless one is already in flight.
-        existing = self.connection.execute(
-            """
-            SELECT id
-            FROM jobs
-            WHERE archive_id = ?
-              AND job_type = 'inspect_archive'
-              AND status IN ('pending', 'claimed', 'running')
-            LIMIT 1
-            """,
-            (archive_id,),
-        ).fetchone()
-
-        if existing is not None:
-            return False
-
-        JobQueue(self.connection).enqueue(
+        #
+        # The separate active-job SELECT this method used to run has
+        # been removed in favor of JobQueue.enqueue_if_absent(), which
+        # checks and inserts atomically. That matters most here: this
+        # method runs from inside a JobWorker handler
+        # (CalculateArchiveHashHandler), outside any transaction, so its
+        # old check-then-insert could interleave with a concurrent
+        # discovery scan enqueueing the same inspect_archive job. The
+        # return contract is unchanged: True when this call created the
+        # job, False when one was already active.
+        outcome = JobQueue(self.connection).enqueue_if_absent(
             "inspect_archive",
             archive_id=archive_id,
             priority=100,
         )
-        return True
+
+        return outcome is EnqueueOutcome.CREATED
 
     def enqueue_missing(self, *, limit: int | None = None) -> int:
         limit_clause = ""
@@ -212,6 +213,19 @@ class ArchiveHashRepository:
         # have no hash yet or whose stored hash is for different
         # file_size/modified_time_ns (i.e. stale), and that don't
         # already have a calculate_archive_hash job in flight.
+        #
+        # The NOT EXISTS clause below is an *advisory* candidate filter,
+        # not the duplicate guard: enqueue_if_absent() is the
+        # authoritative, race-safe gate. Keeping the filter here still
+        # matters, because it decides which rows a bounded `limit`
+        # is spent on -- an archive that already has active work is
+        # excluded up front rather than consuming a limit slot and
+        # yielding ALREADY_ACTIVE. It also carries this job type's
+        # terminal-status policy: 'failed' is deliberately NOT excluded,
+        # so a permanently-failed calculate_archive_hash job still
+        # permits a fresh one (unlike page/perceptual hashing, which do
+        # exclude 'failed'). That difference is intentional and
+        # preserved as-is here.
         rows = self.connection.execute(
             f"""
             SELECT ai.archive_id
@@ -241,15 +255,24 @@ class ArchiveHashRepository:
         ).fetchall()
 
         queue = JobQueue(self.connection)
+        created = 0
 
         for row in rows:
-            queue.enqueue(
+            outcome = queue.enqueue_if_absent(
                 "calculate_archive_hash",
                 archive_id=int(row["archive_id"]),
                 priority=200,
             )
 
-        return len(rows)
+            if outcome is EnqueueOutcome.CREATED:
+                created += 1
+
+        # Count rows actually inserted, not candidates considered: a
+        # candidate can still lose a race to a concurrent enqueue
+        # between the SELECT above and its insert, in which case
+        # enqueue_if_absent() reports ALREADY_ACTIVE and no job was
+        # created by this call.
+        return created
 
     def duplicate_groups(self) -> list[dict]:
         # Group archives (restricted to their current, live location)

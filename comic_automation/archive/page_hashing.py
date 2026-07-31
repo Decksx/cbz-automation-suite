@@ -14,6 +14,7 @@ from comic_automation.archive.repository import (
 )
 from comic_automation.jobs import (
     CategorizedJobError,
+    EnqueueOutcome,
     Job,
     JobQueue,
     PermanentJobError,
@@ -303,6 +304,19 @@ class ArchivePageHashRepository:
         # already have a hash_archive_pages job in flight (including
         # 'failed', so a job that previously failed permanently isn't
         # silently retried here -- see the module's job handler).
+        #
+        # The NOT EXISTS clause below is an *advisory* candidate filter,
+        # not the duplicate guard: enqueue_if_absent() is the
+        # authoritative, race-safe gate. Keeping the filter here still
+        # matters for two reasons. It decides which rows a bounded
+        # `limit` is spent on (an archive with active work is excluded
+        # up front rather than consuming a slot and yielding
+        # ALREADY_ACTIVE), and it carries this job type's terminal
+        # policy: 'failed' IS excluded here, so a permanently-failed
+        # job blocks automatic re-enqueue. enqueue_if_absent() only
+        # knows about active statuses and would happily create a new
+        # job after a failure, so this clause -- not the helper -- is
+        # what preserves that policy.
         rows = self.connection.execute(
             f"""
             SELECT ah.archive_id
@@ -335,15 +349,21 @@ class ArchivePageHashRepository:
             parameters,
         ).fetchall()
         queue = JobQueue(self.connection)
+        created = 0
 
         for row in rows:
-            queue.enqueue(
+            outcome = queue.enqueue_if_absent(
                 "hash_archive_pages",
                 archive_id=int(row["archive_id"]),
                 priority=300,
             )
 
-        return len(rows)
+            if outcome is EnqueueOutcome.CREATED:
+                created += 1
+
+        # Count rows actually inserted, not candidates considered (see
+        # ArchiveHashRepository.enqueue_missing for the reasoning).
+        return created
 
     def duplicate_content_groups(self) -> list[dict]:
         # Group archives (current location only) by content signature
