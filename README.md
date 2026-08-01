@@ -95,7 +95,8 @@ python scripts\cbz_library_maintenance.py apply-plan Logs\organize-plan.json
 - [Image deduplication](docs/image_deduplication.md)
 - [Engineering decisions](docs/engineering_decisions.md)
 - [Implementation roadmap](docs/implementation_roadmap.md)
-- [Latest development log](docs/development_log_2026-07-30.md)
+- [Assistant working agreement](CLAUDE.md)
+- [Latest development log](docs/development_log_2026-07-31.md)
 
 ## Runtime state
 
