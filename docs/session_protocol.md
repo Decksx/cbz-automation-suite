@@ -7,8 +7,7 @@ structured so that hitting a context or tool-call limit mid-task costs a
 This document is about *process*. Standing rules — what is off limits,
 how commits are shaped, how work is verified — are in `CLAUDE.md`.
 Architectural decisions belong in `docs/engineering_decisions.md`; what
-happened on a given day belongs in `docs/development_log_<date>.md`;
-outstanding annotation work belongs in `docs/annotation_progress.md`.
+happened on a given day belongs in `docs/development_log_<date>.md`.
 
 ## The actual failure mode
 
@@ -79,19 +78,17 @@ doubt, land what you have.
    authoritative state.
 3. Read the most recent `docs/development_log_<date>.md`.
 4. Read this file.
-5. Read `docs/annotation_progress.md` if the work is documentation or
-   annotation.
-6. **Verify the tree before trusting any document.** Documents describe
+5. **Verify the tree before trusting any document.** Documents describe
    intent and history; they can lag the code. Confirm what is actually
    implemented with `git log --oneline`, `git diff --stat`, and by
    reading the source. A roadmap item marked outstanding may already be
    shipped.
-7. Confirm `HEAD`, `origin/master`, and working-tree cleanliness before
+6. Confirm `HEAD`, `origin/master`, and working-tree cleanliness before
    changing anything.
-8. Record the test baseline by running the suite, rather than assuming
+7. Record the test baseline by running the suite, rather than assuming
    the number in a document is still current.
 
-Point 6 is not hypothetical. An entire planned work item — the job
+Point 5 is not hypothetical. An entire planned work item — the job
 enqueue duplicate-row fix — was found already implemented in full,
 including its production migration and all 72 required tests, while
 three audit documents still read as though it were outstanding.
