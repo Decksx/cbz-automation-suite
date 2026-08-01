@@ -84,18 +84,47 @@ python scripts\cbz_library_maintenance.py apply-plan Logs\organize-plan.json
 
 ## Documentation
 
+### Project
+
 - [Project overview](docs/overview.md)
 - [Architecture](docs/architecture.md)
+- [Implementation roadmap](docs/implementation_roadmap.md)
+- [Engineering decisions](docs/engineering_decisions.md)
+- [Assistant working agreement](CLAUDE.md)
+- [Session protocol](docs/session_protocol.md)
+
+### Components
+
 - [Unified workflows](docs/workflows.md)
+- [Shared core](docs/cbz_core.md)
+- [Shared pipeline](docs/shared_pipeline.md)
 - [Sanitizer](docs/cbz_sanitizer.md)
 - [Watcher](docs/cbz_watcher.md)
 - [Library maintenance](docs/library_maintenance.md)
-- [Shared pipeline](docs/shared_pipeline.md)
+- [Other tools](docs/other_tools.md)
+
+### Database and hashing
+
 - [Database architecture](docs/database_architecture.md)
+- [SQLite foundation](docs/sqlite_database.md)
 - [Image deduplication](docs/image_deduplication.md)
-- [Engineering decisions](docs/engineering_decisions.md)
-- [Implementation roadmap](docs/implementation_roadmap.md)
-- [Latest development log](docs/development_log_2026-07-30.md)
+
+### Current state
+
+- [Latest production handoff](docs/production_handoff_2026-07-31.md)
+- [Latest development log](docs/development_log_2026-07-31.md)
+
+### Audits
+
+- [Archive I/O and resource limits](docs/archive_io_resource_audit.md)
+- [Job enqueue idempotency](docs/job_enqueue_idempotency_audit.md)
+- [Jobs worker retry](docs/jobs_worker_retry_audit.md)
+
+Earlier development logs and production handoffs remain in `docs/`
+alongside the current ones. Phase-era packaging notes — `PHASE1_APPLY_NOTES.md`,
+the `README_PHASE*` files, `cbz_docs_updated_markdown_bundle.md`, and
+similar — are retained as historical delivery records rather than
+current documentation, and are deliberately not indexed here.
 
 ## Runtime state
 
