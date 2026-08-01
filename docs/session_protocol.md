@@ -1,54 +1,33 @@
 # Session Protocol
 
 How an assistant-driven work session on this project should be
-structured so that hitting a tool-call or context limit mid-task costs
-a "continue" rather than a rewrite.
+structured so that hitting a context or tool-call limit mid-task costs a
+"continue" rather than a rewrite.
 
-This document is about *process*, not architecture. Architectural
-decisions belong in `docs/engineering_decisions.md`; what happened on a
-given day belongs in `docs/development_log_<date>.md`; outstanding
-annotation work belongs in `docs/annotation_progress.md`.
+This document is about *process*. Standing rules — what is off limits,
+how commits are shaped, how work is verified — are in `CLAUDE.md`.
+Architectural decisions belong in `docs/engineering_decisions.md`; what
+happened on a given day belongs in `docs/development_log_<date>.md`;
+outstanding annotation work belongs in `docs/annotation_progress.md`.
 
 ## The actual failure mode
 
-The risk is not running out of budget. The risk is running out of
-budget **with finished work that exists only inside the assistant's
-sandbox**.
+The assistant works directly in `C:\git\ComicAutomation` and commits as
+it goes, so finished work is no longer stranded in a sandbox. What
+remains at risk is different and narrower:
 
-The assistant works in an ephemeral Linux container. A cloned repo at
-`/tmp/repo`, edits made there, and tests run there all disappear when
-the session ends. Work is only durable once it has been written to
-`C:\git\ComicAutomation` or exported as a patch the operator has
-downloaded.
+- a **half-applied chunk** — code changed, tests not yet written, tree
+  in a state no one would want to commit or revert;
+- **reasoning that was never written down** — why a fix took the shape
+  it did, what was deliberately not done, which finding a change closes.
+  That lives only in the session's context until it is committed to a
+  file, and the context is the thing that runs out.
 
-Stopping *after* delivering a chunk costs nothing. Stopping *before*
-delivering costs everything since the last delivery. Every rule below
-follows from that asymmetry.
+Stopping *after* finishing a chunk costs nothing. Stopping *inside* one
+costs everything since the last commit, plus the thinking behind it.
+Every rule below follows from that asymmetry.
 
-## Rule 1 — Write to the repository, not to the sandbox
-
-Use the Filesystem tools to write validated files straight to
-`C:\git\ComicAutomation`. Work becomes durable the moment it is
-correct, with no packaging step to run out of budget before.
-
-```text
-validate in the container  ->  write via Filesystem MCP  ->  operator commits
-```
-
-The container is still the right place to *run* things: install
-dependencies, execute pytest, compile-check, experiment. It is the
-wrong place to leave anything of value.
-
-Git operations stay with the operator. The assistant does not run
-`git add`, `git commit`, or `git push` against the real checkout.
-
-Patch export (`git format-patch` to `/mnt/user-data/outputs/`) remains
-a valid fallback when a change genuinely needs to arrive as a commit
-series with authored messages. It is not the default, because it
-concentrates all delivery risk at the end of the session. If used,
-generate the bundle incrementally rather than once at the end.
-
-## Rule 2 — A chunk is one file plus its tests plus its documentation
+## Rule 1 — A chunk is one file plus its tests plus its documentation
 
 Not one checklist item. Not one audit. One coherent unit that can be
 committed on its own and is useful on its own.
@@ -60,8 +39,8 @@ bad chunk:   "the archive I/O audit's section 3"   (that is three chunks)
 
 A chunk is finished when all of the following are true:
 
-- the code change is written to the repository;
-- its tests are written and passing;
+- the code change is committed;
+- its tests are written, passing, and committed;
 - the relevant documentation reflects it;
 - nothing about it is still only in the assistant's head.
 
@@ -72,32 +51,47 @@ The operator can help here: a request scoped to a single file makes the
 chunk boundary explicit and lets delivery happen sooner than a request
 scoped to a checklist item.
 
-## Rule 3 — Reserve the last portion of the session for delivery
+## Rule 2 — Land each chunk before starting the next
+
+Commits are one file each (see `CLAUDE.md`), so a chunk normally lands
+as a short series: the source file, then its tests, then the
+documentation or audit annotation. That series is the unit of progress —
+start it and finish it before opening the next file.
+
+The tension is deliberate. One-file commits keep history reviewable; the
+chunk keeps them from being meaningless in isolation. A chunk left
+half-committed is worse than either, so do not begin one without the
+budget to finish it.
+
+## Rule 3 — Reserve the last portion of the session for closing out
 
 Stop *starting* new work at roughly 70% of the available budget and
-spend the remainder writing files out, updating documentation, and
-summarizing state.
+spend the remainder committing what is finished, updating documentation,
+and summarizing state.
 
-Two finished, delivered chunks beat three-and-a-half undelivered ones.
-When in doubt, deliver.
+Two finished chunks beat three-and-a-half unfinished ones. When in
+doubt, land what you have.
 
 ## Session start
 
-1. Read `docs/production_handoff_<latest>.md` for the current
+1. Read `CLAUDE.md`.
+2. Read `docs/production_handoff_<latest>.md` for the current
    authoritative state.
-2. Read the most recent `docs/development_log_<date>.md`.
-3. Read this file.
-4. Read `docs/annotation_progress.md` if the work is documentation or
+3. Read the most recent `docs/development_log_<date>.md`.
+4. Read this file.
+5. Read `docs/annotation_progress.md` if the work is documentation or
    annotation.
-5. **Verify the tree before trusting any document.** Documents describe
+6. **Verify the tree before trusting any document.** Documents describe
    intent and history; they can lag the code. Confirm what is actually
    implemented with `git log --oneline`, `git diff --stat`, and by
    reading the source. A roadmap item marked outstanding may already be
    shipped.
-6. Confirm `HEAD`, `origin/master`, and working-tree cleanliness before
+7. Confirm `HEAD`, `origin/master`, and working-tree cleanliness before
    changing anything.
+8. Record the test baseline by running the suite, rather than assuming
+   the number in a document is still current.
 
-Point 5 is not hypothetical. An entire planned work item — the job
+Point 6 is not hypothetical. An entire planned work item — the job
 enqueue duplicate-row fix — was found already implemented in full,
 including its production migration and all 72 required tests, while
 three audit documents still read as though it were outstanding.
@@ -106,20 +100,21 @@ three audit documents still read as though it were outstanding.
 
 Leave the project in a state a fresh session can resume from:
 
-- every finished chunk written to the repository;
+- every finished chunk committed;
 - documentation updated to match;
 - a summary stating what landed, what was deliberately not done and on
   what authority, and what remains open;
 - any environment discovery worth keeping recorded here or in the
   development log.
 
-Never end mid-chunk with the work only in the container.
+Never end mid-chunk with a modified working tree and no record of what
+the modification was for.
 
 ## Budget efficiency
 
 Habits that waste tool calls, observed rather than theorized:
 
-- **Repeated full test-suite runs.** The suite takes ~35s and one call.
+- **Repeated full test-suite runs.** The suite takes ~40s and one call.
   Run the targeted test file while iterating; run the full suite once
   before delivery, and once more at the end if later chunks touched
   shared code.
@@ -127,7 +122,8 @@ Habits that waste tool calls, observed rather than theorized:
   same file is three calls that one consolidated read would have
   covered. Read the whole file when it is a few hundred lines.
 - **Git history rewriting.** `git commit --amend` and interactive rebase
-  invite rework when a command lands somewhere unexpected. Prefer a new,
+  invite rework when a command lands somewhere unexpected, and
+  interactive git is unavailable in this harness. Prefer a new,
   clearly-labeled follow-up commit over amending an earlier one.
 - **Speculating instead of checking.** One command that answers a
   question definitively is cheaper than three messages of reasoning
@@ -141,57 +137,39 @@ failure is unambiguous.
 
 Recorded so future sessions do not spend calls relearning them.
 
-**`git am` requires `--keep-cr` for this repository.** `scripts/` files
-are CRLF. Without the flag, `git mailinfo` normalizes CRLF to LF inside
-the patch body and any patch touching those files fails to apply with
-"patch does not apply". Confirmed by reproduction.
+**`git am` requires `--keep-cr` for this repository.** Two `scripts/`
+files are stored with CRLF in the index. Without the flag, `git
+mailinfo` normalizes CRLF to LF inside the patch body and any patch
+touching them fails to apply with "patch does not apply". Confirmed by
+reproduction.
 
-**Line-ending conventions differ by directory.** `comic_automation/` is
-LF. `scripts/cbz_sanitizer.py` and `scripts/cbz_library_maintenance.py`
-are CRLF. New lines must match the file being edited, which means
-byte-exact edits rather than line-oriented ones in the `scripts/` tree.
+**Line-ending conventions differ by file, at the index level.**
+`git ls-files --eol` reports `i/crlf` for `scripts/cbz_sanitizer.py` and
+`scripts/cbz_library_maintenance.py`, and `i/lf` for everything else,
+with `core.autocrlf=true` and no `.gitattributes`. Edits to those two
+files must emit CRLF, which means byte-exact edits rather than
+line-oriented ones. `CLAUDE.md` carries the full rule.
 
-**`git diff --check` is meaningless in the Linux container.** It flags
-every CRLF line as trailing whitespace. The gate is only informative on
-the Windows checkout with `core.autocrlf` configured. Container output
-must not be reported as a real finding.
+**The suite is expected to pass completely on Windows.** 549 passed in
+about 40s at `a84831e`. `tests/test_series_detection.py` asserts on
+`\\tower\media\comics\...` UNC paths and `tests/test_workflows.py`
+imports `tkinter` through `apps/cbz_gui.py`; both are fine here and are
+the first things to fail if the suite is ever run somewhere that is not
+Windows. Reconcile any delta against the number of tests actually added.
 
-**Two tests fail in the container for environmental reasons.**
-`tests/test_series_detection.py` asserts on `\\tower\media\comics\...`
-UNC paths that do not parse equivalently under Linux `pathlib`. They
-fail identically on unmodified `master`, so they are a constant, not a
-regression signal.
-
-**Container test baseline is branch-dependent.** Record the count at
-session start rather than assuming one. For reference:
-
-```text
-master @ fe8897b                      530 passed, 2 failed
-+ archive I/O hardening branch        542 passed, 2 failed
-```
-
-The 2 failures are the UNC-path tests above in both cases. Always
-reconcile the delta against the number of tests actually added.
-
-**`tests/test_workflows.py` cannot be collected in the container.** It
-imports `apps/cbz_gui.py`, which imports `tkinter`, which is not
-installed. Run the suite with `--ignore=tests/test_workflows.py` and
-note that the file is unverified.
-
-**Container setup requires two installs.** `pip install
---break-system-packages -r requirements.txt` and a separate
-`pip install --break-system-packages pytest`, which is not in
-`requirements.txt`.
+**Dependencies are `requirements.txt` plus `pytest`,** which is not
+listed there. CI installs exactly that on `windows-latest` / Python
+3.11.
 
 ## Verification standards
 
-The project's operating rule — clean reviewed code, read-only
-preflight, protected backup, reconciled postflight — applies to
-production database work. For code work the equivalent minimum is:
+The project's operating rule — clean reviewed code, read-only preflight,
+protected backup, reconciled postflight — applies to production database
+work. For code work the equivalent minimum is:
 
 ```text
-python3 -m py_compile $(find comic_automation scripts -name "*.py")
-python3 -m pytest -q --ignore=tests/test_workflows.py
+python -m pytest -q
+git diff --check
 ```
 
 Additionally:
@@ -201,10 +179,8 @@ Additionally:
 - distinguish pre-existing failures from new ones explicitly, and prove
   it by checking the same failure against unmodified `master` rather
   than asserting it;
-- when exporting patches, re-apply them to a fresh checkout and confirm
-  the resulting tree is byte-identical;
-- flag clearly what could not be verified in the container so the
-  operator knows what to re-run on Windows.
+- flag clearly what could not be verified, and why, so the operator
+  knows what is still open.
 
 A test that passes is not automatically a test that works. Two tests
 written in one session passed for the wrong reason and had to be fixed:
