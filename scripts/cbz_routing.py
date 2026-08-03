@@ -628,6 +628,56 @@ def _convert_v1(raw: dict) -> dict:
     }
 
 
+def _strip_comments(mapping: Any) -> dict:
+    """Drop documentation keys from one mapping.
+
+    Every shipped config uses `_comment*` keys, but the parser had no notion
+    of them, so what happened depended on which block they landed in: ignored
+    at the top level and inside a rule object, fatal inside `signals`, and --
+    worst -- silently accepted inside `lists`, where `list("Japanese...")`
+    produced a 116-entry list of single characters. A comment name colliding
+    with a referenced list would have resolved, matched nothing meaningful,
+    and raised nothing.
+
+    Underscore-prefixed keys are documentation everywhere, uniformly.
+    """
+    if not isinstance(mapping, dict):
+        return {}
+    return {k: v for k, v in mapping.items() if not str(k).startswith("_")}
+
+
+def _parse_lists(raw_lists: Any) -> dict[str, list[str]]:
+    """Validate `name -> [pattern, ...]` strictly.
+
+    Filtering comment keys alone would leave the real defect open: any
+    string value is iterable, so a hand-edited `"asian_publishers":
+    "yen press*"` became a list of nine characters that matched nothing and
+    reported nothing. A list must be an array of strings or the config is
+    malformed.
+    """
+    if raw_lists is None:
+        return {}
+    if not isinstance(raw_lists, dict):
+        raise RoutingConfigError(
+            f"'lists' must be an object, got {type(raw_lists).__name__}"
+        )
+    out: dict[str, list[str]] = {}
+    for name, items in _strip_comments(raw_lists).items():
+        if not isinstance(items, list):
+            raise RoutingConfigError(
+                f"list {name!r} must be an array of strings, got "
+                f"{type(items).__name__}"
+            )
+        for position, item in enumerate(items):
+            if not isinstance(item, str):
+                raise RoutingConfigError(
+                    f"list {name!r} entry {position} must be a string, got "
+                    f"{type(item).__name__}"
+                )
+        out[name] = list(items)
+    return out
+
+
 def parse(raw: dict) -> RoutingConfig:
     source_version = int(raw.get("version", 1))
     if source_version == 1:
@@ -635,7 +685,7 @@ def parse(raw: dict) -> RoutingConfig:
     elif source_version != 2:
         raise RoutingConfigError(f"unsupported routing config version: {source_version}")
 
-    destinations = raw.get("destinations") or {}
+    destinations = _strip_comments(raw.get("destinations") or {})
     if not destinations:
         raise RoutingConfigError("routing config defines no destinations")
     for key, value in destinations.items():
@@ -651,7 +701,8 @@ def parse(raw: dict) -> RoutingConfig:
         )
 
     overrides: list[SeriesOverride] = []
-    for index_, entry in enumerate(raw.get("series_overrides") or []):
+    for index_, raw_entry in enumerate(raw.get("series_overrides") or []):
+        entry = _strip_comments(raw_entry)
         canonical = (entry.get("canonical") or "").strip()
         if not canonical:
             raise RoutingConfigError(
@@ -685,7 +736,7 @@ def parse(raw: dict) -> RoutingConfig:
                 )
             seen_keys[key] = override.canonical
 
-    index_cfg = raw.get("series_index") or {}
+    index_cfg = _strip_comments(raw.get("series_index") or {})
     index_dests = tuple(index_cfg.get("destinations") or ())
     for dest in index_dests:
         if dest not in destinations:
@@ -707,7 +758,7 @@ def parse(raw: dict) -> RoutingConfig:
             raise RoutingConfigError(
                 f"'unresolved' must be an object, got {type(block).__name__}"
             )
-        dest = block.get("destination")
+        dest = _strip_comments(block).get("destination")
         if not isinstance(dest, str) or not dest.strip():
             raise RoutingConfigError(
                 f"unresolved.destination must be a non-empty string, got {dest!r}"
@@ -721,9 +772,12 @@ def parse(raw: dict) -> RoutingConfig:
     cfg = RoutingConfig(
         destinations=destinations,
         default_key=default_key,
-        lists={k: list(v) for k, v in (raw.get("lists") or {}).items()},
-        signals=dict(raw.get("signals") or {}),
-        rules=list(raw.get("rules") or []),
+        lists=_parse_lists(raw.get("lists")),
+        signals=_strip_comments(raw.get("signals") or {}),
+        # Comments are stripped from each rule too, so the runtime model and
+        # to_v2_dict() carry only semantic configuration. Comments live in the
+        # file a person edits, not in the canonical serialisation.
+        rules=[_strip_comments(r) for r in (raw.get("rules") or [])],
         source_version=source_version,
         series_overrides=tuple(overrides),
         series_index_enabled=bool(index_cfg.get("enabled", False)),
