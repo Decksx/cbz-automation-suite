@@ -90,7 +90,18 @@ Record the count before and after, and reconcile the delta against the
 number of tests actually added. CI (`.github/workflows/tests.yml`) runs
 the same suite on `windows-latest` / Python 3.11.
 
-- `git diff --check` is meaningful here and should be clean.
+- `git diff --check` is meaningful only for the LF files, where it should
+  be clean. It is structurally noisy for the two CRLF files above:
+  `--check` inspects *added* lines only, and every added line in a
+  CRLF-stored file ends with `\r`, which it reports as trailing
+  whitespace. This is not a real defect and predates any current work —
+  the merged `7c63bc9` produces 65 such warnings. Scope it to the files
+  it can actually speak to:
+
+  ```text
+  git diff --check -- . ':(exclude)scripts/cbz_sanitizer.py' \
+      ':(exclude)scripts/cbz_library_maintenance.py'
+  ```
 - A passing test is not a working test. Confirm a new test fails when the
   behavior it guards is removed.
 - Distinguish pre-existing failures from new ones by checking the same
