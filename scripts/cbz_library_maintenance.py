@@ -1634,6 +1634,25 @@ def read_comicinfo(cbz_path: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _central_directory_fingerprint(zf: zipfile.ZipFile) -> tuple:
+    """Per-entry (name, CRC32, uncompressed size) from an open archive.
+
+    Taken from the central directory, which zipfile has already parsed on
+    open -- capturing it from an archive we are reading anyway is free.
+    """
+    return tuple((i.filename, i.CRC, i.file_size) for i in zf.infolist())
+
+
+def _read_central_directory_fingerprint(path: Path) -> tuple:
+    """Re-read just the archive's central directory.
+
+    A tail-of-file read, not a second full pass: measured at 0.39 ms against
+    a 173 ms full read of the same 200 MB archive.
+    """
+    with zipfile.ZipFile(path, "r") as zf:
+        return _central_directory_fingerprint(zf)
+
+
 def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: bool) -> bool:
     """Rewrite a CBZ archive with an updated ComicInfo.xml, using a tmp+backup swap for atomicity.
 
@@ -1658,7 +1677,11 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
         # docs/archive_io_resource_audit.md, "Small, low-risk improvements".
         before_stat = cbz_path.stat()
         entries: list[tuple[zipfile.ZipInfo, bytes]] = []
+        before_fingerprint: tuple = ()
         with zipfile.ZipFile(cbz_path, "r") as zin:
+            # Free: the central directory is already parsed for the
+            # infolist() walk below.
+            before_fingerprint = _central_directory_fingerprint(zin)
             for info in zin.infolist():
                 # info.filename is round-tripped unchanged into the rewritten
                 # archive below. Nothing here extracts to a real filesystem
@@ -1697,6 +1720,26 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
             raise OSError(
                 f"{cbz_path.name} changed on disk while its ComicInfo.xml "
                 "was being rewritten; abandoning the rewrite."
+            )
+
+        # Defence in depth for the case size/mtime structurally cannot see: a
+        # replacement of identical length whose mtime lands in the same
+        # filesystem timestamp bucket as the previous write. Content is what
+        # changed, and per-entry CRC32 is the only recorded thing that
+        # reflects it. This narrows the race window; it does not close it, and
+        # it is not atomicity -- the rename still follows. Local volumes only:
+        # over SMB the client caches file data independently of attributes and
+        # this check is blind too. See docs/archive_io_resource_audit.md,
+        # "Validated 2026-08-02".
+        #
+        # Deliberately NOT applied to pack_image_folder(): its window is two
+        # adjacent stat() calls with no read-rebuild between them, and the
+        # target there is an arbitrary existing file that need not be a
+        # readable archive at all.
+        if _read_central_directory_fingerprint(cbz_path) != before_fingerprint:
+            raise OSError(
+                f"{cbz_path.name} contents changed on disk while its "
+                "ComicInfo.xml was being rewritten; abandoning the rewrite."
             )
 
         bak_path.unlink(missing_ok=True)  # remove any stale backup before renaming
