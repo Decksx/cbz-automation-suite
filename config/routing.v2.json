@@ -54,8 +54,8 @@
       "any": [
         { "field": "comicinfo.LanguageISO", "in_list": "asian_languages" },
         { "field": "comicinfo.Manga",       "in": ["Yes", "YesAndRightToLeft"] },
-        { "field": "comicinfo.Publisher",   "glob_in_list": "asian_publishers" },
-        { "field": "comicinfo.Imprint",     "glob_in_list": "asian_publishers" },
+        { "field": "comicinfo.Publisher",   "glob_tokens_in_list": "asian_publishers" },
+        { "field": "comicinfo.Imprint",     "glob_tokens_in_list": "asian_publishers" },
         { "field": "comicinfo.Web",         "glob_in_list": "asian_sites" },
         { "field": "comicinfo.Format",      "contains_any": ["manga", "manhwa", "manhua"] }
       ]
