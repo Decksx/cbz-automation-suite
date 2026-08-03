@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,21 @@ VALID_OPERATORS = frozenset(
 )
 COMBINATORS = frozenset({"any", "all", "not"})
 COMICINFO_PREFIX = "comicinfo."
+
+# Series-name normalisation, kept byte-for-byte compatible with
+# cbz_watcher._series_key so the index agrees with the watcher's own
+# existing-folder matching rather than being a second, subtly different
+# notion of "same series".
+_MARKER_WORDS_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
+_SERIES_KEY_PUNCT_RE = re.compile(r"[^\w\s]")
+_SERIES_KEY_SPACE_RE = re.compile(r"\s+")
+
+
+def series_key(name: str) -> str:
+    """Lowercase, strip punctuation and censorship markers, collapse spaces."""
+    name = _MARKER_WORDS_RE.sub("", name or "")
+    name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
+    return _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
 
 
 class RoutingConfigError(ValueError):
@@ -56,10 +72,36 @@ class RoutingDecision:
     dest_path: str
     rule_name: str | None       # None means nothing matched; the default won
     reason: str
+    # Set when an override renamed the series; callers should use this as the
+    # destination folder name so aliases merge instead of forking.
+    canonical_series: str | None = None
+    # Set when an existing series folder was found, so the caller can move
+    # into that exact directory rather than re-deriving its name.
+    series_dir: Path | None = None
+    ambiguous_series: bool = False
 
     @property
     def matched(self) -> bool:
         return self.rule_name is not None
+
+
+@dataclass(frozen=True)
+class SeriesOverride:
+    """A human decision that outranks both the index and the rules.
+
+    Different scanlation groups romanise and translate the same series
+    differently ("Kanojo, Okarishimasu" / "Kanojo Okarishimasu" /
+    "Rent-a-Girlfriend"), and normalisation cannot unify genuinely different
+    words. An override maps any number of aliases onto one canonical folder
+    name, optionally pinning the destination too.
+    """
+
+    canonical: str
+    aliases: tuple[str, ...]
+    dest_key: str | None = None
+
+    def matches(self, key: str) -> bool:
+        return key in {series_key(a) for a in (self.canonical, *self.aliases)}
 
 
 @dataclass
@@ -70,10 +112,89 @@ class RoutingConfig:
     signals: dict[str, dict] = field(default_factory=dict)
     rules: list[dict] = field(default_factory=list)
     source_version: int = 2
+    series_overrides: tuple[SeriesOverride, ...] = ()
+    # Off by default on purpose. Enabling the index makes a series' current
+    # location sticky, which is right once the library is classified
+    # correctly and actively harmful before then -- it would pin every
+    # series still sitting in a retired or misrouted library exactly where
+    # it is. Turn it on after the reclassification, not before.
+    series_index_enabled: bool = False
+    series_index_destinations: tuple[str, ...] = ()
 
     @property
     def default_path(self) -> str:
         return self.destinations[self.default_key]
+
+    def override_for(self, series_name: str) -> SeriesOverride | None:
+        key = series_key(series_name)
+        if not key:
+            return None
+        for override in self.series_overrides:
+            if override.matches(key):
+                return override
+        return None
+
+
+class SeriesIndex:
+    """`series_key -> destination` for series that already exist on disk.
+
+    Built once per scan pass rather than per directory: the destinations hold
+    ~18k series folders between them and enumerating those costs ~400 ms,
+    against microseconds for rule evaluation. Per-directory lookups would
+    make routing dramatically slower, not faster -- the reason to do this is
+    that a series must not split across libraries when a chapter arrives
+    without usable metadata, not speed.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, tuple[str, Path]] = {}
+        self._ambiguous: set[str] = set()
+
+    @classmethod
+    def build(cls, cfg: RoutingConfig,
+              lister=None) -> "SeriesIndex":
+        index = cls()
+        if not cfg.series_index_enabled:
+            return index
+        listdir = lister or _default_lister
+        keys = cfg.series_index_destinations or tuple(cfg.destinations)
+        for dest_key in keys:
+            root = cfg.destinations.get(dest_key)
+            if not root:
+                continue
+            for path in listdir(Path(root)):
+                index.add(path.name, dest_key, path)
+        return index
+
+    def add(self, series_name: str, dest_key: str, path: Path) -> None:
+        key = series_key(series_name)
+        if not key:
+            return
+        existing = self._entries.get(key)
+        if existing is not None and existing[0] != dest_key:
+            # The same series in two libraries means the library disagrees
+            # with itself; refuse to guess and let the rules decide.
+            self._ambiguous.add(key)
+            return
+        self._entries.setdefault(key, (dest_key, path))
+
+    def lookup(self, series_name: str) -> tuple[str, Path] | None:
+        key = series_key(series_name)
+        if not key or key in self._ambiguous:
+            return None
+        return self._entries.get(key)
+
+    def is_ambiguous(self, series_name: str) -> bool:
+        return series_key(series_name) in self._ambiguous
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+def _default_lister(root: Path):
+    if not root.is_dir():
+        return []
+    return [p for p in root.iterdir() if p.is_dir()]
 
 
 # ---------------------------------------------------------------- context
@@ -194,29 +315,109 @@ def _evaluate_matcher(node: dict, context: dict[str, str],
     )
 
 
-def resolve(cfg: RoutingConfig, context: dict[str, str]) -> RoutingDecision:
-    """Evaluate rules top to bottom; first match wins, else the default."""
+def resolve(
+    cfg: RoutingConfig,
+    context: dict[str, str],
+    series_name: str | None = None,
+    index: SeriesIndex | None = None,
+) -> RoutingDecision:
+    """Decide a destination.
+
+    Precedence, highest first:
+
+      1. a manual series override -- an explicit human decision, and the
+         only way to unify titles that differ by translation rather than by
+         punctuation ("Kanojo Okarishimasu" vs "Rent-a-Girlfriend");
+      2. an existing series folder, so a series never splits across
+         libraries because one chapter arrived without usable metadata;
+      3. the rules, top to bottom, first match wins;
+      4. the default.
+
+    A series found in two libraries at once is treated as no match: the
+    library disagrees with itself, so the rules stay authoritative rather
+    than the engine picking one arbitrarily.
+    """
+    canonical: str | None = None
+    effective = series_name
+
+    if series_name:
+        override = cfg.override_for(series_name)
+        if override is not None:
+            canonical = override.canonical
+            effective = override.canonical
+            if override.dest_key:
+                return RoutingDecision(
+                    override.dest_key, cfg.destinations[override.dest_key],
+                    "series override",
+                    f"series {series_name!r} pinned to {override.dest_key} "
+                    f"as {override.canonical!r}",
+                    canonical_series=canonical,
+                )
+
+    ambiguous = False
+    if effective and index is not None:
+        hit = index.lookup(effective)
+        if hit is not None:
+            dest_key, path = hit
+            return RoutingDecision(
+                dest_key, cfg.destinations[dest_key], "existing series",
+                f"series {effective!r} already exists in {dest_key}",
+                canonical_series=canonical, series_dir=path,
+            )
+        ambiguous = index.is_ambiguous(effective)
+
     for rule in cfg.rules:
         ok, why = _evaluate(rule["when"], context, cfg)
         if ok:
             key = rule["dest"]
             return RoutingDecision(key, cfg.destinations[key],
-                                   rule.get("name", key), why)
+                                   rule.get("name", key), why,
+                                   canonical_series=canonical,
+                                   ambiguous_series=ambiguous)
     return RoutingDecision(cfg.default_key, cfg.default_path, None,
-                           "no rule matched; default")
+                           "no rule matched; default",
+                           canonical_series=canonical,
+                           ambiguous_series=ambiguous)
 
 
-def explain(cfg: RoutingConfig, context: dict[str, str]) -> list[str]:
-    """Full evaluation trace: every rule, whether it fired, and why."""
+def explain(
+    cfg: RoutingConfig,
+    context: dict[str, str],
+    series_name: str | None = None,
+    index: SeriesIndex | None = None,
+) -> list[str]:
+    """Full trace: overrides, the series index, then every rule."""
     lines = [f"context: {context}"]
+    if series_name:
+        lines.append(f"series: {series_name!r} (key={series_key(series_name)!r})")
+        override = cfg.override_for(series_name)
+        if override is not None:
+            lines.append(
+                f"MATCH override -> canonical {override.canonical!r}"
+                + (f", pinned to {override.dest_key}" if override.dest_key else "")
+            )
+        if index is not None:
+            name = override.canonical if override else series_name
+            if index.is_ambiguous(name):
+                lines.append("  --  series index: ambiguous (in >1 library)")
+            elif index.lookup(name):
+                dest_key, path = index.lookup(name)
+                lines.append(f"MATCH series index -> {dest_key} ({path})")
+            else:
+                lines.append("  --  series index: no existing folder")
+
+    decision = resolve(cfg, context, series_name, index)
     for rule in cfg.rules:
         ok, why = _evaluate(rule["when"], context, cfg)
-        mark = "MATCH " if ok else "  --  "
-        lines.append(f"{mark}{rule.get('name', rule['dest'])}: {why}")
+        lines.append(f"{'MATCH ' if ok else '  --  '}"
+                     f"{rule.get('name', rule['dest'])}: {why}")
         if ok:
-            lines.append(f"       -> {rule['dest']} = {cfg.destinations[rule['dest']]}")
-            return lines
-    lines.append(f"  --  (default) -> {cfg.default_key} = {cfg.default_path}")
+            break
+    else:
+        lines.append(f"  --  (default) -> {cfg.default_key}")
+
+    lines.append(f"       => {decision.dest_key} = {decision.dest_path} "
+                 f"[{decision.rule_name or 'default'}]")
     return lines
 
 
@@ -291,6 +492,49 @@ def parse(raw: dict) -> RoutingConfig:
             f"default {default_key!r} is not one of {sorted(destinations)}"
         )
 
+    overrides: list[SeriesOverride] = []
+    for index_, entry in enumerate(raw.get("series_overrides") or []):
+        canonical = (entry.get("canonical") or "").strip()
+        if not canonical:
+            raise RoutingConfigError(
+                f"series_overrides[{index_}] has no 'canonical' name"
+            )
+        dest = entry.get("dest")
+        if dest is not None and dest not in destinations:
+            raise RoutingConfigError(
+                f"series_overrides[{index_}] destination {dest!r} is not defined"
+            )
+        aliases = tuple(entry.get("aliases") or ())
+        if not aliases and dest is None:
+            raise RoutingConfigError(
+                f"series_overrides[{index_}] ({canonical!r}) does nothing: "
+                "give it aliases, a dest, or both"
+            )
+        overrides.append(SeriesOverride(canonical, aliases, dest))
+
+    # An alias claimed by two overrides has no defined winner; reject rather
+    # than let evaluation order decide it silently.
+    seen_keys: dict[str, str] = {}
+    for override in overrides:
+        for name in (override.canonical, *override.aliases):
+            key = series_key(name)
+            if not key:
+                continue
+            if key in seen_keys and seen_keys[key] != override.canonical:
+                raise RoutingConfigError(
+                    f"alias {name!r} is claimed by both "
+                    f"{seen_keys[key]!r} and {override.canonical!r}"
+                )
+            seen_keys[key] = override.canonical
+
+    index_cfg = raw.get("series_index") or {}
+    index_dests = tuple(index_cfg.get("destinations") or ())
+    for dest in index_dests:
+        if dest not in destinations:
+            raise RoutingConfigError(
+                f"series_index destination {dest!r} is not defined"
+            )
+
     cfg = RoutingConfig(
         destinations=destinations,
         default_key=default_key,
@@ -298,6 +542,9 @@ def parse(raw: dict) -> RoutingConfig:
         signals=dict(raw.get("signals") or {}),
         rules=list(raw.get("rules") or []),
         source_version=source_version,
+        series_overrides=tuple(overrides),
+        series_index_enabled=bool(index_cfg.get("enabled", False)),
+        series_index_destinations=index_dests,
     )
 
     for index, rule in enumerate(cfg.rules):
@@ -378,4 +625,16 @@ def to_v2_dict(cfg: RoutingConfig) -> dict:
         "lists": cfg.lists,
         "signals": cfg.signals,
         "rules": cfg.rules,
+        "series_overrides": [
+            {
+                "canonical": o.canonical,
+                "aliases": list(o.aliases),
+                **({"dest": o.dest_key} if o.dest_key else {}),
+            }
+            for o in cfg.series_overrides
+        ],
+        "series_index": {
+            "enabled": cfg.series_index_enabled,
+            "destinations": list(cfg.series_index_destinations),
+        },
     }
