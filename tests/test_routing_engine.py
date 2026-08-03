@@ -266,9 +266,11 @@ def _series_cfg(**overrides):
     return parse(raw)
 
 
-def _index_from(mapping: dict[str, list[str]]) -> SeriesIndex:
+def _index_from(mapping: dict[str, list[str]],
+                priority: tuple[str, ...] = ("comix", "manga", "graphic_novels")
+                ) -> SeriesIndex:
     """Build an index without touching the filesystem."""
-    idx = SeriesIndex()
+    idx = SeriesIndex(priority=priority)
     for dest_key, names in mapping.items():
         for name in names:
             idx.add(name, dest_key, Path(f"X:/{dest_key}/{name}"))
@@ -301,14 +303,38 @@ def test_series_absent_from_index_falls_through_to_rules():
     assert decision.dest_key == "graphic_novels"
 
 
-def test_series_in_two_libraries_is_ambiguous_and_defers_to_rules():
+def test_series_in_two_libraries_resolves_by_destination_priority():
+    # Comix membership is a deliberate adult determination, so it outranks
+    # the other libraries when a series somehow exists in both. The split is
+    # still reported so it can be cleaned up rather than silently papered
+    # over.
     cfg = _series_cfg()
-    idx = _index_from({"manga": ["Split Series"], "graphic_novels": ["Split Series"]})
+    idx = _index_from({"comix": ["Split Series"], "manga": ["Split Series"]})
     decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
                        "Split Series", idx)
-    assert decision.dest_key == "manga"          # from the rule, not the index
-    assert decision.rule_name == "Asian origin"
+    assert decision.dest_key == "comix"
+    assert decision.rule_name == "existing series"
     assert decision.ambiguous_series
+
+
+def test_destination_priority_is_independent_of_discovery_order():
+    # Whichever library is enumerated first, priority decides.
+    cfg = _series_cfg()
+    a = _index_from({"manga": ["Dup"], "comix": ["Dup"]})
+    b = _index_from({"comix": ["Dup"], "manga": ["Dup"]})
+    assert a.lookup("Dup")[0] == "comix"
+    assert b.lookup("Dup")[0] == "comix"
+
+
+def test_curated_comix_membership_outranks_asian_origin_metadata():
+    # The correction that motivated priority ordering: a series a person put
+    # in Comix stays in Comix even when its metadata says Asian origin.
+    cfg = _series_cfg()
+    idx = _index_from({"comix": ["Some Adult Manga"]})
+    decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
+                       "Some Adult Manga", idx)
+    assert decision.dest_key == "comix"
+    assert decision.rule_name == "existing series"
 
 
 def test_alias_resolves_to_the_canonical_series_folder():
