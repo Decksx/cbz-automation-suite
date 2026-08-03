@@ -65,6 +65,24 @@ MIN_AGE       = 300  # seconds a directory must exist before processing
 
 ROUTING_FILE  = REPO_ROOT / "routing.json"
 
+# v2 routing. The legacy v1 loader above still decides every move; this is a
+# parallel classifier for observation only.
+#
+#   off    -- v2 is never consulted (checked-in default)
+#   shadow -- v2 classifies each directory and logs how it would differ
+#
+# Shadow mode opens up to ROUTING_V2_SAMPLE archives per directory to read
+# ComicInfo, and writes nothing. Set CBZ_ROUTING_V2_MODE=shadow to run a
+# comparison pass without editing this file.
+#
+# There is no "active" value: letting v2 choose a destination needs the review
+# staging path that does not exist yet, and repointing ROUTING_FILE at the v2
+# config would NOT activate v2 -- the legacy resolver reads only match/pattern
+# rules and would match nothing, sending the whole library to the default.
+ROUTING_V2_FILE   = REPO_ROOT / "config" / "routing.v2.json"
+ROUTING_V2_MODE   = os.environ.get("CBZ_ROUTING_V2_MODE", "off")
+ROUTING_V2_SAMPLE = 5
+
 # ─────────────────────────────────────────────
 
 COMICINFO_TEMPLATE = """<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -94,6 +112,11 @@ _MARKER_WORDS_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
 _routing_destinations: dict[str, str] = {}   # short-name -> full path
 _routing_rules: list[dict] = []               # ordered rules list
 _routing_default: str = ''                    # default destination path
+
+# v2 router, built once at startup. None whenever v2 is off or its config
+# failed to load — the watcher must keep running on legacy routing either way,
+# since an observation feature has no business stopping ingestion.
+_router = None
 
 # Directories currently being processed — events for these are suppressed to
 # prevent the file-rename step from re-triggering the settle timer in a loop.
@@ -848,6 +871,47 @@ def _load_routing() -> None:
         _routing_default = ''
 
 
+def _load_routing_v2() -> None:
+    """Build the v2 router once, if a mode was asked for.
+
+    Deliberately non-fatal. v2 controls nothing on this branch, so a missing
+    or invalid v2 config must not stop the watcher from ingesting on legacy
+    routing. The one thing it will not do is run degraded and quiet: a failure
+    is logged as an error and v2 stays off.
+    """
+    global _router
+    _router = None
+    if ROUTING_V2_MODE == "off":
+        return
+    try:
+        from scripts.cbz_watcher_router import WatcherRouter
+        _router = WatcherRouter.load(ROUTING_V2_FILE, mode=ROUTING_V2_MODE,
+                                     sample_limit=ROUTING_V2_SAMPLE)
+    except Exception as e:                       # noqa: BLE001 — never fatal
+        log.error(f"  Routing v2 disabled: {type(e).__name__}: {e}")
+        _router = None
+
+
+def _source_folder_name(comic_dir: Path) -> str:
+    """The immediate child of WATCH_FOLDER that *comic_dir* arrived under."""
+    watch = Path(WATCH_FOLDER)
+    for candidate in [comic_dir] + list(comic_dir.parents):
+        if candidate.parent == watch:
+            return candidate.name
+    return comic_dir.name
+
+
+def _shadow_route(comic_dir: Path, legacy_dest: str) -> None:
+    """Log how v2 would have classified *comic_dir*. Changes nothing."""
+    if _router is None or not _router.enabled:
+        return
+    try:
+        _router.shadow(comic_dir, _source_folder_name(comic_dir), legacy_dest)
+    except Exception as e:                       # noqa: BLE001 — never fatal
+        log.error(f"  Routing v2 shadow failed for '{comic_dir.name}': "
+                  f"{type(e).__name__}: {e}")
+
+
 def _resolve_dest(comic_dir: Path) -> str:
     """
     Walk up from comic_dir to find the immediate child of WATCH_FOLDER.
@@ -1199,6 +1263,9 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
 
     for comic_dir, cbz_files in sorted(cbz_dirs.items()):
         dest_folder = _resolve_dest(comic_dir)
+        # Observation only. The legacy destination above is authoritative and
+        # nothing below reads the v2 decision.
+        _shadow_route(comic_dir, dest_folder)
 
         # A directory that has .cbz files sitting directly inside it *and* also
         # contains subdirectories that themselves hold .cbz files (each already
@@ -1647,11 +1714,14 @@ def main():
     os.makedirs(watch_path, exist_ok=True)
 
     _load_routing()
+    _load_routing_v2()
 
     log.info("=" * 60)
     log.info("CBZ Watcher started")
     log.info(f"  Watching : {WATCH_FOLDER}")
     log.info(f"  Routing  : {ROUTING_FILE}")
+    log.info(f"  Routing v2: {ROUTING_V2_MODE}"
+             + (f" ({ROUTING_V2_FILE})" if _router is not None else ""))
     log.info(f"  Log      : {LOG_FILE}")
     log.info(f"  Settle   : {SETTLE_DELAY}s after last file event")
     log.info("=" * 60)
