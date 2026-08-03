@@ -212,6 +212,29 @@ def test_later_no_match_cannot_displace_an_earlier_weak_match(tmp_path: Path):
     assert row.reason_rule == "Asian origin (weak)"
 
 
+def test_ranking_follows_declared_strength_not_the_rule_name(tmp_path: Path):
+    # The coupling this replaced: strength was read out of rule_name, so
+    # renaming a rule silently changed which sample won. Names here carry no
+    # strength marker at all, and one is deliberately misleading.
+    renamed = _origin_cfg(tmp_path, strong_name="origin by language",
+                          weak_name="origin by genre word")
+    row = _plan_one(tmp_path, [NO_MATCH, WEAK], cfg=renamed)
+    assert row.dest_key == "manga"
+    assert row.reason_rule == "origin by genre word"
+    assert row.needs_review is True          # still weak evidence
+
+    other = _plan_one(tmp_path / "second", [WEAK, STRONG], cfg=renamed)
+    assert other.reason_rule == "origin by language"
+    assert other.needs_review is False
+
+    # A name containing "weak" must not demote a rule declared strong.
+    misleading = _origin_cfg(tmp_path / "third",
+                             strong_name="not a weak signal at all")
+    third = _plan_one(tmp_path / "third", [STRONG], cfg=misleading)
+    assert third.dest_key == "manga"
+    assert third.needs_review is False
+
+
 # ── apply guards ─────────────────────────────────────────────────
 
 
