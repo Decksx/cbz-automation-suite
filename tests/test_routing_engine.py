@@ -211,6 +211,76 @@ def test_web_domain_matching_is_not_tokenised():
     assert _matches("by_web", Web="https://mangadex.org/chapter/1") is True
 
 
+# ── evidence strength is structured, not inferred from names ─────
+
+
+def _strength_cfg(strength=None, name="some rule"):
+    raw = json.loads(json.dumps(V2))
+    rule = {"name": name, "when": "asian_origin", "dest": "manga"}
+    if strength is not None:
+        rule["strength"] = strength
+    raw["rules"] = [rule]
+    return parse(raw)
+
+
+def test_matched_decision_carries_the_declared_strength():
+    cfg = _strength_cfg("weak")
+    decision = resolve(cfg, build_context("", "", {"LanguageISO": "ja"}))
+    assert decision.evidence_strength == "weak"
+    assert decision.authoritative is False
+
+
+def test_an_undeclared_rule_is_strong():
+    # Every rule in every config here behaved as strong before strength was
+    # explicit, so the default has to preserve that rather than demote them.
+    decision = resolve(_strength_cfg(), build_context("", "", {"LanguageISO": "ja"}))
+    assert decision.evidence_strength == "strong"
+
+
+def test_a_rule_named_weak_is_not_weak_unless_declared():
+    decision = resolve(_strength_cfg(name="weak-looking name"),
+                       build_context("", "", {"LanguageISO": "ja"}))
+    assert decision.evidence_strength == "strong"
+
+
+def test_the_default_carries_no_evidence():
+    decision = resolve(_strength_cfg("strong"), build_context("", "", {}))
+    assert decision.evidence_strength == "none"
+    assert decision.authoritative is False
+    assert not decision.matched
+
+
+def test_an_override_is_authoritative_and_carries_no_evidence():
+    # An override outranks evidence however strong, so it must not be
+    # expressible on the same scale as evidence.
+    raw = json.loads(json.dumps(V2))
+    raw["series_overrides"] = [{"canonical": "Ice Cream Man", "aliases": [],
+                                "dest": "graphic_novels"}]
+    decision = resolve(parse(raw), build_context("", "", {"LanguageISO": "ja"}),
+                       series_name="Ice Cream Man")
+    assert decision.dest_key == "graphic_novels"
+    assert decision.authoritative is True
+    assert decision.evidence_strength == "none"
+
+
+def test_an_existing_series_hit_is_authoritative():
+    cfg = parse(json.loads(json.dumps(V2)))
+    index = SeriesIndex(priority=("comix", "manga", "graphic_novels"))
+    index.add("Berserk", "comix", Path("X:/Comix/Berserk"))
+    decision = resolve(cfg, build_context("", "", {}),
+                       series_name="Berserk", index=index)
+    assert decision.dest_key == "comix"
+    assert decision.authoritative is True
+    assert decision.evidence_strength == "none"
+
+
+@pytest.mark.parametrize("bad", ["none", "STRONG", "medium", ""])
+def test_an_invalid_rule_strength_is_fatal(bad):
+    # "none" is rejected too: a rule that matched is evidence by definition.
+    with pytest.raises(RoutingConfigError, match="strength"):
+        _strength_cfg(bad)
+
+
 def test_unknown_list_is_still_rejected_for_the_new_operator():
     raw = json.loads(json.dumps(TOKENS))
     raw["signals"]["by_publisher"]["any"][0]["glob_tokens_in_list"] = "nope"

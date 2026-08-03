@@ -42,12 +42,25 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.cbz_routing import (  # noqa: E402
+    STRENGTH_ORDER,
     RoutingConfig,
+    RoutingDecision,
     build_context,
     parse,
     resolve,
     series_key,
 )
+
+
+def _sample_rank(decision: RoutingDecision) -> tuple[int, int]:
+    """Order one sample's decision against another's.
+
+    Authoritative decisions -- a manual override, or an existing series
+    folder -- outrank every reading of metadata, however strong. Within
+    evidence, strong beats weak beats none.
+    """
+    return (1 if decision.authoritative else 0,
+            STRENGTH_ORDER[decision.evidence_strength])
 
 COMICINFO_FIELDS = (
     "Series", "LanguageISO", "Manga", "Genre", "Tags",
@@ -165,25 +178,19 @@ def plan_series(
             build_context(source_name, series_dir.name, info),
             series_name=series_dir.name,
         )
-        # Rank the samples: strong match > weak match > no match. A strong
-        # signal ends the search; a weak one is held only until a strong one
-        # turns up, and a no-match is held only until anything matches.
+        # Rank the samples: authoritative > strong > weak > none. A strong or
+        # authoritative signal ends the search; a weak one is held only until
+        # something better turns up, and a no-match only until anything
+        # matches.
         #
-        # This has to test `decision.matched` rather than `decision` itself.
-        # A RoutingDecision defines neither __bool__ nor __len__, so an
-        # unmatched one is still truthy, and the earlier `decision = decision
-        # or candidate` therefore pinned the first sample's result: once a
-        # no-match was held, no later weak match could displace it, and the
-        # series fell to the default. That contradicts this module's rule that
-        # a series is Asian-origin when *any* sampled archive says so.
-        if candidate.matched:
-            if "weak" not in (candidate.rule_name or ""):
-                decision = candidate
-                break
-            if decision is None or not decision.matched:
-                decision = candidate
-        elif decision is None:
+        # Ranked on the decision's own evidence_strength, never on its
+        # rule_name. Reading strength out of a display string made this
+        # coupled to config naming, so renaming a rule silently changed which
+        # sample won.
+        if decision is None or _sample_rank(candidate) > _sample_rank(decision):
             decision = candidate
+        if candidate.authoritative or candidate.evidence_strength == "strong":
+            break
 
     if decision is None:                        # empty directory
         decision = resolve(
@@ -217,10 +224,13 @@ def plan_series(
         canonical=canonical,
         evidence=evidence,
         # Flag what the operator should look at: decided by absence of
-        # evidence, or decided only by the unreliable genre words.
+        # evidence, or decided only by the unreliable genre words. An
+        # override carries no evidence either, but is a human decision and
+        # needs no review.
         needs_review=(
-            (not decision.matched and with_info == 0)
-            or "weak" in (decision.rule_name or "")
+            (decision.evidence_strength == "none"
+             and not decision.authoritative and with_info == 0)
+            or decision.evidence_strength == "weak"
         ),
     )
 

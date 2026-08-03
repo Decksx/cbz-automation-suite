@@ -129,8 +129,13 @@ WEAK = {"Genre": "seinen"}
 STRONG = {"LanguageISO": "ja"}
 
 
-def _origin_cfg(tmp_path: Path):
-    """Two rules whose names carry the strong/weak markers plan_series ranks on."""
+def _origin_cfg(tmp_path: Path, strong_name="Asian origin (strong)",
+                weak_name="Asian origin (weak)"):
+    """Two rules declaring the strength plan_series ranks on.
+
+    The names are parameters so a test can prove that ranking follows the
+    declared strength and not the display name.
+    """
     return parse({
         "version": 2,
         "destinations": {"manga": str(tmp_path / "manga"),
@@ -146,15 +151,15 @@ def _origin_cfg(tmp_path: Path):
                          "contains_any": ["seinen"]}]},
         },
         "rules": [
-            {"name": "Asian origin (strong)", "when": "asian_origin_strong",
-             "dest": "manga"},
-            {"name": "Asian origin (weak)", "when": "asian_origin_weak",
-             "dest": "manga"},
+            {"name": strong_name, "when": "asian_origin_strong",
+             "dest": "manga", "strength": "strong"},
+            {"name": weak_name, "when": "asian_origin_weak",
+             "dest": "manga", "strength": "weak"},
         ],
     })
 
 
-def _plan_one(tmp_path: Path, samples: list[dict]):
+def _plan_one(tmp_path: Path, samples: list[dict], cfg=None):
     """Plan one series whose chapters carry *samples* in that order.
 
     The sample limit exceeds the chapter count, so sample_archives returns
@@ -166,7 +171,7 @@ def _plan_one(tmp_path: Path, samples: list[dict]):
     roots = {"manga": tmp_path / "manga", "graphic_novels": tmp_path / "gn"}
     for root in roots.values():
         root.mkdir(parents=True, exist_ok=True)
-    return plan_series(series_dir, _origin_cfg(tmp_path), "src", 5, roots)
+    return plan_series(series_dir, cfg or _origin_cfg(tmp_path), "src", 5, roots)
 
 
 def test_later_weak_match_beats_an_earlier_no_match(tmp_path: Path):
@@ -204,7 +209,30 @@ def test_later_no_match_cannot_displace_an_earlier_weak_match(tmp_path: Path):
     # rewritten as "last sample wins".
     row = _plan_one(tmp_path, [WEAK, NO_MATCH])
     assert row.dest_key == "manga"
-    assert "weak" in row.reason_rule
+    assert row.reason_rule == "Asian origin (weak)"
+
+
+def test_ranking_follows_declared_strength_not_the_rule_name(tmp_path: Path):
+    # The coupling this replaced: strength was read out of rule_name, so
+    # renaming a rule silently changed which sample won. Names here carry no
+    # strength marker at all, and one is deliberately misleading.
+    renamed = _origin_cfg(tmp_path, strong_name="origin by language",
+                          weak_name="origin by genre word")
+    row = _plan_one(tmp_path, [NO_MATCH, WEAK], cfg=renamed)
+    assert row.dest_key == "manga"
+    assert row.reason_rule == "origin by genre word"
+    assert row.needs_review is True          # still weak evidence
+
+    other = _plan_one(tmp_path / "second", [WEAK, STRONG], cfg=renamed)
+    assert other.reason_rule == "origin by language"
+    assert other.needs_review is False
+
+    # A name containing "weak" must not demote a rule declared strong.
+    misleading = _origin_cfg(tmp_path / "third",
+                             strong_name="not a weak signal at all")
+    third = _plan_one(tmp_path / "third", [STRONG], cfg=misleading)
+    assert third.dest_key == "manga"
+    assert third.needs_review is False
 
 
 # ── apply guards ─────────────────────────────────────────────────
