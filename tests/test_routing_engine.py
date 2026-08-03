@@ -458,7 +458,7 @@ def test_existing_series_wins_over_rules():
     cfg = _series_cfg()
     idx = _index_from({"manga": ["Some Western Sounding Title"]})
     decision = resolve(cfg, build_context("Indie", "x"),
-                       "Some Western Sounding Title", idx)
+                       series_name="Some Western Sounding Title", index=idx)
     assert decision.dest_key == "manga"
     assert decision.rule_name == "existing series"
     assert decision.series_dir is not None
@@ -525,7 +525,7 @@ def test_override_can_pin_a_destination_outright():
     cfg = _series_cfg()
     idx = _index_from({"graphic_novels": ["Berserk of Gluttony"]})
     decision = resolve(cfg, build_context("Indie", "x"),
-                       "Berserk of Gluttony", idx)
+                       series_name="Berserk of Gluttony", index=idx)
     # Pinned dest outranks even an existing folder elsewhere.
     assert decision.dest_key == "manga"
     assert decision.rule_name == "series override"
