@@ -467,7 +467,8 @@ def test_existing_series_wins_over_rules():
 def test_series_absent_from_index_falls_through_to_rules():
     cfg = _series_cfg()
     idx = _index_from({"manga": ["Something Else"]})
-    decision = resolve(cfg, build_context("", "x", ), "Brand New Series", idx)
+    decision = resolve(cfg, build_context("", "x", ),
+                       series_name="Brand New Series", index=idx)
     assert decision.dest_key == "graphic_novels"
 
 
@@ -479,7 +480,7 @@ def test_series_in_two_libraries_resolves_by_destination_priority():
     cfg = _series_cfg()
     idx = _index_from({"comix": ["Split Series"], "manga": ["Split Series"]})
     decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
-                       "Split Series", idx)
+                       series_name="Split Series", index=idx)
     assert decision.dest_key == "comix"
     assert decision.rule_name == "existing series"
     assert decision.ambiguous_series
@@ -500,7 +501,7 @@ def test_curated_comix_membership_outranks_asian_origin_metadata():
     cfg = _series_cfg()
     idx = _index_from({"comix": ["Some Adult Manga"]})
     decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
-                       "Some Adult Manga", idx)
+                       series_name="Some Adult Manga", index=idx)
     assert decision.dest_key == "comix"
     assert decision.rule_name == "existing series"
 
@@ -508,7 +509,8 @@ def test_curated_comix_membership_outranks_asian_origin_metadata():
 def test_alias_resolves_to_the_canonical_series_folder():
     cfg = _series_cfg()
     idx = _index_from({"manga": ["Rent-a-Girlfriend"]})
-    decision = resolve(cfg, build_context("", "x"), "Kanojo, Okarishimasu", idx)
+    decision = resolve(cfg, build_context("", "x"),
+                       series_name="Kanojo, Okarishimasu", index=idx)
     assert decision.dest_key == "manga"
     assert decision.canonical_series == "Rent-a-Girlfriend"
     assert decision.series_dir == Path("X:/manga/Rent-a-Girlfriend")
