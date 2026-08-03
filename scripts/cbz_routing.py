@@ -38,7 +38,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 VALID_OPERATORS = frozenset(
     {"equals", "in", "in_list", "glob", "glob_in_list", "glob_tokens_in_list",
@@ -52,6 +52,26 @@ VALID_OPERATORS = frozenset(
 TOKEN_SEPARATOR = ","
 COMBINATORS = frozenset({"any", "all", "not"})
 COMICINFO_PREFIX = "comicinfo."
+
+# How much a decision's evidence is worth, as structured data rather than as a
+# substring of the rule's display name. A caller that samples several archives
+# of one series has to rank their decisions, and inferring that ranking from
+# `"weak" in rule_name` coupled it to config naming: renaming a rule silently
+# changed which sample won, and nothing detected it.
+EvidenceStrength = Literal["none", "weak", "strong"]
+
+STRENGTH_ORDER: dict[str, int] = {"none": 0, "weak": 1, "strong": 2}
+
+# A rule that matches always constitutes some evidence, so a rule may declare
+# only "weak" or "strong". "none" is what a decision carries when no rule
+# matched at all, or when the decision did not come from evidence.
+RULE_STRENGTHS = frozenset({"weak", "strong"})
+
+# An undeclared rule is strong. Every rule in every config in this repository
+# was treated as strong before strength became explicit, except the one now
+# annotated in routing.v2.json, so this keeps existing files behaving
+# identically rather than silently demoting them.
+DEFAULT_RULE_STRENGTH: EvidenceStrength = "strong"
 
 # Series-name normalisation, kept byte-for-byte compatible with
 # cbz_watcher._series_key so the index agrees with the watcher's own
@@ -86,6 +106,15 @@ class RoutingDecision:
     # into that exact directory rather than re-deriving its name.
     series_dir: Path | None = None
     ambiguous_series: bool = False
+    # What the metadata was worth. "none" means no rule matched, or the
+    # decision did not come from evidence at all.
+    evidence_strength: EvidenceStrength = "none"
+    # A human decision or an existing placement, not a reading of metadata.
+    # Kept separate from evidence_strength so the two are never compared as if
+    # they were the same kind of thing: an override outranks all evidence
+    # regardless of how strong that evidence is, and saying so with a flag is
+    # clearer than inventing a fourth strength above "strong".
+    authoritative: bool = False
 
     @property
     def matched(self) -> bool:
@@ -396,6 +425,7 @@ def resolve(
                     f"series {series_name!r} pinned to {override.dest_key} "
                     f"as {override.canonical!r}",
                     canonical_series=canonical,
+                    authoritative=True,
                 )
 
     ambiguous = False
@@ -409,7 +439,7 @@ def resolve(
                 dest_key, cfg.destinations[dest_key], "existing series",
                 f"series {effective!r} already exists in {dest_key}{note}",
                 canonical_series=canonical, series_dir=path,
-                ambiguous_series=ambiguous,
+                ambiguous_series=ambiguous, authoritative=True,
             )
 
     for rule in cfg.rules:
@@ -419,7 +449,9 @@ def resolve(
             return RoutingDecision(key, cfg.destinations[key],
                                    rule.get("name", key), why,
                                    canonical_series=canonical,
-                                   ambiguous_series=ambiguous)
+                                   ambiguous_series=ambiguous,
+                                   evidence_strength=rule.get(
+                                       "strength", DEFAULT_RULE_STRENGTH))
     return RoutingDecision(cfg.default_key, cfg.default_path, None,
                            "no rule matched; default",
                            canonical_series=canonical,
@@ -599,6 +631,12 @@ def parse(raw: dict) -> RoutingConfig:
         if rule.get("dest") not in destinations:
             raise RoutingConfigError(
                 f"rule {index} destination {rule.get('dest')!r} is not defined"
+            )
+        strength = rule.get("strength", DEFAULT_RULE_STRENGTH)
+        if strength not in RULE_STRENGTHS:
+            raise RoutingConfigError(
+                f"rule {index} strength {strength!r} must be one of "
+                f"{sorted(RULE_STRENGTHS)}"
             )
         # Validate the predicate now rather than on the first archive that
         # happens to reach it.
