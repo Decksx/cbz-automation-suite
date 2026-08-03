@@ -235,6 +235,39 @@ def test_ranking_follows_declared_strength_not_the_rule_name(tmp_path: Path):
     assert third.needs_review is False
 
 
+def test_planning_ignores_an_unresolved_destination(tmp_path: Path):
+    # This tool reclassifies a library whose series all already have a home,
+    # so an unclassified one must still be planned to the default rather than
+    # diverted to review -- that would invent a move instead of planning one.
+    raw = json.loads(json.dumps({
+        "version": 2,
+        "destinations": {"manga": str(tmp_path / "manga"),
+                         "graphic_novels": str(tmp_path / "gn"),
+                         "review": str(tmp_path / "review")},
+        "default": "graphic_novels",
+        "unresolved": {"destination": "review"},
+        "lists": {"asian_languages": ["ja"]},
+        "signals": {"asian_origin_strong": {
+            "any": [{"field": "comicinfo.LanguageISO",
+                     "in_list": "asian_languages"}]}},
+        "rules": [{"name": "origin", "when": "asian_origin_strong",
+                   "dest": "manga", "strength": "strong"}],
+    }))
+    cfg = parse(raw)
+    assert cfg.unresolved_destination == "review"
+
+    series_dir = tmp_path / "src" / "Series"
+    _cbz_meta(series_dir / "ch00.cbz")
+    roots = {"manga": tmp_path / "manga", "graphic_novels": tmp_path / "gn",
+             "review": tmp_path / "review"}
+    for root in roots.values():
+        root.mkdir(parents=True, exist_ok=True)
+
+    row = plan_series(series_dir, cfg, "src", 5, roots)
+    assert row.dest_key == "graphic_novels"
+    assert row.reason_rule == "default"
+
+
 # ── apply guards ─────────────────────────────────────────────────
 
 
