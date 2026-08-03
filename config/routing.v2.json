@@ -79,8 +79,8 @@
       "when": "explicitly_adult",
       "dest": "comix"
     },
-    { "name": "Asian origin (strong)",   "when": "asian_origin_strong", "dest": "manga" },
-    { "name": "Asian origin (weak)",     "when": "asian_origin_weak",   "dest": "manga" }
+    { "name": "Asian origin (strong)",   "when": "asian_origin_strong", "dest": "manga", "strength": "strong" },
+    { "name": "Asian origin (weak)",     "when": "asian_origin_weak",   "dest": "manga", "strength": "weak" }
   ],
 
   "_comment_overrides": "Manual decisions. Ice Cream Man is an Image Comics title that carries the scraped genre 'seinen,Comedy'; that tag had already misfiled a copy into X:\\Manga before this migration, so it is pinned here to fix both copies and to stop the tag doing it again.",
