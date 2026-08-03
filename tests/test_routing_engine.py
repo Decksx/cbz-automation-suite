@@ -21,6 +21,8 @@ import pytest
 
 from scripts.cbz_routing import (
     RoutingConfigError,
+    SeriesIndex,
+    series_key,
     build_context,
     explain,
     load,
@@ -240,3 +242,176 @@ def test_live_routing_json_still_loads_if_present():
     cfg = load(live)
     assert cfg.destinations
     assert resolve(cfg, build_context("Asura Scans (EN)", "x")).dest_key == "manga"
+
+
+# ── series overrides and the series index ────────────────────────
+
+V2_SERIES = {
+    **{k: v for k, v in V2.items() if k != "rules"},
+    "rules": list(V2["rules"]),
+    "series_overrides": [
+        {
+            "canonical": "Rent-a-Girlfriend",
+            "aliases": ["Kanojo Okarishimasu", "Kanojo, Okarishimasu"],
+        },
+        {"canonical": "Berserk of Gluttony", "aliases": [], "dest": "manga"},
+    ],
+    "series_index": {"enabled": True, "destinations": ["manga", "graphic_novels"]},
+}
+
+
+def _series_cfg(**overrides):
+    raw = json.loads(json.dumps(V2_SERIES))
+    raw.update(overrides)
+    return parse(raw)
+
+
+def _index_from(mapping: dict[str, list[str]]) -> SeriesIndex:
+    """Build an index without touching the filesystem."""
+    idx = SeriesIndex()
+    for dest_key, names in mapping.items():
+        for name in names:
+            idx.add(name, dest_key, Path(f"X:/{dest_key}/{name}"))
+    return idx
+
+
+def test_series_key_matches_the_watchers_normalisation():
+    # The index is only useful if "same series" means the same thing here as
+    # it does in cbz_watcher._series_key.
+    assert series_key("Kanojo, Okarishimasu!") == series_key("kanojo okarishimasu")
+    assert series_key("Nagatoro (Uncensored)") == series_key("Nagatoro")
+
+
+def test_existing_series_wins_over_rules():
+    # Rules alone would send this to graphic_novels; the series already
+    # lives in manga, so it must stay together.
+    cfg = _series_cfg()
+    idx = _index_from({"manga": ["Some Western Sounding Title"]})
+    decision = resolve(cfg, build_context("Indie", "x"),
+                       "Some Western Sounding Title", idx)
+    assert decision.dest_key == "manga"
+    assert decision.rule_name == "existing series"
+    assert decision.series_dir is not None
+
+
+def test_series_absent_from_index_falls_through_to_rules():
+    cfg = _series_cfg()
+    idx = _index_from({"manga": ["Something Else"]})
+    decision = resolve(cfg, build_context("", "x", ), "Brand New Series", idx)
+    assert decision.dest_key == "graphic_novels"
+
+
+def test_series_in_two_libraries_is_ambiguous_and_defers_to_rules():
+    cfg = _series_cfg()
+    idx = _index_from({"manga": ["Split Series"], "graphic_novels": ["Split Series"]})
+    decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
+                       "Split Series", idx)
+    assert decision.dest_key == "manga"          # from the rule, not the index
+    assert decision.rule_name == "Asian origin"
+    assert decision.ambiguous_series
+
+
+def test_alias_resolves_to_the_canonical_series_folder():
+    cfg = _series_cfg()
+    idx = _index_from({"manga": ["Rent-a-Girlfriend"]})
+    decision = resolve(cfg, build_context("", "x"), "Kanojo, Okarishimasu", idx)
+    assert decision.dest_key == "manga"
+    assert decision.canonical_series == "Rent-a-Girlfriend"
+    assert decision.series_dir == Path("X:/manga/Rent-a-Girlfriend")
+
+
+def test_alias_works_before_the_series_exists_anywhere():
+    cfg = _series_cfg()
+    decision = resolve(cfg, build_context("", "x"), "Kanojo Okarishimasu",
+                       _index_from({}))
+    assert decision.canonical_series == "Rent-a-Girlfriend"
+
+
+def test_override_can_pin_a_destination_outright():
+    cfg = _series_cfg()
+    idx = _index_from({"graphic_novels": ["Berserk of Gluttony"]})
+    decision = resolve(cfg, build_context("Indie", "x"),
+                       "Berserk of Gluttony", idx)
+    # Pinned dest outranks even an existing folder elsewhere.
+    assert decision.dest_key == "manga"
+    assert decision.rule_name == "series override"
+
+
+def test_index_is_disabled_by_default():
+    cfg = parse(json.loads(json.dumps(V2)))
+    assert not cfg.series_index_enabled
+    assert len(SeriesIndex.build(cfg)) == 0
+
+
+def test_index_build_skips_filesystem_when_disabled(tmp_path: Path):
+    raw = json.loads(json.dumps(V2_SERIES))
+    raw["series_index"]["enabled"] = False
+    cfg = parse(raw)
+    called = []
+
+    def lister(root):
+        called.append(root)
+        return []
+
+    SeriesIndex.build(cfg, lister=lister)
+    assert not called
+
+
+def test_index_build_only_reads_configured_destinations():
+    cfg = _series_cfg()
+    seen = []
+
+    def lister(root):
+        seen.append(str(root))
+        return []
+
+    SeriesIndex.build(cfg, lister=lister)
+    assert any("Manga" in s for s in seen)
+    assert not any("Comix" in s for s in seen)
+
+
+def test_duplicate_alias_across_overrides_raises():
+    raw = json.loads(json.dumps(V2_SERIES))
+    raw["series_overrides"].append(
+        {"canonical": "Something Else", "aliases": ["Kanojo Okarishimasu"]}
+    )
+    with pytest.raises(RoutingConfigError, match="claimed by both"):
+        parse(raw)
+
+
+def test_override_with_unknown_destination_raises():
+    raw = json.loads(json.dumps(V2_SERIES))
+    raw["series_overrides"][1]["dest"] = "nowhere"
+    with pytest.raises(RoutingConfigError, match="not defined"):
+        parse(raw)
+
+
+def test_override_that_does_nothing_raises():
+    raw = json.loads(json.dumps(V2_SERIES))
+    raw["series_overrides"].append({"canonical": "Inert", "aliases": []})
+    with pytest.raises(RoutingConfigError, match="does nothing"):
+        parse(raw)
+
+
+def test_series_index_unknown_destination_raises():
+    raw = json.loads(json.dumps(V2_SERIES))
+    raw["series_index"]["destinations"] = ["nowhere"]
+    with pytest.raises(RoutingConfigError, match="not defined"):
+        parse(raw)
+
+
+def test_series_config_round_trips_through_v2_dict():
+    cfg = _series_cfg()
+    again = parse(json.loads(json.dumps(to_v2_dict(cfg))))
+    decision = resolve(again, build_context("", "x"), "Kanojo Okarishimasu",
+                       _index_from({}))
+    assert decision.canonical_series == "Rent-a-Girlfriend"
+    assert again.series_index_enabled
+
+
+def test_explain_shows_whether_index_or_rule_decided():
+    cfg = _series_cfg()
+    idx = _index_from({"manga": ["Rent-a-Girlfriend"]})
+    lines = explain(cfg, build_context("", "x"), "Kanojo, Okarishimasu", idx)
+    assert any("override" in line for line in lines)
+    assert any("MATCH series index" in line for line in lines)
