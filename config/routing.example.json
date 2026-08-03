@@ -43,6 +43,10 @@
     }
   },
 
+  "_comment_comments": "Any key beginning with '_' is documentation and is ignored everywhere -- top level, destinations, lists, signals, individual rule objects, series_index, unresolved, and series_overrides entries. Comments are accepted when loading and removed from the runtime model, so a comment name can never satisfy a destination, signal, list, or default reference, and --migrate-routing writes a canonical config with no comment keys. Keep comments in the file you edit; they are not preserved through serialisation.",
+
+  "_comment_lists": "Each list must be a JSON array of strings. A scalar such as \"asian_publishers\": \"yen press*\" is rejected at load rather than being iterated into one-character patterns.",
+
   "_comment_unresolved": "Optional. { \"destination\": \"<key>\" } sends archives that nothing classified -- no manual override, no existing-series match, no rule -- to that destination instead of 'default'. The key must appear in 'destinations'. Omit the block entirely to keep the fallthrough-to-default behaviour. A decision is reported as confidence=unresolved either way; this only chooses where the archive physically goes, and a caller may opt out with route_unresolved=False. Malformed values are fatal at load rather than silently disabling the block.",
 
   "_comment_rules": "Evaluated top to bottom, first match wins, then 'default'. Each rule may declare \"strength\": \"strong\" or \"weak\" -- how much its match is worth when a caller samples several archives of one series and has to rank their decisions. Omitted means strong. Callers rank authoritative decisions (a manual override, or an existing series folder) above all evidence, then strong above weak. Strength is never inferred from a rule's name.",
