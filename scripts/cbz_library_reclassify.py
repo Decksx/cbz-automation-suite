@@ -103,18 +103,31 @@ def read_comic_info(cbz_path: Path) -> dict[str, str]:
     return out
 
 
-def sample_archives(series_dir: Path, limit: int) -> list[Path]:
-    """Spread the sample across the series rather than taking the first N.
+def spread_sample(archives: list[Path], limit: int) -> list[Path]:
+    """Spread the sample across *archives* rather than taking the first N.
 
     Metadata quality is rarely uniform: a series often has ComicInfo on recent
     chapters and none on the back catalogue, so reading only the first few can
     miss the evidence entirely.
+
+    Takes an explicit collection because a caller does not always want every
+    archive under a directory. The watcher in particular must sample only the
+    files it is about to move: a mixed drop point holds loose archives beside
+    nested series directories, and walking the parent would classify one
+    series using another's metadata.
     """
-    archives = sorted(p for p in series_dir.rglob("*.cbz") if p.is_file())
-    if len(archives) <= limit:
-        return archives
-    step = len(archives) / limit
-    return [archives[int(i * step)] for i in range(limit)]
+    ordered = sorted(archives)
+    if len(ordered) <= limit:
+        return ordered
+    step = len(ordered) / limit
+    return [ordered[int(i * step)] for i in range(limit)]
+
+
+def sample_archives(series_dir: Path, limit: int) -> list[Path]:
+    """Spread the sample across every archive under *series_dir*."""
+    return spread_sample(
+        [p for p in series_dir.rglob("*.cbz") if p.is_file()], limit
+    )
 
 
 def tree_digest(source: Path) -> tuple[str, int, int]:
