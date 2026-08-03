@@ -750,6 +750,120 @@ def test_the_staged_config_has_no_character_lists():
         assert not all(len(p) == 1 for p in patterns), name
 
 
+# ── series_index field validation ────────────────────────────────
+#
+# The index makes a series' placement sticky under Comix-first priority,
+# which encodes an adult determination. bool() coercion meant "false" and
+# "no" -- two ordinary ways of writing off -- switched it on.
+
+
+def _index_cfg(**series_index):
+    return {
+        "version": 2,
+        "destinations": {"comix": "X:\\Comix", "manga": "X:\\Manga",
+                         "gn": "X:\\GN"},
+        "default": "gn", "lists": {}, "signals": {}, "rules": [],
+        "series_index": series_index,
+    }
+
+
+@pytest.mark.parametrize("value", ["false", "no", "true", "yes", 0, 1,
+                                   None, [], {}, "", "0"])
+def test_only_a_real_boolean_can_set_enabled(value):
+    with pytest.raises(RoutingConfigError, match="enabled must be true or false"):
+        parse(_index_cfg(enabled=value))
+
+
+@pytest.mark.parametrize("value, expected", [(True, True), (False, False)])
+def test_a_real_boolean_is_accepted(value, expected):
+    assert parse(_index_cfg(enabled=value)).series_index_enabled is expected
+
+
+def test_absent_enabled_leaves_the_index_off():
+    assert parse(_index_cfg()).series_index_enabled is False
+
+
+@pytest.mark.parametrize("value", ["comix", {"a": 1}, 7, True])
+def test_destinations_must_be_an_array(value):
+    with pytest.raises(RoutingConfigError,
+                       match="destinations must be an array of strings"):
+        parse(_index_cfg(enabled=True, destinations=value))
+
+
+@pytest.mark.parametrize("value", [[7], [None], [["comix"]], ["comix", 7]])
+def test_destination_entries_must_be_strings(value):
+    # And must fail on this contract rather than through the later
+    # reference check, which reported "destination 'c' is not defined" for a
+    # scalar and would not have raised at all for a one-character key.
+    with pytest.raises(RoutingConfigError,
+                       match="destinations entry .* must be a string"):
+        parse(_index_cfg(enabled=True, destinations=value))
+
+
+def test_entry_types_are_checked_before_destination_references():
+    # A bad type in an otherwise-unknown-key list must report the type, not
+    # the unknown key.
+    with pytest.raises(RoutingConfigError, match="entry 0 must be a string"):
+        parse(_index_cfg(enabled=True, destinations=[7, "nope"]))
+
+
+@pytest.mark.parametrize("destinations", [None, []])
+def test_absent_null_and_empty_destinations_are_equivalent(destinations):
+    # Deliberate equivalence: all three mean "index every configured
+    # destination". Pinned so a later tightening of null handling cannot
+    # break it silently.
+    absent = parse(_index_cfg(enabled=True))
+    given = parse(_index_cfg(enabled=True, destinations=destinations))
+    assert given.series_index_destinations == absent.series_index_destinations == ()
+
+    lister = lambda path: []
+    built = SeriesIndex.build(given, lister=lister)
+    assert built._priority == ("comix", "manga", "gn")
+    assert built._priority == SeriesIndex.build(absent, lister=lister)._priority
+
+
+def test_a_declared_destination_array_keeps_its_order():
+    cfg = parse(_index_cfg(enabled=True, destinations=["manga", "comix"]))
+    assert cfg.series_index_destinations == ("manga", "comix")
+    assert SeriesIndex.build(cfg, lister=lambda p: [])._priority == ("manga", "comix")
+
+
+def test_an_unknown_destination_is_still_rejected():
+    with pytest.raises(RoutingConfigError, match="is not defined"):
+        parse(_index_cfg(enabled=True, destinations=["nope"]))
+
+
+@pytest.mark.parametrize("series_index", [
+    {"enabled": True},
+    {"enabled": True, "destinations": None},
+    {"enabled": True, "destinations": []},
+])
+def test_serialisation_canonicalises_all_destinations_to_an_empty_array(series_index):
+    canonical = to_v2_dict(parse(_index_cfg(**series_index)))
+    assert canonical["series_index"] == {"enabled": True, "destinations": []}
+    again = parse(json.loads(json.dumps(canonical)))
+    assert again.series_index_destinations == ()
+    assert again.series_index_enabled is True
+
+
+def test_the_shipped_configs_still_parse_unchanged():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("routing.v2.json", "routing.example.json"):
+        cfg = load(root / "config" / name)
+        assert cfg.series_index_enabled is True
+        assert all(d in cfg.destinations for d in cfg.series_index_destinations)
+
+
+def test_v1_conversion_leaves_the_index_off():
+    cfg = parse({
+        "version": 1,
+        "destinations": {"m": "X:\\M", "g": "X:\\G"}, "default": "g",
+        "rules": [{"match": "source", "pattern": "A*", "dest": "m"}],
+    })
+    assert cfg.series_index_enabled is False
+    assert cfg.series_index_destinations == ()
+
+
 # ── v1 compatibility ─────────────────────────────────────────────
 
 V1 = {
