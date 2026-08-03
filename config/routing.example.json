@@ -45,6 +45,8 @@
 
   "_comment_comments": "Any key beginning with '_' is documentation and is ignored everywhere -- top level, destinations, lists, signals, individual rule objects, series_index, unresolved, and series_overrides entries. Comments are accepted when loading and removed from the runtime model, so a comment name can never satisfy a destination, signal, list, or default reference, and --migrate-routing writes a canonical config with no comment keys. Keep comments in the file you edit; they are not preserved through serialisation.",
 
+  "_comment_series_index_schema": "'enabled' must be a real JSON boolean. Strings and numbers are rejected rather than coerced -- \"false\" and \"no\" are truthy in Python and would have switched index authority ON. 'destinations' must be an array of strings when present; absent, null, and [] are equivalent and all mean 'index every configured destination', and --migrate-routing writes that case as [].",
+
   "_comment_lists": "Each list must be a JSON array of strings. A scalar such as \"asian_publishers\": \"yen press*\" is rejected at load rather than being iterated into one-character patterns.",
 
   "_comment_unresolved": "Optional. { \"destination\": \"<key>\" } sends archives that nothing classified -- no manual override, no existing-series match, no rule -- to that destination instead of 'default'. The key must appear in 'destinations'. Omit the block entirely to keep the fallthrough-to-default behaviour. A decision is reported as confidence=unresolved either way; this only chooses where the archive physically goes, and a caller may opt out with route_unresolved=False. Malformed values are fatal at load rather than silently disabling the block.",
