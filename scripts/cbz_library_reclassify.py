@@ -42,25 +42,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.cbz_routing import (  # noqa: E402
-    STRENGTH_ORDER,
     RoutingConfig,
-    RoutingDecision,
     build_context,
+    is_terminal_sample,
     parse,
     resolve,
+    sample_rank,
     series_key,
 )
-
-
-def _sample_rank(decision: RoutingDecision) -> tuple[int, int]:
-    """Order one sample's decision against another's.
-
-    Authoritative decisions -- a manual override, or an existing series
-    folder -- outrank every reading of metadata, however strong. Within
-    evidence, strong beats weak beats none.
-    """
-    return (1 if decision.authoritative else 0,
-            STRENGTH_ORDER[decision.evidence_strength])
 
 COMICINFO_FIELDS = (
     "Series", "LanguageISO", "Manga", "Genre", "Tags",
@@ -195,9 +184,9 @@ def plan_series(
         # rule_name. Reading strength out of a display string made this
         # coupled to config naming, so renaming a rule silently changed which
         # sample won.
-        if decision is None or _sample_rank(candidate) > _sample_rank(decision):
+        if decision is None or sample_rank(candidate) > sample_rank(decision):
             decision = candidate
-        if candidate.authoritative or candidate.evidence_strength == "strong":
+        if is_terminal_sample(candidate):
             break
 
     if decision is None:                        # empty directory
