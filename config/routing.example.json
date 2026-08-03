@@ -1,24 +1,69 @@
 {
-  "_comment": "Copy this file to C:\\ComicAutomation\\routing.json and edit to match your setup.",
+  "_comment": "Copy to the repo root as routing.json and edit. v1 files (no 'version' key, flat rules with match/pattern/dest) still load and are converted in memory.",
+
+  "version": 2,
 
   "destinations": {
-    "comics": "\\\\your-server\\media\\comics\\Comix",
-    "manga":  "\\\\your-server\\media\\comics\\Manga"
+    "comix": "X:\\Comix",
+    "manga": "X:\\Manga",
+    "graphic_novels": "X:\\Graphic Novels"
   },
 
-  "default": "comics",
+  "_comment_default": "Used when no rule matches. Destination paths must be absolute; an invalid config is a startup error, never a silent fallback.",
+  "default": "graphic_novels",
 
+  "_comment_lists": "Plain data referenced by signals. Adding a scanlation site is appending one string here.",
+  "lists": {
+    "asian_origin_sources": [
+      "Asura Scans (EN)",
+      "Atsumaru*",
+      "MangaDex (EN)"
+    ],
+    "asian_imprints": ["Ghost Ship", "Seven Seas", "Yen Press", "VIZ Media"],
+    "asian_languages": ["ja", "ko", "zh", "zh-Hans", "zh-Hant"]
+  },
+
+  "_comment_signals": "Named predicates. Fields are 'source', 'title', or 'comicinfo.<AnyElement>'. Operators: equals, in, in_list, glob, glob_in_list, contains_any. Combinators: any, all, not. A missing ComicInfo field makes a matcher false, never an error.",
+  "signals": {
+    "explicitly_adult": {
+      "any": [
+        { "field": "comicinfo.AgeRating", "in": ["Adults Only 18+", "X18+"] }
+      ]
+    },
+
+    "asian_origin": {
+      "any": [
+        { "field": "comicinfo.LanguageISO", "in_list": "asian_languages" },
+        { "field": "comicinfo.Manga",       "in": ["Yes", "YesAndRightToLeft"] },
+        { "field": "comicinfo.Imprint",     "in_list": "asian_imprints" },
+        { "field": "comicinfo.Genre",       "contains_any": ["manga", "manhwa", "manhua"] },
+        { "field": "source",                "glob_in_list": "asian_origin_sources" }
+      ]
+    }
+  },
+
+  "_comment_rules": "Evaluated top to bottom, first match wins, then 'default'.",
   "rules": [
-    { "_comment": "--- Manga / manhwa sources ---" },
-    { "match": "source", "pattern": "MangaDex (EN)",         "dest": "manga" },
-    { "match": "source", "pattern": "Atsumaru*",              "dest": "manga" },
-    { "match": "source", "pattern": "Webtoons*",             "dest": "manga" },
-    { "match": "source", "pattern": "MangaFire (EN)",        "dest": "manga" },
-    { "match": "source", "pattern": "ManyToon (EN)",         "dest": "manga" },
+    { "name": "explicit adult content", "when": "explicitly_adult", "dest": "comix" },
+    { "name": "Asian origin",           "when": "asian_origin",     "dest": "manga" }
+  ],
 
-    { "_comment": "--- Comics / western sources go to default (comics) ---" },
+  "_comment_overrides": "Manual fixes, checked before everything else. Use 'aliases' to merge titles that differ by translation or romanisation rather than by punctuation -- normalisation already handles case, spacing, punctuation and censorship markers, but cannot know that two different words mean the same series. Add 'dest' to pin a series to a library outright. An alias claimed by two overrides is a config error rather than a silent coin flip.",
+  "series_overrides": [
+    {
+      "canonical": "Rent-a-Girlfriend",
+      "aliases": ["Kanojo Okarishimasu", "Kanojo, Okarishimasu"]
+    },
+    {
+      "canonical": "Some Series That Keeps Getting Misrouted",
+      "aliases": [],
+      "dest": "manga"
+    }
+  ],
 
-    { "_comment": "--- Title-based overrides (match on comic directory name) ---" },
-    { "match": "title",  "pattern": "Batman*",               "dest": "comics" }
-  ]
+  "_comment_series_index": "A series that already has a folder in one of these destinations keeps going there, so it never splits across libraries because one chapter arrived without usable metadata. Built once per scan pass, not per directory. ORDER IS PRECEDENCE: if a series somehow exists in two libraries the first listed wins, so put the library whose membership encodes a human decision first -- Comix membership is a deliberate adult determination and must outrank a metadata-derived origin signal. Do NOT list a library that is being retired or is known-misclassified until its contents have been migrated, or the index will pin them where they sit.",
+  "series_index": {
+    "enabled": true,
+    "destinations": ["comix", "manga", "graphic_novels"]
+  }
 }

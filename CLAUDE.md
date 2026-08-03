@@ -90,7 +90,18 @@ Record the count before and after, and reconcile the delta against the
 number of tests actually added. CI (`.github/workflows/tests.yml`) runs
 the same suite on `windows-latest` / Python 3.11.
 
-- `git diff --check` is meaningful here and should be clean.
+- `git diff --check` is meaningful only for the LF files, where it should
+  be clean. It is structurally noisy for the two CRLF files above:
+  `--check` inspects *added* lines only, and every added line in a
+  CRLF-stored file ends with `\r`, which it reports as trailing
+  whitespace. This is not a real defect and predates any current work —
+  the merged `7c63bc9` produces 65 such warnings. Scope it to the files
+  it can actually speak to:
+
+  ```text
+  git diff --check -- . ':(exclude)scripts/cbz_sanitizer.py' \
+      ':(exclude)scripts/cbz_library_maintenance.py'
+  ```
 - A passing test is not a working test. Confirm a new test fails when the
   behavior it guards is removed.
 - Distinguish pre-existing failures from new ones by checking the same
@@ -116,6 +127,14 @@ the same suite on `windows-latest` / Python 3.11.
   entire planned work item was once found already implemented, tests and
   production migration included, while three audits still called it
   outstanding.
+- **Measure the environment; never infer it.** Filesystem, volume, and
+  access-path behavior is measured on the actual target before it is
+  written down or designed against. On 2026-08-02 three such claims were
+  asserted from plausible reasoning and all three were wrong: that the
+  library volume was SMB (locally attached), that it was NTFS (exFAT at
+  the time), and that a share-mode open would detect a concurrent writer
+  (0/16). Reasoning about these produces a hypothesis worth testing, not
+  a finding. See `docs/engineering_decisions.md`.
 - Implement an audit's low-risk tier; leave anything the audit itself
   marked as needing benchmarking, schema design, or environment-specific
   validation.

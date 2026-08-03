@@ -174,3 +174,60 @@ Komga and Komf identifiers and titles feed the local series model, but provider 
 ## Office PC is the worker
 
 CPU-intensive scanning, image decoding, hashing, and GPU embeddings run on the Office PC. The Pi 5 is for dashboards, scheduling, and health checks.
+
+## Library volume filesystem and access path are architectural
+
+The archive-rewrite guards compare `(st_size, st_mtime_ns)` before and
+after the read-rebuild window. How well that works is a property of the
+volume, not of the code, and it was measured on 2026-08-02:
+
+| Volume | Same-size concurrent replacement detected |
+| --- | --- |
+| `X:\` as exFAT (until 2026-08-02), measured **2-second** `st_mtime_ns` quantum | 5/16 |
+| `X:\` as NTFS 4K (reformatted 2026-08-02, re-verified 2026-08-03) | 10/10 |
+| Local NTFS, timestamp resolution finer than 1.5 ms | 16/16 |
+| `\\tower\media` — SMB, writer on the server | 0/6 within ~10 s (**every** change type, including size) |
+
+Effectiveness depends on **access path and filesystem together**, not on
+either alone. Both have to be right; a fine-grained filesystem reached over
+a caching network path is no better than a coarse local one, and worse.
+
+**The filesystem half.** exFAT exposes the raw DOS 2-second timestamp; the
+10 ms increment field does not surface through Windows. Any same-size
+change landing in the same 2-second bucket as the file's previous write was
+invisible, leaving size as the only reliable change signal. `X:\` was
+reformatted to NTFS (4 KB clusters) on 2026-08-02 — new volume serial
+`0x66895a31`, library copied out to `D:` and back — and re-measured on
+2026-08-03: 400/400 distinct timestamps, and same-size replacement detected
+10/10 where exFAT was 0/20. That enabler is gone, eliminated by the format
+rather than by code.
+
+**The access-path half.** SMB is worse than exFAT was, not better: the
+Windows client caches attributes *and* file data, so for roughly ten
+seconds a remote change is invisible regardless of type, and content-based
+checks are blind alongside metadata ones. A guard is only as good as its
+locality — it must run local to the filesystem it guards. Serving the
+library to Komga on Tower over SMB was considered and **rejected**, for
+unnecessary network traffic and extraneous I/O on Tower's HDDs rather than
+for this; the measurement is recorded because it independently rules the
+configuration out. It also bounds the planned option to source from or
+store to network storage: that is supported, but the rewrite guards degrade
+from a narrow race window to a ten-second blind window, and that tradeoff
+belongs in front of the user choosing it.
+
+The durable lesson is not the 2-second number, which no longer applies. It
+is that nobody was tracking which filesystem the live library sat on, and
+every conclusion about concurrency safety silently depended on it.
+
+## Environment claims get measured, never inferred
+
+Three environment claims were asserted from plausible reasoning during the
+2026-08-02 guard validation and all three were overturned by measurement:
+that the library volume was SMB (it was locally attached), that it was NTFS
+(it was exFAT at the time), and that a share-mode open would detect the
+concurrent writer (0/16 — the writer has already released by check time).
+
+Filesystem, volume, and access-path behavior is measured on the actual
+target before it is written down or designed against. First-principles
+reasoning about these is evidence of a hypothesis worth testing, not a
+finding.

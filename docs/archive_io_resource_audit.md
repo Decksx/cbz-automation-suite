@@ -70,6 +70,76 @@ that `ZipInfo.filename` values are round-tripped unvalidated, so a future
 contributor adding an extraction feature does not assume names are already
 safe. This was the fifth Section 3 item; it is documentation only, by design.
 
+### Validated 2026-08-02 — fault injection against real volumes
+
+Resolution item 4's guards had only ever been exercised against a local
+tmpdir with `Path.stat` monkeypatched, which fabricates drift the
+filesystem would never report. Fault injection against real volumes with a
+real concurrent writer in a separate process — marker bytes carried inside
+a real zip entry, so a vanished marker is data loss rather than
+normalization — produced three results that change item 4's standing.
+
+1. **A same-size replacement within the volume's mtime quantum was silently
+   clobbered — the principal finding.** On `X:\` as it stood on 2026-08-02
+   (exFAT, measured 2-second `st_mtime_ns` quantum), a concurrent writer
+   replacing the archive with a byte-identical *length* but different
+   content during the read-rebuild window went undetected in **11 of 16
+   trials**; both guards reported success (`write_comicinfo` returned
+   `True`) while the other writer's content was destroyed. The identical
+   scenario on NTFS was detected **16/16**. One variable — timestamp
+   resolution — opposite outcomes.
+
+   **Status:** the enabler is gone. `X:\` was reformatted to NTFS (4 KB
+   clusters, new volume serial `0x66895a31`) on 2026-08-02 and re-measured
+   on 2026-08-03: 400/400 distinct timestamps, same-size replacement
+   detected 10/10 where exFAT was 0/20. Note this was closed by the format,
+   not by code, and the underlying *class* of bug survives on NTFS in a far
+   narrower window — one collision in five was observed at delay 0.
+
+2. **The `stat()` comparison cannot see an in-flight write, but this does
+   not cause data loss here.** A writer holding an open handle was detected
+   0/5 on NTFS and 0/20 on exFAT at every delay from 0 ms to 1 s, and
+   detected immediately once the handle closed: Windows does not publish
+   size/mtime to the directory entry until close. The guard's own
+   `rename(bak_path)` nevertheless fails with a sharing violation and the
+   rewrite is abandoned, so the OS covers the gap the guard misses. Real,
+   but mitigated. **Residual risk:** a writer opening with
+   `FILE_SHARE_DELETE` would not be blocked. That case is untested.
+
+3. **A share-mode probe does not fix either one.** Opening the source
+   denying write-sharing (`CreateFileW`, `FILE_SHARE_READ`, testing for
+   `ERROR_SHARING_VIOLATION`) detected **0/16** on the same-size scenario.
+   The concurrent writer's `os.replace()` completes and releases before the
+   check runs, so no handle remains to detect; it is blind for the same
+   structural reason `stat` is, and it addresses only result 2, which the
+   OS already mitigates. Rejected as a repair.
+
+4. **SMB is a measured constraint on a configuration that was rejected.**
+   Against `\\tower\media` with the writer running on the server, *every*
+   change type — including size changes — was invisible for roughly ten
+   seconds (0/6 at 0 ms through 3 s; 6/6 at 11 s), because the Windows SMB
+   client caches attributes. Content-based checking does not rescue it: the
+   central-directory check measured 0/6 immediately and 2/6 at 11 s, since
+   file *data* is cached independently of attributes. Serving the library
+   over SMB was rejected on other grounds (network traffic, extraneous I/O
+   on Tower's HDDs); this is recorded because it independently rules the
+   configuration out, and because it bounds any future network-storage
+   option. It does **not** describe the current library path, which is
+   local.
+
+**Mitigation adopted: central-directory CRC comparison, local volumes
+only.** Comparing per-entry CRC32 from the archive's central directory
+before the rename detected **16/16** with **0/8** false positives, at
+**0.39 ms** against a **173 ms** full read of the same 200 MB archive — a
+tail read, ~440x cheaper than the pass it guards. It is adopted as
+defense-in-depth against the class of bug in result 1, **not** as the fix
+for it (the reformat was that). Two caveats a future reader must not lose:
+it **narrows the TOCTOU window, it does not close it** — the check still
+precedes the rename and is not atomicity — and it is **local-volume only**,
+per result 4. It must not be described as protecting anything over SMB.
+See `docs/engineering_decisions.md`, "Library volume filesystem and access
+path are architectural".
+
 ### Deliberately not implemented
 
 - **Atomic single-step replacement.** The multi-step
@@ -91,10 +161,17 @@ safe. This was the fifth Section 3 item; it is documentation only, by design.
 ### Still open
 
 Everything in Section 5, "Deferred work", is untouched:
-`scripts/cbz_compilation_resolver.py` has still had no I/O audit;
-encrypted-archive handling is still untraced end-to-end; and the SMB-specific
-behavior claims throughout this document still rest on code inspection rather
-than fault-injection testing.
+`scripts/cbz_compilation_resolver.py` has still had no I/O audit; and
+encrypted-archive handling is still untraced end-to-end.
+
+The SMB-specific behavior claims throughout this document no longer rest on
+code inspection alone — see "Validated 2026-08-02". Note that the document
+was written assuming the live library was on SMB; it is not, and never was
+during this audit. `X:\` is a locally-attached volume — exFAT at audit
+time, NTFS since 2026-08-02 — and it was the exFAT timestamp quantum, not
+SMB caching, that defeated the rewrite guards. SMB caching was confirmed
+separately against `\\tower\media` and constrains a rejected configuration
+plus any future network-storage option, not the current library path.
 
 `comic_automation/jobs/worker.py`'s retry/backoff policy, listed as out of
 scope here, was separately audited in `docs/jobs_worker_retry_audit.md` and its
@@ -688,6 +765,11 @@ steps.
   window where no file exists at the target path if interrupted.
 - **No pre-rename staleness check in any `scripts/` rewrite function.**
   **[RESOLVED 2026-07-31 — see Resolution log item 4.]**
+  **[PARTIALLY REOPENED 2026-08-02 — the guard that closed this is blind to
+  a same-size replacement inside the volume's mtime quantum: 11/16 silent
+  clobbers on exFAT, 0/16 on NTFS. Enabler removed 2026-08-02 by
+  reformatting `X:\` to NTFS; the class of bug persists in a narrower
+  window. See Resolution log, "Validated 2026-08-02".]**
   Unlike `page_hashing.py`/`perceptual_hashing.py`'s before/after `stat()`
   guard, none of `_write_cbz_with_comicinfo`, `write_comicinfo`, or
   `pack_image_folder` re-verify the target's size/mtime immediately before

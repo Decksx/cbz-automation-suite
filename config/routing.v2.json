@@ -1,0 +1,94 @@
+{
+  "_comment": "Staged v2 routing config for this library. NOT yet live: the watcher still parses routing.json as v1, so replacing routing.json with this file before the watcher is wired to scripts/cbz_routing.py would break routing. Until then this is the single home for manual series decisions, read by scripts/cbz_library_reclassify.py via --routing.",
+
+  "version": 2,
+
+  "destinations": {
+    "comix": "X:\\Comix",
+    "manga": "X:\\Manga",
+    "graphic_novels": "X:\\Graphic Novels"
+  },
+
+  "_comment_default": "Graphic Novels is the fallback once the adult signal exists. NOTE: not safe to go live until then -- adult sources such as HentaiNexus currently reach Comix only by being the default.",
+  "default": "graphic_novels",
+
+  "lists": {
+    "asian_languages": ["ja", "ko", "zh", "zh-Hans", "zh-Hant"],
+
+    "_comment_publishers": "Japanese/Korean publishers and licensors, taken from ComicInfo actually observed in the library rather than guessed.",
+    "asian_publishers": [
+      "*manga*", "*manhwa*", "*webtoon*",
+      "takeshobo*", "shonen gahosha*", "nihon bungeisha*", "taskey*",
+      "comikey*", "shueisha*", "kodansha*", "shogakukan*", "square enix*",
+      "kadokawa*", "hakusensha*", "futabasha*", "akita shoten*",
+      "ichijinsha*", "coamix*", "yen press*", "seven seas*", "viz*",
+      "dmp*", "dena*", "line*", "lezhin*", "toomics*", "tapas*",
+      "naver*", "kakao*"
+    ],
+
+    "_comment_sites": "Aggregator/scanlation domains seen in the Web field. Several correspond to entries in the curated source list the v1 routing.json already maintained.",
+    "asian_sites": [
+      "*mangairo*", "*manganato*", "*mangadex*", "*mangakakalot*",
+      "*mangafab*", "*boxmanhwa*", "*allmanga*", "*1manga*", "*comick.io*",
+      "*comickfan*", "*asurascans*", "*mangago*", "*bato.to*", "*mangaplus*",
+      "*webtoon*", "*lezhin*", "*toomics*", "*tapas*", "*kakao*", "*naver*",
+      "*hentai*", "*hitomi*", "*pururin*"
+    ],
+
+    "_comment_western_sites": "Negative evidence. An aggregator URL that names a Western publisher outweighs a genre word, which is the failure mode that misfiled Ice Cream Man.",
+    "western_publisher_markers": [
+      "*image-comics*", "*dc-comics*", "*marvel*", "*dark-horse-comics*",
+      "*idw-publishing*", "*boom-studios*", "*valiant*", "*vertigo*",
+      "*oni-press*", "*dynamite*", "*avatar-press*"
+    ]
+  },
+
+  "signals": {
+    "explicitly_adult": {
+      "any": [
+        { "field": "comicinfo.AgeRating", "in": ["Adults Only 18+", "X18+"] }
+      ]
+    },
+
+    "asian_origin_strong": {
+      "any": [
+        { "field": "comicinfo.LanguageISO", "in_list": "asian_languages" },
+        { "field": "comicinfo.Manga",       "in": ["Yes", "YesAndRightToLeft"] },
+        { "field": "comicinfo.Publisher",   "glob_in_list": "asian_publishers" },
+        { "field": "comicinfo.Imprint",     "glob_in_list": "asian_publishers" },
+        { "field": "comicinfo.Web",         "glob_in_list": "asian_sites" },
+        { "field": "comicinfo.Format",      "contains_any": ["manga", "manhwa", "manhua"] }
+      ]
+    },
+
+    "asian_origin_weak": {
+      "all": [
+        { "not": { "field": "comicinfo.Web", "glob_in_list": "western_publisher_markers" } },
+        { "any": [
+          { "field": "comicinfo.Genre", "contains_any": ["manga", "manhwa", "manhua", "webtoon", "seinen", "shounen", "shonen", "shoujo", "shojo", "josei", "ecchi", "isekai", "doujinshi", "yaoi", "yuri"] },
+          { "field": "comicinfo.Tags",  "contains_any": ["manga", "manhwa", "manhua", "webtoon", "seinen", "shounen", "shonen", "shoujo", "shojo", "josei", "ecchi", "isekai", "doujinshi", "yaoi", "yuri"] }
+        ] }
+      ]
+    }
+  },
+
+  "rules": [
+    { "name": "explicit adult content",  "when": "explicitly_adult",    "dest": "comix" },
+    { "name": "Asian origin (strong)",   "when": "asian_origin_strong", "dest": "manga" },
+    { "name": "Asian origin (weak)",     "when": "asian_origin_weak",   "dest": "manga" }
+  ],
+
+  "_comment_overrides": "Manual decisions. Ice Cream Man is an Image Comics title that carries the scraped genre 'seinen,Comedy'; that tag had already misfiled a copy into X:\\Manga before this migration, so it is pinned here to fix both copies and to stop the tag doing it again.",
+  "series_overrides": [
+    {
+      "canonical": "Ice Cream Man",
+      "aliases": ["ICECREAMMAN"],
+      "dest": "graphic_novels"
+    }
+  ],
+
+  "series_index": {
+    "enabled": true,
+    "destinations": ["comix", "manga", "graphic_novels"]
+  }
+}
