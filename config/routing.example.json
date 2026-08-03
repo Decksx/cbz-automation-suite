@@ -43,6 +43,8 @@
     }
   },
 
+  "_comment_unresolved": "Optional. { \"destination\": \"<key>\" } sends archives that nothing classified -- no manual override, no existing-series match, no rule -- to that destination instead of 'default'. The key must appear in 'destinations'. Omit the block entirely to keep the fallthrough-to-default behaviour. A decision is reported as confidence=unresolved either way; this only chooses where the archive physically goes, and a caller may opt out with route_unresolved=False. Malformed values are fatal at load rather than silently disabling the block.",
+
   "_comment_rules": "Evaluated top to bottom, first match wins, then 'default'. Each rule may declare \"strength\": \"strong\" or \"weak\" -- how much its match is worth when a caller samples several archives of one series and has to rank their decisions. Omitted means strong. Callers rank authoritative decisions (a manual override, or an existing series folder) above all evidence, then strong above weak. Strength is never inferred from a rule's name.",
   "rules": [
     { "name": "explicit adult content", "when": "explicitly_adult", "dest": "comix" },
