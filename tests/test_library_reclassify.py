@@ -26,9 +26,11 @@ from scripts.cbz_library_reclassify import (
     apply_series,
     cmd_apply,
     cmd_move,
+    plan_series,
     sample_archives,
     tree_digest,
 )
+from scripts.cbz_routing import parse
 
 
 def _cbz(path: Path, page: bytes = b"page") -> None:
@@ -101,6 +103,108 @@ def test_sampling_spreads_across_the_series(tmp_path: Path):
 def test_sampling_returns_everything_when_under_the_limit(tmp_path: Path):
     source = _library(tmp_path / "src", {"A": 3})
     assert len(sample_archives(source / "A", 10)) == 3
+
+
+# ── sampled decision precedence ──────────────────────────────────
+#
+# Origin is a property of a series, not of a chapter, so the sample ranks
+# strong > weak > no match and a chapter that arrived untagged must not
+# dilute the evidence of one that carries it. The regression these guard
+# is that an unmatched RoutingDecision is truthy, which once let the first
+# sample's no-match suppress every later weak match.
+
+
+def _cbz_meta(path: Path, **fields: str) -> None:
+    """A CBZ carrying exactly *fields*; no fields means no ComicInfo at all."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"<{k}>{v}</{k}>" for k, v in fields.items())
+    with zipfile.ZipFile(path, "w") as zf:
+        if body:
+            zf.writestr("ComicInfo.xml", f"<ComicInfo>{body}</ComicInfo>")
+        zf.writestr("001.jpg", b"page")
+
+
+NO_MATCH: dict[str, str] = {}
+WEAK = {"Genre": "seinen"}
+STRONG = {"LanguageISO": "ja"}
+
+
+def _origin_cfg(tmp_path: Path):
+    """Two rules whose names carry the strong/weak markers plan_series ranks on."""
+    return parse({
+        "version": 2,
+        "destinations": {"manga": str(tmp_path / "manga"),
+                         "graphic_novels": str(tmp_path / "gn")},
+        "default": "graphic_novels",
+        "lists": {"asian_languages": ["ja"]},
+        "signals": {
+            "asian_origin_strong": {
+                "any": [{"field": "comicinfo.LanguageISO",
+                         "in_list": "asian_languages"}]},
+            "asian_origin_weak": {
+                "any": [{"field": "comicinfo.Genre",
+                         "contains_any": ["seinen"]}]},
+        },
+        "rules": [
+            {"name": "Asian origin (strong)", "when": "asian_origin_strong",
+             "dest": "manga"},
+            {"name": "Asian origin (weak)", "when": "asian_origin_weak",
+             "dest": "manga"},
+        ],
+    })
+
+
+def _plan_one(tmp_path: Path, samples: list[dict]):
+    """Plan one series whose chapters carry *samples* in that order.
+
+    The sample limit exceeds the chapter count, so sample_archives returns
+    every chapter in name order and the list reads as the evaluation order.
+    """
+    series_dir = tmp_path / "src" / "Series"
+    for index, fields in enumerate(samples):
+        _cbz_meta(series_dir / f"ch{index:02d}.cbz", **fields)
+    roots = {"manga": tmp_path / "manga", "graphic_novels": tmp_path / "gn"}
+    for root in roots.values():
+        root.mkdir(parents=True, exist_ok=True)
+    return plan_series(series_dir, _origin_cfg(tmp_path), "src", 5, roots)
+
+
+def test_later_weak_match_beats_an_earlier_no_match(tmp_path: Path):
+    # The regression: `decision = decision or candidate` held the no-match.
+    row = _plan_one(tmp_path, [NO_MATCH, WEAK])
+    assert row.dest_key == "manga"
+    assert "weak" in row.reason_rule
+
+
+def test_later_strong_match_beats_an_earlier_weak_match(tmp_path: Path):
+    row = _plan_one(tmp_path, [WEAK, STRONG])
+    assert row.dest_key == "manga"
+    assert "strong" in row.reason_rule
+
+
+def test_no_match_anywhere_falls_through_to_the_default(tmp_path: Path):
+    row = _plan_one(tmp_path, [NO_MATCH, NO_MATCH, NO_MATCH])
+    assert row.dest_key == "graphic_novels"
+    assert row.reason_rule == "default"
+
+
+def test_repeated_weak_matches_do_not_fall_back_to_the_default(tmp_path: Path):
+    row = _plan_one(tmp_path, [WEAK, WEAK])
+    assert row.dest_key == "manga"
+    assert "weak" in row.reason_rule
+
+    # ... and still not once an untagged chapter is sampled first.
+    other = _plan_one(tmp_path / "second", [NO_MATCH, WEAK, WEAK])
+    assert other.dest_key == "manga"
+    assert "weak" in other.reason_rule
+
+
+def test_later_no_match_cannot_displace_an_earlier_weak_match(tmp_path: Path):
+    # Guards the opposite error from the regression: ranking must not be
+    # rewritten as "last sample wins".
+    row = _plan_one(tmp_path, [WEAK, NO_MATCH])
+    assert row.dest_key == "manga"
+    assert "weak" in row.reason_rule
 
 
 # ── apply guards ─────────────────────────────────────────────────

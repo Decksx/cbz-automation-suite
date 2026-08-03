@@ -165,15 +165,25 @@ def plan_series(
             build_context(source_name, series_dir.name, info),
             series_name=series_dir.name,
         )
-        # Any positive signal decides the series, but prefer a strong one if a
-        # later sample offers it; the weak (genre-word) signals are the
-        # unreliable ones.
-        if candidate.matched and "weak" not in (candidate.rule_name or ""):
+        # Rank the samples: strong match > weak match > no match. A strong
+        # signal ends the search; a weak one is held only until a strong one
+        # turns up, and a no-match is held only until anything matches.
+        #
+        # This has to test `decision.matched` rather than `decision` itself.
+        # A RoutingDecision defines neither __bool__ nor __len__, so an
+        # unmatched one is still truthy, and the earlier `decision = decision
+        # or candidate` therefore pinned the first sample's result: once a
+        # no-match was held, no later weak match could displace it, and the
+        # series fell to the default. That contradicts this module's rule that
+        # a series is Asian-origin when *any* sampled archive says so.
+        if candidate.matched:
+            if "weak" not in (candidate.rule_name or ""):
+                decision = candidate
+                break
+            if decision is None or not decision.matched:
+                decision = candidate
+        elif decision is None:
             decision = candidate
-            break
-        if candidate.matched and decision is None:
-            decision = candidate
-        decision = decision or candidate
 
     if decision is None:                        # empty directory
         decision = resolve(
