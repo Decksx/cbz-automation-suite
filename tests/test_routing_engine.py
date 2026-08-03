@@ -518,8 +518,8 @@ def test_alias_resolves_to_the_canonical_series_folder():
 
 def test_alias_works_before_the_series_exists_anywhere():
     cfg = _series_cfg()
-    decision = resolve(cfg, build_context("", "x"), "Kanojo Okarishimasu",
-                       _index_from({}))
+    decision = resolve(cfg, build_context("", "x"),
+                       series_name="Kanojo Okarishimasu", index=_index_from({}))
     assert decision.canonical_series == "Rent-a-Girlfriend"
 
 
@@ -599,8 +599,8 @@ def test_series_index_unknown_destination_raises():
 def test_series_config_round_trips_through_v2_dict():
     cfg = _series_cfg()
     again = parse(json.loads(json.dumps(to_v2_dict(cfg))))
-    decision = resolve(again, build_context("", "x"), "Kanojo Okarishimasu",
-                       _index_from({}))
+    decision = resolve(again, build_context("", "x"),
+                       series_name="Kanojo Okarishimasu", index=_index_from({}))
     assert decision.canonical_series == "Rent-a-Girlfriend"
     assert again.series_index_enabled
 
