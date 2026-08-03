@@ -116,6 +116,14 @@ the same suite on `windows-latest` / Python 3.11.
   entire planned work item was once found already implemented, tests and
   production migration included, while three audits still called it
   outstanding.
+- **Measure the environment; never infer it.** Filesystem, volume, and
+  access-path behavior is measured on the actual target before it is
+  written down or designed against. On 2026-08-02 three such claims were
+  asserted from plausible reasoning and all three were wrong: that the
+  library volume was SMB (locally attached), that it was NTFS (exFAT at
+  the time), and that a share-mode open would detect a concurrent writer
+  (0/16). Reasoning about these produces a hypothesis worth testing, not
+  a finding. See `docs/engineering_decisions.md`.
 - Implement an audit's low-risk tier; leave anything the audit itself
   marked as needing benchmarking, schema design, or environment-specific
   validation.
