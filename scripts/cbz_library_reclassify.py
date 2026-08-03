@@ -173,10 +173,18 @@ def plan_series(
             evidence.setdefault(key, value)
         # The series name must be passed, or resolve() never consults the
         # manual overrides -- they are keyed on it.
+        #
+        # route_unresolved=False at every resolution site here, including the
+        # empty-directory fallback below. This tool reclassifies a library
+        # that already exists: every series in it has a home, so diverting an
+        # unclassified one to a review destination would invent a move rather
+        # than plan one. The decision is still marked unresolved -- only its
+        # physical handling differs.
         candidate = resolve(
             cfg,
             build_context(source_name, series_dir.name, info),
             series_name=series_dir.name,
+            route_unresolved=False,
         )
         # Rank the samples: authoritative > strong > weak > none. A strong or
         # authoritative signal ends the search; a weak one is held only until
@@ -196,6 +204,7 @@ def plan_series(
         decision = resolve(
             cfg, build_context(source_name, series_dir.name, {}),
             series_name=series_dir.name,
+            route_unresolved=False,
         )
 
     canonical = decision.canonical_series or series_dir.name
