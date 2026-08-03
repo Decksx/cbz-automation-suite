@@ -374,6 +374,10 @@ def test_route_unresolved_false_uses_the_default_but_stays_unresolved():
     ({"destination": 3}, "non-empty string"),
     ("review", "must be an object"),
     ([], "must be an object"),
+    # Present-but-null is malformed, not absent. Treating it as absent lets
+    # an operator configure null and believe malformed config is rejected
+    # while routing quietly falls through to the default.
+    (None, "must be an object"),
 ])
 def test_a_malformed_unresolved_block_fails_closed(block, fragment):
     # Silently disabling itself would let an operator believe unclassified
@@ -420,6 +424,47 @@ def test_explain_names_unresolved_rather_than_inventing_a_rule():
     joined = "\n".join(lines)
     assert "Unresolved: no override, existing-series match, or routing rule" in joined
     assert "MATCH" not in joined
+
+
+def test_explain_describes_the_policy_that_actually_applied():
+    # The trace must not say the default was selected while the archive goes
+    # to review, nor label the result with a rule that never fired.
+    joined = "\n".join(explain(_unresolved_cfg(True),
+                               build_context("Indie", "Saga")))
+    assert "(default) -> graphic_novels" not in joined
+    assert "(unresolved handling) -> review" in joined
+    assert "=> review" in joined
+    assert "[unresolved]" in joined
+    assert "[default]" not in joined
+
+
+def test_explain_says_compatibility_default_when_review_is_not_used():
+    for cfg, kwargs in [(_unresolved_cfg(False), {}),
+                        (_unresolved_cfg(True), {"route_unresolved": False})]:
+        joined = "\n".join(explain(cfg, build_context("Indie", "Saga"), **kwargs))
+        assert "(unresolved; compatibility default) -> graphic_novels" in joined
+        assert "=> graphic_novels" in joined
+        assert "[unresolved]" in joined
+
+
+def test_explain_is_unchanged_for_a_matched_rule():
+    joined = "\n".join(explain(_unresolved_cfg(True),
+                               build_context("Asura Scans (EN)", "x")))
+    assert "MATCH Asian origin" in joined
+    assert "=> manga" in joined
+    assert "[Asian origin]" in joined
+    assert "Unresolved" not in joined
+
+
+def test_the_unresolved_reason_names_the_configured_destination():
+    # The setting accepts any destination key, so the reason must not
+    # hardcode one: a config routing to "triage" said "-> review".
+    raw = json.loads(json.dumps(V2))
+    raw["destinations"]["triage"] = "X:\\Triage"
+    raw["unresolved"] = {"destination": "triage"}
+    decision = resolve(parse(raw), build_context("Indie", "Saga"))
+    assert decision.dest_key == "triage"
+    assert decision.reason.endswith("-> triage")
 
 
 def test_review_hints_are_empty_on_every_decision():
