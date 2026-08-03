@@ -543,6 +543,146 @@ def test_malformed_json_raises_rather_than_defaulting(tmp_path: Path):
         load(bad)
 
 
+# ── comment keys are documentation, everywhere ───────────────────
+#
+# The defect these close: `lists` was built with `list(v)`, and a comment
+# string is iterable, so `"_comment_publishers": "Japanese/Korean ..."`
+# became a 116-entry list of single characters. Nothing raised, because
+# nothing referenced it -- but a comment name colliding with a referenced
+# list would have resolved and matched nothing.
+
+COMMENTED = {
+    "version": 2,
+    "destinations": {
+        "_comment_dest": "documentation, not a library",
+        "manga": "X:\\Manga",
+        "graphic_novels": "X:\\Graphic Novels",
+    },
+    "default": "graphic_novels",
+    "lists": {
+        "_comment_publishers": "Japanese/Korean publishers, taken from ComicInfo.",
+        "asian_publishers": ["yen press*"],
+    },
+    "signals": {
+        "_comment_signal": "why this signal exists",
+        "by_publisher": {
+            "any": [{"field": "comicinfo.Publisher",
+                     "glob_tokens_in_list": "asian_publishers"}]},
+    },
+    "rules": [{"_comment": "why this rule exists", "name": "origin",
+               "when": "by_publisher", "dest": "manga", "strength": "strong"}],
+    "series_index": {"_comment": "why", "enabled": False, "destinations": []},
+    "series_overrides": [{"_comment": "why", "canonical": "Pinned",
+                          "aliases": [], "dest": "manga"}],
+}
+
+
+def _commented(**mutations):
+    raw = json.loads(json.dumps(COMMENTED))
+    for key, value in mutations.items():
+        raw[key] = value
+    return raw
+
+
+def test_comment_keys_are_accepted_at_every_level():
+    cfg = parse(_commented())
+    assert "_comment_dest" not in cfg.destinations
+    assert "_comment_publishers" not in cfg.lists
+    assert "_comment_signal" not in cfg.signals
+    assert "_comment" not in cfg.rules[0]
+    assert cfg.rules[0]["name"] == "origin"
+    assert cfg.series_overrides[0].canonical == "Pinned"
+
+
+def test_a_comment_never_becomes_a_list_of_characters():
+    # The actual #24 defect. Before the fix this list had 116 entries.
+    cfg = parse(_commented())
+    assert list(cfg.lists) == ["asian_publishers"]
+    assert cfg.lists["asian_publishers"] == ["yen press*"]
+
+
+def test_a_comment_name_cannot_satisfy_a_list_reference():
+    raw = _commented()
+    raw["signals"]["by_publisher"] = {
+        "any": [{"field": "comicinfo.Publisher",
+                 "glob_tokens_in_list": "_comment_publishers"}]}
+    with pytest.raises(RoutingConfigError, match="unknown list"):
+        parse(raw)
+
+
+@pytest.mark.parametrize("mutate, fragment", [
+    (lambda r: r["rules"][0].__setitem__("dest", "_comment_dest"),
+     "is not defined"),
+    (lambda r: r["rules"][0].__setitem__("when", "_comment_signal"),
+     "unknown signal"),
+    (lambda r: r.__setitem__("default", "_comment_dest"), "is not one of"),
+    (lambda r: r["series_index"].__setitem__("destinations", ["_comment_dest"]),
+     "is not defined"),
+    (lambda r: r["series_overrides"][0].__setitem__("dest", "_comment_dest"),
+     "is not defined"),
+])
+def test_a_comment_cannot_satisfy_any_reference(mutate, fragment):
+    raw = _commented()
+    mutate(raw)
+    with pytest.raises(RoutingConfigError, match=fragment):
+        parse(raw)
+
+
+@pytest.mark.parametrize("value, fragment", [
+    ("yen press*", "must be an array of strings"),
+    ({"a": 1}, "must be an array of strings"),
+    (7, "must be an array of strings"),
+    (None, "must be an array of strings"),
+    (["ok", 7], "entry 1 must be a string"),
+    ([None], "entry 0 must be a string"),
+    ([["nested"]], "entry 0 must be a string"),
+])
+def test_a_malformed_list_fails_closed(value, fragment):
+    # Filtering comment keys alone would leave this open: any string is
+    # iterable, so a hand-edited scalar became a list of characters.
+    raw = _commented()
+    raw["lists"]["asian_publishers"] = value
+    with pytest.raises(RoutingConfigError, match=fragment):
+        parse(raw)
+
+
+def test_lists_itself_must_be_an_object():
+    with pytest.raises(RoutingConfigError, match="'lists' must be an object"):
+        parse(_commented(lists=["asian_publishers"]))
+
+
+def test_canonical_serialisation_drops_comments_and_reparses():
+    cfg = parse(_commented())
+    canonical = to_v2_dict(cfg)
+
+    def comment_keys(node, path="root"):
+        found = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if str(key).startswith("_"):
+                    found.append(f"{path}.{key}")
+                found += comment_keys(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                found += comment_keys(value, f"{path}[{i}]")
+        return found
+
+    assert comment_keys(canonical) == []
+    # Comments are documentation, not configuration: they are deliberately
+    # not preserved through serialisation.
+    again = parse(json.loads(json.dumps(canonical)))
+    assert to_v2_dict(again) == canonical
+
+
+def test_the_staged_config_has_no_character_lists():
+    # Gate on the real file: it carries three comment keys inside "lists".
+    cfg = load(Path(__file__).resolve().parents[1] / "config" / "routing.v2.json")
+    assert not any(name.startswith("_") for name in cfg.lists)
+    for name, patterns in cfg.lists.items():
+        assert all(isinstance(p, str) for p in patterns)
+        assert not all(len(p) == 1 for p in patterns), name
+
+
 # ── v1 compatibility ─────────────────────────────────────────────
 
 V1 = {
