@@ -760,7 +760,47 @@ def parse(raw: dict) -> RoutingConfig:
             seen_keys[key] = override.canonical
 
     index_cfg = _parse_mapping_block(raw, "series_index")
-    index_dests = tuple(index_cfg.get("destinations") or ())
+
+    # A real Boolean, not a truthy value. bool("false") and bool("no") are
+    # both True, so coercion turned two ordinary ways of writing "off" into
+    # index authority switched on -- and the index makes placement sticky
+    # with Comix-first priority, which encodes an adult determination.
+    # Silently enabling that is the wrong way to fail. isinstance rejects 0
+    # and 1 for free: they are int, not bool.
+    if "enabled" not in index_cfg:
+        index_enabled = False
+    elif not isinstance(index_cfg["enabled"], bool):
+        raise RoutingConfigError(
+            f"series_index.enabled must be true or false, got "
+            f"{index_cfg['enabled']!r}"
+        )
+    else:
+        index_enabled = index_cfg["enabled"]
+
+    # Absent, null, and [] all mean "index every configured destination" --
+    # SeriesIndex.build expands the empty tuple -- so the permissiveness here
+    # is deliberate and the three forms are genuinely equivalent. Anything
+    # else must be an array of strings, validated on its own contract before
+    # the reference check below. A scalar "comix" would otherwise iterate
+    # into characters and fail with "destination 'c' is not defined", which
+    # points nowhere near the real mistake.
+    raw_dests = index_cfg.get("destinations")
+    if raw_dests is None:
+        index_dests: tuple[str, ...] = ()
+    elif not isinstance(raw_dests, list):
+        raise RoutingConfigError(
+            f"series_index.destinations must be an array of strings, got "
+            f"{type(raw_dests).__name__}"
+        )
+    else:
+        for position, dest in enumerate(raw_dests):
+            if not isinstance(dest, str):
+                raise RoutingConfigError(
+                    f"series_index.destinations entry {position} must be a "
+                    f"string, got {type(dest).__name__}"
+                )
+        index_dests = tuple(raw_dests)
+
     for dest in index_dests:
         if dest not in destinations:
             raise RoutingConfigError(
@@ -804,7 +844,7 @@ def parse(raw: dict) -> RoutingConfig:
                for i, r in enumerate(_parse_sequence_block(raw, "rules"))],
         source_version=source_version,
         series_overrides=tuple(overrides),
-        series_index_enabled=bool(index_cfg.get("enabled", False)),
+        series_index_enabled=index_enabled,
         series_index_destinations=index_dests,
         unresolved_destination=unresolved_destination,
     )
