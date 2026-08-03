@@ -73,6 +73,13 @@ RULE_STRENGTHS = frozenset({"weak", "strong"})
 # identically rather than silently demoting them.
 DEFAULT_RULE_STRENGTH: EvidenceStrength = "strong"
 
+# Whether classification actually established a destination. Orthogonal to
+# both strength and authority: a decision can be resolved with no evidence
+# (an override), and an unresolved one still has a dest_key, because the
+# archive has to go somewhere. Confidence says how that destination was
+# arrived at, not where it is.
+Confidence = Literal["resolved", "unresolved"]
+
 # Series-name normalisation, kept byte-for-byte compatible with
 # cbz_watcher._series_key so the index agrees with the watcher's own
 # existing-folder matching rather than being a second, subtly different
@@ -91,6 +98,21 @@ def series_key(name: str) -> str:
 
 class RoutingConfigError(ValueError):
     """Raised for any structurally invalid routing configuration."""
+
+
+@dataclass(frozen=True)
+class ReviewHint:
+    """Advisory evidence attached to a decision, never a routing reason.
+
+    A hint explains why an unresolved archive was surfaced for review and
+    what a reviewer might conclude. It must not influence dest_key: title
+    words in particular are far weaker evidence than the provenance signals
+    the rules use, and letting them route would degrade a classifier that
+    currently misfiles two series in 646.
+    """
+
+    kind: str
+    value: str
 
 
 @dataclass(frozen=True)
@@ -115,6 +137,14 @@ class RoutingDecision:
     # regardless of how strong that evidence is, and saying so with a flag is
     # clearer than inventing a fourth strength above "strong".
     authoritative: bool = False
+    # Whether classification established this destination at all. Stays
+    # "unresolved" for a no-match even when compatibility behaviour sends it
+    # to the ordinary default -- where the archive went is a policy question,
+    # whether it was classified is not.
+    confidence: Confidence = "resolved"
+    # Advisory only, and empty until hint producers exist. Never consulted
+    # when choosing dest_key.
+    review_hints: tuple[ReviewHint, ...] = ()
 
     @property
     def matched(self) -> bool:
@@ -158,6 +188,10 @@ class RoutingConfig:
     # have been migrated, or the index will pin them where they sit.
     series_index_enabled: bool = False
     series_index_destinations: tuple[str, ...] = ()
+    # Where an archive goes when nothing classified it. None keeps the
+    # pre-existing behaviour of falling through to `default`, which is what
+    # every config in this repository still does.
+    unresolved_destination: str | None = None
 
     @property
     def default_path(self) -> str:
@@ -391,8 +425,10 @@ def _evaluate_matcher(node: dict, context: dict[str, str],
 def resolve(
     cfg: RoutingConfig,
     context: dict[str, str],
+    *,
     series_name: str | None = None,
     index: SeriesIndex | None = None,
+    route_unresolved: bool = True,
 ) -> RoutingDecision:
     """Decide a destination.
 
@@ -409,6 +445,13 @@ def resolve(
     A series found in two libraries at once is treated as no match: the
     library disagrees with itself, so the rules stay authoritative rather
     than the engine picking one arbitrarily.
+
+    `route_unresolved` is the caller's handling policy, not a statement about
+    the decision. A no-match is always confidence="unresolved"; the flag only
+    decides whether it goes to the configured review destination or falls
+    through to `default`. A migration tool reclassifying an existing library
+    passes False -- those series already have a home, so "unresolved" has no
+    useful destination to offer them.
     """
     canonical: str | None = None
     effective = series_name
@@ -452,10 +495,23 @@ def resolve(
                                    ambiguous_series=ambiguous,
                                    evidence_strength=rule.get(
                                        "strength", DEFAULT_RULE_STRENGTH))
+
+    # Nothing classified this. The destination is a policy question; the fact
+    # that classification failed is not, so confidence is unresolved either
+    # way. The reason text for the compatibility path is left exactly as it
+    # was, so a caller that records it keeps producing identical output.
+    if route_unresolved and cfg.unresolved_destination:
+        key = cfg.unresolved_destination
+        return RoutingDecision(key, cfg.destinations[key], None,
+                               f"no rule matched; unresolved -> {key}",
+                               canonical_series=canonical,
+                               ambiguous_series=ambiguous,
+                               confidence="unresolved")
     return RoutingDecision(cfg.default_key, cfg.default_path, None,
                            "no rule matched; default",
                            canonical_series=canonical,
-                           ambiguous_series=ambiguous)
+                           ambiguous_series=ambiguous,
+                           confidence="unresolved")
 
 
 def explain(
@@ -463,6 +519,8 @@ def explain(
     context: dict[str, str],
     series_name: str | None = None,
     index: SeriesIndex | None = None,
+    *,
+    route_unresolved: bool = True,
 ) -> list[str]:
     """Full trace: overrides, the series index, then every rule."""
     lines = [f"context: {context}"]
@@ -484,7 +542,8 @@ def explain(
             else:
                 lines.append("  --  series index: no existing folder")
 
-    decision = resolve(cfg, context, series_name, index)
+    decision = resolve(cfg, context, series_name=series_name,
+                       index=index, route_unresolved=route_unresolved)
     for rule in cfg.rules:
         ok, why = _evaluate(rule["when"], context, cfg)
         lines.append(f"{'MATCH ' if ok else '  --  '}"
@@ -492,10 +551,31 @@ def explain(
         if ok:
             break
     else:
-        lines.append(f"  --  (default) -> {cfg.default_key}")
+        # Describe the policy that actually applied. Printing "(default)"
+        # while the archive goes to a review destination is a trace that
+        # contradicts its own conclusion.
+        if decision.confidence == "unresolved":
+            if route_unresolved and cfg.unresolved_destination:
+                lines.append(
+                    f"  --  (unresolved handling) -> {decision.dest_key}")
+            else:
+                lines.append(f"  --  (unresolved; compatibility default) "
+                             f"-> {cfg.default_key}")
+        else:
+            lines.append(f"  --  (default) -> {cfg.default_key}")
 
+    # Say plainly that nothing classified this, rather than letting the
+    # trailing summary read as though the default were a matched rule.
+    if decision.confidence == "unresolved":
+        lines.append("Unresolved: no override, existing-series match, or "
+                     "routing rule matched.")
+
+    # Never label a missing rule_name "default": with review routing enabled
+    # the destination is not the default, and the label would name a rule
+    # that never fired.
+    label = decision.rule_name or decision.confidence
     lines.append(f"       => {decision.dest_key} = {decision.dest_path} "
-                 f"[{decision.rule_name or 'default'}]")
+                 f"[{label}]")
     return lines
 
 
@@ -613,6 +693,31 @@ def parse(raw: dict) -> RoutingConfig:
                 f"series_index destination {dest!r} is not defined"
             )
 
+    # Fail closed: a malformed unresolved block must raise rather than
+    # quietly disable itself, or an operator who typoed the key would believe
+    # unclassified archives were being held back when they were not.
+    unresolved_destination = None
+    if "unresolved" in raw:
+        # Present-but-null is malformed, not absent. Treating it as absent
+        # would let an operator write `"unresolved": null`, believe malformed
+        # configuration is rejected, and get a silent fallthrough to default
+        # instead -- the exact failure this block is meant to make impossible.
+        block = raw["unresolved"]
+        if not isinstance(block, dict):
+            raise RoutingConfigError(
+                f"'unresolved' must be an object, got {type(block).__name__}"
+            )
+        dest = block.get("destination")
+        if not isinstance(dest, str) or not dest.strip():
+            raise RoutingConfigError(
+                f"unresolved.destination must be a non-empty string, got {dest!r}"
+            )
+        if dest not in destinations:
+            raise RoutingConfigError(
+                f"unresolved destination {dest!r} is not one of {sorted(destinations)}"
+            )
+        unresolved_destination = dest
+
     cfg = RoutingConfig(
         destinations=destinations,
         default_key=default_key,
@@ -623,6 +728,7 @@ def parse(raw: dict) -> RoutingConfig:
         series_overrides=tuple(overrides),
         series_index_enabled=bool(index_cfg.get("enabled", False)),
         series_index_destinations=index_dests,
+        unresolved_destination=unresolved_destination,
     )
 
     for index, rule in enumerate(cfg.rules):
@@ -722,4 +828,8 @@ def to_v2_dict(cfg: RoutingConfig) -> dict:
             "enabled": cfg.series_index_enabled,
             "destinations": list(cfg.series_index_destinations),
         },
+        # Omitted when unset, so a config that never enabled it round-trips
+        # to a file that still has not enabled it.
+        **({"unresolved": {"destination": cfg.unresolved_destination}}
+           if cfg.unresolved_destination else {}),
     }

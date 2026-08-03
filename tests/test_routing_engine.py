@@ -289,6 +289,192 @@ def test_unknown_list_is_still_rejected_for_the_new_operator():
         parse(raw)
 
 
+# ── unresolved decisions ─────────────────────────────────────────
+#
+# Confidence answers "did anything classify this", dest_key answers "where
+# does it go". They are separate because a no-match still needs somewhere to
+# put the archive, and the caller's handling policy must not be able to
+# rewrite the fact that classification failed.
+
+
+def _unresolved_cfg(enabled: bool):
+    raw = json.loads(json.dumps(V2))
+    raw["destinations"]["review"] = "X:\\Review"
+    if enabled:
+        raw["unresolved"] = {"destination": "review"}
+    return parse(raw)
+
+
+def test_no_match_is_unresolved_even_when_sent_to_the_default():
+    # The compatibility path: without an unresolved block the archive still
+    # lands in graphic_novels, but nothing classified it and it must say so.
+    decision = resolve(_unresolved_cfg(False), build_context("Indie", "Saga"))
+    assert decision.confidence == "unresolved"
+    assert decision.dest_key == "graphic_novels"
+    assert decision.rule_name is None
+    assert decision.evidence_strength == "none"
+    assert decision.authoritative is False
+
+
+def test_a_matched_rule_pointing_at_the_default_is_resolved():
+    # A rule that happens to select the default destination classified the
+    # archive; that is not the same as falling through to it.
+    raw = json.loads(json.dumps(V2))
+    raw["rules"] = [{"name": "western", "when": "asian_origin",
+                     "dest": "graphic_novels"}]
+    decision = resolve(parse(raw), build_context("", "", {"LanguageISO": "ja"}))
+    assert decision.dest_key == "graphic_novels"
+    assert decision.confidence == "resolved"
+    assert decision.matched
+
+
+def test_override_and_index_decisions_are_resolved_and_authoritative():
+    raw = json.loads(json.dumps(V2))
+    raw["series_overrides"] = [{"canonical": "Pinned", "aliases": [],
+                                "dest": "comix"}]
+    cfg = parse(raw)
+    pinned = resolve(cfg, build_context("", "", {}), series_name="Pinned")
+    assert (pinned.confidence, pinned.authoritative) == ("resolved", True)
+
+    idx = SeriesIndex(priority=("comix", "manga", "graphic_novels"))
+    idx.add("Berserk", "comix", Path("X:/Comix/Berserk"))
+    hit = resolve(cfg, build_context("", "", {}),
+                  series_name="Berserk", index=idx)
+    assert (hit.confidence, hit.authoritative) == ("resolved", True)
+
+
+def test_an_enabled_unresolved_destination_takes_only_no_matches():
+    cfg = _unresolved_cfg(True)
+    stray = resolve(cfg, build_context("Indie", "Saga"))
+    assert stray.dest_key == "review"
+    assert stray.confidence == "unresolved"
+
+    # Anything that classified must be unaffected by the block existing.
+    for ctx, expected in [
+        (build_context("", "", {"LanguageISO": "ja"}), "manga"),
+        (build_context("", "", {"AgeRating": "Adults Only 18+"}), "comix"),
+    ]:
+        decision = resolve(cfg, ctx)
+        assert decision.dest_key == expected
+        assert decision.confidence == "resolved"
+
+
+def test_route_unresolved_false_uses_the_default_but_stays_unresolved():
+    decision = resolve(_unresolved_cfg(True), build_context("Indie", "Saga"),
+                       route_unresolved=False)
+    assert decision.dest_key == "graphic_novels"
+    assert decision.confidence == "unresolved"
+
+
+@pytest.mark.parametrize("block, fragment", [
+    ({"destination": "nowhere"}, "not one of"),
+    ({"destination": ""}, "non-empty string"),
+    ({"destination": None}, "non-empty string"),
+    ({}, "non-empty string"),
+    ({"destination": 3}, "non-empty string"),
+    ("review", "must be an object"),
+    ([], "must be an object"),
+    # Present-but-null is malformed, not absent. Treating it as absent lets
+    # an operator configure null and believe malformed config is rejected
+    # while routing quietly falls through to the default.
+    (None, "must be an object"),
+])
+def test_a_malformed_unresolved_block_fails_closed(block, fragment):
+    # Silently disabling itself would let an operator believe unclassified
+    # archives were being held back when they were not.
+    raw = json.loads(json.dumps(V2))
+    raw["destinations"]["review"] = "X:\\Review"
+    raw["unresolved"] = block
+    with pytest.raises(RoutingConfigError, match=fragment):
+        parse(raw)
+
+
+def test_absent_unresolved_block_leaves_routing_unchanged():
+    plain = parse(json.loads(json.dumps(V2)))
+    assert plain.unresolved_destination is None
+    assert resolve(plain, build_context("Indie", "Saga")).dest_key == "graphic_novels"
+
+
+def test_v1_conversion_leaves_unresolved_routing_disabled():
+    v1 = {
+        "version": 1,
+        "destinations": {"manga": "X:\\Manga", "gn": "X:\\GN"},
+        "default": "gn",
+        "rules": [{"match": "source", "pattern": "Asura*", "dest": "manga"}],
+    }
+    cfg = parse(v1)
+    assert cfg.unresolved_destination is None
+    assert resolve(cfg, build_context("Indie", "x")).confidence == "unresolved"
+
+
+def test_unresolved_setting_round_trips_through_v2_dict():
+    cfg = _unresolved_cfg(True)
+    again = parse(json.loads(json.dumps(to_v2_dict(cfg))))
+    assert again.unresolved_destination == "review"
+    assert resolve(again, build_context("Indie", "Saga")).dest_key == "review"
+
+    # And a config that never enabled it round-trips to one that still has not.
+    off = to_v2_dict(_unresolved_cfg(False))
+    assert "unresolved" not in off
+    assert parse(json.loads(json.dumps(off))).unresolved_destination is None
+
+
+def test_explain_names_unresolved_rather_than_inventing_a_rule():
+    lines = explain(_unresolved_cfg(True), build_context("Indie", "Saga"))
+    joined = "\n".join(lines)
+    assert "Unresolved: no override, existing-series match, or routing rule" in joined
+    assert "MATCH" not in joined
+
+
+def test_explain_describes_the_policy_that_actually_applied():
+    # The trace must not say the default was selected while the archive goes
+    # to review, nor label the result with a rule that never fired.
+    joined = "\n".join(explain(_unresolved_cfg(True),
+                               build_context("Indie", "Saga")))
+    assert "(default) -> graphic_novels" not in joined
+    assert "(unresolved handling) -> review" in joined
+    assert "=> review" in joined
+    assert "[unresolved]" in joined
+    assert "[default]" not in joined
+
+
+def test_explain_says_compatibility_default_when_review_is_not_used():
+    for cfg, kwargs in [(_unresolved_cfg(False), {}),
+                        (_unresolved_cfg(True), {"route_unresolved": False})]:
+        joined = "\n".join(explain(cfg, build_context("Indie", "Saga"), **kwargs))
+        assert "(unresolved; compatibility default) -> graphic_novels" in joined
+        assert "=> graphic_novels" in joined
+        assert "[unresolved]" in joined
+
+
+def test_explain_is_unchanged_for_a_matched_rule():
+    joined = "\n".join(explain(_unresolved_cfg(True),
+                               build_context("Asura Scans (EN)", "x")))
+    assert "MATCH Asian origin" in joined
+    assert "=> manga" in joined
+    assert "[Asian origin]" in joined
+    assert "Unresolved" not in joined
+
+
+def test_the_unresolved_reason_names_the_configured_destination():
+    # The setting accepts any destination key, so the reason must not
+    # hardcode one: a config routing to "triage" said "-> review".
+    raw = json.loads(json.dumps(V2))
+    raw["destinations"]["triage"] = "X:\\Triage"
+    raw["unresolved"] = {"destination": "triage"}
+    decision = resolve(parse(raw), build_context("Indie", "Saga"))
+    assert decision.dest_key == "triage"
+    assert decision.reason.endswith("-> triage")
+
+
+def test_review_hints_are_empty_on_every_decision():
+    cfg = _unresolved_cfg(True)
+    for ctx in (build_context("Indie", "Saga"),
+                build_context("", "", {"LanguageISO": "ja"}),
+                build_context("", "", {"AgeRating": "Adults Only 18+"})):
+        assert resolve(cfg, ctx).review_hints == ()
+
+
 # ── decisions are explainable ────────────────────────────────────
 
 
@@ -458,7 +644,7 @@ def test_existing_series_wins_over_rules():
     cfg = _series_cfg()
     idx = _index_from({"manga": ["Some Western Sounding Title"]})
     decision = resolve(cfg, build_context("Indie", "x"),
-                       "Some Western Sounding Title", idx)
+                       series_name="Some Western Sounding Title", index=idx)
     assert decision.dest_key == "manga"
     assert decision.rule_name == "existing series"
     assert decision.series_dir is not None
@@ -467,7 +653,8 @@ def test_existing_series_wins_over_rules():
 def test_series_absent_from_index_falls_through_to_rules():
     cfg = _series_cfg()
     idx = _index_from({"manga": ["Something Else"]})
-    decision = resolve(cfg, build_context("", "x", ), "Brand New Series", idx)
+    decision = resolve(cfg, build_context("", "x", ),
+                       series_name="Brand New Series", index=idx)
     assert decision.dest_key == "graphic_novels"
 
 
@@ -479,7 +666,7 @@ def test_series_in_two_libraries_resolves_by_destination_priority():
     cfg = _series_cfg()
     idx = _index_from({"comix": ["Split Series"], "manga": ["Split Series"]})
     decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
-                       "Split Series", idx)
+                       series_name="Split Series", index=idx)
     assert decision.dest_key == "comix"
     assert decision.rule_name == "existing series"
     assert decision.ambiguous_series
@@ -500,7 +687,7 @@ def test_curated_comix_membership_outranks_asian_origin_metadata():
     cfg = _series_cfg()
     idx = _index_from({"comix": ["Some Adult Manga"]})
     decision = resolve(cfg, build_context("Asura Scans (EN)", "x"),
-                       "Some Adult Manga", idx)
+                       series_name="Some Adult Manga", index=idx)
     assert decision.dest_key == "comix"
     assert decision.rule_name == "existing series"
 
@@ -508,7 +695,8 @@ def test_curated_comix_membership_outranks_asian_origin_metadata():
 def test_alias_resolves_to_the_canonical_series_folder():
     cfg = _series_cfg()
     idx = _index_from({"manga": ["Rent-a-Girlfriend"]})
-    decision = resolve(cfg, build_context("", "x"), "Kanojo, Okarishimasu", idx)
+    decision = resolve(cfg, build_context("", "x"),
+                       series_name="Kanojo, Okarishimasu", index=idx)
     assert decision.dest_key == "manga"
     assert decision.canonical_series == "Rent-a-Girlfriend"
     assert decision.series_dir == Path("X:/manga/Rent-a-Girlfriend")
@@ -516,8 +704,8 @@ def test_alias_resolves_to_the_canonical_series_folder():
 
 def test_alias_works_before_the_series_exists_anywhere():
     cfg = _series_cfg()
-    decision = resolve(cfg, build_context("", "x"), "Kanojo Okarishimasu",
-                       _index_from({}))
+    decision = resolve(cfg, build_context("", "x"),
+                       series_name="Kanojo Okarishimasu", index=_index_from({}))
     assert decision.canonical_series == "Rent-a-Girlfriend"
 
 
@@ -525,7 +713,7 @@ def test_override_can_pin_a_destination_outright():
     cfg = _series_cfg()
     idx = _index_from({"graphic_novels": ["Berserk of Gluttony"]})
     decision = resolve(cfg, build_context("Indie", "x"),
-                       "Berserk of Gluttony", idx)
+                       series_name="Berserk of Gluttony", index=idx)
     # Pinned dest outranks even an existing folder elsewhere.
     assert decision.dest_key == "manga"
     assert decision.rule_name == "series override"
@@ -597,8 +785,8 @@ def test_series_index_unknown_destination_raises():
 def test_series_config_round_trips_through_v2_dict():
     cfg = _series_cfg()
     again = parse(json.loads(json.dumps(to_v2_dict(cfg))))
-    decision = resolve(again, build_context("", "x"), "Kanojo Okarishimasu",
-                       _index_from({}))
+    decision = resolve(again, build_context("", "x"),
+                       series_name="Kanojo Okarishimasu", index=_index_from({}))
     assert decision.canonical_series == "Rent-a-Girlfriend"
     assert again.series_index_enabled
 
