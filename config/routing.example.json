@@ -61,9 +61,9 @@
     }
   ],
 
-  "_comment_series_index": "When enabled, a series that already has a folder in one of these destinations keeps going there, so it never splits across libraries because one chapter arrived without usable metadata. Built once per scan pass, not per directory. DISABLED BY DEFAULT ON PURPOSE: it makes current placement sticky, so enabling it before the library is classified correctly would pin every misplaced or retired-library series exactly where it sits. Enable it after reclassification, listing only active destinations.",
+  "_comment_series_index": "A series that already has a folder in one of these destinations keeps going there, so it never splits across libraries because one chapter arrived without usable metadata. Built once per scan pass, not per directory. ORDER IS PRECEDENCE: if a series somehow exists in two libraries the first listed wins, so put the library whose membership encodes a human decision first -- Comix membership is a deliberate adult determination and must outrank a metadata-derived origin signal. Do NOT list a library that is being retired or is known-misclassified until its contents have been migrated, or the index will pin them where they sit.",
   "series_index": {
-    "enabled": false,
+    "enabled": true,
     "destinations": ["comix", "manga", "graphic_novels"]
   }
 }
