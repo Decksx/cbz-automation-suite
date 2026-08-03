@@ -54,8 +54,8 @@
       "any": [
         { "field": "comicinfo.LanguageISO", "in_list": "asian_languages" },
         { "field": "comicinfo.Manga",       "in": ["Yes", "YesAndRightToLeft"] },
-        { "field": "comicinfo.Publisher",   "glob_in_list": "asian_publishers" },
-        { "field": "comicinfo.Imprint",     "glob_in_list": "asian_publishers" },
+        { "field": "comicinfo.Publisher",   "glob_tokens_in_list": "asian_publishers" },
+        { "field": "comicinfo.Imprint",     "glob_tokens_in_list": "asian_publishers" },
         { "field": "comicinfo.Web",         "glob_in_list": "asian_sites" },
         { "field": "comicinfo.Format",      "contains_any": ["manga", "manhwa", "manhua"] }
       ]
@@ -73,7 +73,12 @@
   },
 
   "rules": [
-    { "name": "explicit adult content",  "when": "explicitly_adult",    "dest": "comix" },
+    {
+      "_comment_explicitly_adult": "PLACEHOLDER ONLY. The August 2026 census found zero matches across 18,119 series because Adults Only 18+ and X18+ do not occur in the measured library metadata. This is not an operative adult-classification safeguard. Replace it with the validated Categories + SourceMihon + Web provenance signal before routing v2 is activated.",
+      "name": "explicit adult content",
+      "when": "explicitly_adult",
+      "dest": "comix"
+    },
     { "name": "Asian origin (strong)",   "when": "asian_origin_strong", "dest": "manga" },
     { "name": "Asian origin (weak)",     "when": "asian_origin_weak",   "dest": "manga" }
   ],

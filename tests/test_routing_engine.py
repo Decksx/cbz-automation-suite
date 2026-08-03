@@ -121,6 +121,104 @@ def test_matching_is_case_insensitive_on_field_names_and_values():
     assert _route(languageiso="JA").dest_key == "manga"
 
 
+# ── comma-joined fields ──────────────────────────────────────────
+#
+# Publisher and Imprint hold lists, e.g. "Gangan Wing,Yen Press". Applying
+# an anchored pattern to the whole value can only match when the publisher
+# of interest happens to be listed first, so those two fields tokenise.
+# Web does not: it holds one URL, and a URL may legitimately contain a
+# comma.
+
+TOKENS = {
+    "version": 2,
+    "destinations": {"manga": "X:\\Manga", "graphic_novels": "X:\\Graphic Novels"},
+    "default": "graphic_novels",
+    "lists": {
+        "asian_publishers": ["yen press*", "line*", "takeshobo*"],
+        "asian_sites": ["*mangadex*", "*a,b*"],
+    },
+    "signals": {
+        "by_publisher": {
+            "any": [{"field": "comicinfo.Publisher",
+                     "glob_tokens_in_list": "asian_publishers"}]},
+        "by_imprint": {
+            "any": [{"field": "comicinfo.Imprint",
+                     "glob_tokens_in_list": "asian_publishers"}]},
+        "by_web": {
+            "any": [{"field": "comicinfo.Web",
+                     "glob_in_list": "asian_sites"}]},
+        "by_publisher_untokenised": {
+            "any": [{"field": "comicinfo.Publisher",
+                     "glob_in_list": "asian_publishers"}]},
+    },
+    "rules": [],
+}
+
+
+def _matches(signal: str, **comicinfo) -> bool:
+    raw = json.loads(json.dumps(TOKENS))
+    raw["rules"] = [{"name": signal, "when": signal, "dest": "manga"}]
+    cfg = parse(raw)
+    return resolve(cfg, build_context("", "", comicinfo)).dest_key == "manga"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("Yen Press", True),
+    ("Gangan Wing,Yen Press", True),
+    ("Gangan Wing, Yen Press", True),
+    ("Gangan Wing,, Yen Press", True),      # empty tokens are skipped
+    ("Not Yen Pressed", False),             # the glob is still anchored
+    ("LINE", True),
+    ("Deadline Comics", False),             # "line*" must not match mid-token
+])
+def test_publisher_tokens_match_per_token(value, expected):
+    assert _matches("by_publisher", Publisher=value) is expected
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("Yen Press", True),
+    ("Gangan Wing,Yen Press", True),
+    ("Deadline Comics", False),
+])
+def test_imprint_tokenises_the_same_way(value, expected):
+    # Imprint carries no data in the measured library, but it is the same
+    # kind of field and must not behave differently from Publisher.
+    assert _matches("by_imprint", Imprint=value) is expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", ",", "  ,  ,"])
+def test_absent_and_empty_publisher_values_are_false(value):
+    assert _matches("by_publisher", Publisher=value) is False
+
+
+def test_missing_publisher_field_is_false_not_an_error():
+    assert _matches("by_publisher") is False
+
+
+def test_glob_in_list_still_matches_against_the_whole_value():
+    # The behaviour deliberately left alone: a comma-joined value is still
+    # matched whole, so an anchored pattern still fails on it. Changing this
+    # is what the new operator exists to avoid having to do.
+    assert _matches("by_publisher_untokenised",
+                    Publisher="Gangan Wing,Yen Press") is False
+    assert _matches("by_publisher_untokenised", Publisher="Yen Press") is True
+
+
+def test_web_domain_matching_is_not_tokenised():
+    # A URL containing a comma must still be matched as one string. If Web
+    # were tokenised, "*a,b*" could never match any token.
+    assert _matches("by_web", Web="https://reader.example/a,b/1") is True
+    assert _matches("by_web", Web="https://mangadex.org/chapter/1") is True
+
+
+def test_unknown_list_is_still_rejected_for_the_new_operator():
+    raw = json.loads(json.dumps(TOKENS))
+    raw["signals"]["by_publisher"]["any"][0]["glob_tokens_in_list"] = "nope"
+    raw["rules"] = [{"name": "x", "when": "by_publisher", "dest": "manga"}]
+    with pytest.raises(RoutingConfigError, match="unknown list"):
+        parse(raw)
+
+
 # ── decisions are explainable ────────────────────────────────────
 
 

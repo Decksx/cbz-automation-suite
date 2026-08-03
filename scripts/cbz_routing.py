@@ -41,8 +41,15 @@ from pathlib import Path
 from typing import Any
 
 VALID_OPERATORS = frozenset(
-    {"equals", "in", "in_list", "glob", "glob_in_list", "contains_any"}
+    {"equals", "in", "in_list", "glob", "glob_in_list", "glob_tokens_in_list",
+     "contains_any"}
 )
+# Fields that carry a comma-joined list rather than one value split on this.
+# Only the comma: a census of the live library found it to be the sole
+# separator present in Publisher, and no occurrences at all of ';', '|', '/'
+# or '&'. Adding speculative separators would widen matching with nothing
+# measured to justify it.
+TOKEN_SEPARATOR = ","
 COMBINATORS = frozenset({"any", "all", "not"})
 COMICINFO_PREFIX = "comicinfo."
 
@@ -329,6 +336,21 @@ def _evaluate_matcher(node: dict, context: dict[str, str],
     elif op == "glob_in_list":
         ok = any(fnmatch.fnmatch(folded, str(p).casefold())
                  for p in named_list(str(operand)))
+    elif op == "glob_tokens_in_list":
+        # Publisher and Imprint carry comma-joined lists, e.g. "Gangan
+        # Wing,Yen Press". glob_in_list applies the pattern to the whole
+        # field, so an anchored pattern like "yen press*" cannot match unless
+        # that publisher happens to be listed first. Match each token
+        # separately instead.
+        #
+        # Deliberately not folded into glob_in_list: Web values are single
+        # URLs, not lists, and a URL legitimately contains commas. Splitting
+        # them would change domain matching for no measured benefit.
+        patterns = [str(p).casefold() for p in named_list(str(operand))]
+        tokens = [t.strip() for t in folded.split(TOKEN_SEPARATOR)]
+        ok = any(fnmatch.fnmatch(token, pattern)
+                 for token in tokens if token
+                 for pattern in patterns)
     else:  # contains_any -- for comma-joined free text like Genre/Tags
         ok = any(str(x).casefold() in folded for x in operand)
 
@@ -624,7 +646,8 @@ def _validate_predicate(node: Any, cfg: RoutingConfig,
     op = operators[0]
     if op not in VALID_OPERATORS:
         raise RoutingConfigError(f"unknown operator {op!r} on field {node['field']!r}")
-    if op in ("in_list", "glob_in_list") and str(node[op]) not in cfg.lists:
+    if op in ("in_list", "glob_in_list", "glob_tokens_in_list") \
+            and str(node[op]) not in cfg.lists:
         raise RoutingConfigError(f"unknown list: {node[op]!r}")
 
 
