@@ -33,7 +33,11 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.cbz_library_reclassify import read_comic_info, sample_archives
+from scripts.cbz_library_reclassify import (
+    read_comic_info,
+    sample_archives,
+    spread_sample,
+)
 from scripts.cbz_routing import (
     RoutingConfig,
     RoutingDecision,
@@ -118,13 +122,34 @@ class ShadowComparison:
         )
 
 
+def _normalise(path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:                     # unresolvable path: compare textually
+        return Path(path)
+
+
 def _same_dir(a: str, b: str) -> bool:
     if not a or not b:
         return False
-    try:
-        return Path(a).resolve() == Path(b).resolve()
-    except OSError:                     # unresolvable path: compare textually
-        return Path(a) == Path(b)
+    return _normalise(a) == _normalise(b)
+
+
+def summarise(results: list[ShadowComparison]) -> str:
+    """One line for the end of one processing pass.
+
+    Takes the results rather than reading router state: a long-running daemon
+    must not accumulate a comparison per directory for its whole lifetime, and
+    per-call state also keeps overlapping passes from mixing.
+    """
+    if not results:
+        return "  Routing v2 shadow: no directories classified."
+    differ = [c for c in results if not c.agrees]
+    unresolved = [c for c in results if c.decision.confidence == "unresolved"]
+    return (
+        f"  Routing v2 shadow: {len(results)} classified, {len(differ)} would "
+        f"differ from legacy, {len(unresolved)} unresolved."
+    )
 
 
 class WatcherRouter:
@@ -142,7 +167,11 @@ class WatcherRouter:
         self.index = index
         self.mode = mode
         self.sample_limit = sample_limit
-        self.comparisons: list[ShadowComparison] = []
+        # Destination path -> key. The legacy resolver yields a path and the
+        # v2 model a key, so recording a completed move needs the reverse map.
+        self._key_by_path = {
+            _normalise(path): key for key, path in cfg.destinations.items()
+        }
 
     @classmethod
     def load(cls, config_path: Path, *, mode: str = MODE_OFF,
@@ -167,8 +196,19 @@ class WatcherRouter:
     # ------------------------------------------------------- classification
 
     def classify(self, comic_dir: Path, source_name: str,
-                 series_name: str | None = None) -> RoutingDecision:
-        """Decide where *comic_dir* belongs, from a spread sample of its CBZs.
+                 series_name: str | None = None,
+                 archives: list[Path] | None = None) -> RoutingDecision:
+        """Decide where this batch belongs, from a spread sample of its CBZs.
+
+        *series_name* must be the identity the caller will actually file under.
+        The watcher resolves "Berserk Ch. 4" to "Berserk" late in processing,
+        and classifying before that misses the existing-series index hit that
+        should have decided it.
+
+        *archives* is the exact collection being moved. Without it a mixed
+        drop point -- loose archives beside nested series directories -- would
+        be sampled by walking the parent, classifying the loose files from an
+        unrelated series' metadata.
 
         `route_unresolved=False` for now: this branch never lets v2 choose a
         destination, and the review path it would name does not exist yet.
@@ -177,8 +217,11 @@ class WatcherRouter:
         """
         series = series_name or comic_dir.name
         decision: RoutingDecision | None = None
+        sampled = (spread_sample(archives, self.sample_limit)
+                   if archives is not None
+                   else sample_archives(comic_dir, self.sample_limit))
 
-        for archive in sample_archives(comic_dir, self.sample_limit):
+        for archive in sampled:
             info = read_comic_info(archive)
             candidate = resolve(
                 self.cfg,
@@ -203,8 +246,14 @@ class WatcherRouter:
         return decision
 
     def shadow(self, comic_dir: Path, source_name: str, legacy_dest: str,
-               series_name: str | None = None) -> ShadowComparison | None:
-        """Classify and record, without influencing anything.
+               series_name: str | None = None,
+               archives: list[Path] | None = None) -> ShadowComparison | None:
+        """Classify and log, without influencing anything.
+
+        Returns the comparison so the caller can collect it for one pass.
+        Deliberately not accumulated on the router: this runs in a daemon, and
+        a per-directory record kept for the process lifetime is an unbounded
+        list and a cross-pass tally nobody asked for.
 
         Returns None when v2 is off, so the caller stays a single line and
         the watcher pays nothing for a mode it is not running.
@@ -214,15 +263,19 @@ class WatcherRouter:
         series = series_name or comic_dir.name
         comparison = ShadowComparison(
             series=series, source=source_name, legacy_dest=legacy_dest,
-            decision=self.classify(comic_dir, source_name, series),
+            decision=self.classify(comic_dir, source_name, series, archives),
         )
-        self.comparisons.append(comparison)
         log.info("  %s", comparison.describe())
         return comparison
 
     # ------------------------------------------------------- index upkeep
 
-    def note_move(self, series_name: str, dest_key: str, path: Path) -> None:
+    def dest_key_for_path(self, dest_folder: str) -> str | None:
+        """Map a legacy destination path back to its v2 destination key."""
+        return self._key_by_path.get(_normalise(dest_folder))
+
+    def note_move(self, series_name: str, dest_folder: str,
+                  series_dir: Path) -> None:
         """Record a completed move so the series is sticky within this session.
 
         The index is built once at startup for cost reasons, so a series
@@ -230,21 +283,21 @@ class WatcherRouter:
         a second chapter arriving an hour later would be classified from
         metadata again and could land somewhere else -- the exact split the
         index exists to prevent.
-        """
-        if dest_key not in self.cfg.destinations:
-            log.warning("  index not updated: unknown destination %r", dest_key)
-            return
-        self.index.add(series_name, dest_key, path)
 
-    def summarise(self) -> str:
-        """One line for the end of a scan pass."""
-        total = len(self.comparisons)
-        if not total:
-            return "  Routing v2 shadow: no directories classified."
-        differ = [c for c in self.comparisons if not c.agrees]
-        unresolved = [c for c in self.comparisons
-                      if c.decision.confidence == "unresolved"]
-        return (
-            f"  Routing v2 shadow: {total} classified, {len(differ)} would "
-            f"differ from legacy, {len(unresolved)} unresolved."
-        )
+        *series_dir* must be the directory the files actually landed in, not a
+        re-derived guess: the mover merges into a pre-existing folder when one
+        matches, and that folder's name is what a later lookup has to find.
+
+        Does nothing when the index is disabled. resolve() consults whatever
+        index it is handed without re-checking the flag, so populating a
+        disabled index would manufacture authority the configuration
+        explicitly withheld.
+        """
+        if not self.cfg.series_index_enabled:
+            return
+        dest_key = self.dest_key_for_path(dest_folder)
+        if dest_key is None:
+            log.warning("  index not updated: %r is not a v2 destination",
+                        dest_folder)
+            return
+        self.index.add(series_name, dest_key, series_dir)
