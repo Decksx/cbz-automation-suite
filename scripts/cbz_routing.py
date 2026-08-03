@@ -503,7 +503,7 @@ def resolve(
     if route_unresolved and cfg.unresolved_destination:
         key = cfg.unresolved_destination
         return RoutingDecision(key, cfg.destinations[key], None,
-                               "no rule matched; unresolved -> review",
+                               f"no rule matched; unresolved -> {key}",
                                canonical_series=canonical,
                                ambiguous_series=ambiguous,
                                confidence="unresolved")
@@ -551,7 +551,18 @@ def explain(
         if ok:
             break
     else:
-        lines.append(f"  --  (default) -> {cfg.default_key}")
+        # Describe the policy that actually applied. Printing "(default)"
+        # while the archive goes to a review destination is a trace that
+        # contradicts its own conclusion.
+        if decision.confidence == "unresolved":
+            if route_unresolved and cfg.unresolved_destination:
+                lines.append(
+                    f"  --  (unresolved handling) -> {decision.dest_key}")
+            else:
+                lines.append(f"  --  (unresolved; compatibility default) "
+                             f"-> {cfg.default_key}")
+        else:
+            lines.append(f"  --  (default) -> {cfg.default_key}")
 
     # Say plainly that nothing classified this, rather than letting the
     # trailing summary read as though the default were a matched rule.
@@ -559,8 +570,12 @@ def explain(
         lines.append("Unresolved: no override, existing-series match, or "
                      "routing rule matched.")
 
+    # Never label a missing rule_name "default": with review routing enabled
+    # the destination is not the default, and the label would name a rule
+    # that never fired.
+    label = decision.rule_name or decision.confidence
     lines.append(f"       => {decision.dest_key} = {decision.dest_path} "
-                 f"[{decision.rule_name or 'default'}]")
+                 f"[{label}]")
     return lines
 
 
@@ -682,7 +697,11 @@ def parse(raw: dict) -> RoutingConfig:
     # quietly disable itself, or an operator who typoed the key would believe
     # unclassified archives were being held back when they were not.
     unresolved_destination = None
-    if "unresolved" in raw and raw["unresolved"] is not None:
+    if "unresolved" in raw:
+        # Present-but-null is malformed, not absent. Treating it as absent
+        # would let an operator write `"unresolved": null`, believe malformed
+        # configuration is rejected, and get a silent fallthrough to default
+        # instead -- the exact failure this block is meant to make impossible.
         block = raw["unresolved"]
         if not isinstance(block, dict):
             raise RoutingConfigError(
