@@ -113,11 +113,13 @@ class RoutingConfig:
     rules: list[dict] = field(default_factory=list)
     source_version: int = 2
     series_overrides: tuple[SeriesOverride, ...] = ()
-    # Off by default on purpose. Enabling the index makes a series' current
-    # location sticky, which is right once the library is classified
-    # correctly and actively harmful before then -- it would pin every
-    # series still sitting in a retired or misrouted library exactly where
-    # it is. Turn it on after the reclassification, not before.
+    # Enabling the index makes a series' current location sticky. Where that
+    # location was decided by a person, stickiness is the point: Comix
+    # membership is a deliberate adult determination, and seeding the index
+    # from it preserves that judgement instead of re-deriving it from
+    # metadata that cannot express it. Where a library is being retired or is
+    # known-misclassified, list it in `destinations` only after its contents
+    # have been migrated, or the index will pin them where they sit.
     series_index_enabled: bool = False
     series_index_destinations: tuple[str, ...] = ()
 
@@ -146,18 +148,31 @@ class SeriesIndex:
     without usable metadata, not speed.
     """
 
-    def __init__(self) -> None:
-        self._entries: dict[str, tuple[str, Path]] = {}
+    def __init__(self, priority: tuple[str, ...] = ()) -> None:
+        # Destination precedence for a series that exists in more than one
+        # library. Order comes from series_index.destinations, so a library
+        # whose membership encodes a human decision -- Comix membership is an
+        # adult determination, made deliberately, not derived from metadata --
+        # is listed first and wins. Deferring to the rules instead would let a
+        # metadata signal quietly overturn that decision.
+        self._priority = priority
+        self._entries: dict[str, tuple[str, Path, int]] = {}
         self._ambiguous: set[str] = set()
+
+    def _rank(self, dest_key: str) -> int:
+        try:
+            return self._priority.index(dest_key)
+        except ValueError:
+            return len(self._priority)
 
     @classmethod
     def build(cls, cfg: RoutingConfig,
               lister=None) -> "SeriesIndex":
-        index = cls()
+        keys = cfg.series_index_destinations or tuple(cfg.destinations)
+        index = cls(priority=keys)
         if not cfg.series_index_enabled:
             return index
         listdir = lister or _default_lister
-        keys = cfg.series_index_destinations or tuple(cfg.destinations)
         for dest_key in keys:
             root = cfg.destinations.get(dest_key)
             if not root:
@@ -170,19 +185,26 @@ class SeriesIndex:
         key = series_key(series_name)
         if not key:
             return
+        rank = self._rank(dest_key)
         existing = self._entries.get(key)
-        if existing is not None and existing[0] != dest_key:
-            # The same series in two libraries means the library disagrees
-            # with itself; refuse to guess and let the rules decide.
-            self._ambiguous.add(key)
+        if existing is None:
+            self._entries[key] = (dest_key, path, rank)
             return
-        self._entries.setdefault(key, (dest_key, path))
+        if existing[0] == dest_key:
+            return
+        # Present in two libraries. Resolve by priority rather than refusing,
+        # but keep it flagged so a genuine split is visible rather than
+        # silently papered over.
+        self._ambiguous.add(key)
+        if rank < existing[2]:
+            self._entries[key] = (dest_key, path, rank)
 
     def lookup(self, series_name: str) -> tuple[str, Path] | None:
         key = series_key(series_name)
-        if not key or key in self._ambiguous:
+        if not key:
             return None
-        return self._entries.get(key)
+        entry = self._entries.get(key)
+        return (entry[0], entry[1]) if entry else None
 
     def is_ambiguous(self, series_name: str) -> bool:
         return series_key(series_name) in self._ambiguous
@@ -356,15 +378,17 @@ def resolve(
 
     ambiguous = False
     if effective and index is not None:
+        ambiguous = index.is_ambiguous(effective)
         hit = index.lookup(effective)
         if hit is not None:
             dest_key, path = hit
+            note = " (also present elsewhere; resolved by priority)" if ambiguous else ""
             return RoutingDecision(
                 dest_key, cfg.destinations[dest_key], "existing series",
-                f"series {effective!r} already exists in {dest_key}",
+                f"series {effective!r} already exists in {dest_key}{note}",
                 canonical_series=canonical, series_dir=path,
+                ambiguous_series=ambiguous,
             )
-        ambiguous = index.is_ambiguous(effective)
 
     for rule in cfg.rules:
         ok, why = _evaluate(rule["when"], context, cfg)
