@@ -651,6 +651,73 @@ def test_lists_itself_must_be_an_object():
         parse(_commented(lists=["asian_publishers"]))
 
 
+# ── a present block is never treated as an absent one ────────────
+#
+# Stripping comments must not turn a malformed block into an empty one. The
+# series_index case is the dangerous one: "enabled" or null would have
+# yielded enabled=False with no destinations, silently disabling index
+# authority on the branch that activates it.
+
+
+def test_a_malformed_series_index_block_never_disables_the_index_silently():
+    for value in ("enabled", [], None, 7):
+        raw = _commented(series_index=value)
+        with pytest.raises(RoutingConfigError, match="series_index.*object"):
+            parse(raw)
+
+
+@pytest.mark.parametrize("key, value", [
+    ("destinations", None),
+    ("destinations", "X:\\Manga"),
+    ("lists", None),
+    ("lists", "asian_publishers"),
+    ("signals", None),
+    ("signals", "not an object"),
+    ("series_index", None),
+    ("series_index", []),
+])
+def test_a_present_non_mapping_block_is_malformed_not_absent(key, value):
+    with pytest.raises(RoutingConfigError, match=f"{key}.*must be an"):
+        parse(_commented(**{key: value}))
+
+
+@pytest.mark.parametrize("key", ["rules", "series_overrides"])
+def test_a_present_non_array_block_is_malformed_not_absent(key):
+    with pytest.raises(RoutingConfigError, match=f"{key}.*must be an array"):
+        parse(_commented(**{key: "not an array"}))
+
+
+@pytest.mark.parametrize("value", ["not an object", None, 7, ["nested"]])
+def test_a_non_object_rule_entry_fails_on_its_own_contract(value):
+    # Previously caught only incidentally, by a later "has no 'when'".
+    raw = _commented()
+    raw["rules"][0] = value
+    with pytest.raises(RoutingConfigError, match=r"rules\[0\] must be an object"):
+        parse(raw)
+
+
+@pytest.mark.parametrize("value", [None, "Pinned", []])
+def test_a_non_object_override_entry_fails_on_its_own_contract(value):
+    raw = _commented()
+    raw["series_overrides"][0] = value
+    with pytest.raises(RoutingConfigError,
+                       match=r"series_overrides\[0\] must be an object"):
+        parse(raw)
+
+
+def test_an_absent_optional_block_is_still_accepted():
+    # The other half of the contract: omission is legitimate, and only
+    # omission yields an empty block.
+    raw = _commented()
+    for key in ("lists", "signals", "series_index", "series_overrides"):
+        del raw[key]
+    raw["rules"] = []
+    cfg = parse(raw)
+    assert (cfg.lists, cfg.signals, cfg.series_overrides) == ({}, {}, ())
+    assert cfg.series_index_enabled is False
+    assert cfg.rules == []
+
+
 def test_canonical_serialisation_drops_comments_and_reparses():
     cfg = parse(_commented())
     canonical = to_v2_dict(cfg)
