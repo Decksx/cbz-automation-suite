@@ -23,7 +23,8 @@
     "asian_languages": ["ja", "ko", "zh", "zh-Hans", "zh-Hant"]
   },
 
-  "_comment_signals": "Named predicates. Fields are 'source', 'title', or 'comicinfo.<AnyElement>'. Operators: equals, in, in_list, glob, glob_in_list, contains_any. Combinators: any, all, not. A missing ComicInfo field makes a matcher false, never an error.",
+  "_comment_signals": "Named predicates. Fields are 'source', 'title', or 'comicinfo.<AnyElement>'. Operators: equals, in, in_list, glob, glob_in_list, glob_tokens_in_list, contains_any. Combinators: any, all, not. A missing ComicInfo field makes a matcher false, never an error.",
+  "_comment_glob_tokens_in_list": "glob_tokens_in_list is glob_in_list for fields that hold a comma-joined list rather than one value, such as Publisher and Imprint. It splits on commas only, trims each token, ignores empty tokens, and matches when any token matches any pattern in the named list -- so an anchored pattern like 'yen press*' still matches 'Gangan Wing,Yen Press'. Use glob_in_list for single-valued fields such as Web, where a URL may legitimately contain a comma.",
   "signals": {
     "explicitly_adult": {
       "any": [
