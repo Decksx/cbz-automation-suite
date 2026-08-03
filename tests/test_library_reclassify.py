@@ -25,6 +25,7 @@ from scripts.cbz_library_reclassify import (
     ApplyStats,
     apply_series,
     cmd_apply,
+    cmd_move,
     sample_archives,
     tree_digest,
 )
@@ -262,3 +263,67 @@ def test_skip_review_holds_back_flagged_rows(tmp_path: Path):
     assert (dest / "A").exists()
     assert not (dest / "B").exists()
     assert (source / "B").is_dir()
+
+
+# -- single-series move ------------------------------------------
+
+def _move_args(tmp_path: Path, series: str, src: Path, dst: Path,
+               confirm: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(
+        series=series, from_root=str(src), to_root=str(dst),
+        quarantine=str(tmp_path / "q"), confirm=confirm,
+    )
+
+
+def test_move_relocates_a_series_between_libraries(tmp_path: Path):
+    src = _library(tmp_path / "manga", {"Ice Cream Man": 2})
+    dst = tmp_path / "gn"
+    dst.mkdir()
+
+    cmd_move(_move_args(tmp_path, "Ice Cream Man", src, dst, confirm=True))
+
+    assert not (src / "Ice Cream Man").exists()
+    assert len(list((dst / "Ice Cream Man").glob("*.cbz"))) == 2
+
+
+def test_move_matches_the_series_name_after_normalisation(tmp_path: Path):
+    # Punctuation and casing differences must not stop a manual fix.
+    src = _library(tmp_path / "manga", {"Ice Cream Man": 1})
+    dst = tmp_path / "gn"
+    dst.mkdir()
+
+    cmd_move(_move_args(tmp_path, "ice-cream man!", src, dst, confirm=True))
+
+    assert (dst / "Ice Cream Man").is_dir()
+
+
+def test_move_merges_without_overwriting(tmp_path: Path):
+    src = _library(tmp_path / "manga", {"A": 0})
+    _cbz(src / "A" / "vol1.cbz")
+    dst = tmp_path / "gn"
+    _cbz(dst / "A" / "ch01.cbz", page=b"already here")
+    keep = (dst / "A" / "ch01.cbz").read_bytes()
+
+    cmd_move(_move_args(tmp_path, "A", src, dst, confirm=True))
+
+    assert (dst / "A" / "vol1.cbz").exists()
+    assert (dst / "A" / "ch01.cbz").read_bytes() == keep
+
+
+def test_move_dry_run_changes_nothing(tmp_path: Path):
+    src = _library(tmp_path / "manga", {"A": 1})
+    dst = tmp_path / "gn"
+    dst.mkdir()
+
+    cmd_move(_move_args(tmp_path, "A", src, dst, confirm=False))
+
+    assert (src / "A").is_dir()
+    assert not (dst / "A").exists()
+
+
+def test_move_refuses_when_the_series_is_absent(tmp_path: Path):
+    src = _library(tmp_path / "manga", {"A": 1})
+    dst = tmp_path / "gn"
+    dst.mkdir()
+    with pytest.raises(SystemExit, match="no series matching"):
+        cmd_move(_move_args(tmp_path, "Nonexistent", src, dst, confirm=True))
