@@ -277,9 +277,19 @@ def cmd_plan(args: argparse.Namespace) -> None:
             raise SystemExit(f"destination {key} does not exist: {root}")
 
     digest, series_count, file_count = tree_digest(source)
-    series_dirs = sorted(p for p in source.iterdir() if p.is_dir())
-    print(f"planning {series_count} series / {file_count} files from {source}")
-    print(f"source digest: {digest[:16]}...\n")
+    all_dirs = sorted(p for p in source.iterdir() if p.is_dir())
+
+    # A directory with no archives is not a series -- it is the shell left
+    # behind by an earlier merge. Planning a move for it would create an
+    # empty series folder in the destination, which Komga would then show.
+    empty = [d for d in all_dirs if not any(d.rglob("*.cbz"))]
+    series_dirs = [d for d in all_dirs if d not in empty]
+
+    print(f"planning {len(series_dirs)} series / {file_count} files from {source}")
+    print(f"source digest: {digest[:16]}...")
+    if empty:
+        print(f"skipping {len(empty)} empty directory(ies): nothing to move")
+    print()
 
     plans = [plan_series(d, cfg, source.name, args.sample, active_roots)
              for d in series_dirs]
@@ -482,6 +492,54 @@ def cmd_apply(args: argparse.Namespace) -> None:
         print("\nNothing was changed. Re-run with --confirm to apply.")
 
 
+def cmd_move(args: argparse.Namespace) -> None:
+    """Relocate a single series between libraries.
+
+    For acting on a manual decision -- a series_overrides pin, or a misfile
+    spotted by eye -- without planning a whole library. Uses the same
+    non-destructive merge as apply: nothing is overwritten, collisions go to
+    quarantine.
+    """
+    from_root, to_root = Path(args.from_root), Path(args.to_root)
+    for label, root in (("--from", from_root), ("--to", to_root)):
+        if not root.is_dir():
+            raise SystemExit(f"REFUSING: {label} does not exist: {root}")
+
+    key = series_key(args.series)
+    src_dir = next(
+        (c for c in from_root.iterdir() if c.is_dir() and series_key(c.name) == key),
+        None,
+    )
+    if src_dir is None:
+        raise SystemExit(f"REFUSING: no series matching {args.series!r} in {from_root}")
+
+    existing = next(
+        (c for c in to_root.iterdir() if c.is_dir() and series_key(c.name) == key),
+        None,
+    )
+    target = existing if existing is not None else to_root / src_dir.name
+    if not _same_volume(from_root, target):
+        raise SystemExit("REFUSING: cross-volume move is not implemented.")
+
+    archives = [p for p in src_dir.rglob("*.cbz") if p.is_file()]
+    print(f"  from : {src_dir}  ({len(archives)} archives)")
+    print(f"  to   : {target}"
+          f"{'  (merging into existing)' if existing is not None else ''}")
+
+    row = {"series": src_dir.name, "target_dir": str(target),
+           "file_count": len(archives)}
+    stats = ApplyStats()
+    dry_run = not args.confirm
+    print(f"\n{'DRY RUN' if dry_run else 'MOVING'}\n")
+    apply_series(row, from_root, Path(args.quarantine), stats, dry_run)
+
+    print(f"\n  files moved       : {stats.files_moved}")
+    print(f"  files quarantined : {stats.files_quarantined}")
+    print(f"  errors            : {stats.errors}")
+    if dry_run:
+        print("\nNothing was changed. Re-run with --confirm to apply.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -507,6 +565,14 @@ def main() -> None:
     a.add_argument("--confirm", action="store_true",
                    help="actually move files; omit for a dry run")
     a.set_defaults(func=cmd_apply)
+
+    m = sub.add_parser("move", help="relocate one series between libraries")
+    m.add_argument("--series", required=True)
+    m.add_argument("--from", dest="from_root", required=True)
+    m.add_argument("--to", dest="to_root", required=True)
+    m.add_argument("--quarantine", required=True)
+    m.add_argument("--confirm", action="store_true")
+    m.set_defaults(func=cmd_move)
 
     args = ap.parse_args()
     args.func(args)
