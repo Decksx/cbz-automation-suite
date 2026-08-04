@@ -1,10 +1,13 @@
 """Review-case mechanics for archives that classification could not resolve.
 
-This module is deliberately inert: it computes case identity, builds
-manifests, chooses a transfer method, plans, and revalidates a source against
-an inventory. It moves nothing, and no watcher call site consumes it yet.
-Separating the filesystem safety protocol from concurrent watcher control
-flow keeps both reviewable.
+It computes case identity, builds manifests, chooses a transfer method,
+plans, revalidates a source against an inventory, and executes the transfer.
+No watcher call site consumes any of it yet, and no routing mode selects it:
+legacy v1 remains authoritative. Separating the filesystem safety protocol
+from concurrent watcher control flow keeps both reviewable.
+
+`execute_transfer` is the only thing here that changes the filesystem.
+Everything above it is read-only.
 
 A review case is one unresolved arrival, staged whole under a deterministic
 identity so that retrying an unchanged source finds the same case instead of
@@ -83,6 +86,23 @@ class PayloadChangedError(StagingError):
 
     Distinct from other staging errors because it is transient: the caller
     should retry once the source has settled, not treat the case as broken.
+    """
+
+
+class StagedPayloadMismatchError(StagingError):
+    """The staged copy does not match the manifest it was copied against.
+
+    The copy is wrong, not the source. The source remains authoritative and
+    untouched, and `.partial` is left in place as recoverable debris.
+    """
+
+
+class CaseCollisionError(StagingError):
+    """Something already occupies this case, and it is not ours to overwrite.
+
+    Refused rather than merged. Merging two payloads under one case id would
+    produce a case whose contents no manifest describes, and overwriting
+    would destroy a decision an operator may already have made.
     """
 
 
@@ -468,6 +488,15 @@ class StagingLayout:
 
     def payload(self, case_id: str) -> Path:
         return self.pending_case(case_id) / PAYLOAD_DIR
+
+    def partial_payload(self, case_id: str) -> Path:
+        """Where the payload lives before publication.
+
+        Mirrors `payload` exactly, so publication is a rename of the case
+        directory and never a restructure. A layout that differed either side
+        of publication would make the atomic step non-atomic.
+        """
+        return self.partial_case(case_id) / PAYLOAD_DIR
 
     def manifest(self, case_id: str) -> Path:
         return self.manifests / f"{case_id}.json"
@@ -952,3 +981,138 @@ def _existing_ancestor(path: Path) -> Path:
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     return probe
+
+
+# ------------------------------------------------------------- transfer
+
+def _verify_staged_payload(staged_payload_root: Path,
+                           expected: PayloadInventory) -> None:
+    """Prove the staged copy matches the manifest. Step 3.
+
+    Re-reads the copied bytes rather than trusting that copytree reported
+    success: a copy that silently truncated, or landed on a volume that
+    rewrote what it was given, is exactly what this gate exists to catch.
+    """
+    current = build_inventory(staged_payload_root)
+    if current.digest != expected.digest:
+        raise StagedPayloadMismatchError(
+            f"the staged copy at {staged_payload_root} does not match the "
+            f"manifest: {inventory_difference(expected, current)}. The source "
+            "has not been touched and remains authoritative."
+        )
+
+
+def _refuse_collisions(layout: StagingLayout, existing: ExistingCase,
+                       case_id: str) -> None:
+    """Refuse anything already occupying this case. Never merge, never overwrite.
+
+    A published payload is refused whether or not a manifest explains it: an
+    orphaned `pending` directory is uninterpretable, and a valid one may
+    already carry an operator's decision. A terminal manifest is refused for
+    the same reason -- promoted, rejected, and rolled back are decisions, not
+    states to redo.
+    """
+    if layout.pending_case(case_id).exists():
+        raise CaseCollisionError(
+            f"{layout.pending_case(case_id)} already exists; refusing to "
+            "merge or overwrite a published case"
+        )
+    if existing.status == STATUS_VALID and existing.manifest is not None:
+        if existing.manifest.state in TERMINAL_STATES:
+            raise CaseCollisionError(
+                f"case {case_id} is {existing.manifest.state}; refusing to "
+                "reopen a decision that has already been made"
+            )
+
+
+def execute_transfer(plan: StagingPlan, *,
+                     delete_source: bool = True) -> CaseManifest:
+    """Stage one case. The source stays authoritative until publication.
+
+    Implements the ordering from #35, whose whole point is that the last
+    checks are the ones easy to leave out::
+
+        1. inventory the source              (done by plan_case)
+        2. copy into .partial/<case-id>      (copy_verify only)
+        3. verify the staged copy            (copy_verify only)
+        4. revalidate the SOURCE             <- both paths, always
+        5. publish: .partial -> pending      (atomic rename)
+        6. release the source                (copy_verify only)
+
+    Steps 3 and 4 are separate mandatory gates on the copy path. Step 3 asks
+    "are the bytes I wrote the bytes I meant to write"; step 4 asks "is the
+    thing I am about to release still the thing I inventoried". Passing the
+    first says nothing about the second, and it is the second that guards
+    what gets destroyed.
+
+    The same-volume rename skips 2 and 3 -- there are no copied bytes to
+    verify -- but not 4. It is revalidated immediately before the rename,
+    which is the last moment anything can be checked. The residual race
+    between that check and the rename is a filesystem TOCTOU boundary and is
+    accepted, not closed: no guard that precedes an operation can cover the
+    instant the operation happens.
+
+    The manifest is written before anything moves, so a crash at any point
+    leaves an interpretable case rather than untracked bytes. `.partial` is
+    never authoritative; debris from an interrupted attempt is cleaned and
+    the transfer redone rather than resumed, which is safe precisely because
+    the source has not been given up. Resuming a partial transfer is a
+    separate concern and is not implemented here.
+
+    On failure the source is left in place, no `pending` entry is created,
+    and no final-library index entry is recorded. `delete_source` exists so a
+    caller can keep the source after a proven publication; it applies only to
+    the copy path, since the rename path never had a second copy to release.
+    """
+    layout, manifest = plan.layout, plan.manifest
+    case_id = manifest.case_id
+    source = Path(manifest.staging_source_path)
+
+    _refuse_collisions(layout, plan.existing, case_id)
+
+    for directory in layout.all_dirs():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    partial_case = layout.partial_case(case_id)
+    if partial_case.exists():
+        shutil.rmtree(partial_case)
+
+    # Written before anything moves: a case with no manifest is debris nobody
+    # can interpret, and that is a worse failure than one that is merely
+    # incomplete.
+    manifest.state = STATE_PLANNED
+    manifest.touch()
+    manifest.write(layout.manifest(case_id))
+
+    staged_payload = layout.partial_payload(case_id) / source.name
+    staged_payload.parent.mkdir(parents=True, exist_ok=True)
+
+    if manifest.transfer_method == METHOD_COPY_VERIFY:
+        if plan.free_bytes < manifest.total_bytes:
+            raise StagingError(
+                f"insufficient space to stage {case_id}: "
+                f"{manifest.total_bytes} bytes needed, "
+                f"{plan.free_bytes} free at {layout.root}"
+            )
+        shutil.copytree(source, staged_payload)
+        _verify_staged_payload(staged_payload, plan.inventory)   # gate 1
+        manifest.state = STATE_COPIED_VERIFIED
+        manifest.touch()
+        manifest.write(layout.manifest(case_id))
+
+    revalidate_source(source, plan.inventory)                    # gate 2
+
+    if manifest.transfer_method == METHOD_RENAME:
+        os.replace(source, staged_payload)
+
+    os.replace(partial_case, layout.pending_case(case_id))       # publish
+
+    manifest.state = STATE_PENDING_REVIEW
+    manifest.staged_path = str(layout.pending_case(case_id))
+    manifest.touch()
+    manifest.write(layout.manifest(case_id))
+
+    if manifest.transfer_method == METHOD_COPY_VERIFY and delete_source:
+        shutil.rmtree(source)
+
+    return manifest
