@@ -209,6 +209,28 @@ def test_a_failed_v2_load_reports_off_not_the_requested_mode(
     assert any("Routing v2 disabled" in r.getMessage() for r in caplog.records)
 
 
+def test_a_fully_failed_shadow_pass_still_summarises(
+        tmp_path, monkeypatch, caplog):
+    # A missing summary reads as "shadow was off", which is exactly the wrong
+    # conclusion when every classification failed.
+    watch_root, _, _, router = _wire(monkeypatch, tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("classifier exploded")
+
+    monkeypatch.setattr(router, "shadow", boom)
+    series = watch_root / "Doomed"
+    _cbz(series / "Doomed.cbz")
+
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(series)
+
+    summaries = [r.getMessage() for r in caplog.records
+                 if "Routing v2 shadow:" in r.getMessage()]
+    assert summaries, "the pass summary vanished when every classification failed"
+    assert "no directories classified" in summaries[-1]
+
+
 def test_shadow_failure_never_stops_processing(tmp_path, monkeypatch, caplog):
     watch_root, dest_root, _, router = _wire(monkeypatch, tmp_path)
 
