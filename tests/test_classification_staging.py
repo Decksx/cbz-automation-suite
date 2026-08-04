@@ -25,7 +25,14 @@ import pytest
 
 from scripts.cbz_classification_staging import (
     CASE_CONTRACT,
+    RECOVERABLE_STATES,
+    STATE_COPIED_VERIFIED,
     STATE_PENDING_REVIEW,
+    STATE_PROMOTED,
+    STATE_REJECTED,
+    STATE_ROLLED_BACK,
+    TERMINAL_STATES,
+    VALID_STATES,
     STATUS_ABSENT,
     STATUS_ORPHANED_PENDING,
     STATUS_PARTIAL,
@@ -372,10 +379,45 @@ def test_an_unknown_state_is_refused(tmp_path):
                                         state="anything"))
 
 
-def test_an_unknown_transfer_method_is_refused(tmp_path):
+@pytest.mark.parametrize("method", ["teleport", "", "RENAME", " rename"])
+def test_an_unknown_transfer_method_is_refused(tmp_path, method):
+    # Empty included: a persisted manifest must name the method that was
+    # actually chosen, even though CaseManifest defaults to "" in memory.
     with pytest.raises(StagingError, match="transfer_method"):
         CaseManifest.from_json(_mutated(_valid_manifest(tmp_path),
-                                        transfer_method="teleport"))
+                                        transfer_method=method))
+
+
+def test_an_in_memory_manifest_may_default_to_no_method(tmp_path):
+    # The default is for construction convenience; it just cannot round-trip.
+    blank = CaseManifest(case_id="x", state=STATE_PLANNED)
+    assert blank.transfer_method == ""
+    with pytest.raises(StagingError, match="transfer_method"):
+        CaseManifest.from_json(blank.to_json())
+
+
+@pytest.mark.parametrize("hints", [
+    [1], [None], ["text"], [[]],
+    [{"kind": 7, "value": "x"}],
+    [{"kind": "x", "value": 7}],
+    [{"kind": "x"}],
+    [{"value": "x"}],
+    [{"kind": "x", "value": "y", "extra": True}],
+    [{"kind": "ok", "value": "ok"}, {"kind": None, "value": "y"}],
+])
+def test_a_malformed_review_hint_row_is_refused(tmp_path, hints):
+    # Validating only the outer list let these reach whoever reviews the case.
+    with pytest.raises(StagingError, match="review_hints"):
+        CaseManifest.from_json(_mutated(_valid_manifest(tmp_path),
+                                        review_hints=hints))
+
+
+def test_well_formed_review_hints_are_accepted(tmp_path):
+    rows = [{"kind": "title_token", "value": "uncensored"},
+            {"kind": "title_token", "value": "sex"}]
+    restored = CaseManifest.from_json(
+        _mutated(_valid_manifest(tmp_path), review_hints=rows))
+    assert restored.review_hints == rows
 
 
 def test_an_inconsistent_file_count_is_refused(tmp_path):
@@ -541,6 +583,35 @@ def test_a_pending_directory_without_a_manifest_is_orphaned(tmp_path):
     assert again.existing.is_recoverable is False
 
 
+@pytest.mark.parametrize("state, recoverable", [
+    (STATE_PLANNED, True),
+    (STATE_COPIED_VERIFIED, True),
+    (STATE_PENDING_REVIEW, True),
+    (STATE_PROMOTED, False),
+    (STATE_REJECTED, False),
+    (STATE_ROLLED_BACK, False),
+])
+def test_recovery_is_state_aware(tmp_path, state, recoverable):
+    # A valid manifest is not enough: reporting a promoted or rejected case
+    # as resumable would let a retry reopen a decision already made.
+    src = _payload(tmp_path / "src", DEFAULT)
+    root = tmp_path / "review"
+    plan = plan_case(root, src, src, "S", series_key("S"), "src")
+    plan.manifest.state = state
+    plan.manifest.write(StagingLayout(root).manifest(plan.case_id))
+
+    existing = inspect_case(StagingLayout(root), plan.case_id)
+    assert existing.status == STATUS_VALID
+    assert existing.manifest.state == state
+    assert existing.is_recoverable is recoverable
+
+
+def test_every_terminal_state_is_non_recoverable():
+    assert TERMINAL_STATES == {STATE_PROMOTED, STATE_REJECTED, STATE_ROLLED_BACK}
+    assert not (TERMINAL_STATES & RECOVERABLE_STATES)
+    assert TERMINAL_STATES | RECOVERABLE_STATES == VALID_STATES
+
+
 def test_a_partial_directory_is_recoverable(tmp_path):
     src = _payload(tmp_path / "src", DEFAULT)
     root = tmp_path / "review"
@@ -652,6 +723,54 @@ def test_a_file_deleted_before_hashing_is_rejected(tmp_path, monkeypatch):
 
     monkeypatch.setattr(staging, "_hash_stable_file", vanish)
     with pytest.raises(PayloadChangedError, match="disappeared"):
+        staging.build_inventory(src)
+
+
+def test_a_file_modified_after_its_own_hash_is_rejected(tmp_path, monkeypatch):
+    """The whole tree must be stable at return, not each file during its read.
+
+    Per-file checks accept this interleaving: hash a.cbz, start hashing
+    b.cbz, rewrite a.cbz, finish b.cbz, membership unchanged. The returned
+    inventory then carries a digest for an a.cbz that no longer exists.
+    """
+    import scripts.cbz_classification_staging as staging
+    src = _payload(tmp_path / "src", {"a.cbz": b"aaaaa", "b.cbz": b"bbbbb"})
+    first, second = src / "a.cbz", src / "b.cbz"
+    real_open = open
+    done = {"n": False}
+
+    def rewrite_first_while_hashing_second(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if Path(path) == second and not done["n"]:
+            done["n"] = True
+            first.write_bytes(b"ccccc")             # identical length
+            stat = staging.os.stat(first)
+            staging.os.utime(
+                first, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        return handle
+
+    monkeypatch.setattr("builtins.open", rewrite_first_while_hashing_second)
+    with pytest.raises(PayloadChangedError, match="after it was hashed"):
+        staging.build_inventory(src)
+    assert done["n"], "the rewrite never happened"
+
+
+def test_a_file_deleted_after_its_own_hash_is_rejected(tmp_path, monkeypatch):
+    import scripts.cbz_classification_staging as staging
+    src = _payload(tmp_path / "src", {"a.cbz": b"aaaaa", "b.cbz": b"bbbbb"})
+    real_members = staging._members
+    seen = {"n": 0}
+
+    def members(root):
+        seen["n"] += 1
+        result = real_members(root)
+        if seen["n"] == 2:
+            # Membership still reports both, but one is gone by the re-stat.
+            (root / "a.cbz").unlink()
+        return result
+
+    monkeypatch.setattr(staging, "_members", members)
+    with pytest.raises(PayloadChangedError, match="disappeared after"):
         staging.build_inventory(src)
 
 
