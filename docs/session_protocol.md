@@ -186,6 +186,43 @@ write time, and one used `id(object())` for uniqueness where memory
 reuse let consecutive values coincide. Confirm a new test fails when the
 behavior it guards is absent.
 
+### Test the guaranteed property, not the mechanics that achieve it
+
+Three tests written on 2026-08-04 were flaky, and all three failed the
+same way: the assertion depended on incidental implementation behavior
+rather than on the property under test. Each passed locally several
+times before failing in CI, and two had already failed once and been
+dismissed as environmental. "It passed five times here" measures this
+machine's timing, not determinism.
+
+- **Trigger mutations with an explicit event or an injected operation.**
+  To prove a payload changing mid-read is rejected, really rewrite the
+  file and force the mtime; do not arrange for a `stat` to report
+  something different. Drive the real condition the guard exists for.
+- **Never use call counts as synchronization.** One test counted
+  `os.stat` calls to decide when to simulate a change. `Path.is_file()`
+  also stats, and whether `rglob` serves that from a cached `scandir`
+  entry varies by platform, so the counter landed differently on CI
+  than locally. A call count is an implementation detail, not a clock.
+- **Never rely on thread acquisition order.** A test asserting that
+  configured destination priority survives a race built a `SeriesIndex`
+  with no priority, so every destination ranked equally and the winner
+  was whichever thread wrote first. It asserted nothing and passed by
+  luck. Use barriers and events to establish order you need, and supply
+  the real configuration the assertion depends on.
+- **Assert the intended interleaving actually occurred.** A concurrency
+  test that silently fails to interleave passes for the wrong reason.
+  Set a flag at the injection point and assert it afterwards, so
+  "nothing raced" cannot masquerade as "the guard held".
+- **Prove a guard is load-bearing by bypassing that exact guard.**
+  Remove the specific block and confirm the test fails; restore it and
+  confirm it passes. Reverting a whole module usually breaks the import
+  instead, which proves nothing about the behavior.
+
+Timestamp- and filesystem-dependent assertions deserve particular
+suspicion: the window they exercise is a property of the volume, not of
+the code (see `docs/archive_io_resource_audit.md`, Finding 2).
+
 ## Scope discipline
 
 Audits classify their own findings by risk. Implement the low-risk tier;
