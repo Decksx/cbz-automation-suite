@@ -121,6 +121,12 @@ def _hash_stable_file(path: Path) -> tuple[int, str]:
     byte count is compared with the size the file ended at. Reading a file
     that is growing would otherwise pair an old size with a new digest and
     mint a case ID that no stable source tree ever had.
+
+    Known limit: an in-place rewrite that keeps the same length, the same
+    file identity, and lands inside the filesystem's timestamp resolution is
+    not detectable this way. Nothing short of re-reading the bytes would
+    catch it. The watcher's settle delay is what makes that unlikely; this
+    check is what makes the ordinary cases loud rather than silently wrong.
     """
     before = os.stat(path)
     digest = hashlib.sha256()

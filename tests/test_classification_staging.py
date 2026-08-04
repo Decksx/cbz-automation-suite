@@ -574,25 +574,35 @@ def test_a_file_growing_during_hashing_is_rejected(tmp_path, monkeypatch):
 
 
 def test_a_file_replaced_during_hashing_is_rejected(tmp_path, monkeypatch):
-    # Same size, different content: only file identity or mtime catches this.
+    """Same size, different content -- caught by mtime, not by length.
+
+    Driven by really rewriting the file mid-read rather than by counting
+    os.stat calls: Path.is_file() stats too, and whether rglob serves that
+    from a cached scandir entry varies by platform, so a call counter is not
+    deterministic. mtime is bumped explicitly for the same reason -- a rewrite
+    landing inside the filesystem's timestamp resolution would otherwise be
+    invisible, which is a real limit of this check and is documented as one.
+    """
     import scripts.cbz_classification_staging as staging
     src = _payload(tmp_path / "src", {"ch01.cbz": b"aaaaa"})
     target = src / "ch01.cbz"
-    calls = {"n": 0}
-    real_stat = staging.os.stat
+    real_open = open
+    swapped = {"done": False}
 
-    def shifting_stat(path, *args, **kwargs):
-        result = real_stat(path, *args, **kwargs)
-        if Path(path) == target:
-            calls["n"] += 1
-            if calls["n"] > 1:                 # the "after" read sees a change
-                return real_stat(_payload(tmp_path / "other",
-                                          {"ch01.cbz": b"bbbbb"}) / "ch01.cbz")
-        return result
+    def replace_mid_read(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if Path(path) == target and not swapped["done"]:
+            swapped["done"] = True
+            target.write_bytes(b"bbbbb")            # identical length
+            stat = staging.os.stat(target)
+            staging.os.utime(
+                target, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        return handle
 
-    monkeypatch.setattr(staging.os, "stat", shifting_stat)
+    monkeypatch.setattr("builtins.open", replace_mid_read)
     with pytest.raises(PayloadChangedError, match="changed while"):
         staging.build_inventory(src)
+    assert swapped["done"], "the replacement never happened"
 
 
 def test_a_file_appearing_between_enumerations_is_rejected(tmp_path, monkeypatch):
