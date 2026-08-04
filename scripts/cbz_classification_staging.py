@@ -1233,3 +1233,219 @@ def execute_transfer(plan: StagingPlan, *,
         shutil.rmtree(source)
 
     return manifest
+
+
+# ------------------------------------------------------------- recovery
+
+# The seven states of #35's recovery interruption matrix, plus the three
+# conditions that are not interruptions at all. Named for the action they
+# imply rather than for what is on disk, because the action is what a caller
+# has to decide.
+RECOVERY_NOTHING_STAGED = "nothing_staged"
+RECOVERY_RESUME_PUBLICATION = "resume_publication"      # matrix 1
+RECOVERY_RESTART_FROM_SOURCE = "restart_from_source"    # matrix 2
+RECOVERY_PUBLISH_PARTIAL = "publish_partial"            # matrix 3
+RECOVERY_PARTIAL_UNUSABLE = "partial_unusable"          # matrix 4
+RECOVERY_COMPLETE = "complete"                          # matrix 5
+RECOVERY_ORPHANED_PENDING = "orphaned_pending"          # matrix 6
+RECOVERY_PENDING_INCONSISTENT = "pending_inconsistent"  # matrix 7
+RECOVERY_TERMINAL = "terminal"
+RECOVERY_OPERATOR_REQUIRED = "operator_required"
+
+# Only these may be acted on without an operator. Everything else either has
+# nothing to do or has a question only a person can answer -- and in every
+# such case the rule is to preserve what exists rather than resolve it.
+AUTOMATIC_RECOVERY_STATES = frozenset({
+    RECOVERY_RESUME_PUBLICATION, RECOVERY_RESTART_FROM_SOURCE,
+    RECOVERY_PUBLISH_PARTIAL, RECOVERY_COMPLETE,
+})
+
+
+@dataclass(frozen=True)
+class RecoveryAssessment:
+    """What interrupted a case, and what may be done about it. Reads only."""
+
+    state: str
+    case_id: str
+    manifest: CaseManifest | None
+    detail: str
+
+    @property
+    def automatic(self) -> bool:
+        return self.state in AUTOMATIC_RECOVERY_STATES
+
+    def describe(self) -> str:
+        route = "automatic" if self.automatic else "operator"
+        return f"{self.case_id[:16]}...  {self.state}  ({route})\n  {self.detail}"
+
+
+def _payload_agrees(root: Path, expected: PayloadInventory) -> tuple[bool, str]:
+    """Whether the tree at *root* is exactly the payload *expected* describes.
+
+    Content-based, and it re-reads the bytes. A payload that is still moving
+    counts as disagreeing rather than raising: recovery runs after an
+    interruption, when a tree in motion is an ordinary thing to find, and the
+    answer to "may I act on this" is no either way.
+    """
+    if not root.is_dir():
+        return False, f"{root} is absent"
+    try:
+        current = build_inventory(root)
+    except PayloadChangedError as exc:
+        return False, f"{root} is still changing ({exc})"
+    except StagingError as exc:
+        return False, f"{root} cannot be inventoried ({exc})"
+    if current.digest != expected.digest:
+        return False, inventory_difference(expected, current)
+    return True, f"{current.file_count} file(s) matching the manifest"
+
+
+def assess_recovery(layout: StagingLayout, case_id: str) -> RecoveryAssessment:
+    """Classify an interrupted case from disk alone. Changes nothing.
+
+    Reconstructs from the persisted manifest and the filesystem, and takes no
+    `StagingPlan`. That is deliberate and is the point of the function: a plan
+    surviving in memory proves only that an exception was caught, never that
+    the process died and the case was rebuilt from what was written down.
+
+    Where the transfer was interrupted decides who may act, and the two
+    methods differ in a way that matters:
+
+        copy_verify   the source survives the whole transfer, so `.partial`
+                      is a replaceable copy and a bad one may be discarded
+        rename        between the move and the publication the source is
+                      gone and `.partial` is the only copy in existence
+
+    So a `.partial` that fails to verify is disposable on one path and
+    irreplaceable on the other, and the same observation produces opposite
+    instructions. Nothing here acts on either; it reports.
+
+    A manifest that will not validate is reported rather than raised, unlike
+    `inspect_case`. That function gates whether a case may be created, where
+    refusing loudly is right. This one exists to tell an operator what is on
+    disk, and "the manifest is corrupt" is the most important thing it could
+    have to say.
+    """
+    manifest_path = layout.manifest(case_id)
+    pending_case = layout.pending_case(case_id)
+    partial_case = layout.partial_case(case_id)
+
+    def assessed(state: str, detail: str,
+                 manifest: CaseManifest | None = None) -> RecoveryAssessment:
+        return RecoveryAssessment(state, case_id, manifest, detail)
+
+    if not manifest_path.exists():
+        if pending_case.exists():
+            return assessed(
+                RECOVERY_ORPHANED_PENDING,
+                f"{pending_case} holds a published payload with no manifest. "
+                "Nothing records what it was, what decided it, or whether its "
+                "bytes are complete, and none of that can be recovered from "
+                "the payload itself.")
+        if partial_case.exists():
+            return assessed(
+                RECOVERY_OPERATOR_REQUIRED,
+                f"{partial_case} exists with no manifest. The executor writes "
+                "the manifest before it moves anything, so this cannot be "
+                "attributed to a case and must not be assumed to belong to "
+                "one.")
+        return assessed(RECOVERY_NOTHING_STAGED,
+                        f"no manifest, no payload, nothing staged for {case_id}")
+
+    try:
+        manifest = CaseManifest.from_json(
+            manifest_path.read_text(encoding="utf-8"))
+    except (OSError, StagingError) as exc:
+        return assessed(
+            RECOVERY_OPERATOR_REQUIRED,
+            f"{manifest_path} does not validate ({exc}). Recovery reads and "
+            "fully validates the manifest before acting, so nothing here may "
+            "be interpreted.")
+
+    if manifest.case_id != case_id:
+        return assessed(
+            RECOVERY_OPERATOR_REQUIRED,
+            f"{manifest_path} describes case {manifest.case_id} but is filed "
+            f"as {case_id}.", manifest)
+
+    if manifest.state in TERMINAL_STATES:
+        return assessed(
+            RECOVERY_TERMINAL,
+            f"case is {manifest.state}, which is an operator's decision "
+            "rather than an interrupted transfer.", manifest)
+
+    expected = _inventory_from_json(manifest.files)
+    source = Path(manifest.staging_source_path)
+    payload_name = source.name
+
+    if pending_case.exists():
+        agrees, why = _payload_agrees(layout.payload(case_id) / payload_name,
+                                      expected)
+        if agrees:
+            return assessed(
+                RECOVERY_COMPLETE,
+                f"already published and verified ({why}); the manifest state "
+                f"is {manifest.state}.", manifest)
+        return assessed(
+            RECOVERY_PENDING_INCONSISTENT,
+            f"{pending_case} exists but its payload does not verify: {why}. "
+            "Refusing to recreate, recopy, or republish a case that claims to "
+            "be published.", manifest)
+
+    if manifest.state == STATE_PENDING_REVIEW:
+        return assessed(
+            RECOVERY_PENDING_INCONSISTENT,
+            f"the manifest says {STATE_PENDING_REVIEW} but {pending_case} does "
+            "not exist. This is a contradiction, not a resumable transfer.",
+            manifest)
+
+    partial_payload = layout.partial_payload(case_id) / payload_name
+
+    if manifest.transfer_method == METHOD_COPY_VERIFY:
+        if not source.is_dir():
+            return assessed(
+                RECOVERY_OPERATOR_REQUIRED,
+                f"a copy transfer whose source {source} is gone. The copy path "
+                "never releases the source before publication, so its absence "
+                "is unexplained and .partial must not be trusted to stand in "
+                "for it.", manifest)
+        agrees, why = _payload_agrees(partial_payload, expected)
+        if agrees:
+            return assessed(
+                RECOVERY_RESUME_PUBLICATION,
+                f"the staged copy verifies ({why}) and the source is still "
+                "present; publication can resume without copying again.",
+                manifest)
+        return assessed(
+            RECOVERY_RESTART_FROM_SOURCE,
+            f"the staged copy does not verify: {why}. The source is present "
+            "and authoritative, so .partial may be discarded and the copy "
+            "redone.", manifest)
+
+    # Same-volume rename.
+    if source.is_dir():
+        return assessed(
+            RECOVERY_RESTART_FROM_SOURCE,
+            f"the source {source} is still present, so the rename had not "
+            "happened; anything under .partial is pre-move debris and the "
+            "transfer can start again from the source.", manifest)
+
+    agrees, why = _payload_agrees(partial_payload, expected)
+    if agrees:
+        return assessed(
+            RECOVERY_PUBLISH_PARTIAL,
+            f"the source is gone and .partial verifies ({why}), so it is the "
+            "authoritative and possibly only copy; it can be published "
+            "without the original source path existing.", manifest)
+
+    if not partial_payload.exists():
+        return assessed(
+            RECOVERY_OPERATOR_REQUIRED,
+            f"the source {source} is gone and {partial_payload} does not "
+            "exist either. The payload is in neither location.", manifest)
+
+    return assessed(
+        RECOVERY_PARTIAL_UNUSABLE,
+        f"the source is gone and .partial does not verify: {why}. It may "
+        "still be the only copy of this payload, so it must not be deleted, "
+        "replaced, merged, or overwritten.", manifest)
