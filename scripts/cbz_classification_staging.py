@@ -114,7 +114,7 @@ def _fingerprint(stat_result: os.stat_result) -> tuple:
             stat_result.st_size, stat_result.st_mtime_ns)
 
 
-def _hash_stable_file(path: Path) -> tuple[int, str]:
+def _hash_stable_file(path: Path) -> tuple[int, str, tuple]:
     """Hash one file, proving it did not change while being read.
 
     Size, identity, and mtime are compared either side of the read, and the
@@ -147,7 +147,7 @@ def _hash_stable_file(path: Path) -> tuple[int, str]:
             f"{path} reported {after.st_size} bytes but {read} were read; "
             "retry after the payload settles"
         )
-    return after.st_size, digest.hexdigest()
+    return after.st_size, digest.hexdigest(), _fingerprint(after)
 
 
 def _relative_posix(path: Path, root: Path) -> str:
@@ -226,24 +226,47 @@ def build_inventory(root: Path) -> PayloadInventory:
     before = {_relative_posix(p, root) for p in first_pass}
 
     entries = []
+    fingerprints: dict[str, tuple] = {}
     for path in first_pass:
         relative = _relative_posix(path, root)
         try:
-            size, digest = _hash_stable_file(path)
+            size, digest, fingerprint = _hash_stable_file(path)
         except FileNotFoundError as exc:
             raise PayloadChangedError(
                 f"{relative} disappeared while the inventory was being built; "
                 "retry after the payload settles"
             ) from exc
         entries.append(FileEntry(relative, size, digest))
+        fingerprints[relative] = fingerprint
 
-    after = {_relative_posix(p, root) for p in _members(root)}
+    final_members = _members(root)
+    after = {_relative_posix(p, root) for p in final_members}
     if after != before:
         added, removed = sorted(after - before), sorted(before - after)
         raise PayloadChangedError(
             "payload membership changed while the inventory was being built "
             f"(added {added}, removed {removed}); retry after it settles"
         )
+
+    # Per-file checks only prove each file held still during its own read. A
+    # file hashed early can still be rewritten while a later one is being
+    # hashed, leaving an inventory that no longer describes the tree it
+    # claims to. Re-fingerprint every member against the state captured
+    # immediately after its own hash.
+    for path in final_members:
+        relative = _relative_posix(path, root)
+        try:
+            current = _fingerprint(os.stat(path))
+        except FileNotFoundError as exc:
+            raise PayloadChangedError(
+                f"{relative} disappeared after it was hashed; "
+                "retry after the payload settles"
+            ) from exc
+        if current != fingerprints[relative]:
+            raise PayloadChangedError(
+                f"{relative} changed after it was hashed; "
+                "retry after the payload settles"
+            )
     return PayloadInventory(tuple(entries))
 
 
@@ -348,9 +371,15 @@ VALID_STATES = frozenset({
     STATE_PLANNED, STATE_COPIED_VERIFIED, STATE_PENDING_REVIEW,
     STATE_PROMOTED, STATE_REJECTED, STATE_ROLLED_BACK,
 })
-VALID_METHODS = frozenset({METHOD_RENAME, METHOD_COPY_VERIFY, ""})
+# No empty value: a persisted manifest must name the method that was
+# actually chosen. CaseManifest still defaults to "" for in-memory
+# construction, but such an object cannot round-trip until planning has
+# assigned one.
+VALID_METHODS = frozenset({METHOD_RENAME, METHOD_COPY_VERIFY})
 
 _FILE_ENTRY_TYPES = {"relative_path": str, "size_bytes": int, "sha256": str}
+# ReviewHint is exactly kind and value, both strings (see cbz_routing).
+_REVIEW_HINT_TYPES = {"kind": str, "value": str}
 
 
 def _check_type(label: str, value, declared) -> None:
@@ -369,6 +398,31 @@ def _check_type(label: str, value, declared) -> None:
             f"{label} must be {wanted.__name__}, got "
             f"{type(value).__name__} ({value!r})"
         )
+
+
+def _validate_review_hints(hints) -> None:
+    """Each hint is exactly kind and value, both strings.
+
+    Validating only the outer list let rows like 1, null, {"kind": 7}, or an
+    object carrying extra keys survive into what a reviewer is shown.
+    """
+    for position, row in enumerate(hints):
+        if not isinstance(row, dict):
+            raise StagingError(
+                f"manifest.review_hints[{position}] must be an object, got "
+                f"{type(row).__name__}"
+            )
+        if set(row) != set(_REVIEW_HINT_TYPES):
+            raise StagingError(
+                f"manifest.review_hints[{position}] keys must be exactly "
+                f"{sorted(_REVIEW_HINT_TYPES)}, got {sorted(row)}"
+            )
+        for key, wanted in _REVIEW_HINT_TYPES.items():
+            if type(row[key]) is not wanted:
+                raise StagingError(
+                    f"manifest.review_hints[{position}].{key} must be "
+                    f"{wanted.__name__}, got {type(row[key]).__name__}"
+                )
 
 
 def _inventory_from_json(files) -> PayloadInventory:
@@ -546,6 +600,7 @@ class CaseManifest:
                 f"manifest.state {raw['state']!r} is not one of "
                 f"{sorted(VALID_STATES)}"
             )
+        _validate_review_hints(raw["review_hints"])
         if raw["transfer_method"] not in VALID_METHODS:
             raise StagingError(
                 f"manifest.transfer_method {raw['transfer_method']!r} is not "
@@ -596,6 +651,16 @@ class CaseManifest:
 
 # ------------------------------------------------------------- inspection
 
+# A case still in flight may be resumed; a terminal one may not. Reporting
+# a promoted or rejected case as recoverable would invite a retry to reopen
+# a decision an operator already made.
+RECOVERABLE_STATES = frozenset({
+    STATE_PLANNED, STATE_COPIED_VERIFIED, STATE_PENDING_REVIEW,
+})
+TERMINAL_STATES = frozenset({
+    STATE_PROMOTED, STATE_REJECTED, STATE_ROLLED_BACK,
+})
+
 STATUS_ABSENT = "absent"
 STATUS_VALID = "valid"
 STATUS_PARTIAL = "partial"
@@ -617,8 +682,17 @@ class ExistingCase:
 
     @property
     def is_recoverable(self) -> bool:
-        """Whether a retry should resume rather than start over."""
-        return self.status in (STATUS_VALID, STATUS_PARTIAL)
+        """Whether a retry should resume rather than start over.
+
+        State-aware: a valid manifest is not enough. A promoted, rejected, or
+        rolled-back case is finished, and reporting it as resumable would let
+        a retry reopen a decision an operator already made.
+        """
+        if self.status == STATUS_PARTIAL:
+            return True
+        if self.status != STATUS_VALID or self.manifest is None:
+            return False
+        return self.manifest.state in RECOVERABLE_STATES
 
 
 def inspect_case(layout: StagingLayout, case_id: str) -> ExistingCase:
