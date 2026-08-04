@@ -238,3 +238,71 @@ Audit documents are preserved unedited as the evidence record of the
 code at the time of audit. Mark closed findings inline and add a
 resolution log; never rewrite an original finding to describe current
 code.
+
+## Recording measurements and their provenance
+
+`CLAUDE.md` carries the two standing rules — a measured figure travels
+with what it measures, and provenance that lives only in a session
+transcript is not recorded. Both were learned the same way, from the
+2026-08-03 evidence census, and the mechanism is worth keeping.
+
+### How a number outlives its qualifier
+
+Issue #31 recorded the adult signal as "97.8% coverage against 0.46%
+false positives ... (2 confirmed false positives)". Three separate
+things had collapsed into one sentence:
+
+```text
+negative FP (raw)        : 3/646 (0.46%)   <- quoted in the issue
+negative FP (adjudicated): 2/646 (0.31%)   <- what the signal was accepted at
+```
+
+Three negative-pool series matched. One, `ERIKA`, was adjudicated a true
+positive — a mixed folder holding 3 adult archives among 9 horror ones —
+and removed from the negative denominator. The acceptance threshold is
+*adjudicated* precision ≥ 0.99, so the issue quoted the one rate that
+did not correspond to its own criterion, and paired it with a count from
+the other.
+
+What made this more than a typo: the acceptance criteria *required* the
+figure be recorded in code alongside the signal. Implementing against
+the issue as written would have moved the conflation into a comment, and
+from there into the permanent record, correctly cited to an issue and no
+longer checkable against anything. Nobody would have had to make a
+mistake for it to become true.
+
+The census artifacts had it right all along — raw and adjudicated
+printed one line apart, the adjudication codified as `ADJUDICATED_TP` /
+`CONFIRMED_FP` with its rationale in the module docstring. The loss
+happened in transcription, at the point where a measurement became a
+headline.
+
+So: when writing a figure into an issue, a comment, or a document, carry
+the denominator and name the population. When a human judgment sits
+between the raw measurement and the quoted one, name the judgment too —
+adjudication is an input, not a result, and a rate that depends on it is
+not reproducible from the data alone.
+
+### Watch for numeric coincidences
+
+The same issue reports `AgeRating` present on 3 of 646 negative-pool
+series — also 0.46%, same numerator and denominator, entirely unrelated
+to the false-positive rate. Two identical numbers meaning different
+things in one document is a trap for the next reader. Annotate the
+collision rather than trusting them to be told apart.
+
+### Identical artifacts prove less than they appear to
+
+Five `rerun*.json` files from that census, named as if they were
+before/after comparisons around a specific PR, are byte-identical to one
+another. `rerun.py` writes a fixed filename, so the variants were copied
+by hand and nothing outside the cleared transcript records which run
+produced which.
+
+Byte-identity is consistent with two different histories: runs that
+genuinely produced identical output, and copies of a single run that was
+never repeated. The files cannot distinguish them, so they do not
+establish that any change left classification output unchanged — which
+is exactly the conclusion their filenames invite. Record what such
+artifacts *cannot* support, explicitly, at the point someone would reach
+for them.

@@ -118,6 +118,17 @@ the same suite on `windows-latest` / Python 3.11.
   and on whose authority, and what remains open. Silence is
   indistinguishable from oversight; record deliberate non-decisions at
   the code site, in the audit, or both.
+- **A measured figure travels with what it measures.** Record the
+  numerator, the denominator, and the population — `2/646 (0.31%)`, not
+  `0.31%`. Where a measurement admits more than one defensible rate,
+  record every rate, the judgment that separates them, and which one the
+  decision was actually made on. A number that outlives its qualifier
+  becomes a false claim without anyone editing it.
+- **Provenance that lives only in a session transcript is not recorded.**
+  Transcripts are cleared. When the artifacts no longer establish how
+  something was produced, write the gap down as a gap. A plausible
+  reconstruction is worse than an acknowledged hole, because it cannot be
+  told apart from a fact.
 - Architectural choices go in `docs/engineering_decisions.md`; what
   happened on a day goes in `docs/development_log_<date>.md`.
 
