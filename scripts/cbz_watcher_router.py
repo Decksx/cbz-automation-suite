@@ -91,6 +91,31 @@ def _reject_indexed_review(cfg: RoutingConfig) -> None:
         )
 
 
+def _reject_mismatched_priority(cfg: RoutingConfig, index: SeriesIndex) -> None:
+    """An index whose precedence disagrees with the config decides by luck.
+
+    Destination order in series_index is precedence: Comix is listed first
+    because its membership encodes a deliberate adult determination that must
+    outrank a metadata-derived origin signal. An index built without that
+    order ranks every destination equally, so `rank < existing` is never true
+    and a series present in two libraries keeps whichever entry was written
+    first -- thread scheduling deciding an adult classification.
+
+    SeriesIndex.build always sets it, so this cannot happen through load().
+    It caught a test helper that constructed a bare SeriesIndex and therefore
+    asserted nothing about priority while appearing to.
+    """
+    if not cfg.series_index_enabled:
+        return
+    expected = cfg.series_index_destinations or tuple(cfg.destinations)
+    if tuple(index.priority) != tuple(expected):
+        raise RoutingConfigError(
+            f"series index priority {tuple(index.priority)} does not match the "
+            f"configured destination order {tuple(expected)}; ambiguity would "
+            "be resolved by write order rather than by configuration"
+        )
+
+
 @dataclass(frozen=True)
 class ShadowComparison:
     """One legacy-versus-v2 result, for logging and later tallying."""
@@ -164,6 +189,7 @@ class WatcherRouter:
                 f"routing mode {mode!r} must be one of {sorted(VALID_MODES)}"
             )
         _reject_indexed_review(cfg)
+        _reject_mismatched_priority(cfg, index)
         self.cfg = cfg
         self.index = index
         self.mode = mode
