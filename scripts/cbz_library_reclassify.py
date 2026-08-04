@@ -42,25 +42,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.cbz_routing import (  # noqa: E402
-    STRENGTH_ORDER,
     RoutingConfig,
-    RoutingDecision,
     build_context,
+    is_terminal_sample,
     parse,
     resolve,
+    sample_rank,
     series_key,
 )
-
-
-def _sample_rank(decision: RoutingDecision) -> tuple[int, int]:
-    """Order one sample's decision against another's.
-
-    Authoritative decisions -- a manual override, or an existing series
-    folder -- outrank every reading of metadata, however strong. Within
-    evidence, strong beats weak beats none.
-    """
-    return (1 if decision.authoritative else 0,
-            STRENGTH_ORDER[decision.evidence_strength])
 
 COMICINFO_FIELDS = (
     "Series", "LanguageISO", "Manga", "Genre", "Tags",
@@ -114,18 +103,31 @@ def read_comic_info(cbz_path: Path) -> dict[str, str]:
     return out
 
 
-def sample_archives(series_dir: Path, limit: int) -> list[Path]:
-    """Spread the sample across the series rather than taking the first N.
+def spread_sample(archives: list[Path], limit: int) -> list[Path]:
+    """Spread the sample across *archives* rather than taking the first N.
 
     Metadata quality is rarely uniform: a series often has ComicInfo on recent
     chapters and none on the back catalogue, so reading only the first few can
     miss the evidence entirely.
+
+    Takes an explicit collection because a caller does not always want every
+    archive under a directory. The watcher in particular must sample only the
+    files it is about to move: a mixed drop point holds loose archives beside
+    nested series directories, and walking the parent would classify one
+    series using another's metadata.
     """
-    archives = sorted(p for p in series_dir.rglob("*.cbz") if p.is_file())
-    if len(archives) <= limit:
-        return archives
-    step = len(archives) / limit
-    return [archives[int(i * step)] for i in range(limit)]
+    ordered = sorted(archives)
+    if len(ordered) <= limit:
+        return ordered
+    step = len(ordered) / limit
+    return [ordered[int(i * step)] for i in range(limit)]
+
+
+def sample_archives(series_dir: Path, limit: int) -> list[Path]:
+    """Spread the sample across every archive under *series_dir*."""
+    return spread_sample(
+        [p for p in series_dir.rglob("*.cbz") if p.is_file()], limit
+    )
 
 
 def tree_digest(source: Path) -> tuple[str, int, int]:
@@ -195,9 +197,9 @@ def plan_series(
         # rule_name. Reading strength out of a display string made this
         # coupled to config naming, so renaming a rule silently changed which
         # sample won.
-        if decision is None or _sample_rank(candidate) > _sample_rank(decision):
+        if decision is None or sample_rank(candidate) > sample_rank(decision):
             decision = candidate
-        if candidate.authoritative or candidate.evidence_strength == "strong":
+        if is_terminal_sample(candidate):
             break
 
     if decision is None:                        # empty directory

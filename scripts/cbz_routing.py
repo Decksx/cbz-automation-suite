@@ -283,6 +283,33 @@ class SeriesIndex:
         return len(self._entries)
 
 
+def sample_rank(decision: RoutingDecision) -> tuple[int, int]:
+    """Order one sample's decision against another's.
+
+    Origin is a property of a series, not of a chapter, so a caller that reads
+    several archives of one series has to rank their decisions. Authoritative
+    decisions -- a manual override, or an existing series folder -- outrank
+    every reading of metadata, however strong. Within evidence, strong beats
+    weak beats none.
+
+    Lives here rather than in a caller because every consumer must rank
+    identically. Two callers with their own copies is how the migration tool
+    and the watcher would drift into disagreeing about the same series.
+    """
+    return (1 if decision.authoritative else 0,
+            STRENGTH_ORDER[decision.evidence_strength])
+
+
+def is_terminal_sample(decision: RoutingDecision) -> bool:
+    """True when no further sample can improve on this one.
+
+    The other half of the ranking contract: nothing outranks an authoritative
+    decision or a strong signal, so reading more archives cannot change the
+    answer and the caller should stop.
+    """
+    return decision.authoritative or decision.evidence_strength == "strong"
+
+
 def _default_lister(root: Path):
     if not root.is_dir():
         return []

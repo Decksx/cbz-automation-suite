@@ -65,6 +65,24 @@ MIN_AGE       = 300  # seconds a directory must exist before processing
 
 ROUTING_FILE  = REPO_ROOT / "routing.json"
 
+# v2 routing. The legacy v1 loader above still decides every move; this is a
+# parallel classifier for observation only.
+#
+#   off    -- v2 is never consulted (checked-in default)
+#   shadow -- v2 classifies each directory and logs how it would differ
+#
+# Shadow mode opens up to ROUTING_V2_SAMPLE archives per directory to read
+# ComicInfo, and writes nothing. Set CBZ_ROUTING_V2_MODE=shadow to run a
+# comparison pass without editing this file.
+#
+# There is no "active" value: letting v2 choose a destination needs the review
+# staging path that does not exist yet, and repointing ROUTING_FILE at the v2
+# config would NOT activate v2 -- the legacy resolver reads only match/pattern
+# rules and would match nothing, sending the whole library to the default.
+ROUTING_V2_FILE   = REPO_ROOT / "config" / "routing.v2.json"
+ROUTING_V2_MODE   = os.environ.get("CBZ_ROUTING_V2_MODE", "off")
+ROUTING_V2_SAMPLE = 5
+
 # ─────────────────────────────────────────────
 
 COMICINFO_TEMPLATE = """<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -94,6 +112,11 @@ _MARKER_WORDS_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
 _routing_destinations: dict[str, str] = {}   # short-name -> full path
 _routing_rules: list[dict] = []               # ordered rules list
 _routing_default: str = ''                    # default destination path
+
+# v2 router, built once at startup. None whenever v2 is off or its config
+# failed to load — the watcher must keep running on legacy routing either way,
+# since an observation feature has no business stopping ingestion.
+_router = None
 
 # Directories currently being processed — events for these are suppressed to
 # prevent the file-rename step from re-triggering the settle timer in a loop.
@@ -848,6 +871,75 @@ def _load_routing() -> None:
         _routing_default = ''
 
 
+def _load_routing_v2() -> None:
+    """Build the v2 router once, if a mode was asked for.
+
+    Deliberately non-fatal. v2 controls nothing on this branch, so a missing
+    or invalid v2 config must not stop the watcher from ingesting on legacy
+    routing. The one thing it will not do is run degraded and quiet: a failure
+    is logged as an error and v2 stays off.
+    """
+    global _router
+    _router = None
+    if ROUTING_V2_MODE == "off":
+        return
+    try:
+        from scripts.cbz_watcher_router import WatcherRouter
+        _router = WatcherRouter.load(ROUTING_V2_FILE, mode=ROUTING_V2_MODE,
+                                     sample_limit=ROUTING_V2_SAMPLE)
+    except Exception as e:                       # noqa: BLE001 — never fatal
+        log.error(f"  Routing v2 disabled: {type(e).__name__}: {e}")
+        _router = None
+
+
+def _source_folder_name(comic_dir: Path) -> str:
+    """The immediate child of WATCH_FOLDER that *comic_dir* arrived under."""
+    watch = Path(WATCH_FOLDER)
+    for candidate in [comic_dir] + list(comic_dir.parents):
+        if candidate.parent == watch:
+            return candidate.name
+    return comic_dir.name
+
+
+def _shadow_route(comic_dir: Path, legacy_dest: str, series_name: str,
+                  archives: list[Path], results: list) -> None:
+    """Log how v2 would have classified this batch. Changes nothing.
+
+    Called after the series identity is resolved and the archives have been
+    renamed, because both change the answer: an arrival named "Berserk Ch. 4"
+    is filed under "Berserk" and would otherwise miss the existing-series
+    index hit, and a mixed drop point's loose files must not be classified
+    from a nested series' metadata.
+    """
+    if _router is None or not _router.enabled:
+        return
+    try:
+        comparison = _router.shadow(comic_dir, _source_folder_name(comic_dir),
+                                    legacy_dest, series_name, archives)
+        if comparison is not None:
+            results.append(comparison)
+    except Exception as e:                       # noqa: BLE001 — never fatal
+        log.error(f"  Routing v2 shadow failed for '{comic_dir.name}': "
+                  f"{type(e).__name__}: {e}")
+
+
+def _note_move(series_name: str, dest_folder: str,
+               landed: Path | None) -> None:
+    """Record a completed move so the series is sticky for this session.
+
+    *landed* is None when the move failed, in which case nothing is recorded:
+    an index entry for a series that is not on disk would hand out authority
+    for a directory that does not exist.
+    """
+    if _router is None or not _router.enabled or landed is None:
+        return
+    try:
+        _router.note_move(series_name, dest_folder, landed)
+    except Exception as e:                       # noqa: BLE001 — never fatal
+        log.error(f"  Routing v2 index update failed for '{series_name}': "
+                  f"{type(e).__name__}: {e}")
+
+
 def _resolve_dest(comic_dir: Path) -> str:
     """
     Walk up from comic_dir to find the immediate child of WATCH_FOLDER.
@@ -1013,7 +1105,7 @@ def _move_cbz_dir(
     dest_folder: str,
     target_name: str | None = None,
     chapter_number: str | None = None,
-) -> None:
+) -> Path | None:
     """Move a processed comic directory to dest_folder, merging if it already exists.
 
     *target_name* overrides the destination folder name (defaults to the source
@@ -1068,10 +1160,12 @@ def _move_cbz_dir(
             if dir_path.exists():
                 shutil.rmtree(dir_path, ignore_errors=True)
             log.info(f"  Merge complete.")
+            return dest_dir
         else:
             try:
                 shutil.move(str(dir_path), str(dest_dir))
                 log.info(f"  Moved successfully.")
+                return dest_dir
             except (OSError, shutil.Error):
                 # WinError 183: dest was created by a concurrent thread between
                 # our exists() check and the move — fall back to merge.
@@ -1083,14 +1177,21 @@ def _move_cbz_dir(
                     if dir_path.exists():
                         shutil.rmtree(dir_path, ignore_errors=True)
                     log.info(f"  Merge complete.")
+                    return dest_dir
                 else:
                     raise
 
     except Exception as e:
         log.error(f"  Failed to move directory '{dir_path.name}': {e}")
 
+    # The destination is returned only on success, so a caller can record the
+    # move without re-deriving where the files went: the merge branches above
+    # may land in a pre-existing folder whose name differs from target_name.
+    return None
 
-def _move_loose_files(files: list[Path], dest_folder: str, series_name: str) -> None:
+
+def _move_loose_files(files: list[Path], dest_folder: str,
+                      series_name: str) -> Path | None:
     """Move individual .cbz files — not their parent directory — into
     ``dest_folder/series_name``, applying the same keep-the-larger-on-conflict
     policy as ``_merge_directories`` on a per-file basis.
@@ -1137,6 +1238,7 @@ def _move_loose_files(files: list[Path], dest_folder: str, series_name: str) -> 
         moved += 1
 
     log.info(f"  Moved {moved} loose file(s) -> {dest_dir}")
+    return dest_dir if moved else None
 
 
 def process_and_move_directory(dir_path: Path) -> None:
@@ -1196,6 +1298,9 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
     progress = ProgressReporter(sum(len(files) for files in cbz_dirs.values()), "files")
 
     total_processed = total_skipped = total_renamed = 0
+    # Bounded to this pass. The router keeps no state of its own, so a
+    # long-running watcher never accumulates a record per directory.
+    shadow_results: list = []
 
     for comic_dir, cbz_files in sorted(cbz_dirs.items()):
         dest_folder = _resolve_dest(comic_dir)
@@ -1309,15 +1414,30 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 f"have their own .cbz files — moving only the loose files, not the whole "
                 f"directory, so unrelated series aren't swept along with it."
             )
-            _move_loose_files(list(parsed_by_path.keys()), dest_folder, series_name)
+            archives = list(parsed_by_path.keys())
+            _shadow_route(comic_dir, dest_folder, series_name, archives,
+                          shadow_results)
+            landed = _move_loose_files(archives, dest_folder, series_name)
+            _note_move(series_name, dest_folder, landed)
             continue
 
-        _move_cbz_dir(comic_dir, dest_folder, target_name=series_name, chapter_number=dir_number)
+        _shadow_route(comic_dir, dest_folder, series_name,
+                      list(parsed_by_path.keys()), shadow_results)
+        landed = _move_cbz_dir(comic_dir, dest_folder, target_name=series_name,
+                               chapter_number=dir_number)
+        _note_move(series_name, dest_folder, landed)
 
     log.info(
         f"  Batch complete — {total_processed} processed, "
         f"{total_renamed} renamed, {total_skipped} skipped."
     )
+    # Reported whenever shadow is running, not only when something was
+    # classified. If every classification fails, the errors are logged but the
+    # pass summary would otherwise vanish -- and a missing summary reads as
+    # "shadow was off", which is exactly the wrong conclusion.
+    if _router is not None and _router.enabled:
+        from scripts.cbz_watcher_router import summarise
+        log.info(summarise(shadow_results))
 
 
 # ─────────────────────────────────────────────
@@ -1647,11 +1767,20 @@ def main():
     os.makedirs(watch_path, exist_ok=True)
 
     _load_routing()
+    _load_routing_v2()
 
     log.info("=" * 60)
     log.info("CBZ Watcher started")
     log.info(f"  Watching : {WATCH_FOLDER}")
     log.info(f"  Routing  : {ROUTING_FILE}")
+    if _router is not None:
+        log.info(f"  Routing v2: {_router.mode} ({ROUTING_V2_FILE})")
+    elif ROUTING_V2_MODE == "off":
+        log.info("  Routing v2: off")
+    else:
+        # Never report the requested mode as if it were in effect.
+        log.info(f"  Routing v2: off (requested {ROUTING_V2_MODE}; "
+                 f"initialization failed)")
     log.info(f"  Log      : {LOG_FILE}")
     log.info(f"  Settle   : {SETTLE_DELAY}s after last file event")
     log.info("=" * 60)
