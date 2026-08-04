@@ -147,12 +147,28 @@ with `core.autocrlf=true` and no `.gitattributes`. Edits to those two
 files must emit CRLF, which means byte-exact edits rather than
 line-oriented ones. `CLAUDE.md` carries the full rule.
 
-**The suite is expected to pass completely on Windows.** 549 passed in
-about 40s at `a84831e`. `tests/test_series_detection.py` asserts on
-`\\tower\media\comics\...` UNC paths and `tests/test_workflows.py`
-imports `tkinter` through `apps/cbz_gui.py`; both are fine here and are
-the first things to fail if the suite is ever run somewhere that is not
-Windows. Reconcile any delta against the number of tests actually added.
+**The suite is expected to pass completely on Windows.**
+
+```text
+commit  : 801614590e3ebbed728dfc4d42b84ba438c45836
+command : python -m pytest -q
+result  : 911 passed, 0 skipped, ~71s
+python  : 3.11.3
+measured: 2026-08-04, clean tree, Windows checkout
+```
+
+`CLAUDE.md` carries the same record and the rule behind its shape.
+`tests/test_series_detection.py` asserts on `\\tower\media\comics\...`
+UNC paths and `tests/test_workflows.py` imports `tkinter` through
+`apps/cbz_gui.py`; both are fine here and are the first things to fail
+if the suite is ever run somewhere that is not Windows. Reconcile any
+delta against the number of tests actually added.
+
+The previous entry here read "549 passed in about 40s at `a84831e`" and
+had drifted by 362 tests before anyone noticed, because nothing about a
+bare count goes stale visibly. Re-measure deliberately, on a clean tree,
+naming the commit — and never as a side effect of unrelated work, since
+a number corrected in passing is a number nobody reviewed.
 
 **Dependencies are `requirements.txt` plus `pytest`,** which is not
 listed there. CI installs exactly that on `windows-latest` / Python

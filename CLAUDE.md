@@ -85,10 +85,24 @@ files fails to apply.
 python -m pytest -q
 ```
 
-Baseline on this Windows checkout: **549 passed, ~40s** at `a84831e`.
-Record the count before and after, and reconcile the delta against the
-number of tests actually added. CI (`.github/workflows/tests.yml`) runs
-the same suite on `windows-latest` / Python 3.11.
+Verified full-suite baseline:
+
+```text
+commit  : 801614590e3ebbed728dfc4d42b84ba438c45836
+command : python -m pytest -q
+result  : 911 passed, 0 skipped, ~71s
+python  : 3.11.3
+measured: 2026-08-04, clean tree, Windows checkout
+```
+
+A baseline is a measurement, not a target. It names the commit it was
+taken at, so a later count that differs is drift to be reconciled rather
+than evidence the record is wrong — and so re-measuring is a deliberate
+act with its own commit, never a number quietly edited inside unrelated
+work. Record the count before and after your change and reconcile the
+delta against the number of tests actually added. CI
+(`.github/workflows/tests.yml`) runs the same suite on `windows-latest`
+/ Python 3.11.
 
 - `git diff --check` is meaningful only for the LF files, where it should
   be clean. It is structurally noisy for the two CRLF files above:
