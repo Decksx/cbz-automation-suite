@@ -14,6 +14,7 @@ silent if broken:
 from __future__ import annotations
 
 import json
+import threading
 import zipfile
 from pathlib import Path
 
@@ -302,6 +303,99 @@ def test_the_destination_path_maps_back_to_its_key(tmp_path):
     router = _router(tmp_path)
     assert router.dest_key_for_path(str(tmp_path / "Manga")) == "manga"
     assert router.dest_key_for_path(str(tmp_path / "Nowhere")) is None
+
+
+# ── the shared index is serialized ───────────────────────────────
+#
+# Unrelated arrival directories run concurrently on Timer threads sharing
+# one router. SeriesIndex.add is a read-modify-write, so two threads adding
+# the same series could both see it absent, both write, and lose the
+# ambiguity marker and destination priority.
+
+
+def test_an_update_cannot_interleave_with_a_classification(tmp_path):
+    router = _router(tmp_path)
+    series = tmp_path / "src" / "Contended"
+    _cbz(series / "ch00.cbz")
+
+    inside_lookup = threading.Event()
+    may_finish = threading.Event()
+    add_entered = threading.Event()
+    real_lookup, real_add = router.index.lookup, router.index.add
+
+    def slow_lookup(name):
+        inside_lookup.set()
+        assert may_finish.wait(5), "test deadlocked waiting to release"
+        return real_lookup(name)
+
+    def watched_add(name, key, path):
+        add_entered.set()
+        return real_add(name, key, path)
+
+    router.index.lookup = slow_lookup
+    router.index.add = watched_add
+
+    errors: list[BaseException] = []
+
+    def classify():
+        try:
+            router.classify(series, "src", series_name="Contended")
+        except BaseException as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    def update():
+        try:
+            router.note_move("Contended", str(tmp_path / "Manga"),
+                             tmp_path / "Manga" / "Contended")
+        except BaseException as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    reader = threading.Thread(target=classify)
+    writer = threading.Thread(target=update)
+    reader.start()
+    assert inside_lookup.wait(5), "classification never reached the index"
+
+    writer.start()
+    # The writer must be unable to touch the index while the reader holds it.
+    assert not add_entered.wait(0.3), "note_move entered during a classification"
+
+    may_finish.set()
+    reader.join(5)
+    writer.join(5)
+    assert not reader.is_alive() and not writer.is_alive()
+    assert errors == []
+    assert add_entered.is_set()
+
+    router.index.lookup, router.index.add = real_lookup, real_add
+    assert router.index.lookup("Contended") == (
+        "manga", tmp_path / "Manga" / "Contended")
+
+
+def test_concurrent_adds_of_one_series_keep_priority_and_ambiguity(tmp_path):
+    # The corrupted outcome the lock prevents: both threads seeing the key
+    # absent, both writing, and the ambiguity marker never being set.
+    router = _router(tmp_path)
+    start = threading.Barrier(2)
+
+    def add(dest, sub):
+        start.wait(5)
+        router.note_move("Split Series", str(tmp_path / dest),
+                         tmp_path / dest / sub)
+
+    threads = [
+        threading.Thread(target=add, args=("Manga", "Split Series")),
+        threading.Thread(target=add, args=("Comix", "Split Series")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+        assert not t.is_alive()
+
+    # Comix is first in the configured priority, so it must win regardless of
+    # which thread got there first, and the split must be visible.
+    assert router.index.lookup("Split Series")[0] == "comix"
+    assert router.index.is_ambiguous("Split Series")
 
 
 # ── the classified identity and archive scope ────────────────────
