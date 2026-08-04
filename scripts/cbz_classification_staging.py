@@ -127,6 +127,17 @@ def _hash_stable_file(path: Path) -> tuple[int, str, tuple]:
     not detectable this way. Nothing short of re-reading the bytes would
     catch it. The watcher's settle delay is what makes that unlikely; this
     check is what makes the ordinary cases loud rather than silently wrong.
+
+    This is the same window as the tmp_replace_same_size scenario in
+    docs/archive_io_resource_audit.md, Finding 2 -- a size+mtime guard blind
+    to a same-size replacement inside the volume's mtime quantum. Measured
+    there at 11/16 silent clobbers on exFAT and 0/16 on NTFS, and `X:` was
+    reformatted to NTFS on 2026-08-02 to remove the enabler.
+
+    So the window's size is a property of the volume, not of this code.
+    Moving staging to a volume with coarser timestamps would widen it again
+    with nothing here changing, and nothing would report that it had. Treat
+    a filesystem change under the staging root as a change to this check.
     """
     before = os.stat(path)
     digest = hashlib.sha256()
