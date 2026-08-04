@@ -97,6 +97,29 @@ class StagedPayloadMismatchError(StagingError):
     """
 
 
+class PartialRecoveryRequiredError(StagingError):
+    """`.partial` may hold the only copy, and only recovery may decide.
+
+    On the copy path the source survives the whole transfer, so `.partial` is
+    genuinely disposable debris. On the rename path it is not: between moving
+    the source in and publishing the case there is a window where the source
+    is gone and `.partial` is the only copy that exists. Deleting it to
+    restart -- which is safe on the copy path -- destroys the payload.
+
+    So this is refused rather than cleaned, and refused without inspecting
+    whether the payload is complete. Deciding that is recovery's job.
+    """
+
+
+class InvalidExecutionPlanError(StagingError):
+    """The plan does not describe the payload it was measured against.
+
+    StagingPlan is frozen but its CaseManifest is not, so the values that
+    decide which directories are created, written, and deleted can be changed
+    after planning. Checked before any of them is used.
+    """
+
+
 class CaseCollisionError(StagingError):
     """Something already occupies this case, and it is not ours to overwrite.
 
@@ -1025,8 +1048,81 @@ def _refuse_collisions(layout: StagingLayout, existing: ExistingCase,
             )
 
 
+def validate_execution_plan(plan: StagingPlan) -> CaseManifest:
+    """Prove the plan still describes what it was measured against.
+
+    `StagingPlan` is frozen; the `CaseManifest` inside it is not. Between
+    planning and execution its fields can change, and the executor uses them
+    to decide which directory to create, which manifest to overwrite, and --
+    on the copy path -- which directory to delete. A mutated `case_id`
+    redirects all three at once.
+
+    Round-tripping through `from_json` re-runs every internal invariant: the
+    contract, the field types, the file rows, the recomputed payload digest,
+    and the case identity recomputed from series key, source path, and
+    inventory. That catches a single field edited in isolation.
+
+    What it cannot catch is the manifest being rewritten wholesale and
+    consistently, because then it is self-consistent by construction. So the
+    checks below anchor it to `plan.inventory` -- the one thing the plan holds
+    that was measured from the filesystem rather than copied out of the
+    manifest. A caller that replaces both in step is beyond what this can
+    see, and is stated here rather than implied to be covered.
+
+    Returns the validated manifest, which is what execution then uses; the
+    plan's own object is left alone so a plan stays a plan.
+    """
+    try:
+        validated = CaseManifest.from_json(plan.manifest.to_json())
+    except StagingError as exc:
+        raise InvalidExecutionPlanError(
+            f"the plan's manifest is not internally consistent: {exc}"
+        ) from exc
+
+    checks = (
+        ("payload_inventory_digest", validated.payload_inventory_digest,
+         plan.inventory.digest),
+        ("file_count", validated.file_count, plan.inventory.file_count),
+        ("total_bytes", validated.total_bytes, plan.inventory.total_bytes),
+        ("files", validated.files, plan.inventory.as_json()),
+        ("staged_path", validated.staged_path,
+         str(plan.layout.pending_case(validated.case_id))),
+    )
+    for name, found, wanted in checks:
+        if found != wanted:
+            raise InvalidExecutionPlanError(
+                f"manifest.{name} does not match the inventory this plan was "
+                f"built from: {found!r} != {wanted!r}"
+            )
+
+    # Anchors case_id to the measured inventory rather than to the manifest's
+    # own copy of it, so a re-minted identity pointing somewhere else is
+    # caught before it can steer a path.
+    expected_id = case_identity(validated.series_key,
+                                Path(validated.staging_source_path),
+                                plan.inventory)
+    if validated.case_id != expected_id:
+        raise InvalidExecutionPlanError(
+            "manifest.case_id does not recompute from the series key, source "
+            "path, and the inventory this plan measured"
+        )
+
+    # The method is a consequence of the volumes the plan recorded, not a free
+    # choice: flipping it alone would take the rename branch across volumes,
+    # where os.replace cannot work and nothing else would notice.
+    implied = (METHOD_RENAME if validated.source_volume == validated.staging_volume
+               else METHOD_COPY_VERIFY)
+    if validated.transfer_method != implied:
+        raise InvalidExecutionPlanError(
+            f"manifest.transfer_method {validated.transfer_method!r} "
+            f"contradicts the recorded volumes (source {validated.source_volume}, "
+            f"staging {validated.staging_volume}), which imply {implied!r}"
+        )
+    return validated
+
+
 def execute_transfer(plan: StagingPlan, *,
-                     delete_source: bool = True) -> CaseManifest:
+                     delete_copied_source: bool = False) -> CaseManifest:
     """Stage one case. The source stays authoritative until publication.
 
     Implements the ordering from #35, whose whole point is that the last
@@ -1053,29 +1149,50 @@ def execute_transfer(plan: StagingPlan, *,
     instant the operation happens.
 
     The manifest is written before anything moves, so a crash at any point
-    leaves an interpretable case rather than untracked bytes. `.partial` is
-    never authoritative; debris from an interrupted attempt is cleaned and
-    the transfer redone rather than resumed, which is safe precisely because
-    the source has not been given up. Resuming a partial transfer is a
-    separate concern and is not implemented here.
+    leaves an interpretable case rather than untracked bytes.
+
+    Whether `.partial` may be discarded depends on the method, and the two
+    are not alike. On the copy path the source survives the whole transfer,
+    so debris is disposable and the transfer is redone rather than resumed.
+    On the rename path there is a window between moving the source in and
+    publishing the case where the source is gone and `.partial` holds the
+    only copy; deleting it to restart would destroy the payload. So a rename
+    finding `.partial` present refuses, and does not inspect whether the
+    payload is complete -- that is recovery's decision, and recovery is a
+    separate scope bullet in #35.
 
     On failure the source is left in place, no `pending` entry is created,
-    and no final-library index entry is recorded. `delete_source` exists so a
-    caller can keep the source after a proven publication; it applies only to
-    the copy path, since the rename path never had a second copy to release.
+    and no final-library index entry is recorded.
+
+    `delete_copied_source` applies to the copy path alone and defaults to
+    off, so the destructive step is opt-in: this repository's standing rule
+    is to quarantine rather than delete, and #35's step 6 is the specific
+    exception a caller must ask for. The rename path never had a second copy
+    to release -- its original is moved, not deleted -- so the flag is
+    irrelevant there and does not silently mean something different.
     """
-    layout, manifest = plan.layout, plan.manifest
+    layout = plan.layout
+    manifest = validate_execution_plan(plan)
     case_id = manifest.case_id
     source = Path(manifest.staging_source_path)
 
-    _refuse_collisions(layout, plan.existing, case_id)
-
-    for directory in layout.all_dirs():
-        directory.mkdir(parents=True, exist_ok=True)
+    # Re-inspected here rather than trusting plan.existing: a case can be
+    # published, promoted, or rejected between planning and execution, and
+    # this is the last moment before anything is created or destroyed.
+    _refuse_collisions(layout, inspect_case(layout, case_id), case_id)
 
     partial_case = layout.partial_case(case_id)
     if partial_case.exists():
+        if manifest.transfer_method == METHOD_RENAME:
+            raise PartialRecoveryRequiredError(
+                f"{partial_case} already exists and this is a rename "
+                "transfer, so it may hold the only copy of the payload. "
+                "Refusing to discard it; recover the case explicitly."
+            )
         shutil.rmtree(partial_case)
+
+    for directory in layout.all_dirs():
+        directory.mkdir(parents=True, exist_ok=True)
 
     # Written before anything moves: a case with no manifest is debris nobody
     # can interpret, and that is a worse failure than one that is merely
@@ -1112,7 +1229,7 @@ def execute_transfer(plan: StagingPlan, *,
     manifest.touch()
     manifest.write(layout.manifest(case_id))
 
-    if manifest.transfer_method == METHOD_COPY_VERIFY and delete_source:
+    if manifest.transfer_method == METHOD_COPY_VERIFY and delete_copied_source:
         shutil.rmtree(source)
 
     return manifest
