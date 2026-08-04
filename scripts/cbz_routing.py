@@ -229,6 +229,18 @@ class SeriesIndex:
         self._entries: dict[str, tuple[str, Path, int]] = {}
         self._ambiguous: set[str] = set()
 
+    @property
+    def priority(self) -> tuple[str, ...]:
+        """The destination precedence this index resolves ambiguity with.
+
+        Public because a caller handed an index has no other way to check it
+        agrees with the configuration. An index built with no priority ranks
+        every destination equally, so a series present in two libraries is
+        decided by whichever write happened first -- silently, and differently
+        run to run.
+        """
+        return self._priority
+
     def _rank(self, dest_key: str) -> int:
         try:
             return self._priority.index(dest_key)
