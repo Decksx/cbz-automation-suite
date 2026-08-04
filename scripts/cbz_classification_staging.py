@@ -1,9 +1,10 @@
 """Review-case mechanics for archives that classification could not resolve.
 
 This module is deliberately inert: it computes case identity, builds
-manifests, chooses a transfer method, and plans. It moves nothing, and no
-watcher call site consumes it yet. Separating the filesystem safety protocol
-from concurrent watcher control flow keeps both reviewable.
+manifests, chooses a transfer method, plans, and revalidates a source against
+an inventory. It moves nothing, and no watcher call site consumes it yet.
+Separating the filesystem safety protocol from concurrent watcher control
+flow keeps both reviewable.
 
 A review case is one unresolved arrival, staged whole under a deterministic
 identity so that retrying an unchanged source finds the same case instead of
@@ -82,6 +83,21 @@ class PayloadChangedError(StagingError):
 
     Distinct from other staging errors because it is transient: the caller
     should retry once the source has settled, not treat the case as broken.
+    """
+
+
+class SourceChangedError(StagingError):
+    """The source settled, but at different content than the case was minted from.
+
+    Deliberately not a PayloadChangedError. That one means the tree was
+    moving *while* it was read, and the same case may succeed once it stops.
+    This one means the tree stopped moving somewhere else: the source is
+    internally consistent and simply is not the payload this case describes.
+
+    The response differs accordingly. Case identity is derived from the
+    inventory, so by the identity contract a changed source is a *different
+    case*. Abandon the transfer, leave the source authoritative, delete
+    nothing, and let a retry mint a new case id rather than resuming this one.
     """
 
 
@@ -279,6 +295,84 @@ def build_inventory(root: Path) -> PayloadInventory:
                 "retry after the payload settles"
             )
     return PayloadInventory(tuple(entries))
+
+
+# ------------------------------------------------------------- revalidation
+
+def _summarise(label: str, paths: list[str], limit: int = 5) -> str:
+    """One bounded clause of a difference report.
+
+    Capped because a source can hold thousands of files and this text goes
+    into an exception an operator reads. The count is always exact; only the
+    listing is truncated.
+    """
+    if not paths:
+        return ""
+    shown = ", ".join(repr(p) for p in paths[:limit])
+    if len(paths) > limit:
+        shown += f", and {len(paths) - limit} more"
+    return f"{label} {len(paths)} ({shown})"
+
+
+def inventory_difference(expected: PayloadInventory,
+                         current: PayloadInventory) -> str:
+    """Describe how *current* differs from *expected*, for an operator.
+
+    Content-based: a path present in both but with a different digest is
+    reported as modified, not as unchanged, even when its size matches.
+    """
+    before = {e.relative_path: e for e in expected.entries}
+    after = {e.relative_path: e for e in current.entries}
+    clauses = [
+        _summarise("added", sorted(set(after) - set(before))),
+        _summarise("removed", sorted(set(before) - set(after))),
+        _summarise("modified", sorted(
+            p for p in set(before) & set(after)
+            if before[p].sha256 != after[p].sha256
+        )),
+    ]
+    return "; ".join(c for c in clauses if c) or "no per-file difference found"
+
+
+def revalidate_source(staging_source_path: Path,
+                      expected: PayloadInventory) -> PayloadInventory:
+    """Prove the source still matches *expected*. Step 4 of the transfer.
+
+    Verifying the staged copy proves only that the copy matches the inventory
+    taken before it started. It proves nothing about the source, and the
+    source is what gets deleted.
+
+    The case this exists for: a drop appends a chapter after the inventory is
+    taken but before the source is released. The staged copy still matches the
+    manifest, so every destination check passes -- and the source, now
+    correct and *larger* than what was staged, is deleted. Nothing is
+    corrupt. The staged case is simply an older, smaller truth, and the newer
+    one is destroyed to make room for it.
+
+    Re-inventorying here catches that, and the check is content-based rather
+    than metadata-based, so it also narrows the same-size-rewrite window that
+    `_hash_stable_file` documents as beyond its reach: a torn or stale read
+    at step 1 surfaces here as a digest mismatch because the bytes are read
+    again. That holds on both transfer paths, including the same-volume
+    rename, which otherwise never re-reads the payload at all.
+
+    Raises SourceChangedError if the source settled at different content, and
+    PayloadChangedError (from build_inventory) if it is still moving. Both
+    mean abandon the transfer; only the second means this case id may be
+    resumed.
+
+    Returns the freshly built inventory, so a caller that needs to act on the
+    current source does not have to walk it a third time.
+    """
+    current = build_inventory(staging_source_path)
+    if current.digest != expected.digest:
+        raise SourceChangedError(
+            f"{staging_source_path} no longer matches the inventory this case "
+            f"was minted from: {inventory_difference(expected, current)}. "
+            "The source is authoritative and has not been touched; retry to "
+            "stage the current payload under a new case id."
+        )
+    return current
 
 
 # ------------------------------------------------------------- identity
