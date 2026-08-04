@@ -1431,7 +1431,11 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         f"  Batch complete — {total_processed} processed, "
         f"{total_renamed} renamed, {total_skipped} skipped."
     )
-    if shadow_results:
+    # Reported whenever shadow is running, not only when something was
+    # classified. If every classification fails, the errors are logged but the
+    # pass summary would otherwise vanish -- and a missing summary reads as
+    # "shadow was off", which is exactly the wrong conclusion.
+    if _router is not None and _router.enabled:
         from scripts.cbz_watcher_router import summarise
         log.info(summarise(shadow_results))
 
