@@ -30,6 +30,7 @@ Three things are deliberate:
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -169,9 +170,21 @@ class WatcherRouter:
         self.sample_limit = sample_limit
         # Destination path -> key. The legacy resolver yields a path and the
         # v2 model a key, so recording a completed move needs the reverse map.
+        # Immutable after construction, so it needs no lock.
         self._key_by_path = {
             _normalise(path): key for key, path in cfg.destinations.items()
         }
+        # The watcher processes unrelated arrival directories concurrently on
+        # Timer threads -- its own guard only prevents two threads working the
+        # same or a nested path -- and they share this router and its index.
+        #
+        # SeriesIndex.add is a compound read-modify-write: it reads _entries,
+        # branches on whether the key was present, and only then writes and
+        # marks ambiguity. Two threads adding the same series can both see it
+        # absent, both write, and lose the ambiguity marker along with the
+        # configured destination priority. The GIL makes each dict operation
+        # atomic; it does not make that sequence atomic.
+        self._index_lock = threading.RLock()
 
     @classmethod
     def load(cls, config_path: Path, *, mode: str = MODE_OFF,
@@ -216,33 +229,43 @@ class WatcherRouter:
         number worth observing in shadow mode.
         """
         series = series_name or comic_dir.name
-        decision: RoutingDecision | None = None
         sampled = (spread_sample(archives, self.sample_limit)
                    if archives is not None
                    else sample_archives(comic_dir, self.sample_limit))
 
-        for archive in sampled:
-            info = read_comic_info(archive)
-            candidate = resolve(
-                self.cfg,
-                build_context(source_name, series, info),
-                series_name=series,
-                index=self.index,
-                route_unresolved=False,
-            )
-            if decision is None or sample_rank(candidate) > sample_rank(decision):
-                decision = candidate
-            if is_terminal_sample(candidate):
-                break
+        # Read every sampled archive before taking the lock. Opening ZIPs and
+        # parsing XML must not block another thread's index update, and the
+        # whole ranking has to see one coherent index state rather than an
+        # index that changed underneath it mid-loop.
+        #
+        # This costs the early exit: previously a strong first sample stopped
+        # the reads. Up to sample_limit archives are now always opened, which
+        # is the price of keeping I/O outside the lock.
+        contexts = [
+            build_context(source_name, series, read_comic_info(archive))
+            for archive in sampled
+        ]
 
-        if decision is None:                    # no archives, or none readable
-            decision = resolve(
-                self.cfg,
-                build_context(source_name, series, {}),
-                series_name=series,
-                index=self.index,
-                route_unresolved=False,
-            )
+        decision: RoutingDecision | None = None
+        with self._index_lock:
+            for context in contexts:
+                candidate = resolve(
+                    self.cfg, context, series_name=series,
+                    index=self.index, route_unresolved=False,
+                )
+                if decision is None or sample_rank(candidate) > sample_rank(decision):
+                    decision = candidate
+                if is_terminal_sample(candidate):
+                    break
+
+            if decision is None:                # no archives, or none readable
+                decision = resolve(
+                    self.cfg,
+                    build_context(source_name, series, {}),
+                    series_name=series,
+                    index=self.index,
+                    route_unresolved=False,
+                )
         return decision
 
     def shadow(self, comic_dir: Path, source_name: str, legacy_dest: str,
@@ -300,4 +323,5 @@ class WatcherRouter:
             log.warning("  index not updated: %r is not a v2 destination",
                         dest_folder)
             return
-        self.index.add(series_name, dest_key, series_dir)
+        with self._index_lock:
+            self.index.add(series_name, dest_key, series_dir)
