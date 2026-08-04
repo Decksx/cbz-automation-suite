@@ -36,11 +36,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,6 +77,14 @@ class StagingError(RuntimeError):
     """Raised when a staging invariant cannot be satisfied."""
 
 
+class PayloadChangedError(StagingError):
+    """The payload moved under us while its inventory was being built.
+
+    Distinct from other staging errors because it is transient: the caller
+    should retry once the source has settled, not treat the case as broken.
+    """
+
+
 # ------------------------------------------------------------- inventory
 
 @dataclass(frozen=True)
@@ -93,6 +102,46 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(_HASH_CHUNK), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _fingerprint(stat_result: os.stat_result) -> tuple:
+    """Identity and mutable state of one file, as the OS reports it.
+
+    st_ino and st_dev are populated on Windows for Python 3.x and identify
+    the file itself, so a same-size replacement is still detected.
+    """
+    return (stat_result.st_ino, stat_result.st_dev,
+            stat_result.st_size, stat_result.st_mtime_ns)
+
+
+def _hash_stable_file(path: Path) -> tuple[int, str]:
+    """Hash one file, proving it did not change while being read.
+
+    Size, identity, and mtime are compared either side of the read, and the
+    byte count is compared with the size the file ended at. Reading a file
+    that is growing would otherwise pair an old size with a new digest and
+    mint a case ID that no stable source tree ever had.
+    """
+    before = os.stat(path)
+    digest = hashlib.sha256()
+    read = 0
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK), b""):
+            digest.update(chunk)
+            read += len(chunk)
+    after = os.stat(path)
+
+    if _fingerprint(before) != _fingerprint(after):
+        raise PayloadChangedError(
+            f"{path} changed while it was being hashed; "
+            "retry after the payload settles"
+        )
+    if read != after.st_size:
+        raise PayloadChangedError(
+            f"{path} reported {after.st_size} bytes but {read} were read; "
+            "retry after the payload settles"
+        )
+    return after.st_size, digest.hexdigest()
 
 
 def _relative_posix(path: Path, root: Path) -> str:
@@ -140,21 +189,56 @@ class PayloadInventory:
         return [asdict(e) for e in self.entries]
 
 
-def build_inventory(root: Path) -> PayloadInventory:
-    """Hash every file under *root*, ordered by relative path.
+def _members(root: Path) -> list[Path]:
+    """Every file under *root*, ordered by relative path.
 
     Sorted by the relative path rather than by enumeration order: two hosts
     walking the same tree must produce the same inventory, and os.scandir
     order is not a promise.
     """
+    return sorted((p for p in root.rglob("*") if p.is_file()),
+                  key=lambda p: _relative_posix(p, root))
+
+
+def build_inventory(root: Path) -> PayloadInventory:
+    """Hash every file under *root*, against a payload proven not to move.
+
+    Case identity is derived from this, so an inventory taken while the
+    source is still arriving would mint an ID for a tree that never existed.
+    Directory membership is enumerated before and after hashing, each file is
+    checked either side of its own read, and any addition, removal, rename,
+    replacement, or modification rejects the whole inventory.
+
+    This detects a payload that moved; it does not prevent one from moving.
+    The watcher's settle delay is what makes a stable read likely, and this
+    is what makes an unstable one loud instead of silently wrong.
+    """
     if not root.is_dir():
         raise StagingError(f"payload root is not a directory: {root}")
-    files = sorted((p for p in root.rglob("*") if p.is_file()),
-                   key=lambda p: _relative_posix(p, root))
-    return PayloadInventory(tuple(
-        FileEntry(_relative_posix(p, root), p.stat().st_size, file_sha256(p))
-        for p in files
-    ))
+
+    first_pass = _members(root)
+    before = {_relative_posix(p, root) for p in first_pass}
+
+    entries = []
+    for path in first_pass:
+        relative = _relative_posix(path, root)
+        try:
+            size, digest = _hash_stable_file(path)
+        except FileNotFoundError as exc:
+            raise PayloadChangedError(
+                f"{relative} disappeared while the inventory was being built; "
+                "retry after the payload settles"
+            ) from exc
+        entries.append(FileEntry(relative, size, digest))
+
+    after = {_relative_posix(p, root) for p in _members(root)}
+    if after != before:
+        added, removed = sorted(after - before), sorted(before - after)
+        raise PayloadChangedError(
+            "payload membership changed while the inventory was being built "
+            f"(added {added}, removed {removed}); retry after it settles"
+        )
+    return PayloadInventory(tuple(entries))
 
 
 # ------------------------------------------------------------- identity
@@ -252,6 +336,110 @@ class StagingLayout:
         return (self.partial, self.pending, self.manifests, self.rejected)
 
 
+# ------------------------------------------------------------- validation
+
+VALID_STATES = frozenset({
+    STATE_PLANNED, STATE_COPIED_VERIFIED, STATE_PENDING_REVIEW,
+    STATE_PROMOTED, STATE_REJECTED, STATE_ROLLED_BACK,
+})
+VALID_METHODS = frozenset({METHOD_RENAME, METHOD_COPY_VERIFY, ""})
+
+_FILE_ENTRY_TYPES = {"relative_path": str, "size_bytes": int, "sha256": str}
+
+
+def _check_type(label: str, value, declared) -> None:
+    """Exact type check. bool is not an int here, and int is not a bool.
+
+    Python treats bool as a subclass of int, so an isinstance check would let
+    `true` satisfy an integer field and `1` satisfy a Boolean one. For
+    persisted state that is a silent corruption, not a convenience.
+    """
+    expected = {"str": str, "int": int, "bool": bool, "list[dict]": list}
+    wanted = expected.get(declared if isinstance(declared, str) else "")
+    if wanted is None:
+        return
+    if type(value) is not wanted:
+        raise StagingError(
+            f"{label} must be {wanted.__name__}, got "
+            f"{type(value).__name__} ({value!r})"
+        )
+
+
+def _inventory_from_json(files) -> PayloadInventory:
+    """Rebuild an inventory from a manifest's file list, validating each row."""
+    entries = []
+    for position, row in enumerate(files):
+        if not isinstance(row, dict):
+            raise StagingError(
+                f"manifest.files[{position}] must be an object, got "
+                f"{type(row).__name__}"
+            )
+        unknown = set(row) - set(_FILE_ENTRY_TYPES)
+        missing = set(_FILE_ENTRY_TYPES) - set(row)
+        if unknown or missing:
+            raise StagingError(
+                f"manifest.files[{position}] keys are wrong: "
+                f"unknown {sorted(unknown)}, missing {sorted(missing)}"
+            )
+        for key, wanted in _FILE_ENTRY_TYPES.items():
+            if type(row[key]) is not wanted:
+                raise StagingError(
+                    f"manifest.files[{position}].{key} must be "
+                    f"{wanted.__name__}, got {type(row[key]).__name__}"
+                )
+        _reject_unsafe_relative_path(position, row["relative_path"])
+        if row["size_bytes"] < 0:
+            raise StagingError(
+                f"manifest.files[{position}].size_bytes is negative"
+            )
+        entries.append(FileEntry(row["relative_path"], row["size_bytes"],
+                                 row["sha256"]))
+
+    paths = [e.relative_path for e in entries]
+    if len(set(paths)) != len(paths):
+        raise StagingError("manifest.files contains duplicate relative paths")
+    if paths != sorted(paths):
+        raise StagingError(
+            "manifest.files is not in canonical relative-path order"
+        )
+    return PayloadInventory(tuple(entries))
+
+
+def _reject_unsafe_relative_path(position: int, relative: str) -> None:
+    """A payload path must stay inside the payload.
+
+    A manifest is read back to decide what to promote or roll back, so an
+    absolute path or a traversal component in it is a way to reach outside
+    the case -- into a library, or over an unrelated file.
+    """
+    if not relative:
+        raise StagingError(f"manifest.files[{position}].relative_path is empty")
+    if relative != relative.strip():
+        raise StagingError(
+            f"manifest.files[{position}].relative_path has surrounding "
+            f"whitespace: {relative!r}"
+        )
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or relative.startswith("/") or "\\" in relative:
+        raise StagingError(
+            f"manifest.files[{position}].relative_path is not relative posix: "
+            f"{relative!r}"
+        )
+    if ntpath.isabs(relative) or ntpath.splitdrive(relative)[0]:
+        raise StagingError(
+            f"manifest.files[{position}].relative_path is a Windows absolute "
+            f"path: {relative!r}"
+        )
+    # Checked against the raw text, not PurePosixPath.parts: the parser
+    # silently normalises "./here.cbz" to "here.cbz", so a parts-based check
+    # would accept a path this canonical form never produces.
+    if any(part in ("..", ".", "") for part in relative.split("/")):
+        raise StagingError(
+            f"manifest.files[{position}].relative_path contains a traversal or "
+            f"empty component: {relative!r}"
+        )
+
+
 # ------------------------------------------------------------- manifest
 
 @dataclass
@@ -312,17 +500,80 @@ class CaseManifest:
 
     @classmethod
     def from_json(cls, text: str) -> "CaseManifest":
-        raw = json.loads(text)
+        """Parse and fully validate a manifest, or raise.
+
+        This is persisted recovery metadata: a manifest that survives parsing
+        is treated as authoritative about what is staged and what may be
+        promoted, so it gets at least the strictness the routing config gets.
+        Every field is type-checked, every declared invariant is recomputed,
+        and anything that fails is not recoverable state.
+        """
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise StagingError(f"manifest is not valid JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise StagingError(
+                f"manifest must be a JSON object, got {type(raw).__name__}"
+            )
+
         contract = raw.get("contract")
         if contract != CASE_CONTRACT:
             raise StagingError(
                 f"manifest contract {contract!r} is not {CASE_CONTRACT!r}; "
                 "refusing to interpret a case minted under another scheme"
             )
-        known = {f for f in cls.__dataclass_fields__}
-        unknown = set(raw) - known
+
+        fields = cls.__dataclass_fields__
+        unknown = set(raw) - set(fields)
         if unknown:
             raise StagingError(f"manifest has unknown fields: {sorted(unknown)}")
+        missing = set(fields) - set(raw)
+        if missing:
+            raise StagingError(f"manifest is missing fields: {sorted(missing)}")
+
+        for name, spec in fields.items():
+            _check_type(f"manifest.{name}", raw[name], spec.type)
+
+        if raw["state"] not in VALID_STATES:
+            raise StagingError(
+                f"manifest.state {raw['state']!r} is not one of "
+                f"{sorted(VALID_STATES)}"
+            )
+        if raw["transfer_method"] not in VALID_METHODS:
+            raise StagingError(
+                f"manifest.transfer_method {raw['transfer_method']!r} is not "
+                f"one of {sorted(VALID_METHODS)}"
+            )
+
+        inventory = _inventory_from_json(raw["files"])
+        if raw["file_count"] != inventory.file_count:
+            raise StagingError(
+                f"manifest.file_count {raw['file_count']} does not match "
+                f"{inventory.file_count} entries"
+            )
+        if raw["total_bytes"] != inventory.total_bytes:
+            raise StagingError(
+                f"manifest.total_bytes {raw['total_bytes']} does not match "
+                f"{inventory.total_bytes} from the inventory"
+            )
+        if raw["payload_inventory_digest"] != inventory.digest:
+            raise StagingError(
+                "manifest.payload_inventory_digest does not recompute from "
+                "its own file list"
+            )
+
+        recomputed = case_identity(
+            raw["series_key"], Path(raw["staging_source_path"]), inventory)
+        if raw["case_identity_digest"] != recomputed:
+            raise StagingError(
+                "manifest.case_identity_digest does not recompute from the "
+                "contract, series key, source path, and inventory"
+            )
+        if raw["case_id"] != raw["case_identity_digest"]:
+            raise StagingError(
+                "manifest.case_id does not equal its case_identity_digest"
+            )
         return cls(**raw)
 
     def write(self, path: Path) -> None:
@@ -337,6 +588,68 @@ class CaseManifest:
         os.replace(tmp, path)
 
 
+# ------------------------------------------------------------- inspection
+
+STATUS_ABSENT = "absent"
+STATUS_VALID = "valid"
+STATUS_PARTIAL = "partial"
+STATUS_ORPHANED_PENDING = "orphaned_pending"
+
+
+@dataclass(frozen=True)
+class ExistingCase:
+    """What is already on disk for one case id.
+
+    A boolean was wrong here. "Something exists at that path" and "a case
+    exists" are different claims, and only the second may suppress creating
+    or recovering the real case. A truncated, wrong-contract, or unrelated
+    manifest must raise rather than silently count as the case being present.
+    """
+
+    status: str
+    manifest: CaseManifest | None = None
+
+    @property
+    def is_recoverable(self) -> bool:
+        """Whether a retry should resume rather than start over."""
+        return self.status in (STATUS_VALID, STATUS_PARTIAL)
+
+
+def inspect_case(layout: StagingLayout, case_id: str) -> ExistingCase:
+    """Report what exists for *case_id*, validating anything it finds.
+
+    Raises rather than reporting a status when what is on disk is
+    self-inconsistent: a manifest that will not parse, was minted under
+    another contract, or describes a different case is a condition an
+    operator has to see, not one to route around.
+    """
+    manifest_path = layout.manifest(case_id)
+    if manifest_path.exists():
+        try:
+            text = manifest_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise StagingError(f"cannot read {manifest_path}: {exc}") from exc
+        manifest = CaseManifest.from_json(text)          # validates fully
+        if manifest.case_id != case_id:
+            raise StagingError(
+                f"{manifest_path} describes case {manifest.case_id} but is "
+                f"filed as {case_id}"
+            )
+        return ExistingCase(STATUS_VALID, manifest)
+
+    # A published payload with no manifest cannot be interpreted: nothing
+    # records what it was, what decided it, or whether its bytes are complete.
+    if layout.pending_case(case_id).exists():
+        return ExistingCase(STATUS_ORPHANED_PENDING)
+
+    # A .partial directory is expected debris from an interrupted transfer.
+    # The source is still authoritative, so this is recoverable by retrying.
+    if layout.partial_case(case_id).exists():
+        return ExistingCase(STATUS_PARTIAL)
+
+    return ExistingCase(STATUS_ABSENT)
+
+
 # ------------------------------------------------------------- planning
 
 @dataclass(frozen=True)
@@ -346,7 +659,7 @@ class StagingPlan:
     manifest: CaseManifest
     layout: StagingLayout
     inventory: PayloadInventory
-    existing_case: bool
+    existing: ExistingCase
     free_bytes: int
 
     @property
@@ -360,7 +673,7 @@ class StagingPlan:
     def describe(self) -> list[str]:
         m = self.manifest
         lines = [
-            f"case {m.case_id[:16]}...  ({'existing' if self.existing_case else 'new'})",
+            f"case {m.case_id[:16]}...  ({self.existing.status})",
             f"  series        : {m.series_name!r} (key {m.series_key!r})",
             f"  arrival       : {m.arrival_path}",
             f"  staging source: {m.staging_source_path}",
@@ -438,8 +751,7 @@ def plan_case(staging_root: Path, arrival_path: Path, staging_source_path: Path,
         manifest=manifest,
         layout=layout,
         inventory=inventory,
-        existing_case=layout.manifest(case_id).exists()
-        or layout.pending_case(case_id).exists(),
+        existing=inspect_case(layout, case_id),
         free_bytes=free,
     )
 
