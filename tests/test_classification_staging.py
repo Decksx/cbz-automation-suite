@@ -38,11 +38,14 @@ from scripts.cbz_classification_staging import (
     STATUS_PARTIAL,
     STATUS_VALID,
     PayloadChangedError,
+    SourceChangedError,
     inspect_case,
+    revalidate_source,
     METHOD_COPY_VERIFY,
     METHOD_RENAME,
     STATE_PLANNED,
     CaseManifest,
+    FileEntry,
     PayloadInventory,
     StagingError,
     StagingLayout,
@@ -779,6 +782,162 @@ def test_a_settled_payload_hashes_without_complaint(tmp_path):
     inventory = build_inventory(src)
     assert inventory.file_count == 3
     assert build_inventory(src) == inventory
+
+
+# ── the source is revalidated before the source is released ─────
+
+
+def test_revalidation_accepts_a_source_that_has_not_moved(tmp_path):
+    src = _payload(tmp_path / "src", DEFAULT)
+    expected = build_inventory(src)
+    assert revalidate_source(src, expected) == expected
+
+
+def test_a_source_that_grew_after_its_inventory_is_refused(tmp_path):
+    """The case step 4 exists for, stated as the issue states it.
+
+    Every check against the staged copy would pass here: the copy genuinely
+    matches the inventory. It is the source that moved on, and the source is
+    what step 6 deletes.
+    """
+    src = _payload(tmp_path / "src", DEFAULT)
+    expected = build_inventory(src)
+    (src / "ch03.cbz").write_bytes(b"a chapter that arrived late")
+
+    with pytest.raises(SourceChangedError, match="no longer matches"):
+        revalidate_source(src, expected)
+
+
+def test_a_source_that_shrank_after_its_inventory_is_refused(tmp_path):
+    src = _payload(tmp_path / "src", DEFAULT)
+    expected = build_inventory(src)
+    (src / "ch02.cbz").unlink()
+
+    with pytest.raises(SourceChangedError, match="removed 1"):
+        revalidate_source(src, expected)
+
+
+def test_a_same_size_rewrite_is_caught_without_relying_on_mtime(tmp_path):
+    """Content, not metadata -- this is the check `_hash_stable_file` cannot make.
+
+    The rewrite keeps the length and the timestamp is deliberately restored,
+    so a size-and-mtime guard would see nothing. Step 4 re-reads the bytes,
+    which is why it narrows the tmp_replace_same_size window on both transfer
+    paths rather than only on the copy path.
+    """
+    import scripts.cbz_classification_staging as staging
+    src = _payload(tmp_path / "src", {"ch01.cbz": b"aaaaa"})
+    expected = build_inventory(src)
+
+    target = src / "ch01.cbz"
+    before = staging.os.stat(target)
+    target.write_bytes(b"bbbbb")                     # identical length
+    staging.os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    after = staging.os.stat(target)
+    assert after.st_size == before.st_size, "the rewrite changed the length"
+    assert after.st_mtime_ns == before.st_mtime_ns, "the mtime was not restored"
+
+    with pytest.raises(SourceChangedError, match="modified 1"):
+        revalidate_source(src, expected)
+
+
+def test_a_renamed_file_reports_both_sides_of_the_rename(tmp_path):
+    src = _payload(tmp_path / "src", {"ch01.cbz": b"one"})
+    expected = build_inventory(src)
+    (src / "ch01.cbz").rename(src / "ch01-v2.cbz")
+
+    with pytest.raises(SourceChangedError) as caught:
+        revalidate_source(src, expected)
+    message = str(caught.value)
+    assert "added 1" in message and "'ch01-v2.cbz'" in message
+    assert "removed 1" in message and "'ch01.cbz'" in message
+
+
+def test_a_refused_revalidation_leaves_the_source_alone(tmp_path):
+    src = _payload(tmp_path / "src", DEFAULT)
+    expected = build_inventory(src)
+    (src / "ch03.cbz").write_bytes(b"late arrival")
+    before = {p.relative_to(src).as_posix(): p.read_bytes()
+              for p in src.rglob("*") if p.is_file()}
+
+    with pytest.raises(SourceChangedError):
+        revalidate_source(src, expected)
+
+    after = {p.relative_to(src).as_posix(): p.read_bytes()
+             for p in src.rglob("*") if p.is_file()}
+    assert after == before, "revalidation is read-only and must delete nothing"
+
+
+def test_a_changed_source_mints_a_new_case_id(tmp_path):
+    """The retry contract: a changed payload is a different case, not a resume."""
+    src = _payload(tmp_path / "src", DEFAULT)
+    original = _identity(src)
+    expected = build_inventory(src)
+
+    (src / "ch03.cbz").write_bytes(b"a chapter that arrived late")
+    with pytest.raises(SourceChangedError):
+        revalidate_source(src, expected)
+
+    assert _identity(src) != original
+
+
+def test_a_source_still_moving_is_transient_not_a_changed_case(tmp_path,
+                                                              monkeypatch):
+    """PayloadChangedError, not SourceChangedError -- this case id may be resumed."""
+    import scripts.cbz_classification_staging as staging
+    src = _payload(tmp_path / "src", {"ch01.cbz": b"start"})
+    expected = build_inventory(src)
+    target = src / "ch01.cbz"
+    real_open = open
+    grown = {"done": False}
+
+    def grow(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if Path(path) == target and not grown["done"]:
+            grown["done"] = True
+            with real_open(path, "ab") as extra:
+                extra.write(b" still arriving")
+        return handle
+
+    monkeypatch.setattr("builtins.open", grow)
+    with pytest.raises(PayloadChangedError):
+        staging.revalidate_source(src, expected)
+    assert grown["done"], "the growth never happened"
+
+
+def test_a_size_only_disagreement_is_still_reported_as_modified(tmp_path):
+    """The report must never come back empty while the digests disagree.
+
+    A manifest can carry a size_bytes inconsistent with its own sha256:
+    from_json recomputes the manifest against itself, never against real
+    files, so such a manifest validates. Comparing content alone would refuse
+    it correctly and then tell the operator nothing had changed.
+    """
+    src = _payload(tmp_path / "src", {"ch01.cbz": b"one"})
+    real = build_inventory(src)
+    entry = real.entries[0]
+    claimed = PayloadInventory((
+        FileEntry(entry.relative_path, entry.size_bytes + 1, entry.sha256),
+    ))
+    assert claimed.digest != real.digest
+
+    with pytest.raises(SourceChangedError, match="modified 1"):
+        revalidate_source(src, claimed)
+
+
+def test_the_difference_report_is_bounded(tmp_path):
+    """Bounded listing, exact count -- this text goes into an operator's face."""
+    src = _payload(tmp_path / "src", {"ch01.cbz": b"one"})
+    expected = build_inventory(src)
+    for n in range(12):
+        (src / f"extra{n:02d}.cbz").write_bytes(b"x")
+
+    with pytest.raises(SourceChangedError) as caught:
+        revalidate_source(src, expected)
+    message = str(caught.value)
+    assert "added 12" in message
+    assert "and 7 more" in message
 
 
 def test_the_plan_description_names_the_case_and_method(tmp_path):
