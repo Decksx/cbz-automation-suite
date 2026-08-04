@@ -45,6 +45,7 @@ from scripts.cbz_classification_staging import (
     METHOD_RENAME,
     STATE_PLANNED,
     CaseManifest,
+    FileEntry,
     PayloadInventory,
     StagingError,
     StagingLayout,
@@ -903,6 +904,26 @@ def test_a_source_still_moving_is_transient_not_a_changed_case(tmp_path,
     with pytest.raises(PayloadChangedError):
         staging.revalidate_source(src, expected)
     assert grown["done"], "the growth never happened"
+
+
+def test_a_size_only_disagreement_is_still_reported_as_modified(tmp_path):
+    """The report must never come back empty while the digests disagree.
+
+    A manifest can carry a size_bytes inconsistent with its own sha256:
+    from_json recomputes the manifest against itself, never against real
+    files, so such a manifest validates. Comparing content alone would refuse
+    it correctly and then tell the operator nothing had changed.
+    """
+    src = _payload(tmp_path / "src", {"ch01.cbz": b"one"})
+    real = build_inventory(src)
+    entry = real.entries[0]
+    claimed = PayloadInventory((
+        FileEntry(entry.relative_path, entry.size_bytes + 1, entry.sha256),
+    ))
+    assert claimed.digest != real.digest
+
+    with pytest.raises(SourceChangedError, match="modified 1"):
+        revalidate_source(src, claimed)
 
 
 def test_the_difference_report_is_bounded(tmp_path):
