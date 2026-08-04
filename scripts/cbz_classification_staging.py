@@ -318,8 +318,13 @@ def inventory_difference(expected: PayloadInventory,
                          current: PayloadInventory) -> str:
     """Describe how *current* differs from *expected*, for an operator.
 
-    Content-based: a path present in both but with a different digest is
-    reported as modified, not as unchanged, even when its size matches.
+    Compares exactly what the digest commits to -- path, size, and content
+    hash -- so this report cannot come back empty while the digests disagree.
+    Comparing content alone would: a manifest may carry a size_bytes that
+    does not match its own sha256, since from_json recomputes the manifest
+    against itself and never against real files. Such a manifest is
+    internally consistent, is refused here correctly, and would otherwise be
+    refused with a message saying nothing had changed.
     """
     before = {e.relative_path: e for e in expected.entries}
     after = {e.relative_path: e for e in current.entries}
@@ -328,7 +333,8 @@ def inventory_difference(expected: PayloadInventory,
         _summarise("removed", sorted(set(before) - set(after))),
         _summarise("modified", sorted(
             p for p in set(before) & set(after)
-            if before[p].sha256 != after[p].sha256
+            if (before[p].size_bytes, before[p].sha256)
+            != (after[p].size_bytes, after[p].sha256)
         )),
     ]
     return "; ".join(c for c in clauses if c) or "no per-file difference found"
