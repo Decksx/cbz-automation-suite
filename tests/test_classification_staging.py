@@ -56,6 +56,7 @@ from scripts.cbz_classification_staging import (
     RECOVERY_OPERATOR_REQUIRED,
     AUTOMATIC_RECOVERY_STATES,
     assess_recovery,
+    recover_case,
     inspect_case,
     execute_transfer,
     revalidate_source,
@@ -1539,6 +1540,283 @@ def test_the_automatic_set_is_exactly_the_actionable_states():
                   RECOVERY_PENDING_INCONSISTENT, RECOVERY_TERMINAL,
                   RECOVERY_OPERATOR_REQUIRED, RECOVERY_NOTHING_STAGED):
         assert state not in AUTOMATIC_RECOVERY_STATES
+
+
+# ── recovery actions ─────────────────────────────────────────────
+
+
+def test_recovery_resumes_a_verified_copy_without_copying_again(tmp_path,
+                                                                monkeypatch):
+    staging, src, plan = _interrupt_before_publication(
+        tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+
+    copied = {"n": 0}
+    real_copytree = staging.shutil.copytree
+
+    def counted(*a, **kw):
+        copied["n"] += 1
+        return real_copytree(*a, **kw)
+
+    monkeypatch.setattr(staging.shutil, "copytree", counted)
+    outcome = recover_case(layout, case_id)
+
+    assert outcome.acted is True
+    assert outcome.state == RECOVERY_RESUME_PUBLICATION
+    assert copied["n"] == 0, "the payload was copied again"
+    assert _staged_files(layout, case_id, "src") == DEFAULT
+    assert src.exists(), "the source is retained by default"
+    assert not layout.partial_case(case_id).exists()
+
+
+def test_recovery_recopies_when_the_staged_copy_is_unusable(tmp_path,
+                                                            monkeypatch):
+    staging, src, plan = _interrupt_before_publication(
+        tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    (layout.partial_payload(case_id) / "src" / "ch01.cbz").write_bytes(b"wrong")
+
+    outcome = recover_case(layout, case_id)
+
+    assert outcome.acted is True
+    assert outcome.state == RECOVERY_RESTART_FROM_SOURCE
+    assert _staged_files(layout, case_id, "src") == DEFAULT
+    assert src.exists()
+
+
+def test_recovery_publishes_an_authoritative_partial_without_the_source(
+        tmp_path, monkeypatch):
+    """The rename crash window: .partial is everything, and it is enough."""
+    staging, src, plan = _interrupt_before_publication(
+        tmp_path, monkeypatch, METHOD_RENAME)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    assert not src.exists(), "precondition: the source is gone"
+
+    outcome = recover_case(layout, case_id)
+
+    assert outcome.acted is True
+    assert outcome.state == RECOVERY_PUBLISH_PARTIAL
+    assert _staged_files(layout, case_id, "src") == DEFAULT
+    assert not src.exists(), "recovery must not require or recreate the source"
+
+
+def test_recovery_reconciles_a_published_case_idempotently(tmp_path,
+                                                           monkeypatch):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    execute_transfer(plan)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+
+    drifted = CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8"))
+    drifted.state = STATE_COPIED_VERIFIED
+    drifted.write(layout.manifest(case_id))
+
+    first = recover_case(layout, case_id)
+    assert first.acted is True
+    assert first.manifest.state == STATE_PENDING_REVIEW
+
+    second = recover_case(layout, case_id)
+    assert second.acted is False, "reconciliation is not idempotent"
+    assert second.state == RECOVERY_COMPLETE
+
+
+@pytest.mark.parametrize("wreck, expected_state", [
+    ("rename_partial", RECOVERY_PARTIAL_UNUSABLE),
+    ("orphan_pending", RECOVERY_ORPHANED_PENDING),
+    ("drop_pending", RECOVERY_PENDING_INCONSISTENT),
+    ("corrupt_manifest", RECOVERY_OPERATOR_REQUIRED),
+])
+def test_recovery_refuses_without_mutating_anything(tmp_path, monkeypatch,
+                                                    wreck, expected_state):
+    """Structured refusal, and the filesystem is byte for byte untouched."""
+    if wreck == "rename_partial":
+        staging, src, plan = _interrupt_before_publication(
+            tmp_path, monkeypatch, METHOD_RENAME)
+        layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+        (layout.partial_payload(case_id) / "src" / "ch01.cbz").write_bytes(b"x")
+    elif wreck == "corrupt_manifest":
+        staging, src, plan = _interrupt_before_publication(
+            tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+        layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+        layout.manifest(case_id).write_text("{not json}", encoding="utf-8")
+    else:
+        staging, src, plan = _forced_plan(tmp_path, monkeypatch,
+                                          METHOD_COPY_VERIFY)
+        execute_transfer(plan)
+        layout, case_id = StagingLayout(tmp_path / "review"), plan.case_id
+        if wreck == "orphan_pending":
+            layout.manifest(case_id).unlink()
+        else:
+            shutil.rmtree(layout.pending_case(case_id))
+
+    before_review, before_source = _snapshot(layout.root), _snapshot(src)
+    outcome = recover_case(layout, case_id)
+
+    assert outcome.acted is False
+    assert outcome.state == expected_state
+    assert "no automatic action" in outcome.detail
+    assert _snapshot(layout.root) == before_review, "recovery mutated the root"
+    assert _snapshot(src) == before_source, "recovery mutated the source"
+
+
+def test_recovery_never_discards_a_rename_partial_that_holds_a_payload(
+        tmp_path, monkeypatch):
+    """Source and rename-path payload both present is unexplained, so refuse."""
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_RENAME)
+    layout = plan.layout
+    plan.manifest.state = STATE_PLANNED
+    plan.manifest.touch()
+    plan.manifest.write(layout.manifest(plan.case_id))
+    staged = layout.partial_payload(plan.case_id) / "src"
+    staged.mkdir(parents=True)
+    (staged / "ch01.cbz").write_bytes(b"one")
+
+    before = _snapshot(layout.root)
+    outcome = recover_case(layout, plan.case_id)
+
+    assert outcome.acted is False
+    assert outcome.state == RECOVERY_OPERATOR_REQUIRED
+    assert _snapshot(layout.root) == before
+    assert src.exists()
+
+
+def test_recovery_aborts_when_the_source_changed_underneath_it(tmp_path,
+                                                               monkeypatch):
+    """Propagated, not returned: the payload is now a different case."""
+    staging, src, plan = _interrupt_before_publication(
+        tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    (src / "ch03.cbz").write_bytes(b"a chapter that arrived late")
+
+    with pytest.raises(SourceChangedError):
+        recover_case(layout, case_id)
+
+    assert not layout.pending_case(case_id).exists()
+    assert (src / "ch03.cbz").exists()
+
+
+def test_recovery_takes_no_plan_and_survives_a_rebuilt_layout(tmp_path,
+                                                              monkeypatch):
+    """Everything recovery needs is on disk, or it is not recovery."""
+    import inspect as _inspect
+    params = _inspect.signature(recover_case).parameters
+    assert "plan" not in params
+    assert [p for p in params if params[p].kind is _inspect.Parameter.POSITIONAL_OR_KEYWORD] \
+        == ["layout", "case_id"]
+
+    staging, src, plan = _interrupt_before_publication(
+        tmp_path, monkeypatch, METHOD_RENAME)
+    del plan
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    assert recover_case(layout, case_id).acted is True
+
+
+def test_recovery_can_delete_the_copied_source_when_asked(tmp_path,
+                                                          monkeypatch):
+    staging, src, plan = _interrupt_before_publication(
+        tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+
+    outcome = recover_case(layout, case_id, delete_copied_source=True)
+    assert outcome.acted is True
+    assert not src.exists()
+    assert _staged_files(layout, case_id, "src") == DEFAULT
+
+
+def test_recovery_refuses_if_a_rename_payload_appears_after_assessment(
+        tmp_path, monkeypatch):
+    """The window between classifying and acting, on the irreplaceable path.
+
+    Assessment only reports RESTART_FROM_SOURCE for a rename when .partial
+    holds no payload. If one appears in the gap, clearing .partial would
+    delete something that may be the only copy -- so it is checked again
+    rather than trusted, and this test is what makes that check reachable.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_RENAME)
+    layout, case_id = plan.layout, plan.case_id
+    plan.manifest.state = STATE_PLANNED
+    plan.manifest.touch()
+    plan.manifest.write(layout.manifest(case_id))
+    layout.partial_payload(case_id).mkdir(parents=True)      # scaffolding only
+
+    assert assess_recovery(layout, case_id).state == RECOVERY_RESTART_FROM_SOURCE
+
+    real_assess = staging.assess_recovery
+
+    def assess_then_plant(lay, cid):
+        found = real_assess(lay, cid)
+        staged = lay.partial_payload(cid) / "src"
+        staged.mkdir(parents=True, exist_ok=True)
+        (staged / "ch01.cbz").write_bytes(b"appeared in the gap")
+        return found
+
+    monkeypatch.setattr(staging, "assess_recovery", assess_then_plant)
+    outcome = staging.recover_case(layout, case_id)
+
+    assert outcome.acted is False
+    assert "appeared between assessment and recovery" in outcome.detail
+    assert (layout.partial_payload(case_id) / "src" / "ch01.cbz").read_bytes() \
+        == b"appeared in the gap", "the planted payload was destroyed"
+    assert src.exists()
+
+
+@pytest.mark.parametrize("method, state", [
+    (METHOD_COPY_VERIFY, RECOVERY_RESUME_PUBLICATION),
+    (METHOD_RENAME, RECOVERY_PUBLISH_PARTIAL),
+])
+def test_recovery_refuses_if_the_staged_payload_stops_verifying(
+        tmp_path, monkeypatch, method, state):
+    """Re-verified immediately before publication, on both paths.
+
+    The assessment describes a moment that has already passed. Publishing on
+    the strength of it would stage bytes nobody checked.
+    """
+    staging, src, plan = _interrupt_before_publication(tmp_path, monkeypatch,
+                                                       method)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    assert assess_recovery(layout, case_id).state == state
+
+    real_assess = staging.assess_recovery
+
+    def assess_then_corrupt(lay, cid):
+        found = real_assess(lay, cid)
+        (lay.partial_payload(cid) / "src" / "ch01.cbz").write_bytes(b"corrupt")
+        return found
+
+    monkeypatch.setattr(staging, "assess_recovery", assess_then_corrupt)
+    outcome = staging.recover_case(layout, case_id)
+
+    assert outcome.acted is False
+    assert "stopped verifying" in outcome.detail
+    assert not layout.pending_case(case_id).exists()
+
+
+def test_a_failed_destination_check_leaves_a_recoverable_case(tmp_path,
+                                                              monkeypatch):
+    """The four properties together, pinning the #35 criterion as a contract.
+
+    Previously only the source-intact half was asserted; the .partial
+    recoverable half was verified by hand and never regression-pinned.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    real_copytree = staging.shutil.copytree
+
+    def copy_then_corrupt(source, destination, *args, **kwargs):
+        result = real_copytree(source, destination, *args, **kwargs)
+        (Path(destination) / "ch01.cbz").write_bytes(b"corrupted in transit")
+        return result
+
+    monkeypatch.setattr(staging.shutil, "copytree", copy_then_corrupt)
+    with pytest.raises(StagedPayloadMismatchError):
+        execute_transfer(plan)
+
+    case_id = plan.case_id
+    assert src.exists(), "the source must survive a destination check failure"
+    assert not plan.layout.pending_case(case_id).exists()
+    assert plan.layout.partial_case(case_id).exists()
+    found = inspect_case(plan.layout, case_id)
+    assert (found.status, found.manifest.state) == (STATUS_VALID, STATE_PLANNED)
+    assert found.is_recoverable is True
 
 
 def test_the_plan_description_names_the_case_and_method(tmp_path):
