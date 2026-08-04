@@ -39,7 +39,10 @@ from scripts.cbz_classification_staging import (
     STATUS_VALID,
     PayloadChangedError,
     SourceChangedError,
+    CaseCollisionError,
+    StagedPayloadMismatchError,
     inspect_case,
+    execute_transfer,
     revalidate_source,
     METHOD_COPY_VERIFY,
     METHOD_RENAME,
@@ -938,6 +941,201 @@ def test_the_difference_report_is_bounded(tmp_path):
     message = str(caught.value)
     assert "added 12" in message
     assert "and 7 more" in message
+
+
+# ── the transfer protocol ────────────────────────────────────────
+
+
+def _forced_plan(tmp_path, monkeypatch, method, files=None):
+    """A plan with *method* forced, independently of this machine's volumes.
+
+    Both branches are exercised on every host: nothing here depends on how
+    the running machine's drives happen to be arranged.
+    """
+    import scripts.cbz_classification_staging as staging
+    src = _payload(tmp_path / "src", DEFAULT if files is None else files)
+    if method == METHOD_COPY_VERIFY:
+        monkeypatch.setattr(staging, "volume_identity",
+                            lambda p: 11 if "src" in str(p) else 22)
+    else:
+        monkeypatch.setattr(staging, "volume_identity", lambda p: 7)
+    plan = staging.plan_case(tmp_path / "review", src, src, "Some Series",
+                             series_key("Some Series"), "src")
+    assert plan.manifest.transfer_method == method, "method was not forced"
+    return staging, src, plan
+
+
+def _staged_files(layout, case_id, source_name) -> dict[str, bytes]:
+    root = layout.payload(case_id) / source_name
+    return {p.relative_to(root).as_posix(): p.read_bytes()
+            for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("method", [METHOD_COPY_VERIFY, METHOD_RENAME])
+def test_a_transfer_publishes_the_payload_under_pending(tmp_path, monkeypatch,
+                                                        method):
+    """Both paths land the same published layout, byte for byte."""
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, method)
+    manifest = execute_transfer(plan)
+
+    assert manifest.state == STATE_PENDING_REVIEW
+    assert _staged_files(plan.layout, plan.case_id, "src") == DEFAULT
+    assert not plan.layout.partial_case(plan.case_id).exists()
+    assert not src.exists(), "the source is released once publication succeeds"
+
+
+@pytest.mark.parametrize("method", [METHOD_COPY_VERIFY, METHOD_RENAME])
+def test_a_published_manifest_round_trips(tmp_path, monkeypatch, method):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, method)
+    execute_transfer(plan)
+    written = plan.layout.manifest(plan.case_id).read_text(encoding="utf-8")
+    assert CaseManifest.from_json(written).state == STATE_PENDING_REVIEW
+
+
+def test_the_copy_path_can_keep_the_source(tmp_path, monkeypatch):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    execute_transfer(plan, delete_source=False)
+    assert src.exists()
+    assert _staged_files(plan.layout, plan.case_id, "src") == DEFAULT
+
+
+def test_a_staged_copy_that_does_not_match_the_manifest_is_refused(tmp_path,
+                                                                   monkeypatch):
+    """Gate 1. The copy is wrong; the source is untouched and still authoritative."""
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    real_copytree = staging.shutil.copytree
+
+    def copy_then_corrupt(source, destination, *args, **kwargs):
+        result = real_copytree(source, destination, *args, **kwargs)
+        (Path(destination) / "ch01.cbz").write_bytes(b"corrupted in transit")
+        return result
+
+    monkeypatch.setattr(staging.shutil, "copytree", copy_then_corrupt)
+
+    with pytest.raises(StagedPayloadMismatchError, match="does not match"):
+        execute_transfer(plan)
+
+    assert {p.relative_to(src).as_posix(): p.read_bytes()
+            for p in src.rglob("*") if p.is_file()} == DEFAULT
+    assert not plan.layout.pending_case(plan.case_id).exists()
+
+
+def test_a_source_that_grows_after_the_copy_aborts_and_deletes_nothing(
+        tmp_path, monkeypatch):
+    """Gate 2, on the copy path -- the case #35 is built around.
+
+    Growth is injected between the destination check and the source check, so
+    gate 1 genuinely passes and only gate 2 can catch it. That is the whole
+    claim: verifying the copy says nothing about the source.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    real_verify = staging._verify_staged_payload
+    grown = {"done": False}
+
+    def verify_then_grow(staged_root, expected):
+        real_verify(staged_root, expected)               # gate 1 really passes
+        if not grown["done"]:
+            grown["done"] = True
+            (src / "ch03.cbz").write_bytes(b"a chapter that arrived late")
+
+    monkeypatch.setattr(staging, "_verify_staged_payload", verify_then_grow)
+
+    with pytest.raises(SourceChangedError, match="no longer matches"):
+        execute_transfer(plan)
+
+    assert grown["done"], "the growth never happened"
+    assert (src / "ch03.cbz").exists(), "the late chapter was destroyed"
+    assert {p.relative_to(src).as_posix(): p.read_bytes()
+            for p in src.rglob("*") if p.is_file()} == {
+        **DEFAULT, "ch03.cbz": b"a chapter that arrived late"}
+    assert not plan.layout.pending_case(plan.case_id).exists()
+
+
+def test_the_rename_path_revalidates_before_it_moves_anything(tmp_path,
+                                                              monkeypatch):
+    """Gate 2, on the path that has no copied bytes to check.
+
+    The rename skips gates 2 and 3 of the copy path but not this one, and it
+    must run before the move -- afterwards there is nothing left to check.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_RENAME)
+    (src / "ch03.cbz").write_bytes(b"a chapter that arrived late")
+
+    with pytest.raises(SourceChangedError, match="no longer matches"):
+        execute_transfer(plan)
+
+    assert src.exists(), "the source was moved despite failing revalidation"
+    assert (src / "ch03.cbz").exists()
+    assert not plan.layout.pending_case(plan.case_id).exists()
+
+
+@pytest.mark.parametrize("method, gate", [
+    # Which gate fires depends on when the growth lands, and both are correct.
+    # Growing before the copy means the staged bytes already disagree with the
+    # manifest, so gate 1 catches it and gate 2 is never reached. The rename
+    # path has no copied bytes, so gate 2 is the only thing standing there.
+    (METHOD_COPY_VERIFY, StagedPayloadMismatchError),
+    (METHOD_RENAME, SourceChangedError),
+])
+def test_a_retry_after_an_abort_mints_a_new_case_id(tmp_path, monkeypatch,
+                                                    method, gate):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, method)
+    (src / "ch03.cbz").write_bytes(b"a chapter that arrived late")
+    with pytest.raises(gate):
+        execute_transfer(plan)
+
+    assert not plan.layout.pending_case(plan.case_id).exists()
+    retry = staging.plan_case(tmp_path / "review", src, src, "Some Series",
+                              series_key("Some Series"), "src")
+    assert retry.case_id != plan.case_id
+
+
+def test_a_published_case_refuses_a_second_transfer(tmp_path, monkeypatch):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY,
+                                      files=DEFAULT)
+    execute_transfer(plan, delete_source=False)
+
+    again = staging.plan_case(tmp_path / "review", src, src, "Some Series",
+                              series_key("Some Series"), "src")
+    assert again.case_id == plan.case_id, "same bytes must resolve to one case"
+    with pytest.raises(CaseCollisionError, match="already exists"):
+        execute_transfer(again)
+
+
+def test_a_terminal_case_is_never_reopened(tmp_path, monkeypatch):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    plan.manifest.state = STATE_PROMOTED
+    plan.manifest.write(plan.layout.manifest(plan.case_id))
+
+    reloaded = staging.plan_case(tmp_path / "review", src, src, "Some Series",
+                                 series_key("Some Series"), "src")
+    with pytest.raises(CaseCollisionError, match="refusing to reopen"):
+        execute_transfer(reloaded)
+    assert src.exists()
+
+
+def test_insufficient_space_refuses_before_copying(tmp_path, monkeypatch):
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    starved = staging.StagingPlan(
+        manifest=plan.manifest, layout=plan.layout, inventory=plan.inventory,
+        existing=plan.existing, free_bytes=0)
+
+    with pytest.raises(StagingError, match="insufficient space"):
+        execute_transfer(starved)
+    assert src.exists()
+    assert not plan.layout.pending_case(plan.case_id).exists()
+
+
+def test_stale_partial_debris_is_cleaned_rather_than_merged(tmp_path,
+                                                            monkeypatch):
+    """.partial is never authoritative, so debris is discarded, not resumed."""
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_COPY_VERIFY)
+    debris = plan.layout.partial_payload(plan.case_id) / "src"
+    debris.mkdir(parents=True)
+    (debris / "leftover.cbz").write_bytes(b"from an interrupted attempt")
+
+    execute_transfer(plan)
+    assert _staged_files(plan.layout, plan.case_id, "src") == DEFAULT
 
 
 def test_the_plan_description_names_the_case_and_method(tmp_path):
