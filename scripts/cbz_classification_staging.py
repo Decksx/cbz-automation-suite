@@ -1424,11 +1424,19 @@ def assess_recovery(layout: StagingLayout, case_id: str) -> RecoveryAssessment:
 
     # Same-volume rename.
     if source.is_dir():
+        if partial_payload.exists():
+            return assessed(
+                RECOVERY_OPERATOR_REQUIRED,
+                f"both {source} and {partial_payload} exist for a rename "
+                "transfer. A rename moves rather than copies, so a payload in "
+                "both places is unexplained, and the standing rule is that a "
+                "rename-path .partial is never discarded automatically.",
+                manifest)
         return assessed(
             RECOVERY_RESTART_FROM_SOURCE,
-            f"the source {source} is still present, so the rename had not "
-            "happened; anything under .partial is pre-move debris and the "
-            "transfer can start again from the source.", manifest)
+            f"the source {source} is still present and .partial holds no "
+            "payload, so the rename had not happened; the empty scaffolding "
+            "can be cleared and the move made from the source.", manifest)
 
     agrees, why = _payload_agrees(partial_payload, expected)
     if agrees:
@@ -1449,3 +1457,145 @@ def assess_recovery(layout: StagingLayout, case_id: str) -> RecoveryAssessment:
         f"the source is gone and .partial does not verify: {why}. It may "
         "still be the only copy of this payload, so it must not be deleted, "
         "replaced, merged, or overwritten.", manifest)
+
+
+@dataclass(frozen=True)
+class RecoveryOutcome:
+    """What recovery did, or declined to do. Always returned, never guessed."""
+
+    acted: bool
+    state: str
+    case_id: str
+    manifest: CaseManifest | None
+    detail: str
+
+
+def _publish(layout: StagingLayout, manifest: CaseManifest) -> None:
+    """Rename .partial to pending and record the case as published."""
+    os.replace(layout.partial_case(manifest.case_id),
+               layout.pending_case(manifest.case_id))
+    manifest.state = STATE_PENDING_REVIEW
+    manifest.staged_path = str(layout.pending_case(manifest.case_id))
+    manifest.touch()
+    manifest.write(layout.manifest(manifest.case_id))
+
+
+def recover_case(layout: StagingLayout, case_id: str, *,
+                 delete_copied_source: bool = False) -> RecoveryOutcome:
+    """Finish or restart an interrupted transfer, from disk alone.
+
+    Takes no `StagingPlan`, for the same reason `assess_recovery` does not:
+    recovery has to work after the process that planned the transfer is gone,
+    and a function that accepts a plan can always be handed one by a caller
+    that still has it, hiding whether the persisted state was ever sufficient.
+
+    Branches only on the classification `assess_recovery` returns, and acts on
+    exactly four of them. Everything else -- a malformed rename `.partial`, an
+    orphaned pending directory, a manifest contradicting its payload, and the
+    combinations the matrix does not specify -- returns a structured refusal
+    and touches nothing. Refusing is a result here, not an error: an operator
+    asking "what happened to this case" deserves an answer rather than a
+    traceback.
+
+    What it does not swallow is a source that changed underneath it.
+    `SourceChangedError` propagates, because by the identity contract the
+    source is then a different case, and returning that as a refusal would
+    make it easy to treat as "nothing to do".
+
+    Everything is re-verified immediately before it is acted on. The
+    assessment is a report about a moment that has already passed, and the
+    gap between reading and acting is exactly where a payload can move.
+    """
+    found = assess_recovery(layout, case_id)
+    manifest = found.manifest
+
+    if not found.automatic or manifest is None:
+        return RecoveryOutcome(
+            False, found.state, case_id, manifest,
+            f"no automatic action available: {found.detail}")
+
+    expected = _inventory_from_json(manifest.files)
+    source = Path(manifest.staging_source_path)
+    partial_case = layout.partial_case(case_id)
+    partial_payload = layout.partial_payload(case_id) / source.name
+
+    if found.state == RECOVERY_COMPLETE:
+        if manifest.state == STATE_PENDING_REVIEW:
+            return RecoveryOutcome(
+                False, found.state, case_id, manifest,
+                "already published and already recorded as pending_review; "
+                "nothing to reconcile.")
+        previous = manifest.state
+        manifest.state = STATE_PENDING_REVIEW
+        manifest.staged_path = str(layout.pending_case(case_id))
+        manifest.touch()
+        manifest.write(layout.manifest(case_id))
+        return RecoveryOutcome(
+            True, found.state, case_id, manifest,
+            f"payload verified; manifest state reconciled from {previous} to "
+            f"{STATE_PENDING_REVIEW}.")
+
+    if found.state == RECOVERY_RESUME_PUBLICATION:
+        revalidate_source(source, expected)
+        agrees, why = _payload_agrees(partial_payload, expected)
+        if not agrees:
+            return RecoveryOutcome(
+                False, found.state, case_id, manifest,
+                f"the staged copy stopped verifying between assessment and "
+                f"publication: {why}")
+        _publish(layout, manifest)
+        if delete_copied_source:
+            shutil.rmtree(source)
+        return RecoveryOutcome(
+            True, found.state, case_id, manifest,
+            "published the already-verified staged copy without copying "
+            "again.")
+
+    if found.state == RECOVERY_PUBLISH_PARTIAL:
+        agrees, why = _payload_agrees(partial_payload, expected)
+        if not agrees:
+            return RecoveryOutcome(
+                False, found.state, case_id, manifest,
+                f"the authoritative .partial stopped verifying between "
+                f"assessment and publication: {why}")
+        _publish(layout, manifest)
+        return RecoveryOutcome(
+            True, found.state, case_id, manifest,
+            "published the authoritative .partial; the original source path "
+            "was not required.")
+
+    # RECOVERY_RESTART_FROM_SOURCE. The source is present and authoritative on
+    # both paths here, which is what makes clearing .partial safe.
+    revalidate_source(source, expected)
+
+    if manifest.transfer_method == METHOD_RENAME:
+        # Assessment reaches this only with no payload under .partial. Checked
+        # again rather than trusted: this is the one place recovery deletes
+        # anything on the path where .partial can be irreplaceable.
+        if partial_payload.exists():
+            return RecoveryOutcome(
+                False, found.state, case_id, manifest,
+                f"refusing to clear {partial_case}: a rename-path payload "
+                "appeared between assessment and recovery.")
+        if partial_case.exists():
+            shutil.rmtree(partial_case)
+        partial_payload.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, partial_payload)
+        _publish(layout, manifest)
+        return RecoveryOutcome(
+            True, found.state, case_id, manifest,
+            "cleared empty scaffolding and completed the rename.")
+
+    if partial_case.exists():
+        shutil.rmtree(partial_case)
+    partial_payload.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, partial_payload)
+    _verify_staged_payload(partial_payload, expected)
+    revalidate_source(source, expected)
+    _publish(layout, manifest)
+    if delete_copied_source:
+        shutil.rmtree(source)
+    return RecoveryOutcome(
+        True, found.state, case_id, manifest,
+        "discarded the unusable staged copy and recopied, verified, "
+        "revalidated, and published from the authoritative source.")
