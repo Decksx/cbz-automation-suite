@@ -70,7 +70,13 @@ def _raw(tmp_path: Path, **overrides) -> dict:
 
 def _router(tmp_path: Path, *, mode=MODE_SHADOW, index=None, **overrides):
     cfg = parse(_raw(tmp_path, **overrides))
-    return WatcherRouter(cfg, index or SeriesIndex(), mode=mode)
+    if index is None:
+        # Mirror SeriesIndex.build exactly. A bare SeriesIndex() ranks every
+        # destination equally, so ambiguity resolves by write order and any
+        # test asserting priority would be decided by thread scheduling.
+        index = SeriesIndex(
+            priority=cfg.series_index_destinations or tuple(cfg.destinations))
+    return WatcherRouter(cfg, index, mode=mode)
 
 
 # ── the review destination must never be indexed ─────────────────
@@ -371,10 +377,45 @@ def test_an_update_cannot_interleave_with_a_classification(tmp_path):
         "manga", tmp_path / "Manga" / "Contended")
 
 
+def test_a_priorityless_index_is_refused(tmp_path):
+    # A bare SeriesIndex ranks every destination equally, so a series in two
+    # libraries keeps whichever entry was written first -- thread scheduling
+    # deciding an adult classification. This caught a test helper that
+    # asserted priority while providing none.
+    cfg = parse(_raw(tmp_path))
+    with pytest.raises(RoutingConfigError, match="priority"):
+        WatcherRouter(cfg, SeriesIndex(), mode=MODE_SHADOW)
+
+
+def test_a_reordered_index_priority_is_refused(tmp_path):
+    cfg = parse(_raw(tmp_path))
+    reordered = SeriesIndex(priority=("manga", "comix", "graphic_novels"))
+    with pytest.raises(RoutingConfigError, match="priority"):
+        WatcherRouter(cfg, reordered, mode=MODE_SHADOW)
+
+
+def test_a_disabled_index_needs_no_priority(tmp_path):
+    cfg = parse(_raw(tmp_path, series_index={"enabled": False,
+                                             "destinations": []}))
+    assert WatcherRouter(cfg, SeriesIndex(), mode=MODE_SHADOW).enabled
+
+
+def test_the_index_built_from_config_satisfies_the_guard(tmp_path):
+    cfg = parse(_raw(tmp_path))
+    built = SeriesIndex.build(cfg, lister=lambda p: [])
+    assert built.priority == ("comix", "manga", "graphic_novels")
+    WatcherRouter(cfg, built, mode=MODE_SHADOW)          # must not raise
+
+
 def test_concurrent_adds_of_one_series_keep_priority_and_ambiguity(tmp_path):
     # The corrupted outcome the lock prevents: both threads seeing the key
     # absent, both writing, and the ambiguity marker never being set.
+    #
+    # This assertion is only meaningful because the index carries the
+    # configured priority; with a bare index every destination ranks equally
+    # and the winner is whichever thread wrote first.
     router = _router(tmp_path)
+    assert router.index.priority[0] == "comix"
     start = threading.Barrier(2)
 
     def add(dest, sub):
