@@ -90,12 +90,18 @@ CRLF** — an LF line silently mixes endings and shows as whole-file churn.
 
 A **`mixed` file is worse**, because there is no single correct ending to
 emit: it must be edited byte-exactly, matching whatever the neighbouring
-lines already use at each site. Editing `cbz_watcher.py` line-wise on
-2026-08-05 normalized the whole file to CRLF and produced **618
-insertions / 565 deletions against a ~60-line change**, most of it lines
-deleted and re-added identically. Restoring from `master` and splicing
-byte-exactly with the local ending gave 79/27 and left the bare-LF count
-untouched. Check the count either side of an edit; if it moved, the edit
+lines already use at each site.
+
+The failure mode this produces, observed once on `cbz_watcher.py` on
+2026-08-05: a line-wise edit normalized the whole file to CRLF and
+produced **618 insertions / 565 deletions against a ~60-line change**,
+most of it lines deleted and re-added identically. Restoring from
+`master` and splicing byte-exactly with the local ending gave 79/27 and
+left the bare-LF count untouched. Nothing about that is specific to the
+watcher — it is what a line-wise edit does to any mixed file, and the
+watcher is simply where it was hit first.
+
+Check the bare-LF count either side of an edit. If it moved, the edit
 normalized something.
 
 Everything else is normalized on commit and needs no special handling.
@@ -133,31 +139,48 @@ delta against the number of tests actually added. CI
 / Python 3.11.
 
 - `git diff --check` is meaningful only for the LF files, where it should
-  be clean. It is structurally noisy for every CRLF or mixed file:
+  be clean. It is structurally noisy for `crlf` and `mixed` files:
   `--check` inspects *added* lines only, and every added line in such a
   file ends with `\r`, which it reports as trailing whitespace. This is
   not a real defect and predates any current work — the merged `7c63bc9`
-  produces 65 such warnings. Derive the exclusions rather than
-  maintaining a list that goes stale the way the table above did:
+  produces 65 such warnings.
 
-  ```text
-  git diff --check -- . $(git ls-files --eol \
-      | grep -v '^i/lf' | sed 's/.*\t/:(exclude)/')
+  Derive the exclusions from git rather than maintaining a list, which is
+  how the table above went stale. Only `crlf` and `mixed` are excluded:
+  `-text` files are binary to git so `--check` never inspects them, and
+  `none` files have no lines to flag, so excluding either would blind the
+  check for no reason.
+
+  ```bash
+  set -euo pipefail
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  git ls-files --eol -z > "$tmp"
+  mapfile -d '' EXCLUDES < <(python - "$tmp" <<'PY'
+  import sys
+  data = open(sys.argv[1], "rb").read()
+  out = [b":(exclude)" + rec.split(b"\t", 1)[1]
+         for rec in data.split(b"\0")
+         if rec.startswith(b"i/crlf") or rec.startswith(b"i/mixed")]
+  sys.stdout.buffer.write(b"\0".join(out))
+  PY
+  )
+  git diff --check -- . "${EXCLUDES[@]}"
   ```
 
-  The equivalent explicit form, for the files this actually reaches
-  today:
+  NUL-separated throughout, so a path containing whitespace cannot split
+  into two pathspecs — none does today, which is exactly why a
+  whitespace-splitting version would pass review and fail later.
+  `set -euo pipefail` makes a failure of `git ls-files` itself an error
+  rather than an empty exclusion list that silently checks everything.
 
-  ```text
-  git diff --check -- . ':(exclude)scripts/cbz_sanitizer.py' \
-      ':(exclude)scripts/cbz_library_maintenance.py' \
-      ':(exclude)scripts/cbz_watcher.py' \
-      ':(exclude)scripts/cbz_gap_checker.py' \
-      ':(exclude)scripts/cbz_compilation_resolver.py' \
-      ':(exclude)tests/test_comicinfo.py' \
-      ':(exclude)tests/test_normalization.py' \
-      ':(exclude)tests/test_series_detection.py'
-  ```
+  Verified on 2026-08-05 at `14058d0`: excludes 45 files, exits 0 on a
+  clean tree, exits 2 on a real trailing space added to an LF file, stays
+  quiet for the same defect added to an excluded file, and exits 128 when
+  run outside a repository.
+
+  Note `git diff --check` does **not** accept `--pathspec-from-file`; it
+  exits 129 with "invalid option". The array form above is the reason.
 - A passing test is not a working test. Confirm a new test fails when the
   behavior it guards is removed.
 - Distinguish pre-existing failures from new ones by checking the same
