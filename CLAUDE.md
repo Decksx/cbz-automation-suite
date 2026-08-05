@@ -61,28 +61,52 @@ These apply to every operation that changes state:
 
 ## Line endings
 
-Measured with `git ls-files --eol` at `14058d0` on 2026-08-05. **This is a
+Measured with `git ls-files --eol` at `99f8f3d` on 2026-08-05. **This is a
 measurement, not an invariant** — a deliberate future edit may change any
 of these counts, and re-measuring is the way to find out rather than
-trusting this block.
+trusting this block. It has already happened once; see below.
 
-`core.autocrlf=true`, no `.gitattributes`. **52 of 221 tracked files are
+`core.autocrlf=true`, no `.gitattributes`. **52 of 222 tracked files are
 not `i/lf`.** Most are archived docs; these are the ones a session
 plausibly edits:
 
 ```text
-file                                 index    CRLF / bare-LF at 14058d0
+file                                 index    CRLF / bare-LF at 99f8f3d
 scripts/cbz_library_maintenance.py   crlf     2578 / 0
 scripts/cbz_sanitizer.py             crlf     1616 / 0
 scripts/cbz_gap_checker.py           crlf      334 / 0
 scripts/__init__.py                  crlf        1 / 0
-scripts/cbz_watcher.py               mixed    1281 / 538
+scripts/cbz_watcher.py               mixed    1333 / 538
 scripts/cbz_compilation_resolver.py  mixed     478 / 13
-tests/test_normalization.py          crlf      146 / 0
-tests/test_series_detection.py       crlf       20 / 0
-tests/test_comicinfo.py              mixed     101 / 61
+tests/test_normalization.py          crlf      218 / 0
+tests/test_series_detection.py       crlf       38 / 0
+tests/test_comicinfo.py              crlf      228 / 0
 apps/cbz_gui.py                      -text    1317 / 467   (git treats as binary)
 ```
+
+Re-measured at `99f8f3d` on 2026-08-05, four hours after the block above
+was first written at `14058d0`. Four entries had already moved:
+
+```text
+tests/test_comicinfo.py       mixed 101/61  ->  crlf 228/0
+tests/test_normalization.py   crlf  146/0   ->  crlf 218/0
+tests/test_series_detection.py crlf  20/0   ->  crlf  38/0
+scripts/cbz_watcher.py        mixed 1281/538 -> mixed 1333/538
+```
+
+Three of those came from a documentation pass over the tests, verified
+token-identical with comments and docstrings stripped and producing the
+same 1026 collected node IDs — so the code did not change, but
+`test_comicinfo.py` was normalized from `mixed` to `crlf` along the way,
+taking 61 bare-LF lines with it. That is an improvement (`mixed` is the
+worst state a file can be in) and it arrived as a side effect of a
+comment change, which is the whole argument for deriving the
+`diff --check` exclusions from git rather than maintaining a list. A
+hand-maintained list would have been wrong within the hour.
+
+The watcher's own change is the lock wiring: 52 CRLF lines added,
+bare-LF untouched at 538, which is what a byte-exact edit to a mixed file
+looks like.
 
 A `crlf` file is stored with literal CRLF in the index and git leaves it
 alone, because the blob already contains CRLF. **Edits to it must emit
@@ -210,6 +234,56 @@ delta against the number of tests actually added. CI
   told apart from a fact.
 - Architectural choices go in `docs/engineering_decisions.md`; what
   happened on a day goes in `docs/development_log_<date>.md`.
+
+## Documenting code
+
+Applies to all implementation work, including issue #44 and every
+subsequent watcher, routing, staging, and indexing change.
+
+- Document every new or materially changed public function, class,
+  exception, and module.
+- Comment where behaviour, ordering, recovery semantics, safety
+  constraints, invariants, or non-obvious design decisions would not be
+  clear from the code alone.
+- **Explain why a guard exists, not what the next line does.** "Checked
+  before blocking, so a violation is reported even when the lock happens
+  to be free" is worth writing; "acquire the lock" is not.
+- Keep comments synchronized with behaviour. Update or delete a stale
+  comment as part of the change that made it stale — a comment that
+  describes code which no longer exists is worse than no comment, because
+  it is read as current.
+- Do not restate obvious syntax.
+- Tests get descriptive names, and a comment or docstring wherever the
+  setup, race simulation, failure injection, or safety assertion is
+  non-obvious. A reader must be able to tell what a test would catch.
+- **Protocol boundaries and accepted limitations belong in durable
+  documentation or an issue**, not only in a code comment and never only
+  in a session transcript. A limit recorded solely at the call site is
+  invisible to anyone deciding whether to rely on the capability.
+
+## Implementation review checklist
+
+Every implementation change is reviewed against all seven:
+
+```text
+[ ] behaviour implemented
+[ ] deterministic tests added
+[ ] safety guards proven load-bearing
+[ ] public interfaces documented
+[ ] non-obvious logic and invariants commented
+[ ] durable protocol documentation updated where applicable
+[ ] comments verified against the final implementation
+```
+
+"Proven load-bearing" means the guard was removed or bypassed and the
+tests that should fail did, by name and count — not that the suite passed
+with the guard present. Three guards written during the #32 work failed
+*nothing* when bypassed: they were unreachable defensive code, and only
+the bypass showed it.
+
+The last item is not a formality either. Comments written against an
+earlier draft survive refactoring silently, so they are re-read against
+the code as it finally landed rather than as it was first written.
 
 ## Scope
 
