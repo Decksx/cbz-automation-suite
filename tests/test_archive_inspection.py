@@ -1,3 +1,15 @@
+"""Tests for comic_automation.archive.inspect_archive: the low-level CBZ
+inspection pipeline that opens an archive, counts pages/entries, and
+parses ComicInfo.xml if present.
+
+Covers: page/entry counting distinguishing images from non-image entries,
+successful ComicInfo.xml parsing, malformed ComicInfo.xml being treated as
+absent/invalid metadata WITHOUT failing the archive as a whole, XXE/DTD
+rejection for untrusted ComicInfo.xml, classification of image-less and
+truly-empty archives, opt-in CRC verification, and error handling for
+corrupt archives, unsupported formats, and missing files.
+"""
+
 from __future__ import annotations
 
 import zipfile
@@ -16,6 +28,7 @@ def create_cbz(
     path: Path,
     entries: dict[str, bytes],
 ) -> Path:
+    """Build a .cbz at `path` containing the given {name: content} entries."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(
@@ -32,6 +45,11 @@ def create_cbz(
 def test_inspects_cbz_pages_and_entries(
     tmp_path: Path,
 ) -> None:
+    """Basic happy path: an archive with two images (one .jpg, one
+    uppercase .PNG) and one non-image file should report status "ok",
+    entry_count 3, but page_count only 2 -- image entries are counted
+    case-insensitively by extension, non-image entries are not pages.
+    """
     archive = create_cbz(
         tmp_path / "issue.cbz",
         {
@@ -55,6 +73,10 @@ def test_inspects_cbz_pages_and_entries(
 def test_reads_comic_info_metadata(
     tmp_path: Path,
 ) -> None:
+    """A well-formed ComicInfo.xml should be parsed into structured fields
+    (title, series, number, volume, year, writer, language), with numeric
+    fields (Number, Volume, Year) converted to their proper types.
+    """
     archive = create_cbz(
         tmp_path / "metadata.cbz",
         {
@@ -91,6 +113,11 @@ def test_reads_comic_info_metadata(
 def test_invalid_comic_info_does_not_invalidate_archive(
     tmp_path: Path,
 ) -> None:
+    """Malformed ComicInfo.xml (truncated here) should be reported as
+    present-but-invalid, with a comic_info_error explaining why -- but the
+    archive as a whole must still inspect successfully (status "ok") since
+    broken metadata shouldn't block processing of the actual pages.
+    """
     archive = create_cbz(
         tmp_path / "invalid-metadata.cbz",
         {
@@ -112,6 +139,11 @@ def test_invalid_comic_info_does_not_invalidate_archive(
 def test_rejects_comic_info_dtd(
     tmp_path: Path,
 ) -> None:
+    """Security guard: a ComicInfo.xml containing a DOCTYPE/ENTITY
+    declaration (an XXE-style attack vector) must be rejected as invalid
+    with an error mentioning it's prohibited, rather than being parsed --
+    ComicInfo.xml comes from untrusted archive files, not a trusted source.
+    """
     archive = create_cbz(
         tmp_path / "unsafe-metadata.cbz",
         {
@@ -138,6 +170,10 @@ def test_rejects_comic_info_dtd(
 def test_cbz_without_images_is_classified(
     tmp_path: Path,
 ) -> None:
+    """An archive with entries but no recognized image files should be
+    classified with status "no_images" rather than "ok", since there's
+    nothing to actually read as comic pages.
+    """
     archive = create_cbz(
         tmp_path / "empty.cbz",
         {"notes.txt": b"no images"},
@@ -153,6 +189,9 @@ def test_cbz_without_images_is_classified(
 def test_truly_empty_cbz_is_classified(
     tmp_path: Path,
 ) -> None:
+    """A zip file with zero entries at all (distinct from "has entries but
+    no images") should be classified with its own status, "empty_archive".
+    """
     archive = tmp_path / "truly-empty.cbz"
 
     with zipfile.ZipFile(archive, mode="w"):
@@ -168,6 +207,10 @@ def test_truly_empty_cbz_is_classified(
 def test_crc_verification_can_be_enabled(
     tmp_path: Path,
 ) -> None:
+    """CRC verification is opt-in via verify_crc=True (off by default,
+    presumably for performance); when enabled on a valid archive, it
+    should report crc_verified=True.
+    """
     archive = create_cbz(
         tmp_path / "verified.cbz",
         {"001.jpg": b"image"},
@@ -182,6 +225,10 @@ def test_crc_verification_can_be_enabled(
 def test_corrupt_cbz_raises_inspection_error(
     tmp_path: Path,
 ) -> None:
+    """A file with a .cbz extension whose content isn't actually a valid
+    zip archive should raise ArchiveInspectionError with a message
+    identifying it as invalid/corrupt.
+    """
     archive = tmp_path / "corrupt.cbz"
     archive.write_bytes(b"this is not a zip archive")
 
@@ -195,6 +242,9 @@ def test_corrupt_cbz_raises_inspection_error(
 def test_unsupported_archive_is_rejected(
     tmp_path: Path,
 ) -> None:
+    """A .cbr (RAR-based) archive is not a supported format for this
+    inspection pipeline and should raise UnsupportedArchiveFormatError.
+    """
     archive = tmp_path / "issue.cbr"
     archive.write_bytes(b"rar")
 
@@ -208,5 +258,8 @@ def test_unsupported_archive_is_rejected(
 def test_missing_archive_raises_file_not_found(
     tmp_path: Path,
 ) -> None:
+    """Inspecting a path that doesn't exist on disk should raise the
+    standard FileNotFoundError rather than a custom archive error.
+    """
     with pytest.raises(FileNotFoundError):
         inspect_archive(tmp_path / "missing.cbz")
