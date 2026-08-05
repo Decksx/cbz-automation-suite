@@ -25,6 +25,11 @@ from collections.abc import Iterable
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+from scripts.cbz_lock_order import (
+    SeriesLockRegistry,
+    UnstableSeriesIdentityError,
+    stable_series_lock,
+)
 
 try:
     from scripts.cbz_core import (
@@ -120,8 +125,19 @@ _router = None
 
 # Directories currently being processed — events for these are suppressed to
 # prevent the file-rename step from re-triggering the settle timer in a loop.
+#
+# Keyed by arrival PATH, and that is the whole reason the registry below
+# exists: this guard only prevents two threads working the same or a nested
+# path. Two different arrival directories that resolve to the same series are
+# not serialized by it at all (issue #32).
 _processing_dirs: set = set()
 _processing_dirs_lock = threading.Lock()
+
+# One lock per resolved series identity, for the classify -> move -> index
+# transaction. Process-wide because the Timer threads that run it are, and
+# because the identity is a property of the library rather than of a run.
+# See docs/lock_topology.md.
+_SERIES_LOCKS = SeriesLockRegistry()
 
 # ─────────────────────────────────────────────
 # LOGGING SETUP
@@ -1396,36 +1412,72 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         # Use the post-rename paths (parsed_by_path keys) rather than the stale
         # pre-rename cbz_files list, so the ComicInfo <Series> evidence check
         # below can actually find the (now-renamed) files on disk.
-        series_name, dir_number = _resolve_series_dir_name(
-            comic_dir, list(parsed_by_path.keys()), dest_folder
-        )
-        if series_name != comic_dir.name:
-            log.info(f"  Series folder: '{comic_dir.name}' -> '{series_name}'")
+        # ── classify -> move -> index, serialized by resolved series identity
+        #
+        # The identity is read from the destination filesystem, which is what
+        # another thread's move changes, so it is resolved provisionally,
+        # locked, and re-resolved under that lock before anything is moved.
+        # Everything above this point is per-arrival work on the source
+        # directory and stays outside the lock: holding it across file
+        # processing would serialize unrelated series on unrelated work.
+        resolution: dict = {}
 
-        # Give placeholder-named archives (see _PLACEHOLDER_STEM_RE) a unique,
-        # traceable name before the merge — otherwise every chapter that reuses
-        # a scanlator's generic filename collides under the same name and one
-        # is silently discarded during _move_cbz_dir's merge.
-        _apply_fallback_naming(parsed_by_path, series_name, dir_number)
+        def _resolve_identity() -> str:
+            """Read-only: inspects the destination and archives, moves nothing.
 
-        if has_nested_comic_dirs:
-            log.warning(
-                f"  '{comic_dir.name}' has loose .cbz file(s) alongside subdirectories that "
-                f"have their own .cbz files — moving only the loose files, not the whole "
-                f"directory, so unrelated series aren't swept along with it."
+            Called once before the lock and once under each acquisition, so it
+            must stay free of irreversible work -- releasing a provisional lock
+            is only safe because nothing was mutated under it.
+            """
+            name, number = _resolve_series_dir_name(
+                comic_dir, list(parsed_by_path.keys()), dest_folder
             )
-            archives = list(parsed_by_path.keys())
-            _shadow_route(comic_dir, dest_folder, series_name, archives,
-                          shadow_results)
-            landed = _move_loose_files(archives, dest_folder, series_name)
-            _note_move(series_name, dest_folder, landed)
-            continue
+            resolution["dir_number"] = number
+            return name
 
-        _shadow_route(comic_dir, dest_folder, series_name,
-                      list(parsed_by_path.keys()), shadow_results)
-        landed = _move_cbz_dir(comic_dir, dest_folder, target_name=series_name,
-                               chapter_number=dir_number)
-        _note_move(series_name, dest_folder, landed)
+        try:
+            with stable_series_lock(_SERIES_LOCKS, _resolve_identity) as settled:
+                # The identity the transaction confirmed under the lock it
+                # holds, not a fresh read: resolving again here would be a
+                # third answer nothing had agreed to.
+                series_name = settled.identity
+                dir_number = resolution["dir_number"]
+                if series_name != comic_dir.name:
+                    log.info(
+                        f"  Series folder: '{comic_dir.name}' -> '{series_name}'")
+
+                # Give placeholder-named archives (see _PLACEHOLDER_STEM_RE) a
+                # unique, traceable name before the merge — otherwise every
+                # chapter that reuses a scanlator's generic filename collides
+                # under the same name and one is silently discarded during
+                # _move_cbz_dir's merge.
+                _apply_fallback_naming(parsed_by_path, series_name, dir_number)
+
+                if has_nested_comic_dirs:
+                    log.warning(
+                        f"  '{comic_dir.name}' has loose .cbz file(s) alongside subdirectories that "
+                        f"have their own .cbz files — moving only the loose files, not the whole "
+                        f"directory, so unrelated series aren't swept along with it."
+                    )
+                    archives = list(parsed_by_path.keys())
+                    _shadow_route(comic_dir, dest_folder, series_name, archives,
+                                  shadow_results)
+                    landed = _move_loose_files(archives, dest_folder, series_name)
+                    _note_move(series_name, dest_folder, landed)
+                    continue
+
+                _shadow_route(comic_dir, dest_folder, series_name,
+                              list(parsed_by_path.keys()), shadow_results)
+                landed = _move_cbz_dir(comic_dir, dest_folder,
+                                       target_name=series_name,
+                                       chapter_number=dir_number)
+                _note_move(series_name, dest_folder, landed)
+        except UnstableSeriesIdentityError as e:
+            # The destination kept moving under us. Deferring is correct:
+            # nothing was mutated, the arrival is still in the watch folder,
+            # and the next settle pass retries against a quieter library.
+            log.error(f"  Deferred '{comic_dir.name}': {e}")
+            continue
 
     log.info(
         f"  Batch complete — {total_processed} processed, "
