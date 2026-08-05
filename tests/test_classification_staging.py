@@ -2032,6 +2032,88 @@ def test_a_terminal_case_refuses_every_acting_command(tmp_path, monkeypatch,
     assert f"the case is {STATE_PROMOTED}" in outcome.detail
 
 
+def test_rollback_reports_cross_volume_unavailability_explicitly(tmp_path,
+                                                                  monkeypatch):
+    """The real gap: a copy case whose source was deliberately released.
+
+    Structured rather than generic, because this is a missing capability
+    rather than a transient obstacle, and an operator needs to see all three
+    facts at once instead of inferring them.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch,
+                                      METHOD_COPY_VERIFY)
+    execute_transfer(plan, delete_copied_source=True)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    assert not src.exists(), "precondition: the source was released"
+    digest = show_case(layout, case_id).record_digest
+
+    before = _snapshot(layout.root)
+    outcome = rollback_case(layout, case_id, expected_record_digest=digest)
+
+    assert outcome.acted is False
+    for line in ("rollback unavailable:",
+                 "original source absent",
+                 "destination is cross-volume",
+                 "no verified cross-volume rollback protocol exists"):
+        assert line in outcome.detail
+
+    assert _snapshot(layout.root) == before, "the staged payload was disturbed"
+    assert layout.pending_case(case_id).exists()
+    assert not src.exists(), "rollback invented a destination"
+
+
+@pytest.mark.parametrize("where", ["review_root", "staged_path", "source_path"])
+def test_promote_refuses_a_destination_the_manifest_rules_out(tmp_path,
+                                                              monkeypatch,
+                                                              where):
+    """Validates the caller's destination; never resolves one of its own."""
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    manifest = show_case(layout, case_id).manifest
+    digest = manifest.record_digest
+
+    roots = {
+        "review_root": layout.pending,
+        "staged_path": Path(manifest.staged_path),
+        "source_path": Path(manifest.staging_source_path).parent,
+    }
+    before = _snapshot(layout.root)
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=roots[where])
+
+    assert outcome.acted is False
+    assert _snapshot(layout.root) == before
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")).state \
+        == STATE_PENDING_REVIEW
+
+
+def test_promote_does_not_resolve_the_decision_destination(tmp_path,
+                                                           monkeypatch):
+    """decision_dest_key is provenance, not an execution directive here.
+
+    Resolving it would couple promotion to routing configuration before #31
+    and v2 activation are ready. The field staying unused is the boundary
+    holding, so this pins it.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_RENAME)
+    plan.manifest.decision_dest_key = "manga"
+    plan.manifest.touch()
+    execute_transfer(plan)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+
+    library = tmp_path / "explicitly_chosen_by_the_caller"
+    digest = show_case(layout, case_id).record_digest
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=library)
+
+    assert outcome.acted is True
+    assert (library / "src").is_dir(), "the caller's destination was not used"
+    assert not (tmp_path / "manga").exists(), "dest_key was resolved to a path"
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")
+    ).decision_dest_key == "manga", "provenance was not preserved"
+
+
 def test_a_cross_volume_promotion_is_refused_rather_than_faked(tmp_path,
                                                                monkeypatch):
     """A cross-volume move is a copy plus a delete, with no safe moment."""
