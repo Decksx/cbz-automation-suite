@@ -211,6 +211,56 @@ delta against the number of tests actually added. CI
 - Architectural choices go in `docs/engineering_decisions.md`; what
   happened on a day goes in `docs/development_log_<date>.md`.
 
+## Documenting code
+
+Applies to all implementation work, including issue #44 and every
+subsequent watcher, routing, staging, and indexing change.
+
+- Document every new or materially changed public function, class,
+  exception, and module.
+- Comment where behaviour, ordering, recovery semantics, safety
+  constraints, invariants, or non-obvious design decisions would not be
+  clear from the code alone.
+- **Explain why a guard exists, not what the next line does.** "Checked
+  before blocking, so a violation is reported even when the lock happens
+  to be free" is worth writing; "acquire the lock" is not.
+- Keep comments synchronized with behaviour. Update or delete a stale
+  comment as part of the change that made it stale — a comment that
+  describes code which no longer exists is worse than no comment, because
+  it is read as current.
+- Do not restate obvious syntax.
+- Tests get descriptive names, and a comment or docstring wherever the
+  setup, race simulation, failure injection, or safety assertion is
+  non-obvious. A reader must be able to tell what a test would catch.
+- **Protocol boundaries and accepted limitations belong in durable
+  documentation or an issue**, not only in a code comment and never only
+  in a session transcript. A limit recorded solely at the call site is
+  invisible to anyone deciding whether to rely on the capability.
+
+## Implementation review checklist
+
+Every implementation change is reviewed against all seven:
+
+```text
+[ ] behaviour implemented
+[ ] deterministic tests added
+[ ] safety guards proven load-bearing
+[ ] public interfaces documented
+[ ] non-obvious logic and invariants commented
+[ ] durable protocol documentation updated where applicable
+[ ] comments verified against the final implementation
+```
+
+"Proven load-bearing" means the guard was removed or bypassed and the
+tests that should fail did, by name and count — not that the suite passed
+with the guard present. Three guards written during the #32 work failed
+*nothing* when bypassed: they were unreachable defensive code, and only
+the bypass showed it.
+
+The last item is not a formality either. Comments written against an
+earlier draft survive refactoring silently, so they are re-read against
+the code as it finally landed rather than as it was first written.
+
 ## Scope
 
 - Verify the tree before trusting any document. Documents lag code — an
