@@ -1,3 +1,17 @@
+"""Tests for comic_automation.archive.InspectArchiveHandler: the job-queue
+handler that wraps inspect_archive() to persist results into the
+archive_inspections table (and back-fill archive_files.page_count) as part
+of the normal job pipeline.
+
+Covers persisting a full inspection result (including parsed ComicInfo.xml
+as JSON), upsert behavior so re-inspecting an archive doesn't leave
+duplicate rows, integration with a real JobWorker for both the success and
+failure paths, and failure-category classification: a missing source file
+is a retryable "filesystem_not_found", while both a CRC/decompression
+error and a plain corrupt archive are permanent "corrupt_archive" failures
+that should not consume retry attempts.
+"""
+
 from __future__ import annotations
 
 import json
@@ -20,6 +34,7 @@ MIGRATION_DIRECTORY = (
 
 
 def create_cbz(path: Path) -> Path:
+    """Build a .cbz with two images and a valid ComicInfo.xml at `path`."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(
@@ -48,6 +63,10 @@ def seed_archive(
     connection,
     archive_path: Path,
 ) -> tuple[int, int]:
+    """Insert minimal archive_files/file_locations rows for archive_path
+    directly via SQL (bypassing the discovery scanner), returning
+    (archive_id, location_id) for tests to build jobs against.
+    """
     stat = archive_path.stat()
 
     archive_cursor = connection.execute(
@@ -85,6 +104,11 @@ def seed_archive(
 def test_handler_persists_inspection_result(
     tmp_path: Path,
 ) -> None:
+    """Running the handler directly on an inspect_archive job should write
+    a full archive_inspections row (status, format, page_count,
+    comic_info flags, comic_info_json, inspected_file_size), and also
+    back-fill archive_files.page_count for quick lookups elsewhere.
+    """
     database = tmp_path / "inspection.db"
     archive = create_cbz(tmp_path / "library" / "issue.cbz")
 
@@ -141,6 +165,11 @@ def test_handler_persists_inspection_result(
 def test_handler_upserts_latest_result(
     tmp_path: Path,
 ) -> None:
+    """Running the handler twice for the same archive (as would happen on
+    re-inspection after a file change) should leave exactly one
+    archive_inspections row -- the second run upserts rather than
+    inserting a duplicate.
+    """
     database = tmp_path / "inspection.db"
     archive = create_cbz(tmp_path / "library" / "issue.cbz")
 
@@ -192,6 +221,10 @@ def test_handler_upserts_latest_result(
 def test_worker_completes_inspection_job(
     tmp_path: Path,
 ) -> None:
+    """Integration check: wiring InspectArchiveHandler into a real
+    JobWorker and running once should complete the job successfully and
+    produce exactly one inspection row.
+    """
     database = tmp_path / "inspection.db"
     archive = create_cbz(tmp_path / "library" / "issue.cbz")
 
@@ -237,6 +270,11 @@ def test_worker_completes_inspection_job(
 def test_worker_fails_missing_archive_without_crashing(
     tmp_path: Path,
 ) -> None:
+    """If the file_locations row points at a path that no longer exists on
+    disk, the handler should fail the job cleanly (not raise/crash the
+    worker) with failure_category "filesystem_not_found" and the missing
+    filename in the error message.
+    """
     database = tmp_path / "inspection.db"
     missing = tmp_path / "library" / "missing.cbz"
 
@@ -297,6 +335,12 @@ def test_crc_decompression_error_fails_permanently_on_first_attempt(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """With verify_crc=True, a zlib decompression error surfaced by
+    ZipFile.testzip (simulated here via monkeypatch to avoid needing a
+    genuinely corrupt compressed stream) should fail the job immediately
+    on the first attempt as failure_category "corrupt_archive" -- retrying
+    a permanently corrupt archive wouldn't help.
+    """
     database = tmp_path / "inspection.db"
     archive = create_cbz(
         tmp_path / "library" / "damaged-stream.cbz"
@@ -351,6 +395,10 @@ def test_crc_decompression_error_fails_permanently_on_first_attempt(
 def test_corrupt_archive_fails_permanently_on_first_attempt(
     tmp_path: Path,
 ) -> None:
+    """A file that isn't a valid zip archive at all should also fail
+    immediately on the first attempt as "corrupt_archive", the same
+    permanent-failure path as the CRC case above.
+    """
     database = tmp_path / "inspection.db"
     archive = tmp_path / "library" / "corrupt.cbz"
     archive.parent.mkdir(parents=True)

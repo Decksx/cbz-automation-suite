@@ -1,3 +1,8 @@
+"""Tests for comic_automation.library.cli: the command-line entry point
+that wraps scan_library() with argument parsing, human-readable summary
+output, and process exit codes.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,6 +17,9 @@ def create_archive(
     path: Path,
     content: bytes = b"test archive",
 ) -> Path:
+    """Write a file at `path` (parents created as needed); content need not
+    be a real archive since only discovery metadata is exercised here.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
@@ -21,6 +29,12 @@ def test_discovery_cli_runs_end_to_end(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """Running the CLI against a library with two archives and one
+    non-archive file should exit 0, create the database, print a
+    human-readable "Scanned/New/Jobs queued" summary to stdout with no
+    stderr output, persist the expected rows, and leave the source files
+    completely untouched (content and mtime unchanged).
+    """
     library = tmp_path / "library"
     database = tmp_path / "database" / "inventory.db"
 
@@ -87,6 +101,9 @@ def test_discovery_cli_second_scan_reports_unchanged(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """Running the CLI a second time against an unchanged library should
+    report the file as unchanged and zero jobs queued.
+    """
     library = tmp_path / "library"
     database = tmp_path / "inventory.db"
 
@@ -116,6 +133,10 @@ def test_discovery_cli_returns_failure_for_missing_root(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """Pointing --root at a directory that doesn't exist should exit 1,
+    print nothing to stdout, and report a clear "does not exist" error on
+    stderr.
+    """
     missing_root = tmp_path / "missing-library"
     database = tmp_path / "inventory.db"
 
