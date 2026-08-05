@@ -41,6 +41,8 @@ from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from scripts.cbz_routing import series_key
+
 
 try:
     from scripts.cbz_core import (
@@ -136,7 +138,6 @@ _DUP_BARE_NUM_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s+\1\b")
 _SPACED_PUNCT_RE = re.compile(r"([!?.])(?: +\1)+")
 _ASYM_HYPH_L_RE = re.compile(r"(\S) -(\S)")
 _ASYM_HYPH_R_RE = re.compile(r"(\S)- (\S)")
-_PUNCT_RE = re.compile(r"[^\w\s]")
 _SPACES_RE = re.compile(r"\s+")
 _MARKER_WORDS_RE = re.compile(r"\b(uncensored|decensored)\b", re.IGNORECASE)
 _CHAPTER_TOKEN_RE = re.compile(r"(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
@@ -267,12 +268,15 @@ def clean_duplicate_tokens(name: str) -> str:
     return re.sub(r"  +", " ", s).strip()
 
 
-def normalise_series_key(name: str) -> str:
-    """Strip censorship markers, punctuation, and extra whitespace for fuzzy series-name comparison."""
-    name = _MARKER_WORDS_RE.sub("", name)
-    name = name.lower()
-    name = _PUNCT_RE.sub(" ", name)
-    return _SPACES_RE.sub(" ", name).strip()
+# The canonical series identity, not a local copy. This module had its own
+# implementation until #44, agreeing with the other two only by coincidence:
+# nothing compared them, and each carried its own regex constants. Grouping
+# and merge decisions here must use the same rule the router and the index
+# use, or maintenance merges two directories the router considers distinct.
+#
+# _MARKER_WORDS_RE and _SPACES_RE are deliberately kept: both are used
+# independently elsewhere in this module for questions other than identity.
+normalise_series_key = series_key
 
 
 def fmt_number(value: float) -> str:
