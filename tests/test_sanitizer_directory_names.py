@@ -21,6 +21,10 @@ from scripts.cbz_sanitizer import CHAPTER_ONLY_RE, clean_directory_name
 
 
 def test_words_ending_in_ch_are_not_truncated():
+    """Ordinary words ending in "ch" with no separator before it must be
+    left completely intact -- this is the core regression case for the
+    `*` vs `+` separator bug described above.
+    """
     assert clean_directory_name("Switch") == "Switch"
     assert clean_directory_name("Iroha Switch") == "Iroha Switch"
     assert clean_directory_name("Beach") == "Beach"
@@ -37,6 +41,10 @@ def test_words_ending_in_ch_are_not_truncated():
 
 
 def test_real_trailing_chapter_tokens_still_stripped():
+    """Genuine trailing chapter/part/volume stubs, properly separated by
+    whitespace, must still be stripped -- the fix only removes the
+    "no separator required" behavior, not the feature itself.
+    """
     # A genuine trailing Ch./Part/v token, separated by whitespace, must still
     # be stripped — only the "no separator required" bug is being fixed.
     assert clean_directory_name("Berserk Ch") == "Berserk"
@@ -46,6 +54,11 @@ def test_real_trailing_chapter_tokens_still_stripped():
 
 
 def test_chapter_only_re_matches_bare_chapter_number():
+    """CHAPTER_ONLY_RE should still correctly capture the numeric chapter
+    value from both the abbreviated ("Ch.5") and spelled-out ("Chapter 12")
+    forms, confirming the doubled-backslash bug doesn't break normal
+    (reachable) usage even though the fallback path is rarely hit.
+    """
     m = CHAPTER_ONLY_RE.match("Ch.5")
     assert m is not None
     assert m.group(1) == "5"
