@@ -1,9 +1,21 @@
+"""Tests for comic_automation.config: TOML-based application configuration.
+
+load_config() parses a config.toml into an AppConfig (with nested
+WorkspaceConfig/ServiceConfig sections), and ensure_workspace() creates the
+on-disk workspace directory layout (cache, embeddings, staging, temp, logs,
+backups, and the database file's parent directory) if it doesn't exist yet.
+"""
+
 from pathlib import Path
 
 from comic_automation.config import ensure_workspace, load_config
 
 
 def test_load_config(tmp_path: Path) -> None:
+    """A well-formed config.toml with [workspace]/[library]/[service]
+    sections should parse into an AppConfig whose fields match the file
+    exactly, including nested workspace paths and service tuning values.
+    """
     config_path = tmp_path / "config.toml"
     workspace = tmp_path / "workspace"
     library = tmp_path / "library"
@@ -44,6 +56,11 @@ operating_mode = "audit"
 
 
 def test_ensure_workspace_creates_directories(tmp_path: Path) -> None:
+    """ensure_workspace() should create every workspace directory declared
+    in the config (root, cache, embeddings, staging, temp, logs, backups)
+    plus the parent directory of the database file, none of which exist on
+    disk until this call.
+    """
     config_path = tmp_path / "config.toml"
     workspace = tmp_path / "workspace"
 
