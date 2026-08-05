@@ -1,3 +1,15 @@
+"""Tests for comic_automation.service.ComicAutomationService: the
+long-running service's startup/initialize() behavior.
+
+Covers workspace/database creation and idempotency, and -- the bulk of this
+file -- the critical safety property that startup's stale-job detection is
+purely observational: it must warn about jobs that look abandoned (claimed
+or running well past the configured threshold) without ever mutating them,
+since a legitimately long-running job (e.g. decoding a huge archive) must
+not be silently reset just because it's been running a while with no
+heartbeat to prove liveness.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -41,12 +53,19 @@ _RECOVERY_SENSITIVE_COLUMNS = (
 
 
 def _utc_sql_timestamp(moment: datetime) -> str:
+    """Format a datetime as the UTC "YYYY-MM-DD HH:MM:SS" string SQLite
+    columns in this schema store timestamps as.
+    """
     return moment.astimezone(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
 
 def _seconds_ago(seconds: int) -> str:
+    """SQL timestamp string for a moment `seconds` seconds in the past,
+    used to backdate job activity timestamps deterministically instead of
+    sleeping in tests.
+    """
     return _utc_sql_timestamp(
         datetime.now(timezone.utc)
         - timedelta(seconds=seconds)
@@ -75,6 +94,10 @@ def write_test_config(
     *,
     cpu_workers: int = 1,
 ) -> Path:
+    """Write a minimal but complete service.toml (workspace/library/service
+    sections) under tmp_path and return its path, for tests that need a
+    real ComicAutomationService to construct against.
+    """
     workspace = tmp_path / "workspace"
     library = tmp_path / "library"
     config_path = tmp_path / "service.toml"
@@ -113,6 +136,10 @@ operating_mode = "audit"
 def test_service_initialize_creates_workspace_and_database(
     tmp_path: Path,
 ) -> None:
+    """initialize() should apply all 10 migrations and create every
+    workspace subdirectory (cache, embeddings, staging, temp, logs,
+    backups) plus the database file itself, starting from nothing.
+    """
     config_path = write_test_config(tmp_path)
     service = ComicAutomationService(config_path)
 
@@ -132,6 +159,10 @@ def test_service_initialize_creates_workspace_and_database(
 def test_service_initialize_is_idempotent(
     tmp_path: Path,
 ) -> None:
+    """A second call to initialize() should apply zero further migrations,
+    confirming startup can be safely re-run against an already-set-up
+    workspace/database.
+    """
     config_path = write_test_config(tmp_path)
     service = ComicAutomationService(config_path)
 
@@ -296,6 +327,12 @@ def test_service_initialize_warns_about_stale_jobs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Startup should log exactly one WARNING covering both stale jobs,
+    naming the count, the configured threshold, both job IDs, and pointing
+    to the manual recovery CLI (with --confirm/--workers-stopped flags) --
+    while explicitly stating nothing was changed and repeating the worker-
+    liveness caveat verbatim from the audit module.
+    """
     config_path = write_test_config(tmp_path)
     service = ComicAutomationService(
         config_path,
@@ -339,6 +376,9 @@ def test_service_initialize_does_not_warn_without_stale_jobs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A job that was just claimed (well inside the staleness threshold)
+    should produce no WARNING-level log output at all on startup.
+    """
     config_path = write_test_config(tmp_path)
     service = ComicAutomationService(
         config_path,
@@ -400,6 +440,10 @@ def test_stale_job_detection_connection_is_read_only(
 def test_stale_job_threshold_alias_tracks_configured_value(
     tmp_path: Path,
 ) -> None:
+    """service.stale_job_threshold_seconds should reflect whatever
+    abandoned_after_seconds was passed to the constructor, defaulting to
+    300 seconds when not specified.
+    """
     config_path = write_test_config(tmp_path)
     service = ComicAutomationService(
         config_path,
@@ -415,6 +459,10 @@ def test_stale_job_threshold_alias_tracks_configured_value(
 def test_service_does_not_create_or_modify_library_root(
     tmp_path: Path,
 ) -> None:
+    """initialize() sets up the workspace, but must never create or touch
+    the library_root itself -- that's the user's comic library, not
+    application-owned storage.
+    """
     config_path = write_test_config(tmp_path)
     service = ComicAutomationService(config_path)
     library_root = service.config.library_root
