@@ -112,6 +112,106 @@ monotonic.
 This is recorded as a design consequence, not implemented here. It
 should be settled before the critical section is wrapped.
 
+## Lock key normalization
+
+The key is `cbz_lock_order.lock_key`, built on `cbz_routing.series_key` —
+the identity routing itself files under — and **not** the display
+directory name. The directory name is not guaranteed unique across the
+operation domain, and two arrivals whose folders differ only in
+punctuation resolve to one series.
+
+`series_key` lowercases, strips `uncensored`/`decensored` markers,
+replaces every non-word non-space character with a space, and collapses
+whitespace. Verified over a sample, these already key the same:
+
+```text
+case          "BERSERK"          == "Berserk"
+punctuation   "Berserk!!"        == "Berserk"
+hyphen        "Attack-on-Titan"  == "Attack on Titan"
+marker        "X (Uncensored)"   == "X"
+outer space   "Berserk "         == "Berserk"
+```
+
+### Measured: composition splits identities
+
+`series_key` applies no Unicode normalization. Measured on this
+checkout, a title carrying a combining diaeresis:
+
+```text
+NFC form  ->  'kantai'  (with the precomposed vowel, a word character)
+NFD form  ->  'ka ntai' (the combining mark is not \w, so it becomes a space)
+```
+
+Two forms of one title, two keys, therefore two locks and no
+serialization at all. Content arriving from a macOS-side share is
+routinely NFD, so this is reachable rather than theoretical. `lock_key`
+normalizes to NFC before and after `series_key`, which closes it.
+
+This makes the lock key deliberately **coarser** than routing's own: two
+names routing treats as distinct series can share one lock.
+Over-serializing costs a little concurrency; under-serializing costs the
+split this issue exists to prevent. The asymmetry is taken on purpose.
+
+### Two gaps documented rather than closed
+
+Both would change `series_key` itself, and therefore change SeriesIndex
+keys, which is not something an additions-only chunk may do:
+
+- **Separator handling is inconsistent.** `_` is a word character and
+  survives; `-` does not. So `Attack_on_Titan` and `Attack on Titan` key
+  differently while `Attack-on-Titan` and `Attack on Titan` do not.
+- **There are two implementations.** `cbz_routing.series_key:92` and
+  `cbz_watcher._series_key:983` each define their own copies of the same
+  three regexes. They agree today — verified across a sample — but
+  nothing enforces that they keep agreeing, and a divergence would mean
+  the watcher comparing series by one rule while the lock and the index
+  use another.
+
+Neither affects correctness of the lock as specified, because `lock_key`
+is the single definition the registry uses. Both are worth their own
+issue.
+
+## Provisional resolve, lock, re-resolve
+
+Because the identity is derived from destination state, a single
+pre-lock resolution serializes operations that already agreed without
+guaranteeing the identity is authoritative once the section begins.
+`stable_series_lock` implements the bounded algorithm:
+
+```text
+1. resolve provisionally           -> K1
+2. acquire the series lock for K1
+3. re-resolve while holding K1
+4. still K1  -> body runs, holding K1
+5. now K2    -> release K1 having mutated nothing, acquire K2
+6. re-resolve under K2; still K2 -> body runs
+7. changed again -> UnstableSeriesIdentityError
+```
+
+Two keyed acquisitions, never more. The second re-resolution covers
+another operation completing between releasing K1 and acquiring K2. A
+third distinct identity means the topology is still moving; looping
+would starve the operation and make the outcome depend on scheduling
+rather than on the library, so it refuses with every identity it
+observed.
+
+Releasing K1 is safe precisely because nothing has been mutated under
+it. The resolver passed in must therefore be free of irreversible work:
+
+```text
+permitted    read routing inputs
+             inspect destination directories
+             re-resolve identity
+
+forbidden    move or rename a payload
+             create authoritative staging state
+             update index or repository state
+             emit a completed routing decision
+```
+
+Nothing in the primitive can enforce that, so it is stated as the
+contract it is.
+
 ## Ordering rule
 
 ```text
