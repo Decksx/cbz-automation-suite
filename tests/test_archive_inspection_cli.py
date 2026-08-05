@@ -1,3 +1,19 @@
+"""Tests for comic_automation.archive.cli: the batch runner that drains
+pending inspect_archive jobs from the queue up to a --limit, reporting a
+human-readable summary and optional machine-readable JSON/CSV output.
+
+Covers: bounded batch processing (--limit stopping partway through a
+larger backlog), JSON summary output, input validation (missing database,
+invalid --limit), a retryable failure (missing source file) consuming
+exactly one attempt per CLI run rather than looping until exhausted, a
+permanent failure (corrupt archive) reported as terminal immediately,
+structured failure reports (--failure-json-output/--failure-csv-output)
+for both the empty and non-empty cases, and a regression test confirming
+migration 005 correctly backfills failure_category on legacy (pre-
+migration) failed job rows by pattern-matching their stored error
+messages.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -20,6 +36,7 @@ MIGRATION_DIRECTORY = (
 
 
 def create_cbz(path: Path) -> Path:
+    """Build a minimal valid .cbz (one image + ComicInfo.xml) at `path`."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(
@@ -45,6 +62,9 @@ def seed_job(
     connection,
     archive_path: Path,
 ) -> int:
+    """Insert archive_files/file_locations rows for archive_path and enqueue
+    a pending inspect_archive job for it, returning the new archive_id.
+    """
     stat = archive_path.stat()
 
     cursor = connection.execute(
@@ -86,6 +106,11 @@ def test_cli_processes_bounded_jobs(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """With 3 pending jobs and --limit 2, the CLI should process exactly 2
+    (both succeeding), report the correct Processed/Succeeded/Remaining
+    pending counts in its summary, and leave the 3rd job untouched (still
+    pending) for a future run.
+    """
     database = tmp_path / "inspection.db"
 
     with database_connection(database) as connection:
@@ -151,6 +176,10 @@ def test_cli_processes_bounded_jobs(
 def test_cli_writes_json_summary(
     tmp_path: Path,
 ) -> None:
+    """--json-output should write a machine-readable summary (processed/
+    succeeded/retry_scheduled/terminally_failed/failed/remaining_pending
+    counts plus a per-status breakdown) matching the human-readable output.
+    """
     database = tmp_path / "inspection.db"
     output = tmp_path / "logs" / "summary.json"
 
@@ -190,6 +219,9 @@ def test_cli_rejects_missing_database(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """Pointing --database at a path that doesn't exist should exit 1 with
+    a clear "Database does not exist" message on stderr.
+    """
     result = main(
         [
             "--database",
@@ -209,6 +241,10 @@ def test_cli_rejects_invalid_limit(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """--limit 0 (or any non-positive value) should be rejected with exit
+    code 1 and an explanatory stderr message, rather than silently
+    processing zero jobs.
+    """
     database = tmp_path / "inspection.db"
     database.touch()
 
@@ -231,6 +267,12 @@ def test_cli_processes_retryable_job_only_once_per_run(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """A job for a missing source file (retryable) should be attempted
+    exactly once per CLI invocation -- even with a high --limit and
+    --retry-delay-seconds 0, the batch runner must not loop on the same
+    retryable job within a single run. Reports as "Retry scheduled" with
+    attempts incremented to 1 and status back to pending.
+    """
     database = tmp_path / "inspection.db"
     missing = tmp_path / "library" / "missing.cbz"
 
@@ -284,6 +326,10 @@ def test_cli_reports_corrupt_archive_as_terminal(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """A corrupt (non-zip) archive should be reported as "Terminally
+    failed" in the summary, with the job ending in FAILED status after
+    exactly one attempt.
+    """
     database = tmp_path / "inspection.db"
     archive = tmp_path / "library" / "corrupt.cbz"
     archive.parent.mkdir(parents=True)
@@ -318,6 +364,12 @@ def test_cli_reports_corrupt_archive_as_terminal(
 def test_cli_writes_structured_failure_reports(
     tmp_path: Path,
 ) -> None:
+    """--report-only should only report on jobs that have already failed;
+    since this job (a corrupt archive) is still pending -- --report-only
+    generates reports without processing the queue -- the JSON/CSV failure
+    reports should come back empty: terminal_failure_count 0, no category
+    counts, no CSV rows.
+    """
     database = tmp_path / "inspection.db"
     archive = tmp_path / "library" / "corrupt.cbz"
     archive.parent.mkdir(parents=True)
@@ -355,6 +407,12 @@ def test_cli_failure_reports_include_terminal_corruption(
     tmp_path: Path,
     capsys,
 ) -> None:
+    """After actually processing a corrupt-archive job to FAILED (first CLI
+    call), a follow-up --report-only run should surface it in both the
+    JSON (terminal_failure_count, failure_category_counts, per-failure
+    detail with failure_kind "permanent") and CSV outputs, and print a
+    matching human-readable failure breakdown.
+    """
     database = tmp_path / "inspection.db"
     archive = tmp_path / "library" / "corrupt.cbz"
     archive.parent.mkdir(parents=True)
@@ -404,6 +462,13 @@ def test_cli_failure_reports_include_terminal_corruption(
 def test_failure_category_migration_backfills_legacy_errors(
     tmp_path: Path,
 ) -> None:
+    """Regression test: applying only migrations 1-4 (pre-dating
+    failure_category), manually inserting two failed job rows with
+    legacy-style error_message text, then applying migration 5 should
+    backfill failure_category on each by pattern-matching the stored
+    message text -- proving the migration's backfill logic actually
+    classifies real historical error strings correctly.
+    """
     database = tmp_path / "inspection.db"
 
     with database_connection(database) as connection:
