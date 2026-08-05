@@ -1,3 +1,13 @@
+"""Tests for the higher-level workflow orchestration in scripts.cbz_workflows.
+
+These cover translating a parsed CLI Namespace into the ordered list of
+underlying stage commands ("series" and "maintenance" workflows), CLI
+argument validation (rejecting unknown --stages values), a sanity check that
+dry-run mode in cbz_sanitizer never touches the source archive, and a
+guard-rail test that every option exposed in the Tkinter GUI (apps.cbz_gui)
+has user-facing documentation.
+"""
+
 from argparse import Namespace
 from pathlib import Path
 import zipfile
@@ -12,6 +22,12 @@ from scripts.cbz_workflows import (
 
 
 def test_series_workflow_combines_requested_stages():
+    """Given a "series" workflow Namespace requesting organize/stage/review/
+    compilations stages, build_series_commands should produce one labeled
+    command per requested stage, in order, with the CLI flags (dry-run,
+    metadata-dedupe, move-which, etc.) correctly translated onto the
+    organize-series invocation.
+    """
     args = Namespace(
         root=Path("Library"),
         stages=["organize", "stage", "review", "compilations"],
@@ -41,6 +57,11 @@ def test_series_workflow_combines_requested_stages():
 
 
 def test_maintenance_workflow_runs_selected_stages_in_order():
+    """Given a "maintenance" workflow Namespace requesting sanitize/archive/
+    metadata/names stages, build_maintenance_commands should produce exactly
+    one command per stage, in the requested order, each invoking the correct
+    underlying script with the expected flags translated from the Namespace.
+    """
     args = Namespace(
         root=Path("Library"),
         stages=["sanitize", "archive", "metadata", "names"],
@@ -70,6 +91,10 @@ def test_maintenance_workflow_runs_selected_stages_in_order():
 
 
 def test_workflow_parser_rejects_unknown_stage():
+    """Passing an unrecognized --stages value to the "series" subcommand
+    should cause argparse to exit with status code 2 (its standard usage-
+    error exit code), not silently accept the bogus stage name.
+    """
     parser = build_parser()
     try:
         parser.parse_args(["series", "Library", "--stages=unknown"])
@@ -80,6 +105,11 @@ def test_workflow_parser_rejects_unknown_stage():
 
 
 def test_sanitizer_dry_run_does_not_rename_or_rewrite_archive(tmp_path):
+    """process_cbz_file(dry_run=True) should compute and return the proposed
+    new path without renaming the archive on disk or rewriting its
+    ComicInfo.xml -- the source file and its contents must be byte-for-byte
+    unchanged after a dry run.
+    """
     archive = tmp_path / "001 - Chapter 1.cbz"
     source_xml = "<ComicInfo><Title>Chapter 1</Title></ComicInfo>"
     with zipfile.ZipFile(archive, "w") as zf:
@@ -96,6 +126,11 @@ def test_sanitizer_dry_run_does_not_rename_or_rewrite_archive(tmp_path):
 
 
 def test_every_visible_gui_option_has_guidance():
+    """Documentation guard-rail: every option on every tool listed in the
+    Tkinter GUI's TOOLS registry must define a description, an example, and
+    an expected_result -- so the GUI never ships an option with no
+    user-facing explanation of what it does.
+    """
     for tool in TOOLS:
         for option in tool.get("options", []):
             assert option.get("description"), (tool["id"], option["key"])
