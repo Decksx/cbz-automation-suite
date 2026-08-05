@@ -721,6 +721,21 @@ class CaseManifest:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False,
                           sort_keys=True)
 
+    @property
+    def record_digest(self) -> str:
+        """A snapshot digest of the whole record, not just its payload.
+
+        Deliberately covers everything -- state, decision, timestamps -- so
+        any change at all moves it. An operator reads it from a report and
+        hands it back to the command that acts, and the command refuses if it
+        no longer matches. That is what stops a decision being applied to a
+        case that changed after the operator looked at it.
+
+        Distinct from payload_inventory_digest, which answers "are these the
+        same bytes". This one answers "is this the same case record".
+        """
+        return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
     @classmethod
     def from_json(cls, text: str) -> "CaseManifest":
         """Parse and fully validate a manifest, or raise.
@@ -1599,3 +1614,290 @@ def recover_case(layout: StagingLayout, case_id: str, *,
         True, found.state, case_id, manifest,
         "discarded the unusable staged copy and recopied, verified, "
         "revalidated, and published from the authoritative source.")
+
+
+# ------------------------------------------------------------- operator
+
+ACTION_PROMOTE = "promote"
+ACTION_REJECT = "reject"
+ACTION_ROLLBACK = "rollback"
+
+
+@dataclass(frozen=True)
+class OperatorOutcome:
+    """What an operator command did, or why it declined."""
+
+    acted: bool
+    action: str
+    case_id: str
+    manifest: CaseManifest | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class CaseReport:
+    """Everything known about one case, read only. What `show` returns.
+
+    Carries `record_digest` because the whole point of reporting first is to
+    give the operator the token that the acting commands demand back.
+    """
+
+    case_id: str
+    manifest: CaseManifest | None
+    record_digest: str
+    payload_verified: bool
+    payload_detail: str
+    recovery: RecoveryAssessment
+
+    def describe(self) -> list[str]:
+        lines = [f"case {self.case_id}"]
+        if self.manifest is None:
+            lines.append("  manifest      : absent or unreadable")
+        else:
+            m = self.manifest
+            lines += [
+                f"  state         : {m.state}",
+                f"  series        : {m.series_name!r} (key {m.series_key!r})",
+                f"  source        : {m.staging_source_path}",
+                f"  staged        : {m.staged_path or '-'}",
+                f"  method        : {m.transfer_method}",
+                f"  payload       : {m.file_count} file(s), "
+                f"{m.total_bytes / 1e6:,.1f} MB",
+                f"  decision      : {m.decision_dest_key or '-'} "
+                f"[{m.decision_confidence or '-'}]",
+                f"  record digest : {self.record_digest}",
+            ]
+        lines += [
+            f"  payload check : "
+            f"{'verified' if self.payload_verified else 'FAILED'} "
+            f"({self.payload_detail})",
+            f"  recovery      : {self.recovery.state}",
+        ]
+        return lines
+
+
+def show_case(layout: StagingLayout, case_id: str) -> CaseReport:
+    """Report on one case without touching anything. Report before you act.
+
+    Verifies the staged payload as part of reporting rather than asserting it
+    from the manifest, because "the manifest says 40 files" and "40 files are
+    there" are different claims and only the second is worth acting on.
+    """
+    manifest, _ = _load_case_record(layout, case_id)
+    recovery = assess_recovery(layout, case_id)
+
+    verified, detail = False, "no manifest to check against"
+    if manifest is not None:
+        expected = _inventory_from_json(manifest.files)
+        root = _staged_payload_root(layout, manifest)
+        verified, detail = _payload_agrees(root, expected)
+
+    return CaseReport(
+        case_id=case_id,
+        manifest=manifest,
+        record_digest=manifest.record_digest if manifest else "",
+        payload_verified=verified,
+        payload_detail=detail,
+        recovery=recovery,
+    )
+
+
+def _load_case_record(layout: StagingLayout,
+                      case_id: str) -> tuple[CaseManifest | None, str]:
+    """The validated manifest for *case_id*, or None and why not."""
+    path = layout.manifest(case_id)
+    if not path.exists():
+        return None, f"no manifest at {path}"
+    try:
+        manifest = CaseManifest.from_json(path.read_text(encoding="utf-8"))
+    except (OSError, StagingError) as exc:
+        return None, f"{path} does not validate ({exc})"
+    if manifest.case_id != case_id:
+        return None, (f"{path} describes case {manifest.case_id} but is filed "
+                      f"as {case_id}")
+    return manifest, ""
+
+
+def _staged_payload_root(layout: StagingLayout, manifest: CaseManifest) -> Path:
+    return layout.payload(manifest.case_id) / Path(
+        manifest.staging_source_path).name
+
+
+def _ready_for_operator(layout: StagingLayout, case_id: str, action: str,
+                        expected_record_digest: str
+                        ) -> tuple[CaseManifest | None, OperatorOutcome | None]:
+    """Shared refusals for every acting command.
+
+    Three separate questions, and all three have to hold: is this case
+    readable, is it the case the operator looked at, and is it in a state
+    where the action means anything. A terminal case is refused here rather
+    than silently re-decided.
+    """
+    def refuse(detail: str, manifest: CaseManifest | None = None):
+        return None, OperatorOutcome(False, action, case_id, manifest, detail)
+
+    manifest, why = _load_case_record(layout, case_id)
+    if manifest is None:
+        return refuse(f"cannot {action}: {why}")
+
+    if manifest.record_digest != expected_record_digest:
+        return refuse(
+            f"cannot {action}: the case record has changed since it was "
+            f"reported (expected {expected_record_digest[:16]}..., found "
+            f"{manifest.record_digest[:16]}...). Re-read it and decide again.",
+            manifest)
+
+    if manifest.state != STATE_PENDING_REVIEW:
+        return refuse(
+            f"cannot {action}: the case is {manifest.state}, not "
+            f"{STATE_PENDING_REVIEW}.", manifest)
+
+    return manifest, None
+
+
+def _verified_staged_payload(layout: StagingLayout, manifest: CaseManifest,
+                             action: str
+                             ) -> tuple[Path | None, OperatorOutcome | None]:
+    """The staged payload root, proven to match the manifest, or a refusal."""
+    expected = _inventory_from_json(manifest.files)
+    root = _staged_payload_root(layout, manifest)
+    agrees, why = _payload_agrees(root, expected)
+    if not agrees:
+        return None, OperatorOutcome(
+            False, action, manifest.case_id, manifest,
+            f"cannot {action}: the staged content does not match its "
+            f"manifest ({why}).")
+    return root, None
+
+
+def _same_volume_move(source: Path, destination: Path, action: str,
+                      manifest: CaseManifest
+                      ) -> OperatorOutcome | None:
+    """Refuse a move that would not be an atomic rename.
+
+    A cross-volume move is a copy followed by a delete, and there is no point
+    in that sequence where a failure leaves exactly one good copy. Doing it
+    safely needs the same verified-transfer protocol the executor implements,
+    and that is not what an operator command should be quietly reinventing.
+    """
+    if not same_volume(source, destination.parent):
+        return OperatorOutcome(
+            False, action, manifest.case_id, manifest,
+            f"cannot {action}: {destination.parent} is on a different volume "
+            f"from {source}, so the move would not be atomic. Cross-volume "
+            f"{action} needs the verified-transfer protocol and is not "
+            "implemented here.")
+    return None
+
+
+def _finish(layout: StagingLayout, manifest: CaseManifest, state: str,
+            action: str, detail: str) -> OperatorOutcome:
+    manifest.state = state
+    manifest.touch()
+    manifest.write(layout.manifest(manifest.case_id))
+    return OperatorOutcome(True, action, manifest.case_id, manifest, detail)
+
+
+def promote_case(layout: StagingLayout, case_id: str, *,
+                 expected_record_digest: str,
+                 destination_root: Path) -> OperatorOutcome:
+    """Accept a case and move its payload out of review into *destination_root*.
+
+    Requires the case id and the record digest the operator was shown, and
+    re-verifies the staged content before moving it. The digest is what makes
+    this a decision about the case that was reviewed rather than about
+    whatever is at that id now.
+
+    Refuses rather than overwrites when the destination is occupied. Two
+    series directories with the same name are not the same series, and
+    merging them is not a promotion.
+    """
+    manifest, refusal = _ready_for_operator(layout, case_id, ACTION_PROMOTE,
+                                            expected_record_digest)
+    if refusal is not None:
+        return refusal
+
+    payload_root, refusal = _verified_staged_payload(layout, manifest,
+                                                     ACTION_PROMOTE)
+    if refusal is not None:
+        return refusal
+
+    destination = Path(destination_root) / payload_root.name
+    if destination.exists():
+        return OperatorOutcome(
+            False, ACTION_PROMOTE, case_id, manifest,
+            f"cannot promote: {destination} already exists. Refusing to merge "
+            "or overwrite a destination that is already occupied.")
+
+    Path(destination_root).mkdir(parents=True, exist_ok=True)
+    refusal = _same_volume_move(payload_root, destination, ACTION_PROMOTE,
+                                manifest)
+    if refusal is not None:
+        return refusal
+
+    os.replace(payload_root, destination)
+    return _finish(layout, manifest, STATE_PROMOTED, ACTION_PROMOTE,
+                   f"payload verified and promoted to {destination}.")
+
+
+def reject_case(layout: StagingLayout, case_id: str, *,
+                expected_record_digest: str) -> OperatorOutcome:
+    """Decline a case, moving it whole into `rejected/`.
+
+    Quarantine rather than delete: a rejected case keeps its payload and its
+    manifest, so a decision made in error stays reversible by hand.
+    """
+    manifest, refusal = _ready_for_operator(layout, case_id, ACTION_REJECT,
+                                            expected_record_digest)
+    if refusal is not None:
+        return refusal
+
+    destination = layout.rejected / case_id
+    if destination.exists():
+        return OperatorOutcome(
+            False, ACTION_REJECT, case_id, manifest,
+            f"cannot reject: {destination} already exists.")
+
+    layout.rejected.mkdir(parents=True, exist_ok=True)
+    os.replace(layout.pending_case(case_id), destination)
+    return _finish(layout, manifest, STATE_REJECTED, ACTION_REJECT,
+                   f"case moved to {destination}; payload retained.")
+
+
+def rollback_case(layout: StagingLayout, case_id: str, *,
+                  expected_record_digest: str) -> OperatorOutcome:
+    """Undo staging, returning the payload to the path it was staged from.
+
+    Refuses when the original path is now occupied. Something else being
+    there means the world moved on: a re-download, a manual restore, a
+    different arrival of the same series. Writing over it would destroy
+    whatever that is, and merging into it would produce a directory no
+    manifest describes.
+    """
+    manifest, refusal = _ready_for_operator(layout, case_id, ACTION_ROLLBACK,
+                                            expected_record_digest)
+    if refusal is not None:
+        return refusal
+
+    payload_root, refusal = _verified_staged_payload(layout, manifest,
+                                                     ACTION_ROLLBACK)
+    if refusal is not None:
+        return refusal
+
+    original = Path(manifest.staging_source_path)
+    if original.exists():
+        return OperatorOutcome(
+            False, ACTION_ROLLBACK, case_id, manifest,
+            f"cannot roll back: {original} is occupied. Something is already "
+            "at the path this case was staged from, and it is not this case's "
+            "to overwrite or merge into.")
+
+    refusal = _same_volume_move(payload_root, original, ACTION_ROLLBACK,
+                                manifest)
+    if refusal is not None:
+        return refusal
+
+    original.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(payload_root, original)
+    return _finish(layout, manifest, STATE_ROLLED_BACK, ACTION_ROLLBACK,
+                   f"payload verified and returned to {original}.")
