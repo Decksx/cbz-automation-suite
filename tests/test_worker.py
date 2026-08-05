@@ -1,3 +1,14 @@
+"""Tests for comic_automation.jobs.JobWorker: the poll-claim-run loop that
+pulls jobs off a JobQueue and dispatches them to registered handler
+functions by job type.
+
+Covers the success path, transient-vs-permanent failure handling (retry vs.
+immediate terminal failure), handler-type filtering, idle behavior when no
+handlers are registered, clean shutdown via a stop event, an unreachable-
+in-practice missing-handler branch, and the worst case where even recording
+a failure can't be persisted.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -33,6 +44,9 @@ MIGRATION_DIRECTORY = (
 def test_worker_completes_successful_job(
     tmp_path: Path,
 ) -> None:
+    """run_once() should claim a pending job, invoke the registered handler
+    for its type, and mark it COMPLETED when the handler returns normally.
+    """
     database_path = tmp_path / "worker.db"
     handled: list[int] = []
 
@@ -64,6 +78,11 @@ def test_worker_completes_successful_job(
 def test_worker_retries_handler_failure(
     tmp_path: Path,
 ) -> None:
+    """A handler raising a plain RuntimeError is treated as transient: the
+    first failure retries the job (back to PENDING, attempts incremented),
+    and only once max_attempts is exhausted does a further failure move it
+    to FAILED with the exception message recorded.
+    """
     database_path = tmp_path / "worker.db"
 
     def failing_handler(job) -> None:
@@ -104,6 +123,10 @@ def test_worker_retries_handler_failure(
 def test_worker_permanent_failure_is_terminal_immediately(
     tmp_path: Path,
 ) -> None:
+    """A handler raising PermanentJobError should fail the job immediately
+    (TERMINALLY_FAILED, attempts=1) regardless of remaining attempts budget
+    -- for errors retrying can never fix, e.g. a corrupt archive.
+    """
     database_path = tmp_path / "worker.db"
 
     def permanent_failure(job) -> None:
@@ -134,6 +157,10 @@ def test_worker_permanent_failure_is_terminal_immediately(
 def test_worker_reports_retry_scheduled(
     tmp_path: Path,
 ) -> None:
+    """A handler raising a plain OSError (transient) with attempts remaining
+    should report RETRY_SCHEDULED and leave the job PENDING for another
+    attempt.
+    """
     database_path = tmp_path / "worker.db"
 
     def transient_failure(job) -> None:
@@ -165,6 +192,10 @@ def test_worker_reports_retry_scheduled(
 def test_worker_claims_only_registered_job_types(
     tmp_path: Path,
 ) -> None:
+    """A worker should only claim jobs whose type has a registered handler
+    -- a job of an unknown type must be left untouched (still PENDING)
+    rather than claimed and then failing for lack of a handler.
+    """
     database_path = tmp_path / "worker.db"
 
     with database_connection(database_path) as connection:
@@ -189,6 +220,10 @@ def test_worker_claims_only_registered_job_types(
 def test_worker_without_handlers_remains_idle(
     tmp_path: Path,
 ) -> None:
+    """A worker constructed with an empty handler map should simply report
+    nothing processed, rather than erroring, when there's a pending job it
+    has no handler for.
+    """
     database_path = tmp_path / "worker.db"
 
     with database_connection(database_path) as connection:
@@ -211,6 +246,10 @@ def test_worker_without_handlers_remains_idle(
 def test_worker_loop_stops_cleanly(
     tmp_path: Path,
 ) -> None:
+    """run() (the continuous poll loop, as opposed to run_once()) should
+    exit its background thread promptly once stop_event is set, rather than
+    running forever or requiring a hard kill.
+    """
     database_path = tmp_path / "worker.db"
     stop_event = threading.Event()
 
