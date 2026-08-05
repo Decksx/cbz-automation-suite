@@ -1790,6 +1790,47 @@ def _same_volume_move(source: Path, destination: Path, action: str,
     return None
 
 
+def _destination_permitted(layout: StagingLayout, manifest: CaseManifest,
+                           destination: Path, action: str
+                           ) -> OperatorOutcome | None:
+    """Refuse a destination the manifest already rules out.
+
+    Validates the caller's destination; it does not invent or resolve one.
+    `decision_dest_key` is persisted decision provenance, and turning it into
+    a path needs routing configuration this module deliberately does not read
+    -- that belongs to a caller, after #31 and v2 activation. Leaving the
+    field unused here is the boundary working, not an oversight.
+
+    What can be checked without any of that is whether the destination
+    contradicts what the case already records.
+    """
+    def refuse(detail: str) -> OperatorOutcome:
+        return OperatorOutcome(False, action, manifest.case_id, manifest,
+                               f"cannot {action}: {detail}")
+
+    target = destination.absolute()
+    review_root = layout.root.absolute()
+    if target == review_root or review_root in target.parents:
+        return refuse(
+            f"{destination} is inside the review root {layout.root}. "
+            "Promotion moves a payload out of review; a destination within it "
+            "would leave the case staged under a manifest that no longer "
+            "describes where it is.")
+
+    staged = Path(manifest.staged_path).absolute()
+    if manifest.staged_path and (target == staged or staged in target.parents):
+        return refuse(
+            f"{destination} is the case's own staged location.")
+
+    if target == Path(manifest.staging_source_path).absolute():
+        return refuse(
+            f"{destination} is the path this case was staged from. Returning "
+            "a payload there is a rollback, not a promotion, and the two "
+            "record different decisions.")
+
+    return None
+
+
 def _finish(layout: StagingLayout, manifest: CaseManifest, state: str,
             action: str, detail: str) -> OperatorOutcome:
     manifest.state = state
@@ -1823,6 +1864,11 @@ def promote_case(layout: StagingLayout, case_id: str, *,
         return refusal
 
     destination = Path(destination_root) / payload_root.name
+    refusal = _destination_permitted(layout, manifest, destination,
+                                     ACTION_PROMOTE)
+    if refusal is not None:
+        return refusal
+
     if destination.exists():
         return OperatorOutcome(
             False, ACTION_PROMOTE, case_id, manifest,
@@ -1892,10 +1938,23 @@ def rollback_case(layout: StagingLayout, case_id: str, *,
             "at the path this case was staged from, and it is not this case's "
             "to overwrite or merge into.")
 
-    refusal = _same_volume_move(payload_root, original, ACTION_ROLLBACK,
-                                manifest)
-    if refusal is not None:
-        return refusal
+    if not same_volume(payload_root, original.parent):
+        # Reported as an explicit unavailability rather than a generic
+        # cross-volume refusal, because this combination is a real gap in the
+        # contract rather than a transient obstacle: a copy_verify case whose
+        # source was deliberately released has nowhere safe to go back to.
+        # Rollback is not quietly reinterpreted as "copy somewhere
+        # equivalent", and the staged payload is left exactly where it is.
+        return OperatorOutcome(
+            False, ACTION_ROLLBACK, case_id, manifest,
+            "rollback unavailable:\n"
+            f"    original source absent ({original})\n"
+            f"    destination is cross-volume (staged payload {payload_root}, "
+            f"target parent {original.parent})\n"
+            "    no verified cross-volume rollback protocol exists\n"
+            "The staged payload has not been moved, deleted, or "
+            "reinterpreted. A verified cross-volume return is a separate "
+            "capability and is not an implicit extension of rollback.")
 
     original.parent.mkdir(parents=True, exist_ok=True)
     os.replace(payload_root, original)
