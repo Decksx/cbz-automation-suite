@@ -31,6 +31,11 @@ therefore refused; re-entering the same lock is not.
 from __future__ import annotations
 
 import threading
+import unicodedata
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+from scripts.cbz_routing import series_key
 
 LOCK_SERIES = "series-operation"
 LOCK_INDEX = "router-index"
@@ -144,14 +149,65 @@ class OrderedLock:
         return f"OrderedLock({self.lock_class!r}, {self.key!r})"
 
 
+def lock_key(series_name: str) -> str:
+    """The normalized identity two arrivals must share to contend for one lock.
+
+    Built on `cbz_routing.series_key`, the identity routing itself files
+    under, rather than on the display directory name -- the directory name is
+    not guaranteed unique across the operation domain, and two arrivals whose
+    folders differ only in punctuation resolve to one series.
+
+    `series_key` lowercases, strips `uncensored`/`decensored` markers,
+    replaces every non-word non-space character with a space, and collapses
+    runs of whitespace. So these already agree:
+
+        case            "BERSERK"        == "Berserk"
+        punctuation     "Berserk!!"      == "Berserk"
+        hyphens         "Attack-on-Titan" == "Attack on Titan"
+        markers         "X (Uncensored)" == "X"
+        outer space     "Berserk "       == "Berserk"
+
+    Unicode composition is applied here and not by `series_key`. Measured:
+    the NFD form of a title with a combining diaeresis keys to `ka ntai`
+    while its NFC form keys to `kantai`-with-umlaut, because the combining
+    mark is not a word character and becomes a space. Content arriving from
+    a macOS-side share is routinely NFD, so without this the same series
+    could take two different locks and serialize against nothing. Normalizing
+    to NFC before and after closes it.
+
+    That makes this key deliberately *coarser* than routing's own: two names
+    routing would treat as distinct series can share one lock. Over-
+    serializing costs a little concurrency; under-serializing costs the split
+    this whole issue exists to prevent, so the asymmetry is taken on purpose.
+
+    Two gaps are documented rather than closed here, because both change
+    `series_key` itself and therefore change SeriesIndex keys:
+
+        underscores     "Attack_on_Titan" != "Attack on Titan"
+                        `_` is a word character, so it survives while `-`
+                        does not -- separator handling is inconsistent
+        duplication     `cbz_watcher._series_key` is a second implementation
+                        with its own copies of the same three regexes. They
+                        agree today, verified over a sample; nothing enforces
+                        that they keep agreeing.
+
+    See `docs/lock_topology.md`.
+    """
+    normalized = unicodedata.normalize("NFC", series_name or "")
+    return unicodedata.normalize("NFC", series_key(normalized))
+
+
 class SeriesLockRegistry:
     """One `series-operation` lock per resolved series identity.
 
-    Keyed by the *resolved* identity -- what the archives will actually be
-    filed under -- and never by source path, staging case id, or destination
-    directory. Two arrivals at different paths that resolve to the same series
-    are the case this exists for, and keying on anything the arrival happens
-    to carry would let both through.
+    Keyed by the *resolved, normalized* identity -- what the archives will
+    actually be filed under -- and never by source path, staging case id, or
+    destination directory. Two arrivals at different paths that resolve to the
+    same series are the case this exists for, and keying on anything the
+    arrival happens to carry would let both through.
+
+    Normalization is applied by the registry rather than trusted to callers,
+    so a caller that passes a display name still gets the right lock.
 
     The registry's own guard is deliberately not an OrderedLock. It is a leaf:
     held only for a dictionary lookup, never while acquiring anything else, so
@@ -166,20 +222,109 @@ class SeriesLockRegistry:
     def for_series(self, identity: str) -> OrderedLock:
         """The lock for *identity*, created once and reused.
 
-        Returning the same object for the same identity is the whole contract:
-        two threads that resolve to one series must contend for one lock, and
-        a registry that minted a fresh lock per call would serialize nothing
-        while appearing to.
+        Returning the same object for the same normalized identity is the
+        whole contract: two threads that resolve to one series must contend
+        for one lock, and a registry that minted a fresh lock per call would
+        serialize nothing while appearing to.
         """
-        if not identity:
-            raise ValueError("a series lock needs a resolved identity")
+        key = lock_key(identity)
+        if not key:
+            raise ValueError(
+                f"a series lock needs a resolved identity; {identity!r} "
+                "normalizes to nothing"
+            )
         with self._guard:
-            lock = self._locks.get(identity)
+            lock = self._locks.get(key)
             if lock is None:
-                lock = OrderedLock(LOCK_SERIES, identity, factory=self._factory)
-                self._locks[identity] = lock
+                lock = OrderedLock(LOCK_SERIES, key, factory=self._factory)
+                self._locks[key] = lock
             return lock
 
     def __len__(self) -> int:
         with self._guard:
             return len(self._locks)
+
+
+# ------------------------------------------------------- stable identity
+
+MAX_KEYED_ACQUISITIONS = 2
+
+
+class UnstableSeriesIdentityError(RuntimeError):
+    """The resolved identity kept moving across successive locks.
+
+    Structured rather than bare: `observed` is every identity seen, in order,
+    so an operator can tell a genuine topology change from a resolver bug
+    without reproducing it.
+    """
+
+    def __init__(self, observed: tuple[str, ...]) -> None:
+        self.observed = observed
+        super().__init__(
+            "series identity did not settle after "
+            f"{MAX_KEYED_ACQUISITIONS} keyed acquisitions; observed "
+            + " -> ".join(repr(name) for name in observed)
+            + ". Refusing rather than retrying again: a third identity means "
+            "the destination is still changing, and looping would starve this "
+            "operation and make the outcome depend on scheduling."
+        )
+
+
+@dataclass(frozen=True)
+class SeriesTransaction:
+    """The settled identity a critical section may act under."""
+
+    identity: str
+    key: str
+    acquisitions: int
+
+
+@contextmanager
+def stable_series_lock(registry: SeriesLockRegistry, resolve):
+    """Hold the series lock for an identity proven stable under that lock.
+
+    The resolved identity is derived from the destination filesystem, which
+    is exactly what another thread's move changes. So a single pre-lock
+    resolution is not enough: it serializes operations that already agreed,
+    without guaranteeing the identity is still authoritative once the
+    critical section begins.
+
+        1. resolve provisionally           -> K1
+        2. acquire the series lock for K1
+        3. re-resolve while holding K1
+        4. still K1  -> the body runs, holding K1
+        5. now K2    -> release K1 having mutated nothing, acquire K2
+        6. re-resolve under K2; still K2 -> the body runs
+        7. changed again -> UnstableSeriesIdentityError
+
+    Two keyed acquisitions, never more. The second re-resolution is what
+    covers another operation completing between releasing K1 and acquiring
+    K2. A third distinct identity means the topology is still moving, and
+    looping would starve this operation and make the result depend on
+    scheduling rather than on the library.
+
+    *resolve* is called once before any lock and once under each. It must be
+    free of irreversible work: reading routing inputs, inspecting destination
+    directories, and re-resolving identity are all fine, but it must not
+    move or rename a payload, create authoritative staging state, update the
+    index, or emit a completed routing decision. Nothing here can enforce
+    that, so it is stated as the contract it is.
+    """
+    observed: list[str] = []
+    identity = resolve()
+    observed.append(identity)
+
+    for attempt in range(1, MAX_KEYED_ACQUISITIONS + 1):
+        lock = registry.for_series(identity)
+        with lock:
+            confirmed = resolve()
+            if lock_key(confirmed) == lock_key(identity):
+                yield SeriesTransaction(identity=confirmed, key=lock.key,
+                                        acquisitions=attempt)
+                return
+            observed.append(confirmed)
+            identity = confirmed
+            # Falls out of the `with` having mutated nothing, which is what
+            # makes releasing and re-acquiring safe rather than a rollback.
+
+    raise UnstableSeriesIdentityError(tuple(observed))
