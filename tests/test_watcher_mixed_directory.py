@@ -26,12 +26,22 @@ from scripts import cbz_watcher as watcher
 
 
 def _make_cbz(path: Path, payload_size: int = 50) -> None:
+    """Create a minimal single-page .cbz at the given path (parents created
+    as needed) so tests can build out arbitrary drop-point directory trees.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("page1.jpg", b"\0" * payload_size)
 
 
 def test_loose_files_dont_sweep_up_sibling_series_directories(tmp_path, monkeypatch):
+    """Reproduces the "mixed" drop-point incident: loose .cbz files sitting
+    directly in a drop-point directory alongside several unrelated per-title
+    subdirectories. Each subdirectory must be routed to its own destination
+    folder independently, the loose files must fall back to a folder named
+    after the drop point, and no file may be lost or swept into the wrong
+    destination in the process.
+    """
     watch_root = tmp_path / "incoming"
     dest_root = tmp_path / "library"
     watch_root.mkdir()
