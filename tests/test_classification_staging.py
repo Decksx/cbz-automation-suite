@@ -57,6 +57,13 @@ from scripts.cbz_classification_staging import (
     AUTOMATIC_RECOVERY_STATES,
     assess_recovery,
     recover_case,
+    show_case,
+    promote_case,
+    reject_case,
+    rollback_case,
+    ACTION_PROMOTE,
+    ACTION_REJECT,
+    ACTION_ROLLBACK,
     inspect_case,
     execute_transfer,
     revalidate_source,
@@ -1817,6 +1824,309 @@ def test_a_failed_destination_check_leaves_a_recoverable_case(tmp_path,
     found = inspect_case(plan.layout, case_id)
     assert (found.status, found.manifest.state) == (STATUS_VALID, STATE_PLANNED)
     assert found.is_recoverable is True
+
+
+# ── operator commands ────────────────────────────────────────────
+
+
+def _published(tmp_path, monkeypatch, method=METHOD_RENAME):
+    """A case staged and published, ready for an operator decision."""
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, method)
+    execute_transfer(plan)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    return staging, src, layout, case_id
+
+
+def test_a_report_carries_the_digest_the_acting_commands_demand(tmp_path,
+                                                                monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    report = show_case(layout, case_id)
+
+    assert report.payload_verified is True
+    assert report.record_digest == report.manifest.record_digest
+    assert report.record_digest in "\n".join(report.describe())
+
+    outcome = promote_case(layout, case_id,
+                           expected_record_digest=report.record_digest,
+                           destination_root=tmp_path / "library")
+    assert outcome.acted is True
+
+
+def test_a_report_verifies_the_payload_rather_than_believing_the_manifest(
+        tmp_path, monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    (layout.payload(case_id) / "src" / "ch01.cbz").write_bytes(b"tampered")
+
+    report = show_case(layout, case_id)
+    assert report.payload_verified is False
+    assert "FAILED" in "\n".join(report.describe())
+
+
+def test_showing_a_case_changes_nothing(tmp_path, monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    before = _snapshot(layout.root)
+    show_case(layout, case_id)
+    assert _snapshot(layout.root) == before
+
+
+def test_the_record_digest_moves_when_anything_about_the_case_does(tmp_path,
+                                                                   monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    first = show_case(layout, case_id).record_digest
+
+    manifest = CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8"))
+    manifest.decision_reason = "an operator note added after the report"
+    manifest.write(layout.manifest(case_id))
+
+    assert show_case(layout, case_id).record_digest != first
+
+
+def test_promote_moves_the_payload_and_records_the_decision(tmp_path,
+                                                            monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    library = tmp_path / "library"
+    digest = show_case(layout, case_id).record_digest
+
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=library)
+
+    assert (outcome.acted, outcome.action) == (True, ACTION_PROMOTE)
+    assert {p.relative_to(library / "src").as_posix(): p.read_bytes()
+            for p in (library / "src").rglob("*") if p.is_file()} == DEFAULT
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")).state \
+        == STATE_PROMOTED
+
+
+@pytest.mark.parametrize("action", [ACTION_PROMOTE, ACTION_REJECT,
+                                    ACTION_ROLLBACK])
+def test_a_stale_record_digest_refuses_every_acting_command(tmp_path,
+                                                            monkeypatch,
+                                                            action):
+    """The digest is what makes the decision about the case that was reviewed."""
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    stale = show_case(layout, case_id).record_digest
+
+    moved = CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8"))
+    moved.decision_reason = "changed after the operator looked"
+    moved.write(layout.manifest(case_id))
+
+    before = _snapshot(layout.root)
+    if action == ACTION_PROMOTE:
+        outcome = promote_case(layout, case_id, expected_record_digest=stale,
+                               destination_root=tmp_path / "library")
+    elif action == ACTION_REJECT:
+        outcome = reject_case(layout, case_id, expected_record_digest=stale)
+    else:
+        outcome = rollback_case(layout, case_id, expected_record_digest=stale)
+
+    assert outcome.acted is False
+    assert "has changed since it was reported" in outcome.detail
+    assert _snapshot(layout.root) == before
+
+
+def test_promote_refuses_an_occupied_destination(tmp_path, monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    library = tmp_path / "library"
+    (library / "src").mkdir(parents=True)
+    (library / "src" / "something_else.cbz").write_bytes(b"not this case")
+    digest = show_case(layout, case_id).record_digest
+
+    before = _snapshot(layout.root)
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=library)
+
+    assert outcome.acted is False
+    assert "already exists" in outcome.detail
+    assert (library / "src" / "something_else.cbz").exists()
+    assert _snapshot(layout.root) == before
+
+
+def test_promote_refuses_staged_content_that_does_not_match(tmp_path,
+                                                            monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    digest = show_case(layout, case_id).record_digest
+    (layout.payload(case_id) / "src" / "ch01.cbz").write_bytes(b"tampered")
+
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=tmp_path / "library")
+
+    assert outcome.acted is False
+    assert "does not match its manifest" in outcome.detail
+    assert not (tmp_path / "library").exists()
+
+
+def test_reject_quarantines_rather_than_deletes(tmp_path, monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    digest = show_case(layout, case_id).record_digest
+
+    outcome = reject_case(layout, case_id, expected_record_digest=digest)
+
+    assert (outcome.acted, outcome.action) == (True, ACTION_REJECT)
+    rejected = layout.rejected / case_id / "payload" / "src"
+    assert {p.relative_to(rejected).as_posix(): p.read_bytes()
+            for p in rejected.rglob("*") if p.is_file()} == DEFAULT
+    assert not layout.pending_case(case_id).exists()
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")).state \
+        == STATE_REJECTED
+
+
+def test_rollback_returns_the_payload_to_where_it_was_staged_from(tmp_path,
+                                                                  monkeypatch):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch,
+                                               METHOD_RENAME)
+    assert not src.exists(), "precondition: the rename gave up the source"
+    digest = show_case(layout, case_id).record_digest
+
+    outcome = rollback_case(layout, case_id, expected_record_digest=digest)
+
+    assert (outcome.acted, outcome.action) == (True, ACTION_ROLLBACK)
+    assert {p.relative_to(src).as_posix(): p.read_bytes()
+            for p in src.rglob("*") if p.is_file()} == DEFAULT
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")).state \
+        == STATE_ROLLED_BACK
+
+
+def test_rollback_refuses_when_the_original_path_is_occupied(tmp_path,
+                                                             monkeypatch):
+    """#35's criterion. Something else being there means the world moved on."""
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch,
+                                               METHOD_RENAME)
+    src.mkdir(parents=True)
+    (src / "a_different_download.cbz").write_bytes(b"arrived while in review")
+    digest = show_case(layout, case_id).record_digest
+
+    before_review, before_source = _snapshot(layout.root), _snapshot(src)
+    outcome = rollback_case(layout, case_id, expected_record_digest=digest)
+
+    assert outcome.acted is False
+    assert "is occupied" in outcome.detail
+    assert _snapshot(src) == before_source, "the occupant was overwritten"
+    assert _snapshot(layout.root) == before_review
+
+
+@pytest.mark.parametrize("action", [ACTION_PROMOTE, ACTION_REJECT,
+                                    ACTION_ROLLBACK])
+def test_a_terminal_case_refuses_every_acting_command(tmp_path, monkeypatch,
+                                                      action):
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    manifest = CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8"))
+    manifest.state = STATE_PROMOTED
+    manifest.write(layout.manifest(case_id))
+    digest = show_case(layout, case_id).record_digest
+
+    if action == ACTION_PROMOTE:
+        outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                               destination_root=tmp_path / "library")
+    elif action == ACTION_REJECT:
+        outcome = reject_case(layout, case_id, expected_record_digest=digest)
+    else:
+        outcome = rollback_case(layout, case_id, expected_record_digest=digest)
+
+    assert outcome.acted is False
+    assert f"the case is {STATE_PROMOTED}" in outcome.detail
+
+
+def test_rollback_reports_cross_volume_unavailability_explicitly(tmp_path,
+                                                                  monkeypatch):
+    """The real gap: a copy case whose source was deliberately released.
+
+    Structured rather than generic, because this is a missing capability
+    rather than a transient obstacle, and an operator needs to see all three
+    facts at once instead of inferring them.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch,
+                                      METHOD_COPY_VERIFY)
+    execute_transfer(plan, delete_copied_source=True)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+    assert not src.exists(), "precondition: the source was released"
+    digest = show_case(layout, case_id).record_digest
+
+    before = _snapshot(layout.root)
+    outcome = rollback_case(layout, case_id, expected_record_digest=digest)
+
+    assert outcome.acted is False
+    for line in ("rollback unavailable:",
+                 "original source absent",
+                 "destination is cross-volume",
+                 "no verified cross-volume rollback protocol exists"):
+        assert line in outcome.detail
+
+    assert _snapshot(layout.root) == before, "the staged payload was disturbed"
+    assert layout.pending_case(case_id).exists()
+    assert not src.exists(), "rollback invented a destination"
+
+
+@pytest.mark.parametrize("where", ["review_root", "staged_path", "source_path"])
+def test_promote_refuses_a_destination_the_manifest_rules_out(tmp_path,
+                                                              monkeypatch,
+                                                              where):
+    """Validates the caller's destination; never resolves one of its own."""
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    manifest = show_case(layout, case_id).manifest
+    digest = manifest.record_digest
+
+    roots = {
+        "review_root": layout.pending,
+        "staged_path": Path(manifest.staged_path),
+        "source_path": Path(manifest.staging_source_path).parent,
+    }
+    before = _snapshot(layout.root)
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=roots[where])
+
+    assert outcome.acted is False
+    assert _snapshot(layout.root) == before
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")).state \
+        == STATE_PENDING_REVIEW
+
+
+def test_promote_does_not_resolve_the_decision_destination(tmp_path,
+                                                           monkeypatch):
+    """decision_dest_key is provenance, not an execution directive here.
+
+    Resolving it would couple promotion to routing configuration before #31
+    and v2 activation are ready. The field staying unused is the boundary
+    holding, so this pins it.
+    """
+    staging, src, plan = _forced_plan(tmp_path, monkeypatch, METHOD_RENAME)
+    plan.manifest.decision_dest_key = "manga"
+    plan.manifest.touch()
+    execute_transfer(plan)
+    layout, case_id = _rebuilt_from_disk(tmp_path / "review")
+
+    library = tmp_path / "explicitly_chosen_by_the_caller"
+    digest = show_case(layout, case_id).record_digest
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=library)
+
+    assert outcome.acted is True
+    assert (library / "src").is_dir(), "the caller's destination was not used"
+    assert not (tmp_path / "manga").exists(), "dest_key was resolved to a path"
+    assert CaseManifest.from_json(
+        layout.manifest(case_id).read_text(encoding="utf-8")
+    ).decision_dest_key == "manga", "provenance was not preserved"
+
+
+def test_a_cross_volume_promotion_is_refused_rather_than_faked(tmp_path,
+                                                               monkeypatch):
+    """A cross-volume move is a copy plus a delete, with no safe moment."""
+    staging, src, layout, case_id = _published(tmp_path, monkeypatch)
+    digest = show_case(layout, case_id).record_digest
+    monkeypatch.setattr(staging, "same_volume", lambda a, b: False)
+
+    outcome = promote_case(layout, case_id, expected_record_digest=digest,
+                           destination_root=tmp_path / "library")
+
+    assert outcome.acted is False
+    assert "different volume" in outcome.detail
+    assert layout.pending_case(case_id).exists(), "the payload was given up"
 
 
 def test_the_plan_description_names_the_case_and_method(tmp_path):
