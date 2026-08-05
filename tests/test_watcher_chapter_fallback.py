@@ -22,17 +22,30 @@ from scripts import cbz_watcher as watcher
 
 
 def _make_cbz(path: Path, payload_size: int) -> None:
+    """Create a minimal single-page .cbz whose page content is `payload_size`
+    zero bytes -- the size acts as a stand-in fingerprint so tests can later
+    confirm which archive's content ended up in which output file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("page1.jpg", b"\0" * payload_size)
 
 
 def _payload_size(cbz_path: Path) -> int:
+    """Read back the page1.jpg size from a .cbz, to confirm archive content
+    (not just the filename) survived a watcher run.
+    """
     with zipfile.ZipFile(cbz_path) as zf:
         return len(zf.read("page1.jpg"))
 
 
 def test_generic_same_name_releases_get_unique_chapter_names(tmp_path, monkeypatch):
+    """Reproduces the original incident directly: two directories, each with
+    an identically-named generic-placeholder archive, processed as two
+    separate watcher runs. Both chapters must end up in the library with
+    distinct, chapter-numbered filenames and their original content intact
+    -- neither should silently overwrite or discard the other.
+    """
     watch_root = tmp_path / "incoming"
     dest_root = tmp_path / "library"
     watch_root.mkdir()
