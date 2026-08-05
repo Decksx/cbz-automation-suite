@@ -25,10 +25,14 @@ from scripts.cbz_lock_order import (
     LOCK_CLASSES,
     LOCK_INDEX,
     LOCK_SERIES,
+    MAX_KEYED_ACQUISITIONS,
     LockOrderError,
     OrderedLock,
     SeriesLockRegistry,
+    UnstableSeriesIdentityError,
     held_locks,
+    lock_key,
+    stable_series_lock,
 )
 
 
@@ -228,6 +232,178 @@ def test_held_state_is_per_thread():
 
     assert seen["held"] == ()
     assert seen["inner"] == ((LOCK_SERIES, "Berserk"),)
+    assert held_locks() == ()
+
+
+# ── key normalization ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("a, b", [
+    ("BERSERK", "Berserk"),                     # case
+    ("Berserk!!", "Berserk"),                   # punctuation
+    ("Attack-on-Titan", "Attack on Titan"),     # hyphen as separator
+    ("Berserk (Uncensored)", "Berserk"),        # censorship marker
+    ("Berserk  ", "Berserk"),                   # outer whitespace
+    ("Käntai", "Käntai"),   # NFC vs NFD
+])
+def test_equivalent_identities_share_one_lock(a, b):
+    """Anything that keys the same must contend for the same lock."""
+    assert lock_key(a) == lock_key(b)
+    registry = SeriesLockRegistry()
+    assert registry.for_series(a) is registry.for_series(b)
+    assert len(registry) == 1
+
+
+def test_composed_and_decomposed_forms_are_one_series():
+    """Measured, not assumed: series_key alone splits these.
+
+    The combining diaeresis is not a word character, so `series_key` turns it
+    into a space and the NFD form keys to something else entirely. Content
+    from a macOS-side share is routinely NFD, so without normalization the
+    same series would take two locks and serialize against nothing.
+    """
+    from scripts.cbz_routing import series_key as routing_key
+    nfc, nfd = "Käntai", "Käntai"
+    assert nfc != nfd
+    assert routing_key(nfc) != routing_key(nfd), "series_key stopped splitting these"
+    assert lock_key(nfc) == lock_key(nfd), "the lock key failed to reunite them"
+
+
+def test_distinct_series_do_not_collide():
+    assert lock_key("Berserk") != lock_key("Vinland Saga")
+
+
+def test_an_identity_that_normalizes_away_is_refused():
+    with pytest.raises(ValueError, match="normalizes to nothing"):
+        SeriesLockRegistry().for_series("!!!")
+
+
+# ── provisional resolve, lock, re-resolve ────────────────────────
+
+
+class _Resolver:
+    """Returns a scripted sequence of identities, one per call."""
+
+    def __init__(self, *identities: str) -> None:
+        self._identities = list(identities)
+        self.calls = 0
+
+    def __call__(self) -> str:
+        self.calls += 1
+        index = min(self.calls - 1, len(self._identities) - 1)
+        return self._identities[index]
+
+
+def test_a_stable_identity_takes_one_acquisition():
+    registry = SeriesLockRegistry()
+    resolve = _Resolver("Berserk", "Berserk")
+    executed = []
+
+    with stable_series_lock(registry, resolve) as transaction:
+        executed.append(transaction.identity)
+        assert held_locks() == ((LOCK_SERIES, lock_key("Berserk")),)
+
+    assert executed == ["Berserk"], "the body ran other than exactly once"
+    assert transaction.acquisitions == 1
+    assert len(registry) == 1
+    assert held_locks() == ()
+
+
+def test_an_identity_that_changes_once_executes_under_the_second_key():
+    """K1 -> K2. Nothing may have been mutated under K1."""
+    registry = SeriesLockRegistry()
+    resolve = _Resolver("Berserk Ch. 4", "Berserk", "Berserk")
+    executed = []
+
+    with stable_series_lock(registry, resolve) as transaction:
+        executed.append(transaction.identity)
+        assert held_locks() == ((LOCK_SERIES, lock_key("Berserk")),)
+
+    assert executed == ["Berserk"], "the body ran under the wrong identity"
+    assert transaction.acquisitions == 2
+    assert transaction.key == lock_key("Berserk")
+    assert held_locks() == ()
+
+
+def test_an_identity_that_changes_twice_refuses(tmp_path):
+    """K1 -> K2 -> K3. Structured refusal, and the body never runs."""
+    registry = SeriesLockRegistry()
+    resolve = _Resolver("First", "Second", "Third")
+    executed = []
+
+    with pytest.raises(UnstableSeriesIdentityError) as caught:
+        with stable_series_lock(registry, resolve):
+            executed.append("ran")
+
+    assert executed == [], "the critical section ran on an unsettled identity"
+    assert caught.value.observed == ("First", "Second", "Third")
+    assert "did not settle" in str(caught.value)
+    assert held_locks() == (), "a lock survived the refusal"
+
+
+def test_the_refusal_is_bounded_at_two_acquisitions():
+    """No spinning: a third identity refuses rather than trying again."""
+    registry = SeriesLockRegistry()
+    resolve = _Resolver("A", "B", "C", "D", "E")
+
+    with pytest.raises(UnstableSeriesIdentityError):
+        with stable_series_lock(registry, resolve):
+            pass
+
+    # one pre-lock resolve, then one per keyed acquisition
+    assert resolve.calls == 1 + MAX_KEYED_ACQUISITIONS
+
+
+def test_converging_observations_serialize_under_the_final_identity():
+    """Two arrivals see different provisional names and converge on one series.
+
+    The point of re-resolution: whichever provisional key each started from,
+    both end up contending for the same final lock.
+    """
+    registry = SeriesLockRegistry()
+
+    # Convergence is the resolver's doing, not the key function's: lock_key
+    # normalizes but does not strip chapter tokens, so the two provisional
+    # names genuinely disagree until each is re-resolved.
+    assert lock_key("Berserk Ch. 4") != lock_key("Berserk 5")
+    assert lock_key("Berserk Ch. 4") != lock_key("Berserk")
+
+    with stable_series_lock(registry, _Resolver("Berserk Ch. 4",
+                                                "Berserk", "Berserk")) as first:
+        assert first.key == lock_key("Berserk")
+        # A second arrival that resolved "Berserk 5" down to "Berserk" asks
+        # for that identity and must wait.
+        assert _acquired_by_a_fresh_thread(registry.for_series("Berserk")) \
+            is False, "a converging arrival was not serialized"
+        # ...while the unresolved provisional key is a different lock, which
+        # is exactly why locking the provisional key alone is insufficient.
+        assert _acquired_by_a_fresh_thread(
+            registry.for_series("Berserk Ch. 4")) is True
+
+
+def test_an_exception_in_the_body_releases_everything():
+    registry = SeriesLockRegistry()
+    resolve = _Resolver("Berserk", "Berserk")
+
+    with pytest.raises(RuntimeError, match="move failed"):
+        with stable_series_lock(registry, resolve):
+            raise RuntimeError("move failed")
+
+    assert held_locks() == ()
+    assert _acquired_by_a_fresh_thread(registry.for_series("Berserk")) is True
+
+
+def test_the_index_lock_is_reachable_from_inside_a_transaction():
+    """The permitted direction, through the real entry point."""
+    registry = SeriesLockRegistry()
+    index = OrderedLock(LOCK_INDEX)
+    reached = False
+
+    with stable_series_lock(registry, _Resolver("Berserk", "Berserk")):
+        with index:
+            reached = True
+
+    assert reached
     assert held_locks() == ()
 
 
