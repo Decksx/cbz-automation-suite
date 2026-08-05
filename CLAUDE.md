@@ -61,23 +61,51 @@ These apply to every operation that changes state:
 
 ## Line endings
 
-Verified with `git ls-files --eol`, not assumed:
+Measured with `git ls-files --eol` at `14058d0` on 2026-08-05. **This is a
+measurement, not an invariant** — a deliberate future edit may change any
+of these counts, and re-measuring is the way to find out rather than
+trusting this block.
+
+`core.autocrlf=true`, no `.gitattributes`. **52 of 221 tracked files are
+not `i/lf`.** Most are archived docs; these are the ones a session
+plausibly edits:
 
 ```text
-scripts/cbz_sanitizer.py            i/crlf  w/crlf
-scripts/cbz_library_maintenance.py  i/crlf  w/crlf
-everything else                     i/lf    w/crlf
+file                                 index    CRLF / bare-LF at 14058d0
+scripts/cbz_library_maintenance.py   crlf     2578 / 0
+scripts/cbz_sanitizer.py             crlf     1616 / 0
+scripts/cbz_gap_checker.py           crlf      334 / 0
+scripts/__init__.py                  crlf        1 / 0
+scripts/cbz_watcher.py               mixed    1281 / 538
+scripts/cbz_compilation_resolver.py  mixed     478 / 13
+tests/test_normalization.py          crlf      146 / 0
+tests/test_series_detection.py       crlf       20 / 0
+tests/test_comicinfo.py              mixed     101 / 61
+apps/cbz_gui.py                      -text    1317 / 467   (git treats as binary)
 ```
 
-`core.autocrlf=true`, no `.gitattributes`. Those two files are stored
-with literal CRLF in the index; git leaves them alone because the index
-blob already contains CRLF. **Edits to them must emit CRLF line endings**
-— an LF line silently mixes endings and shows as whole-file churn. Edits
-elsewhere are normalized on commit and need no special handling.
+A `crlf` file is stored with literal CRLF in the index and git leaves it
+alone, because the blob already contains CRLF. **Edits to it must emit
+CRLF** — an LF line silently mixes endings and shows as whole-file churn.
+
+A **`mixed` file is worse**, because there is no single correct ending to
+emit: it must be edited byte-exactly, matching whatever the neighbouring
+lines already use at each site. Editing `cbz_watcher.py` line-wise on
+2026-08-05 normalized the whole file to CRLF and produced **618
+insertions / 565 deletions against a ~60-line change**, most of it lines
+deleted and re-added identically. Restoring from `master` and splicing
+byte-exactly with the local ending gave 79/27 and left the bare-LF count
+untouched. Check the count either side of an edit; if it moved, the edit
+normalized something.
+
+Everything else is normalized on commit and needs no special handling.
+**Check before editing, do not infer from this table** — it was wrong for
+50 files until 2026-08-05, and the file it was wrong about was the
+watcher.
 
 This is also why `git am` needs `--keep-cr`: without it `git mailinfo`
-normalizes CRLF inside the patch body and any patch touching those two
-files fails to apply.
+normalizes CRLF inside the patch body and any patch touching a CRLF or
+mixed file fails to apply.
 
 ## Verifying code work
 
@@ -105,16 +133,30 @@ delta against the number of tests actually added. CI
 / Python 3.11.
 
 - `git diff --check` is meaningful only for the LF files, where it should
-  be clean. It is structurally noisy for the two CRLF files above:
-  `--check` inspects *added* lines only, and every added line in a
-  CRLF-stored file ends with `\r`, which it reports as trailing
-  whitespace. This is not a real defect and predates any current work —
-  the merged `7c63bc9` produces 65 such warnings. Scope it to the files
-  it can actually speak to:
+  be clean. It is structurally noisy for every CRLF or mixed file:
+  `--check` inspects *added* lines only, and every added line in such a
+  file ends with `\r`, which it reports as trailing whitespace. This is
+  not a real defect and predates any current work — the merged `7c63bc9`
+  produces 65 such warnings. Derive the exclusions rather than
+  maintaining a list that goes stale the way the table above did:
+
+  ```text
+  git diff --check -- . $(git ls-files --eol \
+      | grep -v '^i/lf' | sed 's/.*\t/:(exclude)/')
+  ```
+
+  The equivalent explicit form, for the files this actually reaches
+  today:
 
   ```text
   git diff --check -- . ':(exclude)scripts/cbz_sanitizer.py' \
-      ':(exclude)scripts/cbz_library_maintenance.py'
+      ':(exclude)scripts/cbz_library_maintenance.py' \
+      ':(exclude)scripts/cbz_watcher.py' \
+      ':(exclude)scripts/cbz_gap_checker.py' \
+      ':(exclude)scripts/cbz_compilation_resolver.py' \
+      ':(exclude)tests/test_comicinfo.py' \
+      ':(exclude)tests/test_normalization.py' \
+      ':(exclude)tests/test_series_detection.py'
   ```
 - A passing test is not a working test. Confirm a new test fails when the
   behavior it guards is removed.
