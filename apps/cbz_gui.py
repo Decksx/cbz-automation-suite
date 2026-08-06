@@ -1272,14 +1272,31 @@ class CBZLauncherApp(tk.Tk):
             var.set(path)
 
     # ── Run / Stop ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _script_command(script_name):
+        """Invoke a scripts/ tool as a module, never by path.
+
+        Running `python scripts/cbz_watcher.py` puts scripts/ itself on
+        sys.path[0], so the package root is absent and any module-level
+        `from scripts...` import dies with ModuleNotFoundError before the
+        tool prints anything. Popen already runs with cwd=REPO_ROOT, so
+        `-m scripts.<module>` resolves correctly.
+
+        This is not hypothetical: cbz_watcher.py gained such an import in
+        113985f and the GUI could not launch it from that commit until this
+        fix. tests/test_gui_tool_commands.py asserts every tool in TOOLS can
+        actually start, which is the check that was missing.
+        """
+        return [sys.executable, "-m", f"scripts.{Path(script_name).stem}"]
+
     def _build_command(self, tool):
         opts = self._option_vars
 
         # Check if we're applying a saved plan (only relevant for tools with run_mode)
         apply_plan = opts.get("apply_saved_plan") and opts["apply_saved_plan"].get()
         if apply_plan:
-            script = SCRIPT_DIR / "cbz_library_maintenance.py"
-            cmd = [sys.executable, str(script), "apply-plan"]
+            cmd = self._script_command("cbz_library_maintenance.py")
+            cmd.append("apply-plan")
             plan_file = LOG_DIR / "plan.json"
             cmd.append(str(plan_file))
             run_mode = opts.get("run_mode")
@@ -1287,8 +1304,7 @@ class CBZLauncherApp(tk.Tk):
                 cmd.append("--dry-run")
             return cmd
 
-        script = SCRIPT_DIR / tool["script"]
-        cmd = [sys.executable, str(script)]
+        cmd = self._script_command(tool["script"])
         if tool.get("subcommand"):
             cmd.append(tool["subcommand"])
         cmd.extend(tool.get("fixed_flags", []))
