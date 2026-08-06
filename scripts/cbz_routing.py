@@ -90,7 +90,38 @@ _SERIES_KEY_SPACE_RE = re.compile(r"\s+")
 
 
 def series_key(name: str) -> str:
-    """Lowercase, strip punctuation and censorship markers, collapse spaces."""
+    """The canonical series identity. One definition, four consumers.
+
+    This is the single rule for "same series" across the watcher, the
+    reclassifier, the series-operation lock registry, and SeriesIndex. It was
+    three separate implementations until #44; a divergence between them would
+    have meant the watcher comparing series by one rule while the lock and the
+    index used another, with nothing detecting it.
+
+    The normalization, in order:
+
+        1. `uncensored` / `decensored` removed as whole words, case-insensitive
+        2. lowercased
+        3. every non-word, non-space character replaced with a space
+        4. runs of whitespace collapsed, ends stripped
+
+    So "BERSERK", "Berserk!!", "Berserk (Uncensored)" and "Berserk " all key
+    alike, and "Attack-on-Titan" keys as "attack on titan".
+
+    Known and deliberate for now: `_` is a word character, so it survives step
+    3 while `-` does not, and "A_B" does not key as "A B". Tracked as part of
+    #44; changing it changes identity, so it lands separately from this
+    consolidation.
+
+    No Unicode normalization here. `cbz_lock_order.lock_key` adds NFC around
+    this deliberately, because the lock domain must over-serialize rather than
+    under-serialize; SeriesIndex does not, so composed and decomposed forms
+    remain distinct series to routing.
+
+    Accepts None and returns "". No caller passes it -- every call site
+    supplies a str by contract -- so this is a defensive floor, not a
+    behaviour to depend on.
+    """
     name = _MARKER_WORDS_RE.sub("", name or "")
     name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
     return _SERIES_KEY_SPACE_RE.sub(" ", name).strip()

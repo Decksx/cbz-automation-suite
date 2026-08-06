@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+from scripts.cbz_routing import series_key
 from scripts.cbz_lock_order import (
     SeriesLockRegistry,
     UnstableSeriesIdentityError,
@@ -992,15 +993,17 @@ def _resolve_dest(comic_dir: Path) -> str:
     return _routing_default or ''
 
 
-_SERIES_KEY_PUNCT_RE = re.compile(r"[^\w\s]")
-_SERIES_KEY_SPACE_RE = re.compile(r"\s+")
-
-
-def _series_key(name: str) -> str:
-    """Lowercase, strip punctuation and censorship markers for series-folder comparison."""
-    name = _MARKER_WORDS_RE.sub("", name)
-    name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
-    return _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
+# The canonical series identity, not a local copy. Three implementations of
+# this rule existed until #44 and agreed only by coincidence; the watcher,
+# the lock registry, and SeriesIndex must agree on what "same series" means,
+# or the watcher files under one rule while the index records another.
+# tests/test_series_key_canonical.py fails if a private implementation
+# reappears here.
+#
+# _MARKER_WORDS_RE is deliberately kept: it is used independently below to
+# detect censorship markers in a directory name, which is a different
+# question from series identity.
+_series_key = series_key
 
 
 def _read_comicinfo_series(cbz_path: Path) -> str | None:
