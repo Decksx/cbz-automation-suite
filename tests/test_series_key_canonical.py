@@ -167,16 +167,17 @@ def test_the_documented_normalization_rules_hold(name, expected):
     assert CANONICAL(name) == expected
 
 
-def test_the_underscore_exception_is_still_present():
-    """Deliberate for now, and tracked in #44 as the separate identity change.
+def test_the_underscore_exception_is_gone():
+    """Updated deliberately by PR B, which is why the old assertion existed.
 
-    Asserted rather than left implicit so the separator work has a test that
-    must be updated when the rule changes, instead of silently starting to
-    pass.
+    Before #44's separator change this asserted the opposite -- that `_`
+    survived while `-` did not. It was written that way so the change could
+    not land by a test quietly starting to pass; it had to be edited by
+    someone who had decided to edit it.
     """
-    assert CANONICAL("Attack_on_Titan") == "attack_on_titan"
+    assert CANONICAL("Attack_on_Titan") == "attack on titan"
     assert CANONICAL("Attack-on-Titan") == "attack on titan"
-    assert CANONICAL("Attack_on_Titan") != CANONICAL("Attack on Titan")
+    assert CANONICAL("Attack_on_Titan") == CANONICAL("Attack on Titan")
 
 
 # ── the None compatibility decision ──────────────────────────────
