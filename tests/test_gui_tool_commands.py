@@ -2,14 +2,18 @@
 
 `test_workflows.py` already checks that `cbz_gui.TOOLS` has the right shape --
 that each entry names a script, that options are well formed. That is not the
-property that matters. On 2026-08-05 commit 113985f added a module-level
-`from scripts.cbz_lock_order import ...` to `cbz_watcher.py`, and from that
-commit the GUI could not launch the watcher at all: invoking a script *by
-path* puts `scripts/` on `sys.path[0]` instead of the repository root, so the
-`scripts` package is not importable and the process dies with
-`ModuleNotFoundError` before printing anything.
+property that matters.
 
-Every shape assertion still passed. The break shipped.
+The GUI invoked tools *by path*, which puts `scripts/` on `sys.path[0]`
+instead of the repository root, leaving the `scripts` package unimportable.
+That was wrong from the start; it was simply latent, because no GUI-launched
+tool imported from the package at module level. On 2026-08-05 commit 113985f
+added `from scripts.cbz_lock_order import ...` to `cbz_watcher.py` and made
+it observable -- the watcher then died with `ModuleNotFoundError` before
+printing anything.
+
+Every shape assertion still passed, on both sides of that commit. The
+latent flaw was never detectable by them, and the observable one shipped.
 
 So these tests execute what the GUI builds rather than inspecting it. The
 property is "this command can start", not "this dict has the right keys".
