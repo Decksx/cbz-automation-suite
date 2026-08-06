@@ -15,7 +15,8 @@ cleanly.
 
 ### Cause
 
-`CBZLauncherApp._build_command` invoked tools **by path**:
+The defect is in `CBZLauncherApp._build_command`, which invoked tools **by
+path**:
 
 ```python
 script = SCRIPT_DIR / tool["script"]
@@ -30,7 +31,13 @@ invocation form was wrong.
 
 Fixed by invoking as a module: `python -m scripts.<name>`.
 
-### When it broke, measured rather than assumed
+### When it became observable, measured rather than assumed
+
+Stated precisely, because the distinction matters for where the fix belongs:
+**the GUI's command construction was already incorrect.** It built an
+invocation whose import environment could not satisfy a `scripts.*` import,
+and that was true long before any tool contained one. The flaw was latent
+only because no GUI-launched tool imported from the package at module level.
 
 The initial hypothesis was PR #30's shadow-routing integration. That is
 wrong. #30 imports the router *inside functions*
@@ -42,9 +49,16 @@ git log -S "from scripts.cbz_lock_order import" -- scripts/cbz_watcher.py
 ```
 
 `113985f` is the per-series lock wiring from **PR #46**, merged as `99f8f3d`
-on 2026-08-05. That commit added the first module-level `scripts.*` import to
-the watcher, and the GUI could not launch it from that moment. It was
+on 2026-08-05. It introduced the first module-level `scripts.*` import in a
+GUI-launched tool, which is what made the pre-existing flaw observable — and
+from that commit the watcher could not be launched from the GUI. It was
 reported the following morning.
+
+That framing is not a technicality. If #46 had "broken the GUI", the fix
+would belong in `cbz_watcher.py` — move the import inside a function and the
+symptom disappears. It does not belong there. The invocation boundary is
+wrong for every tool, which is why the fix is one change in the launcher
+rather than a rule that scripts must avoid importing their own package.
 
 ### A second, still-unmerged instance of the same break
 
