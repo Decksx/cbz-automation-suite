@@ -115,6 +115,14 @@ Use structured JSON logs, `processing_runs`, guarded reports, and a
 lightweight `docs/engineering_decisions.md` log in the current
 environment.
 
+The target architecture for the GUI is recorded separately in
+`docs/gui_architecture_implementation_roadmap.md`. **That document does not
+reverse the two deferrals above** — it neither introduces a network-facing
+control plane nor adopts a frontend framework. It is written now so that the
+safety invariants and sequencing are fixed before any frontend work begins,
+rather than being settled later under delivery pressure. Activation remains
+tied to backend readiness rather than a date.
+
 ## Near-term implementation sequence
 
 ### Step 1 — Finish and audit the Version 1 perceptual-hash backfill
@@ -1127,6 +1135,15 @@ demonstrates the need.
 
 An eventual small FastAPI and server-rendered/HTMX interface may fit
 the project, but it is not a current foundation requirement.
+
+What that interface should look like when it is built is specified in
+`docs/gui_architecture_implementation_roadmap.md` — the plan lifecycle,
+version-specific approval, execute-time revalidation, narrow entity-level
+locking, and the phased escalation from a read-only control plane to guarded
+execution. It is a **future workstream**, and stating the architecture does
+not make building it a current requirement: the deferral recorded under
+*Deliberate deferrals* still stands, and the GUI must never become a route
+around the routing-v2 readiness gates.
 
 ## Definition of roadmap completion
 
