@@ -85,7 +85,11 @@ Confidence = Literal["resolved", "unresolved"]
 # existing-folder matching rather than being a second, subtly different
 # notion of "same series".
 _MARKER_WORDS_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
-_SERIES_KEY_PUNCT_RE = re.compile(r"[^\w\s]")
+# Non-word non-space characters, plus underscore. The underscore needs its own
+# alternative because `\w` includes it, so it cannot simply be added to the
+# negated class. Without it `-` and `_` normalize differently and
+# "Attack_on_Titan" is a different series from "Attack on Titan" (#44).
+_SERIES_KEY_PUNCT_RE = re.compile(r"[^\w\s]|_")
 _SERIES_KEY_SPACE_RE = re.compile(r"\s+")
 
 
@@ -102,16 +106,24 @@ def series_key(name: str) -> str:
 
         1. `uncensored` / `decensored` removed as whole words, case-insensitive
         2. lowercased
-        3. every non-word, non-space character replaced with a space
+        3. every non-word, non-space character *and every underscore*
+           replaced with a space
         4. runs of whitespace collapsed, ends stripped
 
     So "BERSERK", "Berserk!!", "Berserk (Uncensored)" and "Berserk " all key
-    alike, and "Attack-on-Titan" keys as "attack on titan".
+    alike, and "Attack-on-Titan", "Attack_on_Titan" and "Attack on Titan" are
+    one series.
 
-    Known and deliberate for now: `_` is a word character, so it survives step
-    3 while `-` does not, and "A_B" does not key as "A B". Tracked as part of
-    #44; changing it changes identity, so it lands separately from this
-    consolidation.
+    Underscore is called out in step 3 because it is a word character: `\\w`
+    matches it, so a plain negated class silently keeps it. Until #44 it did
+    survive, which made `-` and `_` normalize differently and split every
+    series whose releases used the two interchangeably -- a real division,
+    since scanlator naming uses both.
+
+    A name consisting only of separators now keys to "" where it previously
+    kept its underscores. That matches what "!!!" has always done, and callers
+    that cannot act on an empty identity already reject it: see
+    `cbz_lock_order.SeriesLockRegistry.for_series`.
 
     No Unicode normalization here. `cbz_lock_order.lock_key` adds NFC around
     this deliberately, because the lock domain must over-serialize rather than
