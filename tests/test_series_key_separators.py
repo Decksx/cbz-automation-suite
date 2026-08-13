@@ -22,10 +22,40 @@ entries would be a change that had not actually happened.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from scripts.cbz_lock_order import SeriesLockRegistry, lock_key
 from scripts.cbz_routing import series_key
+
+
+# ── the pre-#44 rule, reconstructed ──────────────────────────────
+
+# The separator rule as it stood before #44 B: `\w` matched `_`, so a plain
+# negated class dropped every other punctuation mark while keeping underscores.
+#
+# Reconstructed at module scope so the recorded `before` values below can be
+# *derived* rather than trusted. One of them could not be, and was wrong: the
+# entry for "_-_" recorded "_ " when the old rule produced "_ _". Nothing
+# compared a recorded value against the rule it claimed to describe, so the
+# literal survived review and two passing tests.
+_OLD_PUNCT_RE = re.compile(r"[^\w\s]")
+_OLD_MARKER_WORDS_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
+_OLD_SPACE_RE = re.compile(r"\s+")
+
+
+def _old_key(name: str) -> str:
+    """What `series_key` returned for *name* before the underscore change.
+
+    Deliberately a standalone reconstruction rather than an import: the point
+    is to have a reference that does not move when `series_key` moves, so a
+    future edit to the production rule cannot silently redefine what "before"
+    meant.
+    """
+    text = _OLD_MARKER_WORDS_RE.sub("", name or "")
+    text = _OLD_PUNCT_RE.sub(" ", text.lower())
+    return _OLD_SPACE_RE.sub(" ", text).strip()
 
 
 # ── the exact corpus ─────────────────────────────────────────────
@@ -88,7 +118,9 @@ NEWLY_CHANGED = {
     "trailing_": ("trailing_", "trailing"),
     "_both_": ("_both_", "both"),
     "___": ("___", ""),
-    "_-_": ("_ ", ""),
+    # "_-_": the hyphen became a space and both underscores survived, so the
+    # old rule produced "_ _". Recorded as "_ " until 2026-08-13.
+    "_-_": ("_ _", ""),
 }
 
 
@@ -104,34 +136,55 @@ def test_every_newly_changed_input_is_accounted_for(name, before_after):
     `before` is what the previous rule produced, kept here as the record of
     what moved. If a later change alters one of these again, this fails and
     the impact has to be re-stated rather than absorbed.
+
+    The recorded `before` is checked against the reconstructed old rule, not
+    merely asserted to differ from `after`. `before != after` plus the
+    moved-name-set check in `test_the_changed_set_is_complete` let a wrong
+    historical value pass: both are satisfied by any string that is not the
+    new key, so "_-_" carried "_ " instead of "_ _" through review.
     """
     before, after = before_after
     assert before != after, f"{name!r} is listed as changed but did not change"
+    assert _old_key(name) == before, (
+        f"recorded before-value for {name!r} is {before!r}, but the rule it "
+        f"claims to describe produced {_old_key(name)!r}")
     assert series_key(name) == after
 
 
 def test_the_changed_set_is_complete():
     """No corpus entry moved without being listed.
 
-    Guards the list above from going stale: recomputing the old rule here
-    means a newly-affected input cannot slip through undocumented.
+    Guards the list above from going stale: recomputing the old rule means a
+    newly-affected input cannot slip through undocumented.
+
+    Uses the shared `_old_key` rather than a local copy, so this check and the
+    per-entry `before` check cannot drift apart into two different notions of
+    what the old rule was.
     """
-    import re
-
-    old_punct = re.compile(r"[^\w\s]")
-    marker = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
-    spaces = re.compile(r"\s+")
-
-    def old_key(name):
-        n = marker.sub("", name or "")
-        n = old_punct.sub(" ", n.lower())
-        return spaces.sub(" ", n).strip()
-
-    moved = {n for n in EXPECTED if old_key(n) != series_key(n)}
+    moved = {n for n in EXPECTED if _old_key(n) != series_key(n)}
     assert moved == set(NEWLY_CHANGED), (
         f"undocumented: {sorted(moved - set(NEWLY_CHANGED))}; "
         f"listed but unchanged: {sorted(set(NEWLY_CHANGED) - moved)}"
     )
+
+
+def test_the_reconstructed_old_rule_is_faithful():
+    """Anchors `_old_key`, which the two checks above are measured against.
+
+    A reconstruction that is itself wrong would validate wrong `before` values
+    just as happily as no check at all. #44 B changed underscore handling and
+    nothing else, so the reconstruction must agree with the current rule on
+    every corpus entry containing no underscore. That is checkable without
+    reference to any recorded historical value, which is what makes it a real
+    anchor rather than a restatement of the data it guards.
+    """
+    without_underscore = [n for n in EXPECTED if "_" not in n]
+    assert without_underscore, "corpus must contain non-underscore inputs"
+
+    for name in without_underscore:
+        assert _old_key(name) == series_key(name), (
+            f"{name!r} contains no underscore, so the old and new rules must "
+            f"agree, but got {_old_key(name)!r} vs {series_key(name)!r}")
 
 
 # ── the collision proof ──────────────────────────────────────────
