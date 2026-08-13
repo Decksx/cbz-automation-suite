@@ -132,7 +132,14 @@ marker        "X (Uncensored)"   == "X"
 outer space   "Berserk "         == "Berserk"
 ```
 
-### Measured: composition splits identities
+### Measured: composition splits identities [RESOLVED 2026-08-13]
+
+**Resolved by #44's Unicode strand.** `series_key` now normalizes to NFC
+before anything else, so composition forms converge everywhere rather
+than only inside the lock domain, and `lock_key` no longer normalizes at
+all — it delegates entirely. The finding below is the original
+measurement and is kept as written; see *Resolution* at the end of this
+section for what changed.
 
 `series_key` applies no Unicode normalization. Measured on this
 checkout, a title carrying a combining diaeresis:
@@ -152,7 +159,39 @@ names routing treats as distinct series can share one lock.
 Over-serializing costs a little concurrency; under-serializing costs the
 split this issue exists to prevent. The asymmetry is taken on purpose.
 
-### Two gaps documented rather than closed
+#### Resolution 2026-08-13
+
+NFC moved to the front of `series_key`, before marker removal,
+lowercasing, and the punctuation rule. The ordering is load-bearing: the
+punctuation rule is what destroys a combining mark, so normalizing after
+it would compose nothing.
+
+```text
+NFC  'Kantai'-with-umlaut      ->  'kantai'-with-umlaut
+NFD  'Ka' + U+0308 + 'ntai'    ->  'kantai'-with-umlaut   (was 'ka ntai')
+```
+
+Both halves of `lock_key`'s wrapper were removed: the inner call is
+redundant by construction, the outer by measurement — `series_key`
+cannot emit a non-NFC string, checked over 14,800,248 probes with zero
+violations, and pinned by `test_series_key_output_is_always_nfc`.
+
+**The lock key is therefore no longer coarser than routing's own.** The
+asymmetry described above was a compensation for an index that split
+composition forms; the index no longer splits them, so the two rules
+agree exactly.
+
+The change also *separates* identities in one direction, which is easy
+to miss: the old rule deleted an NFD accent rather than failing to
+compose it, so `'Cafe' + U+0301` keyed to `cafe` and collided with the
+plain ASCII `Cafe`. It now keys to `café`. An index built under the old
+rule must be rebuilt rather than topped up.
+
+### Two gaps documented rather than closed [BOTH RESOLVED 2026-08-13]
+
+Both were closed by #44, in separate PRs, after this section was
+written. The findings are kept as recorded; the resolutions are noted
+inline.
 
 Both would change `series_key` itself, and therefore change SeriesIndex
 keys, which is not something an additions-only chunk may do:
@@ -160,12 +199,17 @@ keys, which is not something an additions-only chunk may do:
 - **Separator handling is inconsistent.** `_` is a word character and
   survives; `-` does not. So `Attack_on_Titan` and `Attack on Titan` key
   differently while `Attack-on-Titan` and `Attack on Titan` do not.
+  — **[RESOLVED 2026-08-13, PR #51.](https://github.com/Decksx/cbz-automation-suite/pull/51)**
+  `_` is now normalized as a separator. 14 inputs changed identity.
 - **There are two implementations.** `cbz_routing.series_key:92` and
   `cbz_watcher._series_key:983` each define their own copies of the same
   three regexes. They agree today — verified across a sample — but
   nothing enforces that they keep agreeing, and a divergence would mean
   the watcher comparing series by one rule while the lock and the index
   use another.
+  — **[RESOLVED 2026-08-13, PR #49.](https://github.com/Decksx/cbz-automation-suite/pull/49)**
+  Consolidated onto `cbz_routing.series_key`; the old names survive as
+  aliases, and a test pins the set of modules that import it.
 
 Neither affects correctness of the lock as specified, because `lock_key`
 is the single definition the registry uses. Both are worth their own
