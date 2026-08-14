@@ -275,10 +275,21 @@ negative FP (adjudicated): 2/646 (0.31%)   <- what the signal was accepted at
 
 Three negative-pool series matched. One, `ERIKA`, was adjudicated a true
 positive — a mixed folder holding 3 adult archives among 9 horror ones —
-and removed from the negative denominator. The acceptance threshold is
+and is therefore not counted in the confirmed false-positive numerator.
+The denominator stays 646 for both rates: adjudication changes what
+counts as an error, not the size of the population measured against.
+`derive_adult.py` prints `len(fp_rows)/len(neg)` with `len(neg)` fixed
+at 646, and `derive.txt` reads `2/646`. The acceptance threshold is
 *adjudicated* precision ≥ 0.99, so the issue quoted the one rate that
 did not correspond to its own criterion, and paired it with a count from
 the other.
+
+This paragraph said "removed from the negative denominator" until
+2026-08-14, which is the very failure it exists to warn about: the
+correct fractions were printed two lines above it, and the prose beside
+them still drifted. It is hard to catch by eye because a 645 denominator
+rounds to the same 0.31% — so the fraction is the check, and the
+percentage is not.
 
 What made this more than a typo: the acceptance criteria *required* the
 figure be recorded in code alongside the signal. Implementing against
