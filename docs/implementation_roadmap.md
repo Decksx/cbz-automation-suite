@@ -125,6 +125,31 @@ tied to backend readiness rather than a date.
 
 ## Near-term implementation sequence
 
+### How to read this document
+
+The numbered steps below express **dependency order**: each is written to
+be startable once the ones it names as prerequisites are done.
+
+The phase checklists further down are a different kind of list. They
+group **capabilities and outcomes** — what the system will be able to do,
+and what will be true when a phase is complete. They are not execution
+order, and their numbering is not a schedule. Phase 5 items are checked
+while Phase 1 items are not, and that is the document working as
+intended, not a backlog that slipped.
+
+So **an unchecked item in a lower-numbered phase does not automatically
+preempt current prerequisite work.** "Phase 1 isn't finished" is not on
+its own a reason to stop what is in progress; the question is whether the
+work in progress depends on that item.
+
+Where phase numbering appears to conflict with the sequences, **the
+explicit prerequisites and gates control.** They are stated at the point
+of the work — "do not begin structural Phase 4 work until archive
+revisions and the minimum DAL are stable", the #60 diagnostics gate on
+the ambiguity evaluation, the frozen Version 1 hash semantics during the
+active backfill — and each names what it blocks. A phase number names
+nothing, so it cannot override a gate that does.
+
 ### Step 1 — Finish and audit the Version 1 perceptual-hash backfill
 
 After each active guarded batch completes:
@@ -1002,6 +1027,62 @@ Initial decisions should cover:
 - quarantine precedes deletion;
 - heavy work uses the persistent queue;
 - Version 1 hash semantics are frozen during the active backfill.
+
+## Return sequence for unfinished Phase 1–3 work
+
+The phase checklists below carry unchecked items across Phases 1, 2, and
+3. They are not a queue to be worked top to bottom — see "How to read
+this document". This is the order to return to them in, and it is a
+dependency order like the near-term sequence, not a phase order.
+
+1. **Finish the Version 1 perceptual-hash backfill.** Structural
+   migrations wait because changing revision ownership or evidence
+   foreign keys during the active backfill would require compatibility
+   across two storage models, and would compromise the single frozen
+   baseline used to reconcile the run.
+2. **Complete the final coverage and terminal-failure audit, update the
+   production metrics, and create and independently verify the final
+   pre-migration backup.** Independently verified means checked against
+   the artifact rather than against the command that claimed to write
+   it. This is the last known-good point before structural change.
+3. **Complete the focused golden corpus and the targeted property,
+   crash-recovery, and fault-injection tests** the upcoming structural
+   work needs. These tests precede the migration so expected behaviour
+   and failure handling are specified independently of the
+   implementation. Tests added afterward can still expose defects, but
+   they are more vulnerable to encoding the implementation's assumptions
+   instead of challenging them.
+4. **Establish the minimum DAL**, migrating new and functionally touched
+   database access incrementally. Explicitly not an all-at-once rewrite —
+   existing standalone scripts move as they are touched.
+5. **Implement archive revisions, retention, and evidence ownership**
+   using DAL-managed migrations, transactions, and backups, so the
+   migration inherits one connection, pragma, and transaction policy
+   rather than inventing a second.
+6. **Harden the job queue** before relying on it for revision-aware
+   background work. Ordering matters: hardening a queue that already
+   carries revision-aware jobs means changing acquisition semantics
+   underneath live work.
+7. **Resume structural Phase 4 work** once archive revisions and the
+   minimum DAL are stable. Within Phase 4, #60 and the diagnostic-aware
+   remeasurement block **ambiguity-gate evaluation and any v2-authority
+   decision**, but they do **not** block the provider-neutral candidate
+   model or the read-only adapters.
+
+### The exact-duplicate resolution plans are a separate workstream
+
+The two known exact-duplicate groups are an **independent guarded
+operator workstream**, not a step in the sequence above. They may run
+after the final audit (step 2), provided the plans are freshly reviewed
+and revalidated against current state at the time they run — a plan
+reviewed months earlier is evidence about a tree that has since moved.
+
+They **neither block nor replace the archive-revision migration.** The
+two concerns are deliberately separate: the migration preserves distinct
+archive identities and shared byte-level hashes, so duplicate identities
+are not merged by it, and resolving the duplicates is a decision about
+which copy to keep rather than a change to how revisions are modelled.
+Running either without the other is coherent.
 
 ## Phase 1 — Baseline and tests
 
