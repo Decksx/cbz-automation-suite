@@ -111,6 +111,7 @@ def series_key(name: str) -> str:
         3. every non-word, non-space character *and every underscore*
            replaced with a space
         4. runs of whitespace collapsed, ends stripped
+        5. the result normalized to NFC again, as a postcondition
 
     So "BERSERK", "Berserk!!", "Berserk (Uncensored)" and "Berserk " all key
     alike, and "Attack-on-Titan", "Attack_on_Titan" and "Attack on Titan" are
@@ -154,10 +155,30 @@ def series_key(name: str) -> str:
     reconciles two encodings of the identical character sequence. "Kantai"
     with an umlaut and "Kantai" without one remain different series.
 
-    Because NFC now happens here, `cbz_lock_order.lock_key` no longer wraps
-    this call in its own normalization -- see the note there, and
-    `test_series_key_output_is_always_nfc`, which pins this function's output
-    as already-NFC so that delegation stays safe.
+    **NFC is applied at both ends, and the two calls do different jobs.**
+
+        first   load-bearing. Composition must happen before the punctuation
+                rule, which destroys combining marks. Remove this and NFD
+                input is mangled beyond recovery -- the trailing call cannot
+                rebuild a mark that has already become a space.
+        last    a postcondition. It guarantees the *returned identity* is
+                NFC, rather than leaving that to hold as a consequence of
+                what the intervening transforms happen to do.
+
+    The trailing call is what lets `cbz_lock_order.lock_key` delegate here
+    outright instead of re-normalizing. That delegation now rests on a
+    contract this function enforces, not on a measurement of the current
+    Unicode database and the current behaviour of `str.lower()`.
+
+    Exhaustive measurement did confirm the intervening transforms currently
+    preserve NFC -- every codepoint in four embeddings, and every cased
+    character crossed with every combining mark in three orders, 14,800,248
+    probes with zero non-NFC outputs. That evidence is recorded in the PR and
+    in `docs/lock_topology.md`, and `test_series_key_output_is_always_nfc`
+    keeps checking it. But it is now corroboration rather than the thing
+    holding the invariant up: `.lower()` can emit combining sequences, and a
+    future Unicode revision changing one case mapping must not be able to
+    silently break a caller that trusted this function's output.
 
     Accepts None and returns "". No caller passes it -- every call site
     supplies a str by contract -- so this is a defensive floor, not a
@@ -166,7 +187,10 @@ def series_key(name: str) -> str:
     name = unicodedata.normalize("NFC", name or "")
     name = _MARKER_WORDS_RE.sub("", name)
     name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
-    return _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
+    name = _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
+    # Postcondition, not a repeat of the call above: callers are entitled to
+    # an NFC identity regardless of what the transforms in between do.
+    return unicodedata.normalize("NFC", name)
 
 
 class RoutingConfigError(ValueError):
