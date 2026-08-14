@@ -9,7 +9,7 @@
     "graphic_novels": "X:\\Graphic Novels"
   },
 
-  "_comment_default": "Graphic Novels is the fallback once the adult signal exists. NOTE: not safe to go live until then -- adult sources such as HentaiNexus currently reach Comix only by being the default.",
+  "_comment_default": "Graphic Novels is the fallback. The adult signal this waited on now exists (#31), so adult sources such as HentaiNexus are classified rather than reaching Comix only by being the default. Still not live: the watcher parses routing.json as v1 and there is no active v2 mode, so nothing here routes anything yet. Activation is a separate, separately reviewed decision with its own remaining gates.",
   "default": "graphic_novels",
 
   "lists": {
@@ -40,13 +40,60 @@
       "*image-comics*", "*dc-comics*", "*marvel*", "*dark-horse-comics*",
       "*idw-publishing*", "*boom-studios*", "*valiant*", "*vertigo*",
       "*oni-press*", "*dynamite*", "*avatar-press*"
+    ],
+
+    "_comment_adult_evidence": "The three evidence classes of the accepted adult signal, derived from the 2026-08-03 census (issue #31). 125 features in total: 59 domains, 60 SourceMihon values, 6 Categories tokens. Reproduced verbatim from adult_candidates_v2.json rather than retyped. See _comment_adult_signal on the signal itself for the measured coverage and both false-positive rates.",
+
+    "_comment_adult_domains": "Matched with domain_in_list, which parses the host out of the Web value exactly as the census did (scheme, www. and port stripped, then casefolded). Not glob_in_list: that matches anywhere in the URL, so a query parameter naming one of these would classify another site's series as adult.",
+    "adult_domains": [
+      "18porncomic.com", "9hentai.so", "allporncomic.com", "allporncomic.io",
+      "allporncomics.co", "apcomics.org", "api.blossommanhwa.comapi",
+      "api.hdoujin.org", "api.simply-hentai.com", "asmhentai.com",
+      "bestporncomix.com", "comicland.org", "comics.8muses.com",
+      "comicsvalley.com", "doujin.io", "doujins.com", "e-hentai.org",
+      "eggporncomics.com", "erofus.com", "exhentai.org", "gedecomix.com",
+      "hentai3z.cc", "hentaienvy.com", "hentaiera.com", "hentaifox.com",
+      "hentaihand.com", "hentaihere.com", "hentaikisu.com", "hentainexus.com",
+      "hentairead.com", "hentairead.io", "hentairox.com", "hentaisco.cc",
+      "hentaitnt.net", "hentaixcomic.com", "hentaizap.com", "hentalk.pw",
+      "heytoon.net", "hitomi.la", "hotcomics.me", "imhentai.xxx",
+      "kingcomix.com", "luscious.net", "manga18.me", "mangaball.net",
+      "mangadistrict.com", "manhuascan.us", "manytoon.com", "milftoon.xxx",
+      "multporn.net", "myhentaigallery.com", "nhentai.com", "nhentai.net",
+      "nhentai.xxx", "pornhwa.to", "pururin.me", "rokuhentai.com", "toon18.to",
+      "xlecx.one"
+    ],
+
+    "_comment_adult_provenance": "xsd:SourceMihon values, whole-field exact match. `komga` is deliberately absent and must stay absent: it means the archive was re-imported from the Komga library, so inferring adult status from it would infer the answer from the current placement. The watcher's own COMICINFO_TEMPLATE writes SourceMihon=Komga, so this exclusion is load-bearing against this repository's own writes, not only against re-imports.",
+    "adult_provenance": [
+      "18 porn comic", "8muses", "adult webtoon", "allporncomic",
+      "allporncomic.io", "allporncomics.co", "ap comics", "asmhentai",
+      "comicland", "comics valley", "doujin.io - j18", "doujins", "e-hentai",
+      "eggporncomics", "erofus", "exhentai", "gede comix", "hdoujin",
+      "hentai3z.cc", "hentaienvy", "hentaiera", "hentaifox", "hentaihand",
+      "hentaihere", "hentaikisu", "hentainexus", "hentairead", "hentairead.io",
+      "hentairox", "hentaisco", "hentaixcomic", "hentaizap", "heytoon",
+      "hiperdex", "hitomi", "hotcomics", "imhentai", "kingcomix", "luscious",
+      "madaradex", "manga ball", "manga district", "mangacrazy",
+      "manhuascan.us", "manhwa xxl", "manytoon", "milftoon", "multporn",
+      "myhentaigallery", "nhentai", "nhentai.com (unoriginal)", "nhentai.xxx",
+      "ninehentai", "porncomix", "pururin", "roku hentai", "simply hentai",
+      "spyfakku", "toon18", "xlecx"
+    ],
+
+    "_comment_adult_categories": "xsd:Categories tokens. The field is comma-joined, so glob_tokens_in_list splits on the comma and matches each token; none of these six values contains a glob metacharacter, so the match is exact token equality, which is what the census measured. Adding a value containing * or ? here would widen it into pattern matching.",
+    "adult_categories": [
+      "exh", "extra gooey", "gooey", "hdoujin", "hnex", "manhwa - h"
     ]
   },
 
   "signals": {
+    "_comment_adult_signal": "The accepted adult signal (#31), measured on the 2026-08-03 census. Coverage 17,096/17,468 Comix series = 97.87%. Negative control 646 Manga/Graphic Novels series, three of which match. TWO RATES, NOT INTERCHANGEABLE: raw 3/646 = 0.46% counts every negative match before adjudication; adjudicated 2/646 = 0.31% counts confirmed errors only. The signal was accepted at adjudicated precision >= 0.99, so 0.31% is the operative rate and 0.46% must never be quoted as the false-positive rate of this signal. The difference is ERIKA (domain:pururin.me), adjudicated a TRUE POSITIVE -- a mixed folder holding 3 confirmed adult archives among 9 horror ones, unresolved pending an archive-level split -- and therefore not counted in the confirmed false-positive numerator. The negative-control denominator remains 646 for BOTH rates: the adjudication changes what counts as an error, not the size of the population measured. derive_adult.py prints len(fp_rows)/len(neg) with len(neg) fixed at 646 for both. This is easy to get wrong because a 645 denominator rounds to the same 0.31%, so the percentage alone cannot tell the two readings apart -- which is why every rate here is written as an explicit fraction and never as a bare percentage. The two confirmed false positives are Kichiku Hero (category:extra gooey) and The Eminence in Shadow I NEED MORE POWER! (category:gooey). Support >= 5 Comix series; a sweep down to support 1 was measured and rejected, 92 extra features buying 13 series (97.87% -> 97.94%). Unrelated coincidence: AgeRating's negative-pool presence is also 3/646 = 0.46%, a different measurement entirely.",
     "explicitly_adult": {
       "any": [
-        { "field": "comicinfo.AgeRating", "in": ["Adults Only 18+", "X18+"] }
+        { "field": "comicinfo.Web",         "domain_in_list": "adult_domains" },
+        { "field": "comicinfo.SourceMihon", "in_list": "adult_provenance" },
+        { "field": "comicinfo.Categories",  "glob_tokens_in_list": "adult_categories" }
       ]
     },
 
@@ -74,7 +121,7 @@
 
   "rules": [
     {
-      "_comment_explicitly_adult": "PLACEHOLDER ONLY. The August 2026 census found zero matches across 18,119 series because Adults Only 18+ and X18+ do not occur in the measured library metadata. This is not an operative adult-classification safeguard. Replace it with the validated Categories + SourceMihon + Web provenance signal before routing v2 is activated.",
+      "_comment_explicitly_adult": "Was a placeholder matching AgeRating in [Adults Only 18+, X18+], which the August 2026 census found matched zero of 18,119 series -- neither value occurs in this library, where the only AgeRating present is Mature 17+ on 3 series. Replaced in #31 by the validated Categories + SourceMihon + Web provenance signal above, which is measured rather than assumed. AgeRating is no longer consulted for adult classification and expanding it is not the way to widen this signal.",
       "name": "explicit adult content",
       "when": "explicitly_adult",
       "dest": "comix"

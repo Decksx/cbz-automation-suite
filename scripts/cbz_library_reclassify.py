@@ -56,6 +56,19 @@ COMICINFO_FIELDS = (
     "Publisher", "Imprint", "Format", "Web", "AgeRating",
 )
 
+# Mihon/Tachiyomi provenance fields. They are not plain element names: the
+# ComicInfo template declares the XMLSchema namespace and writes them under a
+# prefix, so ElementTree reports them by expanded name and root.find("Categories")
+# returns None. That is why they were invisible to this reader until #31, and
+# they carry the evidence the accepted adult signal is built from.
+#
+# The prefix in the template is per-element (`ty:` for Categories, `mh:` for
+# SourceMihon) rather than the `xsd:` declared on the root, but all three bind
+# the same URI and ElementTree reports expanded names, so the prefix does not
+# reach this code at all.
+COMICINFO_NAMESPACE = "{http://www.w3.org/2001/XMLSchema}"
+NAMESPACED_COMICINFO_FIELDS = ("Categories", "SourceMihon")
+
 
 @dataclass
 class SeriesPlan:
@@ -79,7 +92,15 @@ class SeriesPlan:
 # ---------------------------------------------------------------- reading
 
 def read_comic_info(cbz_path: Path) -> dict[str, str]:
-    """Best-effort ComicInfo extraction. Unreadable archives yield {}."""
+    """Best-effort ComicInfo extraction. Unreadable archives yield {}.
+
+    Returns plain keys throughout. The namespaced provenance fields are keyed
+    on their local name -- `Categories`, not the expanded
+    `{http://www.w3.org/2001/XMLSchema}Categories` -- so a routing config
+    references `comicinfo.Categories` like any other field and does not have
+    to spell a URI. The namespace is an artifact of how Mihon writes the file,
+    not a distinction the classifier needs to carry.
+    """
     try:
         with zipfile.ZipFile(cbz_path, "r") as zf:
             names = {n.lower(): n for n in zf.namelist()}
@@ -98,6 +119,15 @@ def read_comic_info(cbz_path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for name in COMICINFO_FIELDS:
         element = root.find(name)
+        if element is not None and (element.text or "").strip():
+            out[name] = element.text.strip()
+    # Namespaced form only, deliberately. An unnamespaced <Categories> would
+    # be evidence the census never measured, so accepting one here would widen
+    # the accepted signal past the population its coverage and false-positive
+    # rates were computed over. If such archives turn up, that is a
+    # measurement to make, not a fallback to add.
+    for name in NAMESPACED_COMICINFO_FIELDS:
+        element = root.find(f"{COMICINFO_NAMESPACE}{name}")
         if element is not None and (element.text or "").strip():
             out[name] = element.text.strip()
     return out

@@ -211,6 +211,81 @@ def test_web_domain_matching_is_not_tokenised():
     assert _matches("by_web", Web="https://mangadex.org/chapter/1") is True
 
 
+# ── domain_in_list: exact host, never substring ──────────────────
+#
+# The adult signal's measured coverage and false-positive rates were
+# computed over hosts parsed the way derive_adult.py parses them. This
+# operator exists so the encoded signal is that signal rather than a glob
+# approximation of it, so the tests below are about the derivation being
+# reproduced exactly -- not merely about "a domain matching".
+
+DOMAINS = {
+    "version": 2,
+    "destinations": {"comix": "X:\\Comix", "manga": "X:\\Manga"},
+    "default": "manga",
+    "lists": {"adult_domains": ["pururin.me", "nhentai.net", "e-hentai.org"]},
+    "signals": {
+        "by_domain": {
+            "any": [{"field": "comicinfo.Web", "domain_in_list": "adult_domains"}]
+        },
+    },
+    "rules": [{"name": "by domain", "when": "by_domain", "dest": "comix"}],
+}
+
+
+def _domain_matches(**comicinfo) -> bool:
+    cfg = parse(json.loads(json.dumps(DOMAINS)))
+    return resolve(cfg, build_context("", "", comicinfo)).dest_key == "comix"
+
+
+@pytest.mark.parametrize("url", [
+    "https://pururin.me/gallery/1",
+    "http://pururin.me",
+    "pururin.me",                          # bare host, no scheme
+    "https://www.pururin.me/x",            # www. stripped
+    "HTTPS://WWW.PURURIN.ME/X",            # ... after casefolding, so WWW. too
+    "https://pururin.me:8443/x",           # port stripped
+    "  https://pururin.me/x  ",            # surrounding whitespace
+])
+def test_the_host_is_parsed_the_way_the_census_parsed_it(url):
+    assert _domain_matches(Web=url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/?ref=pururin.me",     # accepted host in the query
+    "https://example.com/pururin.me/1",        # ... in the path
+    "https://pururin.me.evil.test/x",          # ... as a subdomain label
+    "https://notpururin.me/x",                 # ... as a suffix of the host
+])
+def test_an_accepted_domain_elsewhere_in_the_url_does_not_match(url):
+    # The whole reason this operator exists. glob_in_list with "*pururin.me*"
+    # accepts every one of these, and each would classify some other site's
+    # series as adult on the strength of a query parameter or a path segment.
+    assert _domain_matches(Web=url) is False
+
+
+def test_a_missing_or_empty_web_field_is_false_not_an_error():
+    assert _domain_matches() is False
+    assert _domain_matches(Web="") is False
+
+
+def test_domain_in_list_rejects_an_undefined_list():
+    raw = json.loads(json.dumps(DOMAINS))
+    raw["signals"]["by_domain"]["any"][0]["domain_in_list"] = "nope"
+    with pytest.raises(RoutingConfigError, match="unknown list"):
+        resolve(parse(raw), build_context("", "", {"Web": "https://pururin.me/"}))
+
+
+def test_a_configured_entry_written_as_a_url_still_matches():
+    # Both sides go through the same derivation, so an entry hand-edited as a
+    # full URL is not silently dead configuration.
+    raw = json.loads(json.dumps(DOMAINS))
+    raw["lists"]["adult_domains"] = ["https://www.pururin.me/"]
+    cfg = parse(raw)
+    assert resolve(cfg, build_context("", "", {"Web": "https://pururin.me/x"})
+                   ).dest_key == "comix"
+
+
 # ── evidence strength is structured, not inferred from names ─────
 
 
