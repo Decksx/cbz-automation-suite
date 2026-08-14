@@ -8,8 +8,10 @@ child with a module-level `from scripts...` import then dies during import:
     python scripts\\cbz_library_maintenance.py organize-series ...
     -> ModuleNotFoundError: No module named 'scripts'
 
-`cwd=REPO_ROOT` does not help; only `-m` puts the current directory on the
-path.
+`cwd=REPO_ROOT` does not fix this. Executing a file directly prepends the
+*script's* directory to `sys.path`; `-m` prepends the *current working
+directory*. The repository root is importable in the module form, not merely
+because a working directory was passed alongside a script path.
 
 PR #49 exposed this by adding the first such import to a child. PR #50 fixed
 the analogous GUI -> script boundary but did not cover workflow -> child
