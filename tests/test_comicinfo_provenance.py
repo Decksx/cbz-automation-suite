@@ -29,6 +29,7 @@ would be missed.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -317,6 +318,11 @@ def test_the_staged_signal_carries_all_125_accepted_features():
     assert len(cfg.lists["adult_categories"]) == 6
 
 
+def _adult_signal_note() -> str:
+    raw = json.loads(STAGED_CONFIG.read_text(encoding="utf-8"))
+    return raw["signals"]["_comment_adult_signal"]
+
+
 def test_both_false_positive_rates_travel_with_the_signal():
     """The rates are not interchangeable, so neither may stand alone.
 
@@ -324,11 +330,54 @@ def test_both_false_positive_rates_travel_with_the_signal():
     was accepted at. Recording only one -- either one -- is how a number
     outlives the qualifier that makes it meaningful.
     """
-    raw = json.loads(STAGED_CONFIG.read_text(encoding="utf-8"))
-    note = raw["signals"]["_comment_adult_signal"]
+    note = _adult_signal_note()
     assert "0.46%" in note and "0.31%" in note
     assert "ERIKA" in note
     assert "97.87%" in note
+
+
+def test_every_recorded_rate_is_a_fraction_over_the_646_denominator():
+    """The adjudication moves ERIKA out of the numerator, not the denominator.
+
+    This guards a defect the earlier wording actually carried: it said ERIKA
+    was "removed from the negative denominator", which contradicts the 2/646
+    recorded beside it. derive_adult.py prints len(fp_rows)/len(neg) with
+    len(neg) fixed at 646 for both rates -- the adjudication changes which
+    matches count as errors, not the population they are measured against.
+
+    Checked on the fractions rather than the prose because 2/645 rounds to
+    the same 0.31% (asserted below), so a percentage cannot distinguish the
+    two readings and a test that only looked for "0.31%" would have passed
+    against the wrong claim. Every negative-pool fraction in the note must
+    therefore carry 646 explicitly.
+    """
+    note = _adult_signal_note()
+    fractions = re.findall(r"(\d[\d,]*)/(\d[\d,]*)", note)
+    assert fractions, "no fraction recorded at all"
+
+    coverage = ("17,096", "17,468")
+    negative = [(n, d) for n, d in fractions if (n, d) != coverage]
+    assert negative, "no negative-pool rate recorded"
+    assert {d for _, d in negative} == {"646"}, negative
+
+    # Both rates present as fractions, not only as percentages.
+    assert ("3", "646") in negative        # raw, pre-adjudication
+    assert ("2", "646") in negative        # adjudicated, the operative rate
+
+    # The reason the prose check above is not sufficient on its own.
+    assert f"{2/645:.2%}" == f"{2/646:.2%}" == "0.31%"
+
+
+def test_the_note_states_which_side_of_the_ratio_the_adjudication_moves():
+    """Prose guard, paired with the arithmetic one above.
+
+    The fractions could be right while the sentence explaining them stays
+    wrong, and the sentence is what a reader carries away.
+    """
+    note = _adult_signal_note()
+    assert "numerator" in note
+    assert "denominator remains 646" in note
+    assert "removed from the negative denominator" not in note
 
 
 def test_reading_the_provenance_fields_did_not_activate_v2():
