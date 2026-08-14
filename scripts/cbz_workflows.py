@@ -40,9 +40,12 @@ def _python_command(script: str, *args: str) -> list[str]:
         python scripts\\cbz_library_maintenance.py organize-series ...
         -> ModuleNotFoundError: No module named 'scripts'
 
-    `cwd=REPO_ROOT` in `run_commands` does not help. The working directory
-    has not contributed to `sys.path` since Python 3.11, and never did for a
-    path invocation -- only `-m` puts the current directory on the path.
+    `cwd=REPO_ROOT` in `run_commands` does not fix path invocation. When
+    Python executes a file directly it prepends the *script's* directory to
+    `sys.path`; when invoked with `-m` it prepends the *current working
+    directory*. So the repository root is importable in the module form, and
+    not merely because `subprocess.run(..., cwd=REPO_ROOT)` was passed a
+    script path.
 
     PR #49 exposed this by adding the first such import to a child; PR #50
     fixed the analogous GUI -> script boundary but did not cover
