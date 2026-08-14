@@ -1035,10 +1035,11 @@ The phase checklists below carry unchecked items across Phases 1, 2, and
 this document". This is the order to return to them in, and it is a
 dependency order like the near-term sequence, not a phase order.
 
-1. **Finish the Version 1 perceptual-hash backfill.** Everything
-   structural waits on it, because Version 1 hash semantics are frozen
-   while it runs and a migration underneath an active backfill would
-   change what the remaining batches produce.
+1. **Finish the Version 1 perceptual-hash backfill.** Structural
+   migrations wait because changing revision ownership or evidence
+   foreign keys during the active backfill would require compatibility
+   across two storage models, and would compromise the single frozen
+   baseline used to reconcile the run.
 2. **Complete the final coverage and terminal-failure audit, update the
    production metrics, and create and independently verify the final
    pre-migration backup.** Independently verified means checked against
@@ -1046,9 +1047,11 @@ dependency order like the near-term sequence, not a phase order.
    it. This is the last known-good point before structural change.
 3. **Complete the focused golden corpus and the targeted property,
    crash-recovery, and fault-injection tests** the upcoming structural
-   work needs. These come before the migration, not after: they are what
-   makes a migration failure legible, and a test written afterwards
-   cannot fail on the bug it was meant to catch.
+   work needs. These tests precede the migration so expected behaviour
+   and failure handling are specified independently of the
+   implementation. Tests added afterward can still expose defects, but
+   they are more vulnerable to encoding the implementation's assumptions
+   instead of challenging them.
 4. **Establish the minimum DAL**, migrating new and functionally touched
    database access incrementally. Explicitly not an all-at-once rewrite —
    existing standalone scripts move as they are touched.
