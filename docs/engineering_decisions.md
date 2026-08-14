@@ -181,17 +181,31 @@ ruling carried between sessions — and a limit that lives only in a
 transcript is invisible to whoever later decides whether to rely on the
 capability.
 
-Programmatic matching may retrieve, score, rank, and explain candidates.
-It may not decide. A materially ambiguous identity is never resolved
-automatically by score, provider order, popularity, current placement, or
-index priority. An explicit human decision overrides conflicting
-programmatic proposals, and stands until another reviewed decision
-supersedes it.
+Programmatic matching may retrieve, score, rank, and explain candidates,
+and may resolve an identity automatically only when an approved,
+deterministic, tested rule finds exactly one unambiguous result with no
+material contradictory evidence. A confidence score or threshold alone
+does not make an ambiguous identity authoritative. Multiple plausible
+candidates, conflicting identity evidence, mixed folders, and merge or
+split decisions whose identity remains uncertain require explicit human
+review. A materially ambiguous identity is never resolved automatically
+by score, provider order, popularity, current placement, or index
+priority. A reviewed human decision overrides conflicting programmatic
+proposals, and stands until another reviewed decision supersedes it.
 
 The distinction is between confidence and authority. A high-scoring
-candidate is stronger evidence than a low-scoring one; neither is a
-decision, and no threshold converts one into the other. Ranking exists to
-make the operator's choice cheap, not to make it unnecessary.
+candidate is stronger evidence than a low-scoring one, and neither is by
+itself a decision. Authority comes from the rule that consumed the
+evidence — approved, deterministic, and tested — or from a person; never
+from a score crossing a line. Raising a threshold changes how much
+evidence is demanded before acting, but it cannot turn a contested
+identity into an uncontested one, because the rival candidate is still
+there and the rule is now merely more confident about ignoring it.
+
+So the question a rule must answer is not "how good is the best
+candidate" but "is there exactly one". Ranking earns its place either
+way: it makes the operator's choice cheap where review is required, and
+makes the single unambiguous case cheap to recognise where it is not.
 
 **Current placement is not evidence of correct placement.** Deriving an
 identity from where a series currently sits infers the answer from the
