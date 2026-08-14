@@ -171,10 +171,25 @@ NFC  'Kantai'-with-umlaut      ->  'kantai'-with-umlaut
 NFD  'Ka' + U+0308 + 'ntai'    ->  'kantai'-with-umlaut   (was 'ka ntai')
 ```
 
-Both halves of `lock_key`'s wrapper were removed: the inner call is
-redundant by construction, the outer by measurement — `series_key`
-cannot emit a non-NFC string, checked over 14,800,248 probes with zero
-violations, and pinned by `test_series_key_output_is_always_nfc`.
+`series_key` normalizes at **both** ends, and the two calls do different
+jobs. The first is load-bearing: composition must precede the
+punctuation rule, which destroys combining marks. The last is a
+postcondition — the returned identity is NFC whatever the transforms in
+between do.
+
+Both halves of `lock_key`'s wrapper were therefore removed: the inner
+call because `series_key` normalizes its own input, the outer because
+`series_key` now guarantees its own output.
+
+An earlier draft removed that outer call on the strength of an
+exhaustive scan instead — every codepoint in four embeddings, plus every
+cased character crossed with every combining mark in three orders:
+**14,800,248 probes, zero non-NFC outputs**. That measurement stands and
+is kept here as evidence, but it described the Unicode database and the
+`str.lower()` behaviour of the day it was taken. `.lower()` can emit
+combining sequences, so a revision to one case mapping could have
+invalidated it silently. The postcondition carries the invariant;
+`test_series_key_output_is_always_nfc` corroborates it.
 
 **The lock key is therefore no longer coarser than routing's own.** The
 asymmetry described above was a compensation for an index that split
