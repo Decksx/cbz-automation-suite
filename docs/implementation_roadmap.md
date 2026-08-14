@@ -1105,20 +1105,41 @@ the rules the work is built against.
 Sequence, in order:
 
 1. finish #31 without activation — **done**, PR #56;
-2. measure current ambiguity using the canonical `series_key` — **done**
-   2026-08-14, results below; the measurement also found the #60 index
-   defects, so it must be repeated once those are fixed;
-3. define a provider-neutral candidate model and durable human-decision
+2. measure current ambiguity using the canonical `series_key` — initial
+   measurement taken 2026-08-14, results below; **incomplete**, pending
+   #60 and a diagnostic-aware remeasurement;
+3. fix the `SeriesIndex` defects the measurement exposed (#60): lossless
+   collision representation, explicit input classification, structured
+   diagnostics;
+4. remeasure ambiguity against those diagnostics — only then is step 2
+   complete;
+5. define a provider-neutral candidate model and durable human-decision
    manifest;
-4. add read-only MangaDex search and cover retrieval first;
-5. add MyAnimeList or Jikan only behind the same adapter interface;
-6. display local cover/ComicInfo evidence beside bounded external
+6. add read-only MangaDex search and cover retrieval first;
+7. add MyAnimeList or Jikan only behind the same adapter interface;
+8. display local cover/ComicInfo evidence beside bounded external
    candidates;
-7. allow assign, alternate edition, split, none-of-these, and unresolved
+9. allow assign, alternate edition, split, none-of-these, and unresolved
    decisions;
-8. add guarded metadata/move plan generation and separately approved
-   apply;
-9. re-measure ambiguity before any v2-authority decision.
+10. add guarded metadata/move plan generation and separately approved
+    apply;
+11. re-measure ambiguity before any v2-authority decision.
+
+Steps 3 and 4 are listed here because they gate, not because everything
+waits on them. They **do not block** steps 5 through 10: a
+provider-neutral candidate model and a read-only adapter can be designed
+and built against an incomplete inventory, since neither depends on
+knowing the full ambiguity set. Should a design turn out to need a
+complete inventory, that dependency is the signal to reorder, and it
+should be recorded rather than absorbed.
+
+What steps 3 and 4 do block is narrower and absolute: **declaring the
+measurement complete, evaluating the ambiguity gate, and any v2-authority
+decision.** Step 2 is not finished until step 4 has run, and the gate in
+`docs/engineering_decisions.md` cannot be assessed against a count that
+all three #60 defects are invisible to: `is_ambiguous` does not see a
+same-root collision, cannot tell that `.stfolder` is not a series, and
+has nothing to report for a directory dropped on an empty key.
 
 One provider comes before two so the adapter boundary is proven by use
 rather than asserted, and the candidate model precedes both so it is
@@ -1186,7 +1207,9 @@ remain, so the gate above must consume the structured diagnostics from
 
 Both figures are dated on purpose. The library is live, and the +7
 against 2026-08-03 is itself the evidence that the number moves — so
-step 9 re-measures rather than citing this one.
+step 4 remeasures against the #60 diagnostics, and step 11 remeasures
+again before any v2-authority decision, rather than either citing this
+one.
 
 ## Phase 5 — Perceptual deduplication
 
