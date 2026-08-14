@@ -338,19 +338,25 @@ def test_lock_key_is_now_exactly_the_canonical_rule():
 
 
 def test_series_key_output_is_always_nfc():
-    """Pins the measurement that let `lock_key` drop its outer normalization.
+    """`series_key` returns NFC. A contract it enforces, not a hope.
 
-    `lock_key` used to wrap `series_key` in NFC on both sides. The inner call
-    is redundant by construction now that `series_key` normalizes its own
-    input; the outer call is redundant only if `series_key` can never *emit*
-    a non-NFC string. That was measured over 14,800,248 probes -- every
-    codepoint in four embeddings, and every cased character crossed with
-    every combining mark in three orders -- with zero non-NFC outputs.
+    The function normalizes at both ends: the first call is load-bearing
+    (composition must precede the punctuation rule), the last is a
+    postcondition guaranteeing the returned identity is NFC whatever the
+    transforms in between do. `lock_key` delegates here outright on the
+    strength of that guarantee.
 
-    A full rescan is far too slow for the suite, so this covers the cases
-    that could plausibly break it: characters whose lowercase mapping emits a
-    combining sequence, crossed with marks that might then compose. If this
-    ever fails, `lock_key`'s delegation is no longer safe.
+    An earlier draft instead removed `lock_key`'s outer normalization on the
+    strength of an exhaustive scan -- 14,800,248 probes, zero non-NFC
+    outputs. That evidence stands and is recorded in the PR and in
+    `docs/lock_topology.md`, but it described the current Unicode database
+    and the current behaviour of `str.lower()`, which can emit combining
+    sequences. A revision to one case mapping would have quietly invalidated
+    it. The postcondition removes that exposure.
+
+    This test therefore now checks a stated contract rather than an
+    empirical accident, which also means it can no longer fail for a reason
+    the code did not choose.
     """
     probes = list(ASCII_UNCHANGED)
     probes += [p[1] for p in PAIRS] + [p[2] for p in PAIRS]
@@ -388,12 +394,19 @@ def test_the_consumers_still_share_the_canonical_helper():
     assert lock_order.series_key is canonical
 
 
-def test_only_the_canonical_module_normalizes_unicode():
-    """Asserted on source text, which catches a copy that is defined but unused.
+def test_no_consumer_sets_its_own_series_identity_normalization():
+    """No consumer may hold Unicode *policy* for series identity.
 
-    Object identity above catches a copy that is wired in; it cannot see one
-    sitting in a module waiting to be called. That is the state a
-    half-finished edit leaves behind.
+    The invariant is about policy ownership, not about the string
+    "unicodedata". `series_key` decides what composition means for series
+    identity and guarantees an NFC result; a consumer that normalizes on its
+    own is either duplicating that decision or hedging against it, and both
+    recreate the divergence #44 removed.
+
+    Asserted on source text because object identity, checked above, only
+    catches a copy that is already wired in. It cannot see one sitting in a
+    module waiting to be called -- which is the state a half-finished edit
+    leaves behind.
     """
     from pathlib import Path
 
