@@ -171,6 +171,78 @@ Use quarantine and review before permanent deletion even though a separate libra
 
 Komga and Komf identifiers and titles feed the local series model, but provider and timestamp provenance must be retained.
 
+## A human decision is the only resolution of an ambiguous identity
+
+Extends "Uncertain series matches require review" from fuzzy local
+matching to external providers, and strengthens "External metadata is
+evidence" into a rule about who may act on it. Recorded 2026-08-14 on
+issue #57, because until then this gate existed only as an operator
+ruling carried between sessions — and a limit that lives only in a
+transcript is invisible to whoever later decides whether to rely on the
+capability.
+
+Programmatic matching may retrieve, score, rank, and explain candidates,
+and may resolve an identity automatically only when an approved,
+deterministic, tested rule finds exactly one unambiguous result with no
+material contradictory evidence. A confidence score or threshold alone
+does not make an ambiguous identity authoritative. Multiple plausible
+candidates, conflicting identity evidence, mixed folders, and merge or
+split decisions whose identity remains uncertain require explicit human
+review. A materially ambiguous identity is never resolved automatically
+by score, provider order, popularity, current placement, or index
+priority. A reviewed human decision overrides conflicting programmatic
+proposals, and stands until another reviewed decision supersedes it.
+
+The distinction is between confidence and authority. A high-scoring
+candidate is stronger evidence than a low-scoring one, and neither is by
+itself a decision. Authority comes from the rule that consumed the
+evidence — approved, deterministic, and tested — or from a person; never
+from a score crossing a line. Raising a threshold changes how much
+evidence is demanded before acting, but it cannot turn a contested
+identity into an uncontested one, because the rival candidate is still
+there and the rule is now merely more confident about ignoring it.
+
+So the question a rule must answer is not "how good is the best
+candidate" but "is there exactly one". Ranking earns its place either
+way: it makes the operator's choice cheap where review is required, and
+makes the single unambiguous case cheap to recognise where it is not.
+
+**Current placement is not evidence of correct placement.** Deriving an
+identity from where a series currently sits infers the answer from the
+thing under question — the same circularity that excludes
+`SourceMihon=komga` from the adult signal, which means "re-imported from
+the Komga library". Index priority resolves a routing decision at
+runtime so archives are not stranded; it does not adjudicate what a
+series is.
+
+**Ambiguity is a property of a folder, not only of a series.** Mixed
+folders must support archive-by-archive assignment and splitting. `ERIKA`
+is the worked example: 3 confirmed adult archives among 9 horror ones,
+adjudicated a true positive at the series level while remaining
+unresolved pending an archive-level split. A series-level model cannot
+express its correct outcome, so a resolution model that only assigns
+whole series is not sufficient.
+
+External metadata and covers stay advisory until the operator selects
+them. Candidate search is read-only; changing ComicInfo is a separate
+content-addressed plan/apply operation carrying source-revision
+revalidation, backup, and audit history — the same shape as every other
+guarded mutation here, and for the same reason: a plan reviewed against
+one source state must refuse to apply to another.
+
+### The v2 index authority gate
+
+Before the v2 series index becomes authoritative, ambiguity must equal
+zero, or every remaining ambiguous key must carry a reviewed
+exception/identity manifest.
+
+Logging `ambiguous_series=True` while continuing to route does **not**
+satisfy this. The flag records that the library disagrees with itself; it
+resolves nothing. Enabling index authority over unresolved duplicates
+would encode that disagreement as an authoritative prior decision, and
+the first production index build would make it one — after which the
+evidence that it was ever ambiguous is a log line.
+
 ## Office PC is the worker
 
 CPU-intensive scanning, image decoding, hashing, and GPU embeddings run on the Office PC. The Pi 5 is for dashboards, scheduling, and health checks.

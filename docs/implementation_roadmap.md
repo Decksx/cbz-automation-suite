@@ -1049,10 +1049,85 @@ byte-level hashes.
 - [ ] provider and filesystem observations;
 - [ ] confidence-scored identity proposals;
 - [ ] operator-confirmed merges and splits;
-- [ ] provenance for identity evidence and decisions.
+- [ ] provenance for identity evidence and decisions;
+- [ ] provider-neutral candidate model and durable human-decision
+      manifest;
+- [ ] read-only external candidate search and cover retrieval;
+- [ ] archive-level assignment and splitting for mixed folders;
+- [ ] guarded metadata/move plan generation with separately approved
+      apply;
+- [ ] ambiguity re-measured under the canonical `series_key`.
+
+Part of the normalization item landed in #44: `series_key()` in
+`scripts/cbz_routing.py` is now the single definition of "same series"
+for the watcher, the reclassifier, the series-operation lock registry,
+and `SeriesIndex`, NFC-normalized at both ends. The item stays open
+because canonical series records do not exist yet, and alias handling
+today is a hand-maintained `series_overrides` list in
+`config/routing.v2.json` rather than a modelled one.
 
 Do not begin structural Phase 4 work until archive revisions and the
 minimum DAL are stable.
+
+### Human-reviewed identity resolution (#57)
+
+Binding. See "A human decision is the only resolution of an ambiguous
+identity" in `docs/engineering_decisions.md` for the reasoning; these are
+the rules the work is built against.
+
+1. Programmatic matching may retrieve, score, rank, and explain
+   candidates, and may resolve an identity automatically only when an
+   approved, deterministic, tested rule finds exactly one unambiguous
+   result with no material contradictory evidence.
+2. A confidence score or threshold alone does not make an ambiguous
+   identity authoritative. A materially ambiguous identity is never
+   resolved automatically by score, provider order, popularity, current
+   placement, or index priority.
+3. Multiple plausible candidates, conflicting identity evidence, mixed
+   folders, and merge or split decisions whose identity remains
+   uncertain require explicit human review.
+4. A reviewed human decision overrides conflicting programmatic
+   proposals until another reviewed decision supersedes it.
+5. Mixed folders support archive-by-archive assignment and splitting.
+6. External metadata and covers are advisory until the operator selects
+   them.
+7. Candidate search is read-only. ComicInfo changes require a separate
+   content-addressed plan/apply operation with source-revision
+   revalidation, backup, and audit history.
+8. Before the v2 index becomes authoritative, ambiguity must equal zero,
+   or every remaining ambiguous key must carry a reviewed
+   exception/identity manifest.
+9. Logging `ambiguous_series=True` while continuing to route does not
+   satisfy rule 8.
+
+Sequence, in order:
+
+1. finish #31 without activation — **done**, PR #56;
+2. measure current ambiguity using the canonical `series_key`;
+3. define a provider-neutral candidate model and durable human-decision
+   manifest;
+4. add read-only MangaDex search and cover retrieval first;
+5. add MyAnimeList or Jikan only behind the same adapter interface;
+6. display local cover/ComicInfo evidence beside bounded external
+   candidates;
+7. allow assign, alternate edition, split, none-of-these, and unresolved
+   decisions;
+8. add guarded metadata/move plan generation and separately approved
+   apply;
+9. re-measure ambiguity before any v2-authority decision.
+
+One provider comes before two so the adapter boundary is proven by use
+rather than asserted, and the candidate model precedes both so it is
+provider-neutral rather than shaped by whichever API arrived first.
+
+Step 2 is a measurement, not a formality. The last count — **25 keys**,
+22 Comix↔Manga/GN plus 3 Manga↔GN — was taken on 2026-08-03 and recorded
+in `duplicates.json` in the retained census. It predates the `series_key`
+consolidation of #44/#51/#54, and normalization can only merge more
+names, so it is a **lower bound rather than a current figure**. It cannot
+be recomputed from retained evidence, which kept the overlapping keys but
+not the directory listings they were derived from, so step 2 requires
+reading the live destination roots.
 
 ## Phase 5 — Perceptual deduplication
 
