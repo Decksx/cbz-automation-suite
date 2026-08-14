@@ -1076,23 +1076,29 @@ identity" in `docs/engineering_decisions.md` for the reasoning; these are
 the rules the work is built against.
 
 1. Programmatic matching may retrieve, score, rank, and explain
-   candidates.
-2. A materially ambiguous identity is never resolved automatically by
-   score, provider order, popularity, current placement, or index
-   priority.
-3. An explicit human decision overrides conflicting programmatic
+   candidates, and may resolve an identity automatically only when an
+   approved, deterministic, tested rule finds exactly one unambiguous
+   result with no material contradictory evidence.
+2. A confidence score or threshold alone does not make an ambiguous
+   identity authoritative. A materially ambiguous identity is never
+   resolved automatically by score, provider order, popularity, current
+   placement, or index priority.
+3. Multiple plausible candidates, conflicting identity evidence, mixed
+   folders, and merge or split decisions whose identity remains
+   uncertain require explicit human review.
+4. A reviewed human decision overrides conflicting programmatic
    proposals until another reviewed decision supersedes it.
-4. Mixed folders support archive-by-archive assignment and splitting.
-5. External metadata and covers are advisory until the operator selects
+5. Mixed folders support archive-by-archive assignment and splitting.
+6. External metadata and covers are advisory until the operator selects
    them.
-6. Candidate search is read-only. ComicInfo changes require a separate
+7. Candidate search is read-only. ComicInfo changes require a separate
    content-addressed plan/apply operation with source-revision
    revalidation, backup, and audit history.
-7. Before the v2 index becomes authoritative, ambiguity must equal zero,
+8. Before the v2 index becomes authoritative, ambiguity must equal zero,
    or every remaining ambiguous key must carry a reviewed
    exception/identity manifest.
-8. Logging `ambiguous_series=True` while continuing to route does not
-   satisfy rule 7.
+9. Logging `ambiguous_series=True` while continuing to route does not
+   satisfy rule 8.
 
 Sequence, in order:
 
