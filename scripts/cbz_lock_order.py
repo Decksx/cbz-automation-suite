@@ -172,24 +172,27 @@ def lock_key(series_name: str) -> str:
     keyed to `kantai`-with-umlaut. **#44 moved NFC to the front of
     `series_key` itself**, so this function no longer adds any.
 
-    Both halves of the old wrapper are gone deliberately, and for different
-    reasons:
+    Both halves of the old wrapper are gone deliberately, and neither removal
+    rests on a measurement:
 
-        inner   redundant by construction -- `series_key` now normalizes its
-                own input before touching it
-        outer   redundant by measurement -- `series_key` cannot emit a
-                non-NFC string. Scanned over every codepoint in four
-                embeddings and every cased character crossed with every
-                combining mark in three orders: 14,800,248 probes, zero
-                non-NFC outputs. The regex phase only replaces characters
-                with spaces and collapses whitespace runs, so it never makes
-                two previously separated characters adjacent and cannot
-                create a new composition opportunity.
+        inner   `series_key` normalizes its own input before touching it
+        outer   `series_key` guarantees its *output* is NFC, as an explicit
+                postcondition rather than as a side effect of the transforms
+                in between
 
-    That measurement is an assumption about `series_key`, so it is pinned by
-    `test_series_key_output_is_always_nfc` rather than left to hold by
-    accident. If a future change to the canonical rule can emit non-NFC text,
-    that test fails and this delegation has to be reconsidered.
+    The second point is the one that matters here. An earlier draft of this
+    change removed the outer call on the strength of an exhaustive scan --
+    14,800,248 probes, zero non-NFC outputs -- which is strong evidence about
+    today's Unicode database and today's `str.lower()`, and no guarantee at
+    all about tomorrow's. `.lower()` can emit combining sequences, so a
+    revision to a single case mapping could have silently broken every caller
+    that trusted this key. Making `series_key` close its own contract removes
+    that exposure; the scan survives as corroboration in the PR record and in
+    `docs/lock_topology.md`, and `test_series_key_output_is_always_nfc` keeps
+    checking it.
+
+    So this function holds no Unicode policy of its own -- not a duplicated
+    rule, and not a hedge against its dependency misbehaving.
 
     This key is therefore no longer coarser than routing's own -- the two
     agree exactly, which is the point of #44. Equivalent composition forms
