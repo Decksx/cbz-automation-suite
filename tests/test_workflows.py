@@ -80,7 +80,10 @@ def test_maintenance_workflow_runs_selected_stages_in_order():
     commands = build_maintenance_commands(args)
 
     assert len(commands) == 4
-    assert "cbz_sanitizer.py" in commands[0][1][1]
+    # Updated when the workflow stopped launching children by path: the
+    # sanitizer is now identified by module name, not by script filename.
+    # `tests/test_workflow_child_launch.py` covers why.
+    assert commands[0][1][1:3] == ["-m", "scripts.cbz_sanitizer"]
     assert "--dry-run" in commands[0][1]
     assert "--full" in commands[0][1]
     assert "--rules=comicinfo,translate" in commands[0][1]
