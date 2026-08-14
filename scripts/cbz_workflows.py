@@ -30,7 +30,37 @@ def _parse_stages(raw: str, valid: tuple[str, ...], default: tuple[str, ...]) ->
 
 
 def _python_command(script: str, *args: str) -> list[str]:
-    return [sys.executable, str(SCRIPT_DIR / script), *args]
+    """Launch a child tool as a *module*, never by filesystem path.
+
+    Path invocation puts the script's own directory on `sys.path[0]`, so
+    `scripts/` leads the path and the repository root is absent entirely. Any
+    child with a module-level `from scripts...` import then dies before it
+    prints anything:
+
+        python scripts\\cbz_library_maintenance.py organize-series ...
+        -> ModuleNotFoundError: No module named 'scripts'
+
+    `cwd=REPO_ROOT` in `run_commands` does not help. The working directory
+    has not contributed to `sys.path` since Python 3.11, and never did for a
+    path invocation -- only `-m` puts the current directory on the path.
+
+    PR #49 exposed this by adding the first such import to a child; PR #50
+    fixed the analogous GUI -> script boundary but did not cover
+    workflow -> child launches, which is this one. Correcting it in the one
+    helper fixes all five call sites and all three child modules at once.
+
+    Only `cbz_library_maintenance` is broken today. `cbz_sanitizer` and
+    `cbz_compilation_resolver` currently have no module-level `scripts.*`
+    import and so happen to survive path invocation -- exactly the latency
+    that hid this defect until #49, and the reason they are corrected here
+    rather than left to fail later.
+
+    *script* is accepted as a filename because that is what every call site
+    reads naturally next to its arguments; the stem is what actually
+    identifies the module.
+    """
+    module = Path(script).stem
+    return [sys.executable, "-m", f"scripts.{module}", *args]
 
 
 def build_series_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
