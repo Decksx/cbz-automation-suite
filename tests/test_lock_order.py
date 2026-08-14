@@ -255,18 +255,30 @@ def test_equivalent_identities_share_one_lock(a, b):
 
 
 def test_composed_and_decomposed_forms_are_one_series():
-    """Measured, not assumed: series_key alone splits these.
+    """Updated deliberately by #44's Unicode strand, which is why it existed.
 
-    The combining diaeresis is not a word character, so `series_key` turns it
-    into a space and the NFD form keys to something else entirely. Content
-    from a macOS-side share is routinely NFD, so without normalization the
-    same series would take two locks and serialize against nothing.
+    This previously asserted the *opposite* -- that `series_key` split these
+    and that `lock_key` reunited them -- so the split could not be closed by
+    a test quietly starting to pass. It had to be edited by someone who had
+    decided to edit it.
+
+    `series_key` now normalizes to NFC before anything else, so the two forms
+    are one series everywhere rather than only inside the lock domain.
+    `lock_key` no longer adds normalization of its own and simply agrees.
+
+    The pre-change behaviour is recorded rather than dropped: the NFD form
+    keyed to "ka ntai", because the combining diaeresis is not a word
+    character and the punctuation rule turned it into a space.
     """
     from scripts.cbz_routing import series_key as routing_key
-    nfc, nfd = "Käntai", "Käntai"
-    assert nfc != nfd
-    assert routing_key(nfc) != routing_key(nfd), "series_key stopped splitting these"
-    assert lock_key(nfc) == lock_key(nfd), "the lock key failed to reunite them"
+
+    nfc, nfd = "K\u00e4ntai", "Ka\u0308ntai"
+    assert nfc != nfd, "the corpus degraded: these are the same string"
+
+    assert routing_key(nfc) == routing_key(nfd) == "k\u00e4ntai", (
+        "series_key no longer unifies composition forms")
+    assert lock_key(nfc) == lock_key(nfd) == "k\u00e4ntai", (
+        "lock_key disagreed with the canonical rule")
 
 
 def test_distinct_series_do_not_collide():

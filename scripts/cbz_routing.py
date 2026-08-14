@@ -36,6 +36,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -104,11 +105,13 @@ def series_key(name: str) -> str:
 
     The normalization, in order:
 
+        0. Unicode composition normalized to NFC
         1. `uncensored` / `decensored` removed as whole words, case-insensitive
         2. lowercased
         3. every non-word, non-space character *and every underscore*
            replaced with a space
         4. runs of whitespace collapsed, ends stripped
+        5. the result normalized to NFC again, as a postcondition
 
     So "BERSERK", "Berserk!!", "Berserk (Uncensored)" and "Berserk " all key
     alike, and "Attack-on-Titan", "Attack_on_Titan" and "Attack on Titan" are
@@ -125,18 +128,69 @@ def series_key(name: str) -> str:
     that cannot act on an empty identity already reject it: see
     `cbz_lock_order.SeriesLockRegistry.for_series`.
 
-    No Unicode normalization here. `cbz_lock_order.lock_key` adds NFC around
-    this deliberately, because the lock domain must over-serialize rather than
-    under-serialize; SeriesIndex does not, so composed and decomposed forms
-    remain distinct series to routing.
+    **NFC runs first, before marker removal, lowercasing, or punctuation**
+    (#44). The order is not cosmetic. A combining mark is not a word
+    character, so the punctuation rule turns it into a space: run NFC after
+    that rule and the mark it needed has already been destroyed. Measured
+    before the change, with a combining diaeresis:
+
+        NFC  "Kantai"-with-umlaut   ->  "kantai"-with-umlaut
+        NFD  "Ka" + U+0308 + "ntai" ->  "ka ntai"
+
+    Two spellings of one title, two identities -- and content arriving from
+    a macOS-side share is routinely NFD, so this was reachable rather than
+    theoretical. Normalizing first makes the two converge everywhere the
+    canonical rule is used: the index, the lock registry, the watcher, and
+    library maintenance.
+
+    It also *separates* one thing that used to collide. The old rule deleted
+    an NFD accent rather than failing to compose it, so "Cafe" + U+0301 keyed
+    to "cafe" alongside the plain ASCII "Cafe". It now keys to "cafe" with the
+    accent, which is correct and is why an index built under the old rule has
+    to be rebuilt rather than topped up.
+
+    This is canonical composition only. It deliberately does **not** casefold,
+    apply NFKC/NFKD compatibility mappings, strip accents, or transliterate:
+    those change which series are considered distinct, whereas NFC only
+    reconciles two encodings of the identical character sequence. "Kantai"
+    with an umlaut and "Kantai" without one remain different series.
+
+    **NFC is applied at both ends, and the two calls do different jobs.**
+
+        first   load-bearing. Composition must happen before the punctuation
+                rule, which destroys combining marks. Remove this and NFD
+                input is mangled beyond recovery -- the trailing call cannot
+                rebuild a mark that has already become a space.
+        last    a postcondition. It guarantees the *returned identity* is
+                NFC, rather than leaving that to hold as a consequence of
+                what the intervening transforms happen to do.
+
+    The trailing call is what lets `cbz_lock_order.lock_key` delegate here
+    outright instead of re-normalizing. That delegation now rests on a
+    contract this function enforces, not on a measurement of the current
+    Unicode database and the current behaviour of `str.lower()`.
+
+    Exhaustive measurement did confirm the intervening transforms currently
+    preserve NFC -- every codepoint in four embeddings, and every cased
+    character crossed with every combining mark in three orders, 14,800,248
+    probes with zero non-NFC outputs. That evidence is recorded in the PR and
+    in `docs/lock_topology.md`, and `test_series_key_output_is_always_nfc`
+    keeps checking it. But it is now corroboration rather than the thing
+    holding the invariant up: `.lower()` can emit combining sequences, and a
+    future Unicode revision changing one case mapping must not be able to
+    silently break a caller that trusted this function's output.
 
     Accepts None and returns "". No caller passes it -- every call site
     supplies a str by contract -- so this is a defensive floor, not a
     behaviour to depend on.
     """
-    name = _MARKER_WORDS_RE.sub("", name or "")
+    name = unicodedata.normalize("NFC", name or "")
+    name = _MARKER_WORDS_RE.sub("", name)
     name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
-    return _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
+    name = _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
+    # Postcondition, not a repeat of the call above: callers are entitled to
+    # an NFC identity regardless of what the transforms in between do.
+    return unicodedata.normalize("NFC", name)
 
 
 class RoutingConfigError(ValueError):

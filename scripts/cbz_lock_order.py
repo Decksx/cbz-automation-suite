@@ -31,7 +31,6 @@ therefore refused; re-entering the same lock is not.
 from __future__ import annotations
 
 import threading
-import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -167,34 +166,42 @@ def lock_key(series_name: str) -> str:
         markers         "X (Uncensored)" == "X"
         outer space     "Berserk "       == "Berserk"
 
-    Unicode composition is applied here and not by `series_key`. Measured:
-    the NFD form of a title with a combining diaeresis keys to `ka ntai`
-    while its NFC form keys to `kantai`-with-umlaut, because the combining
-    mark is not a word character and becomes a space. Content arriving from
-    a macOS-side share is routinely NFD, so without this the same series
-    could take two different locks and serialize against nothing. Normalizing
-    to NFC before and after closes it.
+    Unicode composition used to be applied *here*, wrapping `series_key` in
+    NFC on both sides, because `series_key` applied none and the NFD form of
+    a title with a combining diaeresis keyed to `ka ntai` while its NFC form
+    keyed to `kantai`-with-umlaut. **#44 moved NFC to the front of
+    `series_key` itself**, so this function no longer adds any.
 
-    That makes this key deliberately *coarser* than routing's own: two names
-    routing would treat as distinct series can share one lock. Over-
-    serializing costs a little concurrency; under-serializing costs the split
-    this whole issue exists to prevent, so the asymmetry is taken on purpose.
+    Both halves of the old wrapper are gone deliberately, and neither removal
+    rests on a measurement:
 
-    Two gaps are documented rather than closed here, because both change
-    `series_key` itself and therefore change SeriesIndex keys:
+        inner   `series_key` normalizes its own input before touching it
+        outer   `series_key` guarantees its *output* is NFC, as an explicit
+                postcondition rather than as a side effect of the transforms
+                in between
 
-        underscores     "Attack_on_Titan" != "Attack on Titan"
-                        `_` is a word character, so it survives while `-`
-                        does not -- separator handling is inconsistent
-        duplication     `cbz_watcher._series_key` is a second implementation
-                        with its own copies of the same three regexes. They
-                        agree today, verified over a sample; nothing enforces
-                        that they keep agreeing.
+    The second point is the one that matters here. An earlier draft of this
+    change removed the outer call on the strength of an exhaustive scan --
+    14,800,248 probes, zero non-NFC outputs -- which is strong evidence about
+    today's Unicode database and today's `str.lower()`, and no guarantee at
+    all about tomorrow's. `.lower()` can emit combining sequences, so a
+    revision to a single case mapping could have silently broken every caller
+    that trusted this key. Making `series_key` close its own contract removes
+    that exposure; the scan survives as corroboration in the PR record and in
+    `docs/lock_topology.md`, and `test_series_key_output_is_always_nfc` keeps
+    checking it.
+
+    So this function holds no Unicode policy of its own -- not a duplicated
+    rule, and not a hedge against its dependency misbehaving.
+
+    This key is therefore no longer coarser than routing's own -- the two
+    agree exactly, which is the point of #44. Equivalent composition forms
+    now converge in the index as well as the lock domain, rather than the
+    lock domain over-serializing to compensate for an index that split them.
 
     See `docs/lock_topology.md`.
     """
-    normalized = unicodedata.normalize("NFC", series_name or "")
-    return unicodedata.normalize("NFC", series_key(normalized))
+    return series_key(series_name)
 
 
 class SeriesLockRegistry:
