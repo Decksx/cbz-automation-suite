@@ -43,8 +43,11 @@ from typing import Any, Literal
 
 VALID_OPERATORS = frozenset(
     {"equals", "in", "in_list", "glob", "glob_in_list", "glob_tokens_in_list",
-     "contains_any"}
+     "contains_any", "domain_in_list"}
 )
+# Scheme separator for host extraction. Matched case-insensitively because a
+# ComicInfo Web value is whatever a scraper wrote, not a normalized URL.
+_URL_SCHEME_RE = re.compile(r"\s*[a-z]+://([^/]+)", re.IGNORECASE)
 # Fields that carry a comma-joined list rather than one value split on this.
 # Only the comma: a census of the live library found it to be the sole
 # separator present in Publisher, and no occurrences at all of ';', '|', '/'
@@ -456,6 +459,36 @@ def _lookup(context: dict[str, str], field_name: str) -> str | None:
     return value if value not in (None, "") else None
 
 
+def web_domain(url: str) -> str:
+    """The host of a ComicInfo Web value: no scheme, no `www.`, no port.
+
+    Byte-for-byte the derivation the 2026-08-03 evidence census used
+    (`derive_adult.py`'s `domain()`), and that is the whole point of it
+    existing rather than being approximated with a substring glob. The
+    accepted adult signal's 97.87% coverage and 0.31% adjudicated
+    false-positive rate were measured over *these* strings. A signal encoded
+    against a different derivation is a different signal, and the recorded
+    figures would no longer describe it.
+
+    The order matters and is deliberately the census's:
+
+        1. surrounding whitespace stripped
+        2. `scheme://` removed, keeping everything up to the first `/`
+        3. casefolded
+        4. a leading `www.` removed -- after folding, so `WWW.` also goes
+        5. `:port` removed
+
+    A value with no `scheme://` is treated as a bare host, so `pururin.me`
+    and `https://pururin.me/x` agree. Two limits are inherited rather than
+    fixed, because fixing them here would silently change what was measured:
+    userinfo (`user@host`) stays attached to the host, and a trailing dot is
+    not removed. Neither form occurs in the measured library.
+    """
+    match = _URL_SCHEME_RE.match(url.strip())
+    host = match.group(1) if match else url.strip()
+    return host.casefold().removeprefix("www.").split(":")[0]
+
+
 # ------------------------------------------------------------- evaluation
 
 def _evaluate(node: Any, context: dict[str, str],
@@ -550,6 +583,23 @@ def _evaluate_matcher(node: dict, context: dict[str, str],
         ok = any(fnmatch.fnmatch(token, pattern)
                  for token in tokens if token
                  for pattern in patterns)
+    elif op == "domain_in_list":
+        # Exact host equality, never substring. glob_in_list on a URL would
+        # accept the accepted domain anywhere in the string, so
+        # "https://example.com/?ref=nhentai.net" would classify as adult on
+        # another site's query parameter. The census matched a parsed host,
+        # and this reproduces that rather than approximating it.
+        #
+        # Applied to `value`, not `folded`: web_domain does its own folding at
+        # the census's point in the sequence, and pre-folding here would make
+        # this operator's derivation differ from the one it must reproduce.
+        #
+        # Both sides go through it. The accepted values are already bare hosts,
+        # so this changes nothing for them; it means a hand-edited entry
+        # written as "https://www.pururin.me/" still matches rather than
+        # silently never firing.
+        host = web_domain(value)
+        ok = host in {web_domain(str(d)) for d in named_list(str(operand))}
     else:  # contains_any -- for comma-joined free text like Genre/Tags
         ok = any(str(x).casefold() in folded for x in operand)
 
