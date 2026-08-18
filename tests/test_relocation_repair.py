@@ -574,6 +574,121 @@ def test_apply_refuses_a_path_claimed_by_another_archive(
     assert other_id != moving_id
 
 
+def test_apply_refuses_a_path_held_by_another_archives_retired_row(
+    database: Path, tmp_path: Path
+):
+    """A retired row still occupies the path, because path is UNIQUE.
+
+    An earlier revision checked ownership only among is_current = 1 rows. With a
+    retired row for another archive sitting on the target path, the repair
+    retired the archive's old location, the conditional upsert then matched
+    nothing because the archive ids differed, and the archive was left with NO
+    current location -- while its signature was refreshed and the repair was
+    reported as applied.
+    """
+    library = tmp_path / "lib"
+    payload = b"payload behind a retired row"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+
+    target = library / "elsewhere" / "b.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        # Another archive once lived at the target path and its row was retired
+        # rather than deleted, which is what mark_missing and quarantine do.
+        other_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 0, ?, 5)
+            """,
+            (other_id, str(target), size),
+        )
+        connection.commit()
+
+    original.unlink()
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = plan_repairs(
+            find_broken_locations(connection),
+            index_roots([library]),
+            known_paths=current_paths(connection),
+        )
+        assert len(plan.repairs) == 1
+
+        outcome = apply_repairs(connection, plan.repairs)
+        connection.commit()
+
+        current = connection.execute(
+            "SELECT COUNT(*) FROM file_locations "
+            "WHERE archive_id = ? AND is_current = 1",
+            (moving_id,),
+        ).fetchone()[0]
+
+    assert outcome["applied"] == []
+    assert "retired location of archive" in outcome["skipped"][0]["reason"]
+    # The decisive assertion: the archive still has a current location.
+    assert current == 1
+
+
+def test_apply_never_leaves_an_archive_without_a_current_location(
+    database: Path, tmp_path: Path
+):
+    """Whatever the outcome, an archive must not end up with zero current rows.
+
+    This is the invariant the retired-row defect violated, asserted directly so
+    a future change that reintroduces a silent no-op upsert is caught even if
+    it arrives by a different route.
+    """
+    library = tmp_path / "lib"
+    payload = b"invariant payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "orig" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "new" / "a.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        archive_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        connection.commit()
+
+    original.unlink()
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = plan_repairs(
+            find_broken_locations(connection),
+            index_roots([library]),
+            known_paths=current_paths(connection),
+        )
+        apply_repairs(connection, plan.repairs)
+        connection.commit()
+
+        current = connection.execute(
+            "SELECT COUNT(*) FROM file_locations "
+            "WHERE archive_id = ? AND is_current = 1",
+            (archive_id,),
+        ).fetchone()[0]
+
+    assert current == 1
+
+
 def test_incoherent_evidence_is_never_repaired(database: Path, tmp_path: Path):
     """Matching the archive hash does not license refreshing the page signature.
 
