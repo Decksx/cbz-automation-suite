@@ -9,6 +9,7 @@ one connection can claim a given job even under concurrent access.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -395,3 +396,279 @@ def test_only_one_connection_can_claim_job(
         assert first_claim is not None
         assert first_claim.id == queued.id
         assert second_claim is None
+
+
+# ---------------------------------------------------------------------------
+# Cancellation
+#
+# JobStatus.CANCELLED existed from the start with no transition reaching it.
+# These tests pin the transition that closes that gap and, more importantly,
+# the things it refuses to do.
+# ---------------------------------------------------------------------------
+
+
+class _FailingCommitConnection:
+    """Delegates to a real connection but makes COMMIT fail.
+
+    A proxy rather than a monkeypatched method because sqlite3.Connection is a
+    C type and does not accept attribute assignment. Only the surface cancel()
+    uses is forwarded, so a future call it does not cover surfaces as an
+    AttributeError rather than silently bypassing the injected failure.
+    """
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    def execute(self, sql: str, *args):
+        if sql.strip().upper().startswith("COMMIT"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, *args)
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+    @property
+    def row_factory(self):
+        return self._real.row_factory
+
+
+def _archive(queue: JobQueue, archive_id: int) -> int:
+    """Create the archive_files row that jobs.archive_id references.
+
+    These tests use real archive ids because idx_jobs_unique_active is a
+    partial index on (job_type, archive_id) and does not constrain NULL, so a
+    test that left archive_id unset would not exercise the identity behaviour
+    cancellation depends on.
+    """
+    queue.connection.execute(
+        "INSERT OR IGNORE INTO archive_files (id, file_size) VALUES (?, 1)",
+        (archive_id,),
+    )
+    return archive_id
+
+
+def _force_blocked(queue: JobQueue, job_id: int) -> None:
+    """Force a job into 'blocked'; no public transition produces it."""
+    queue.connection.execute(
+        "UPDATE jobs SET status = ? WHERE id = ?",
+        (JobStatus.BLOCKED.value, job_id),
+    )
+
+
+def test_cancel_retires_a_pending_job(queue: JobQueue) -> None:
+    """The case this transition was written for: work that is impossible.
+
+    Archive 45217's perceptual job cannot be repaired -- its content lives
+    under another archive's current location -- and retrying it would burn
+    attempts until it landed in the terminal-failure audit as a corruption it
+    is not.
+    """
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 45217))
+
+    cancelled = queue.cancel(job.id, "content survives under another archive")
+
+    assert cancelled.status is JobStatus.CANCELLED
+    assert cancelled.cancellation_reason == (
+        "content survives under another archive"
+    )
+    assert cancelled.cancelled_at is not None
+
+
+def test_cancel_retires_a_blocked_job(queue: JobQueue) -> None:
+    """'blocked' is nonterminal and has no other way out."""
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 7))
+    _force_blocked(queue, job.id)
+
+    cancelled = queue.cancel(job.id, "upstream dependency abandoned")
+
+    assert cancelled.status is JobStatus.CANCELLED
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\t\n"])
+def test_cancel_requires_a_reason(queue: JobQueue, reason: str) -> None:
+    """A cancelled job with no reason is indistinguishable from a mistake."""
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 8))
+
+    with pytest.raises(ValueError):
+        queue.cancel(job.id, reason)
+
+    assert queue.get(job.id).status is JobStatus.PENDING
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_cancel_refuses_a_terminal_job(queue: JobQueue, terminal: str) -> None:
+    """Cancelling a finished job would rewrite history, not close it out."""
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 9))
+    queue.claim_next("worker-1")
+
+    if terminal == "completed":
+        queue.mark_completed(job.id)
+    else:
+        queue.mark_failed(job.id, "corrupt", permanent=True)
+
+    before = queue.get(job.id)
+
+    with pytest.raises(InvalidJobTransitionError) as caught:
+        queue.cancel(job.id, "changed my mind")
+
+    assert terminal in str(caught.value)
+
+    after = queue.get(job.id)
+    assert after.status is before.status
+    assert after.cancelled_at is None
+    assert after.cancellation_reason is None
+
+
+@pytest.mark.parametrize("owned", ["claimed", "running"])
+def test_cancel_refuses_a_job_a_worker_owns(
+    queue: JobQueue, owned: str
+) -> None:
+    """Nonterminal is not sufficient; a live worker still owns these.
+
+    Cancelling underneath a worker turns an operator's decision into an
+    unexplained worker error the next time it reports the job's outcome.
+    """
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 10))
+    queue.claim_next("worker-1")
+    if owned == "running":
+        queue.mark_running(job.id)
+
+    with pytest.raises(InvalidJobTransitionError) as caught:
+        queue.cancel(job.id, "operator retired it")
+
+    # The refusal names the allowed statuses so the caller can act on it.
+    assert "pending" in str(caught.value)
+    assert queue.get(job.id).status is JobStatus(owned)
+
+
+def test_a_worker_owned_job_is_cancellable_after_recovery(
+    queue: JobQueue,
+) -> None:
+    """The documented two-step path: recover to 'pending', then cancel."""
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 11))
+    queue.claim_next("worker-1")
+
+    queue.recover_abandoned(older_than_seconds=0)
+    assert queue.get(job.id).status is JobStatus.PENDING
+
+    recovered = queue.cancel(job.id, "retired after recovery")
+    assert recovered.status is JobStatus.CANCELLED
+
+
+def test_repeat_cancellation_is_rejected_and_keeps_the_first_reason(
+    queue: JobQueue,
+) -> None:
+    """A silent second cancel would discard or overwrite the audit trail."""
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 12))
+    first = queue.cancel(job.id, "the real reason")
+
+    with pytest.raises(InvalidJobTransitionError) as caught:
+        queue.cancel(job.id, "a different reason")
+
+    assert "cancelled" in str(caught.value)
+
+    after = queue.get(job.id)
+    assert after.cancellation_reason == "the real reason"
+    assert after.cancelled_at == first.cancelled_at
+
+
+def test_cancel_preserves_the_failure_evidence_and_timestamps(
+    queue: JobQueue,
+) -> None:
+    """Closing a job out must not erase why it was stuck.
+
+    This is the shape of the 79 relocation-blocked jobs: failed with
+    filesystem_not_found, retried back to 'pending', then retired. That
+    failure_category is the record of the incident, and cancelling is a new
+    fact about the job rather than a replacement for the old one.
+    """
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 45217))
+    queue.claim_next("worker-1")
+    queue.mark_running(job.id)
+    queue.mark_failed(
+        job.id,
+        "source file missing",
+        failure_category="filesystem_not_found",
+    )
+
+    before = queue.get(job.id)
+    assert before.status is JobStatus.PENDING
+
+    after = queue.cancel(job.id, "deduplicated; keeper is another archive")
+
+    assert after.error_message == "source file missing"
+    assert after.failure_category == "filesystem_not_found"
+    assert after.attempts == before.attempts
+    assert after.claimed_at == before.claimed_at
+    assert after.started_at == before.started_at
+    # A cancelled job did not complete, so completed_at stays as it was.
+    assert after.completed_at == before.completed_at
+    assert after.created_at == before.created_at
+
+
+def test_cancellation_is_persisted_not_just_returned(tmp_path: Path) -> None:
+    """Read it back on a second connection, not from the returned object."""
+    database_path = tmp_path / "persist.db"
+
+    with database_connection(database_path) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        queue = JobQueue(connection)
+        job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 45217))
+        queue.cancel(job.id, "retired: keeper is another archive")
+
+    with database_connection(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT status, cancellation_reason, cancelled_at, completed_at
+            FROM jobs WHERE id = ?
+            """,
+            (job.id,),
+        ).fetchone()
+
+    assert row[0] == JobStatus.CANCELLED.value
+    assert row[1] == "retired: keeper is another archive"
+    assert row[2] is not None
+    assert row[3] is None
+
+
+def test_cancelling_frees_the_active_job_identity(queue: JobQueue) -> None:
+    """'cancelled' is outside idx_jobs_unique_active, so re-enqueue works.
+
+    Without this a retired job would permanently block its archive from ever
+    being enqueued again -- the opposite of retiring it.
+    """
+    job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 13))
+    queue.cancel(job.id, "retired")
+
+    replacement = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 13))
+
+    assert replacement.id != job.id
+    assert replacement.status is JobStatus.PENDING
+
+
+def test_a_failing_commit_leaves_the_job_untouched(tmp_path: Path) -> None:
+    """COMMIT can fail on its own, and that must not skip the rollback.
+
+    A full disk at commit time must leave the caller seeing the database as it
+    was, with no transaction left open holding the change.
+    """
+    database_path = tmp_path / "rollback.db"
+
+    with database_connection(database_path) as connection:
+        apply_migrations(connection, MIGRATION_DIRECTORY)
+        queue = JobQueue(connection)
+        job = queue.enqueue("perceptual_hash", archive_id=_archive(queue, 14))
+
+        failing = JobQueue(_FailingCommitConnection(connection))
+
+        with pytest.raises(sqlite3.OperationalError):
+            failing.cancel(job.id, "retired")
+
+        assert connection.in_transaction is False
+
+        after = queue.get(job.id)
+
+    assert after.status is JobStatus.PENDING
+    assert after.cancelled_at is None
+    assert after.cancellation_reason is None

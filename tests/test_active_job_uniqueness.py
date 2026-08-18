@@ -37,7 +37,7 @@ INDEX_NAME = "idx_jobs_unique_active"
 ACTIVE_STATUSES = ("pending", "claimed", "running")
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "blocked")
 
-ALL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+ALL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
 
 def migrated_database(tmp_path: Path, name: str = "jobs.db") -> Path:
@@ -81,7 +81,7 @@ def snapshot_jobs(
 
     Deliberately `SELECT *` rather than a hand-picked column list: the
     point of the upgrade tests is that migration 010 changes *nothing*
-    about existing rows, so the comparison must cover all 17 current
+    about existing rows, so the comparison must cover every current
     columns and must also fail if a future migration adds, removes, or
     reorders one. The column names are returned alongside the values so
     a schema change is caught as well as a data change.
@@ -118,7 +118,7 @@ def build_partial_migration_directory(
 # --- migration application ------------------------------------------
 
 
-def test_fresh_database_applies_migrations_one_through_ten(
+def test_fresh_database_applies_every_migration(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "fresh.db"
@@ -521,13 +521,17 @@ def test_upgrade_from_migrations_one_through_nine_preserves_rows(
             (INDEX_NAME,),
         ).fetchone()[0]
 
-    assert upgraded == [10]
+    assert upgraded == [10, 11]
     assert index_exists == 1
-    # Column-for-column comparison across every column of every row:
-    # migration 010 adds an index and must not touch existing data.
-    assert after_columns == before_columns
-    assert len(after_columns) == 17
-    assert after_rows == before_rows
+    # Column-for-column comparison across every column of every row.
+    # Migration 010 adds an index and 011 adds two nullable columns; neither
+    # may alter an existing row. The new columns land at the end holding NULL
+    # for every row written before they existed, which is what "nothing was
+    # cancelled" looks like.
+    assert before_columns == after_columns[:17]
+    assert after_columns[17:] == ["cancelled_at", "cancellation_reason"]
+    assert len(after_columns) == 19
+    assert after_rows == [row + (None, None) for row in before_rows]
     assert {active_id, completed_id, failed_id} == {
         row[0] for row in after_rows
     }
