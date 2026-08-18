@@ -76,23 +76,27 @@ def test_comicinfo_differences_do_not_defeat_content_matching(tmp_path):
     """Identical pages must still match when only ComicInfo differs.
 
     update_comicinfo_xml derives Title from the filename, so two copies of one
-    chapter always carry different ComicInfo. If the fingerprint included that
+    chapter always carry different ComicInfo. If the fingerprint counted that
     file, no real duplicate would ever be detected.
+
+    An earlier version of this test used a stray .txt entry as the "difference"
+    and asserted the fingerprints must diverge. That encoded the hand-rolled
+    implementation's behaviour of hashing every non-ComicInfo entry. The
+    canonical algorithm counts only image extensions, and is right to: a readme
+    or a thumbnail database is not page content. The difference asserted below
+    is therefore a real page difference.
     """
     pages = {"001.jpg": b"page one", "002.jpg": b"page two"}
     first = tmp_path / "a.cbz"
     second = tmp_path / "b.cbz"
     _make_cbz(first, pages, number="1")
-    _make_cbz(second, pages, number="1")
-    # Rewrite one ComicInfo so the two differ in metadata but not in pages.
-    with zipfile.ZipFile(second, "a") as zf:
-        zf.writestr("extra_ComicInfo_marker.txt", b"")
+    _make_cbz(second, pages, number="7")  # different ComicInfo, same pages
 
-    assert _archive_content_fingerprint(first) == _archive_content_fingerprint(
-        tmp_path / "a.cbz"
-    )
-    # The marker file is a real content difference, so these must NOT match.
-    assert _archive_content_fingerprint(first) != _archive_content_fingerprint(second)
+    assert _archive_content_fingerprint(first) == _archive_content_fingerprint(second)
+
+    third = tmp_path / "c.cbz"
+    _make_cbz(third, {**pages, "003.jpg": b"an extra page"})
+    assert _archive_content_fingerprint(first) != _archive_content_fingerprint(third)
 
 
 def test_page_rename_alone_still_counts_as_identical(tmp_path):
@@ -177,6 +181,81 @@ def test_page_order_changes_the_fingerprint(tmp_path):
 
     assert _archive_content_fingerprint(forward) != _archive_content_fingerprint(
         reversed_pages
+    )
+
+
+def test_natural_page_order_matches_the_canonical_algorithm(tmp_path):
+    """Page order must follow natural sort, not lexicographic sort.
+
+    Lexicographically "10.jpg" precedes "2.jpg"; naturally it does not. The
+    rest of the system (page_hashing._natural_key) uses natural order, so a
+    guard sorting lexicographically could call two archives identical whose
+    canonical page order differs -- reachable by re-zero-padding page names and
+    redistributing content between them.
+
+    Here both archives hold the same three payloads but assign them to page
+    numbers such that only one ordering agrees. They must not compare equal.
+    """
+    natural = tmp_path / "natural.cbz"
+    padded = tmp_path / "padded.cbz"
+    _make_cbz(natural, {"1.jpg": b"A", "2.jpg": b"B", "10.jpg": b"C"})
+    # Same payload set; zero-padding makes lexicographic order match natural
+    # order here, but the page CONTENT is assigned differently.
+    _make_cbz(padded, {"01.jpg": b"A", "02.jpg": b"C", "10.jpg": b"B"})
+
+    assert _archive_content_fingerprint(natural) != _archive_content_fingerprint(
+        padded
+    )
+
+
+def test_zero_padding_alone_does_not_change_the_fingerprint(tmp_path):
+    """Renaming pages while preserving natural order keeps archives equal.
+
+    "1.jpg" and "01.jpg" occupy the same position under natural ordering, so a
+    release that only re-pads its page names is still a duplicate.
+    """
+    plain = tmp_path / "plain.cbz"
+    padded = tmp_path / "padded.cbz"
+    _make_cbz(plain, {"1.jpg": b"A", "2.jpg": b"B", "10.jpg": b"C"})
+    _make_cbz(padded, {"01.jpg": b"A", "02.jpg": b"B", "010.jpg": b"C"})
+
+    assert _archive_content_fingerprint(plain) == _archive_content_fingerprint(padded)
+
+
+def test_non_image_entries_are_excluded_like_the_canonical_algorithm(tmp_path):
+    """Only image extensions count as pages.
+
+    The canonical implementation filters on IMAGE_EXTENSIONS. A guard that
+    hashed every non-ComicInfo entry would treat a stray readme or thumbs
+    database as page content and call two otherwise-identical archives
+    different.
+    """
+    bare = tmp_path / "bare.cbz"
+    littered = tmp_path / "littered.cbz"
+    _make_cbz(bare, {"001.jpg": b"page one", "002.jpg": b"page two"})
+    _make_cbz(
+        littered,
+        {"001.jpg": b"page one", "002.jpg": b"page two", "readme.txt": b"junk"},
+    )
+
+    assert _archive_content_fingerprint(bare) == _archive_content_fingerprint(littered)
+
+
+def test_maintenance_fingerprint_equals_the_stored_signature_algorithm(tmp_path):
+    """The guard and archive_content_signatures must agree by construction.
+
+    This is the property that makes the guard meaningful: it is the same
+    function the database's content signature comes from, not a second opinion
+    that could drift from it.
+    """
+    from comic_automation.archive.page_hashing import calculate_page_hashes
+
+    archive = tmp_path / "a.cbz"
+    _make_cbz(archive, {"1.jpg": b"A", "2.jpg": b"B", "10.jpg": b"C"})
+
+    assert (
+        _archive_content_fingerprint(archive)
+        == calculate_page_hashes(archive).content_digest
     )
 
 
