@@ -10,6 +10,7 @@ pin the conditions under which it refuses to act.
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from pathlib import Path
 
@@ -48,7 +49,15 @@ def _seed(
     digest: str,
     size: int,
     mtime_ns: int,
+    signature_size: int | None = None,
+    signature_mtime_ns: int | None = None,
 ) -> int:
+    """Seed one archive.
+
+    ``signature_*`` default to the hash row's values, which is the coherent
+    case. Passing different values models the incoherent one: an archive hash
+    recomputed after a content change while the page signature stayed stale.
+    """
     archive_id = int(
         connection.execute(
             "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
@@ -81,7 +90,12 @@ def _seed(
         )
         VALUES (?, 'ordered-page-sha256', '1', ?, 10, 1024, ?, ?)
         """,
-        (archive_id, "sig-" + digest[:8], size, mtime_ns),
+        (
+            archive_id,
+            "sig-" + digest[:8],
+            size if signature_size is None else signature_size,
+            mtime_ns if signature_mtime_ns is None else signature_mtime_ns,
+        ),
     )
     return archive_id
 
@@ -449,6 +463,211 @@ def test_plan_digest_changes_when_the_plan_changes(database: Path, tmp_path: Pat
         )
 
     assert digest_a != plan_b.digest()
+
+
+def test_two_archives_cannot_both_claim_one_file(database: Path, tmp_path: Path):
+    """Duplicate archives sharing a digest must not both select the same file.
+
+    Two archives with the same stored SHA-256 is exactly what a duplicate pair
+    is, and production holds 886 such groups. Planning previously computed the
+    claimed-path set once and never reserved targets as it went, so both
+    archives selected the surviving file and the apply handed it to whichever
+    ran last.
+    """
+    library = tmp_path / "lib"
+    payload = b"shared duplicate payload"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    first = library / "one" / "a.cbz"
+    second = library / "two" / "b.cbz"
+    _write_archive(first, payload)
+    _write_archive(second, payload)
+    size = first.stat().st_size
+
+    with database_connection(database) as connection:
+        _seed(connection, path=first, digest=digest, size=size, mtime_ns=1)
+        _seed(connection, path=second, digest=digest, size=size, mtime_ns=2)
+        connection.commit()
+
+    # Both originals vanish; one identical copy survives elsewhere.
+    first.unlink()
+    second.unlink()
+    survivor = library / "survivor" / "c.cbz"
+    _write_archive(survivor, payload)
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = plan_repairs(
+            find_broken_locations(connection),
+            index_roots([library]),
+            known_paths=current_paths(connection),
+        )
+
+    # Exactly one archive may claim the survivor; the other is left unresolved.
+    targets = [r.new_path for r in plan.repairs]
+    assert len(targets) == len(set(targets))
+    assert len(plan.repairs) <= 1
+
+
+def test_apply_refuses_a_path_claimed_by_another_archive(
+    database: Path, tmp_path: Path
+):
+    """A path claimed after planning must not be stolen at apply time.
+
+    Silently re-pointing a live location at a different archive merges two
+    identities and strands one archive's accumulated evidence.
+    """
+    library = tmp_path / "lib"
+    payload = b"contested payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        connection.commit()
+
+    original.unlink()
+    target = library / "elsewhere" / "b.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = plan_repairs(
+            find_broken_locations(connection),
+            index_roots([library]),
+            known_paths=current_paths(connection),
+        )
+        assert len(plan.repairs) == 1
+
+        # A scan running after the plan claims that path for a new archive.
+        other_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 1, ?, 9)
+            """,
+            (other_id, str(target), size),
+        )
+        connection.commit()
+
+        outcome = apply_repairs(connection, plan.repairs)
+        connection.commit()
+
+        owner = connection.execute(
+            "SELECT archive_id FROM file_locations WHERE path = ? AND is_current = 1",
+            (str(target),),
+        ).fetchone()
+
+    assert outcome["applied"] == []
+    assert "current location of archive" in outcome["skipped"][0]["reason"]
+    assert int(owner["archive_id"]) == other_id  # ownership untouched
+    assert other_id != moving_id
+
+
+def test_incoherent_evidence_is_never_repaired(database: Path, tmp_path: Path):
+    """Matching the archive hash does not license refreshing the page signature.
+
+    If the archive hash was recomputed after a content change while the page
+    signature stayed stale, the two rows describe different file states.
+    Refreshing source_* would launder the stale page evidence into looking
+    current, so repair must refuse and ask for reinspection instead.
+    """
+    archive = tmp_path / "lib" / "a.cbz"
+    payload = b"payload whose page evidence is stale"
+    digest = _write_archive(archive, payload)
+
+    with database_connection(database) as connection:
+        _seed(
+            connection,
+            path=archive,
+            digest=digest,
+            size=len(payload),
+            mtime_ns=111,
+            # Page signature was computed from a DIFFERENT observed state.
+            signature_size=len(payload) - 5,
+            signature_mtime_ns=42,
+        )
+        connection.commit()
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = plan_repairs(
+            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+        )
+
+    assert plan.repairs == []
+    assert len(plan.unresolved) == 1
+    assert "different file states" in plan.unresolved[0]["reason"]
+
+
+def test_coherent_evidence_is_repaired(database: Path, tmp_path: Path):
+    """The provenance gate must not block the ordinary case."""
+    archive = tmp_path / "lib" / "a.cbz"
+    payload = b"coherent payload"
+    digest = _write_archive(archive, payload)
+
+    with database_connection(database) as connection:
+        _seed(
+            connection, path=archive, digest=digest, size=len(payload), mtime_ns=111
+        )
+        connection.commit()
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        plan = plan_repairs(
+            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+        )
+
+    assert len(plan.repairs) == 1
+    assert plan.repairs[0].kind == "metadata_drift"
+
+
+def test_permission_error_is_not_treated_as_absence(
+    database: Path, tmp_path: Path, monkeypatch
+):
+    """An unreadable path says nothing about whether the file is there.
+
+    Classifying it as "missing" would send repair hunting for a replacement for
+    a file that exists, and could re-point the archive at a different copy.
+    """
+    archive = tmp_path / "lib" / "a.cbz"
+    payload = b"present but unreadable"
+    digest = _write_archive(archive, payload)
+
+    with database_connection(database) as connection:
+        _seed(connection, path=archive, digest=digest, size=len(payload), mtime_ns=1)
+        connection.commit()
+
+    real_stat = os.stat
+
+    def denying_stat(path, *args, **kwargs):
+        if str(path) == str(archive):
+            raise PermissionError(13, "Access is denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "comic_automation.library.relocation_repair.os.stat", denying_stat
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        broken = find_broken_locations(connection)
+
+    assert [b.state for b in broken] == ["unreadable"]
+
+    plan = plan_repairs(broken, {}, known_paths=set())
+    assert plan.repairs == []
+    assert "not evidence of absence" in plan.unresolved[0]["reason"]
 
 
 def test_healthy_locations_are_not_reported_as_broken(database: Path, tmp_path: Path):
