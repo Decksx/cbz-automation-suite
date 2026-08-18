@@ -41,9 +41,23 @@ miss recompressed copies. Byte identity is reported alongside as
 ``archive_sha256`` where available, so a reviewer can see which groups
 are also byte-identical.
 
-Only locations with ``is_current = 1`` are counted, so an archive whose
-recorded path no longer holds the file is not offered as a duplicate to
-delete.
+Recorded state is not live state
+--------------------------------
+
+Only locations with ``is_current = 1`` are counted, but that is a claim about
+the row, not about the disk: 3,578 current locations were measured on
+2026-08-17 that no longer described the file at their path. This audit does not
+stat the filesystem -- it is safe to point at a protected backup, which
+statting would break -- so it reports the staleness it *can* see from stored
+data: a member whose ``archive_content_signatures.source_*`` no longer matches
+its ``file_locations`` size and mtime is flagged ``signature_is_stale``, and
+any group containing one is reported as not ``actionable``.
+
+Such groups are still listed rather than hidden. The evidence is real; it is
+just not safe to resolve until the location is repaired or re-verified against
+the filesystem. **A caller resolving duplicates must re-verify against live
+bytes regardless** -- this report is grounds for review, never for deletion on
+its own.
 
 Reads go through ``read_guards.read_consistent_snapshot``: one deferred
 read transaction bracketed by ``PRAGMA data_version`` readings taken
@@ -96,6 +110,10 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
             acs.image_bytes       AS image_bytes,
             af.file_size          AS file_size,
             fl.path               AS path,
+            fl.file_size          AS location_size,
+            fl.modified_time_ns   AS location_mtime_ns,
+            acs.source_file_size        AS signature_source_size,
+            acs.source_modified_time_ns AS signature_source_mtime_ns,
             ah.digest             AS archive_sha256
         FROM archive_content_signatures AS acs
         JOIN file_locations AS fl
@@ -116,6 +134,14 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
 
     by_signature: dict[str, list[dict]] = {}
     for row in rows:
+        # A signature describes the bytes observed when it was computed. If the
+        # location has moved on since, the signature no longer describes what
+        # is at that path -- 3,578 such locations were measured on 2026-08-17.
+        # is_current = 1 is a claim about the row, not about the disk.
+        stale = (
+            row["signature_source_size"] != row["location_size"]
+            or row["signature_source_mtime_ns"] != row["location_mtime_ns"]
+        )
         by_signature.setdefault(str(row["signature"]), []).append(
             {
                 "archive_id": int(row["archive_id"]),
@@ -124,6 +150,7 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
                 "file_size": int(row["file_size"] or 0),
                 "image_bytes": int(row["image_bytes"] or 0),
                 "archive_sha256": row["archive_sha256"],
+                "signature_is_stale": bool(stale),
             }
         )
 
@@ -131,7 +158,14 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
     for signature, members in by_signature.items():
         if len(members) < 2:
             continue
-        distinct_hashes = {m["archive_sha256"] for m in members if m["archive_sha256"]}
+        hashes = [m["archive_sha256"] for m in members]
+        # Every member must have a hash AND they must all agree. An earlier
+        # revision filtered out the missing ones first, so a group where one
+        # member had no hash and the rest agreed was reported byte-identical on
+        # the strength of evidence that did not exist for every member.
+        byte_identical = all(hashes) and len(set(hashes)) == 1
+        stale_members = [m for m in members if m["signature_is_stale"]]
+        fresh_members = [m for m in members if not m["signature_is_stale"]]
         # Everything past the first copy is redundant. Sizes can differ between
         # members (different compression of identical pages), so the reclaimable
         # figure is measured against the largest, which is the copy most likely
@@ -143,8 +177,12 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
                 "member_count": len(members),
                 "redundant_count": len(members) - 1,
                 "page_count": members[0]["page_count"],
-                "byte_identical": len(distinct_hashes) == 1
-                and len(distinct_hashes) > 0,
+                "byte_identical": byte_identical,
+                "stale_member_count": len(stale_members),
+                # Only a group whose every member's signature still describes
+                # its recorded location is safe to act on without re-verifying
+                # against the filesystem first.
+                "actionable": not stale_members and len(fresh_members) >= 2,
                 "reclaimable_bytes": sum(m["file_size"] for m in members) - largest,
                 "members": members,
             }
@@ -158,12 +196,24 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
 
 def summarize(groups: list[dict]) -> dict:
     """Aggregate counts a reviewer needs before opening the detail rows."""
+    actionable = [g for g in groups if g["actionable"]]
     return {
         "group_count": len(groups),
         "redundant_copies": sum(g["redundant_count"] for g in groups),
         "reclaimable_bytes": sum(g["reclaimable_bytes"] for g in groups),
         "byte_identical_groups": sum(1 for g in groups if g["byte_identical"]),
         "largest_group": max((g["member_count"] for g in groups), default=0),
+        # Reported separately rather than filtered out: a group containing a
+        # stale member is still evidence worth seeing, it is just not safe to
+        # resolve until the location is repaired or re-verified.
+        "actionable_groups": len(actionable),
+        "actionable_redundant_copies": sum(g["redundant_count"] for g in actionable),
+        "actionable_reclaimable_bytes": sum(
+            g["reclaimable_bytes"] for g in actionable
+        ),
+        "groups_with_stale_members": sum(
+            1 for g in groups if g["stale_member_count"]
+        ),
     }
 
 
@@ -188,7 +238,9 @@ def _write_csv(path: Path, groups: list[dict]) -> Path:
             [
                 "signature",
                 "member_count",
+                "actionable",
                 "byte_identical",
+                "signature_is_stale",
                 "archive_id",
                 "page_count",
                 "file_size",
@@ -202,7 +254,9 @@ def _write_csv(path: Path, groups: list[dict]) -> Path:
                     [
                         group["signature"],
                         group["member_count"],
+                        "yes" if group["actionable"] else "no",
                         "yes" if group["byte_identical"] else "no",
+                        "yes" if member["signature_is_stale"] else "",
                         member["archive_id"],
                         member["page_count"],
                         member["file_size"],
@@ -319,6 +373,18 @@ def print_summary(output: dict, top: int = 15) -> None:
     print(f"  byte-identical:    {summary['byte_identical_groups']:,} groups")
     print(f"  largest group:     {summary['largest_group']:,} members")
     print(f"Reclaimable:         {summary['reclaimable_bytes'] / (1024 ** 3):,.2f} GiB")
+    print("")
+    print("Actionable now (every member's signature still describes its location):")
+    print(f"  groups:            {summary['actionable_groups']:,}")
+    print(f"  redundant copies:  {summary['actionable_redundant_copies']:,}")
+    print(
+        "  reclaimable:       "
+        f"{summary['actionable_reclaimable_bytes'] / (1024 ** 3):,.2f} GiB"
+    )
+    print(
+        f"  held back:         {summary['groups_with_stale_members']:,} groups "
+        "contain a member whose recorded location has drifted"
+    )
 
     if output["groups"]:
         print(f"\nLargest reclaims (top {top}):")
