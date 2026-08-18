@@ -48,6 +48,17 @@ def _utc_sql_timestamp(
     )
 
 
+def _optional_column(row: sqlite3.Row, column: str) -> Any:
+    """Read a column that a pre-migration-011 database will not have.
+
+    `get()` selects `*`, and read-only audits may legitimately open a
+    database that has not reached version 11 yet. Returning None there is
+    accurate -- nothing was cancelled -- and is preferable to an IndexError
+    that would make an audit fail for a reason unrelated to what it audits.
+    """
+    return row[column] if column in row.keys() else None
+
+
 def _row_to_job(row: sqlite3.Row) -> Job:
     return Job(
         id=int(row["id"]),
@@ -71,7 +82,28 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         failure_category=row["failure_category"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        cancelled_at=_optional_column(row, "cancelled_at"),
+        cancellation_reason=_optional_column(row, "cancellation_reason"),
     )
+
+
+# Cancellation is permitted only from these statuses, named explicitly
+# rather than derived as "not terminal".
+#
+# 'claimed' and 'running' are excluded on purpose even though they are
+# nonterminal: a live worker owns those rows, and cancelling one out from
+# under it produces a worker that later calls mark_completed() or
+# mark_failed() on a row that no longer accepts either, turning an
+# operator's decision into an unexplained worker error. A stuck claimed or
+# running job goes through recover_abandoned() first, which returns it to
+# 'pending', and can then be cancelled -- two visible steps rather than one
+# racy one.
+CANCELLABLE_STATUSES = frozenset(
+    {
+        JobStatus.PENDING,
+        JobStatus.BLOCKED,
+    }
+)
 
 
 class JobQueue:
@@ -587,6 +619,96 @@ class JobQueue:
                         job_id,
                     ),
                 )
+
+            self.connection.execute("COMMIT")
+            return self.get(job_id)
+
+        except Exception:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def cancel(
+        self,
+        job_id: int,
+        reason: str,
+    ) -> Job:
+        """Retire a job that can never reach a terminal status on its own.
+
+        The case this exists for: a job whose work is impossible rather than
+        merely failing. Archive 45217's perceptual job is the first one --
+        its content survives under another archive's current location, so
+        location repair can never point it at a file, and retrying it would
+        only burn attempts until it landed in the terminal-failure audit as
+        a corruption it is not.
+
+        What is written: `status`, `cancelled_at`, `cancellation_reason`,
+        `updated_at`. What is deliberately left alone: `error_message`,
+        `failure_category`, `attempts`, `claimed_at`, `started_at`, and
+        `completed_at`. Cancelling a job records a *new* fact about it and
+        must not erase the evidence of why it was stuck -- for the
+        relocation-blocked jobs that evidence is `filesystem_not_found`, the
+        record of the incident itself.
+
+        `reason` is required and must contain something other than
+        whitespace. A cancelled job with no reason is indistinguishable
+        later from a mistake, and this transition exists precisely for cases
+        a future reader will question.
+
+        Cancelling an already-cancelled job is **rejected**, not treated as
+        a no-op. A silent second cancel would either discard a different
+        reason or overwrite the first one, and both destroy the audit trail
+        the first cancel was written to create. The rejection names the
+        current status, so a caller that expected idempotence can see
+        exactly what happened.
+
+        Raises:
+            ValueError: `reason` is empty or whitespace.
+            JobNotFoundError: no such job.
+            InvalidJobTransitionError: the job is not in a cancellable
+                status. Terminal statuses ('completed', 'failed',
+                'cancelled') and worker-owned ones ('claimed', 'running')
+                are all refused; see CANCELLABLE_STATUSES.
+        """
+        if not reason or not reason.strip():
+            raise ValueError(
+                "Cancelling a job requires a non-empty reason."
+            )
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            job = self.get(job_id)
+
+            if job.status not in CANCELLABLE_STATUSES:
+                allowed = ", ".join(
+                    sorted(s.value for s in CANCELLABLE_STATUSES)
+                )
+                raise InvalidJobTransitionError(
+                    f"Job {job_id} cannot be cancelled from status "
+                    f"{job.status.value!r}; cancellation is permitted "
+                    f"only from: {allowed}."
+                )
+
+            now = _utc_sql_timestamp()
+
+            self.connection.execute(
+                """
+                UPDATE jobs
+                SET
+                    status = ?,
+                    cancelled_at = ?,
+                    cancellation_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    JobStatus.CANCELLED.value,
+                    now,
+                    reason,
+                    now,
+                    job_id,
+                ),
+            )
 
             self.connection.execute("COMMIT")
             return self.get(job_id)
