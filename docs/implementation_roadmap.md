@@ -41,15 +41,15 @@ audit.
 | Redundant copies in those groups | 1,085 |
 | Page SHA-256 rows | 2,955,304 |
 | Perceptual job rows | 45,700 |
-| Perceptual jobs completed | 45,500 |
+| Perceptual jobs completed | 45,578 |
 | Perceptual jobs failed | 121 |
-| Active perceptual jobs | 78 (repaired, runnable) |
+| Active perceptual jobs | 0 |
 | Production schema migrations | 1–11 |
-| dHash rows, Version 1 | 2,334,288 |
-| pHash rows, Version 1 | 2,334,288 |
+| dHash rows, Version 1 | 2,339,340 |
+| pHash rows, Version 1 | 2,339,340 |
 | Pages with exactly one perceptual hash | 0 |
-| Perceptual page coverage | 79.0% (2,334,288 / 2,955,304) |
-| Eligible archives remaining | 12,554 |
+| Perceptual page coverage | 79.16% (2,339,340 / 2,955,304) |
+| Eligible archives remaining | 12,555 (226 of them absent from disk) |
 | Near-duplicate candidates | 3,000 |
 | Broken current locations | 1,066 (was 3,612 before the 2026-08-18 repair) |
 | Last guarded batch | 5,000 processed |
@@ -105,8 +105,39 @@ questions.
 Retiring it needed a transition that did not exist. `JobStatus.CANCELLED`
 was defined in `comic_automation/jobs/models.py` and treated as terminal
 by migration 010, but no `JobQueue` method reached it. `JobQueue.cancel()`
-now does, guarded (PR #67). Zero active jobs remains a precondition for
-the next batch.
+now does, guarded (PR #67).
+
+The 78 repaired jobs were drained on 2026-08-18 in a bounded, enqueue-free run:
+78 processed, 78 succeeded, no retries, no terminal failures. Coverage moved
+78.99% -> 79.16%, dHash and pHash stayed equal at 2,339,340, no page holds one
+hash of a pair, and terminal failures stayed at 121 with unchanged categories.
+**Active jobs across every job type are now zero**, which was the standing
+precondition for any further batch.
+
+### Retiring a job returns its archive to the eligible set
+
+Eligibility rose from 12,554 to 12,555 across a run that hashed 78 archives.
+That is not drift. The eligible-archive predicate excludes archives holding an
+*active* job, and `cancelled` is terminal, so retiring archive 45217's job
+returned the archive to the eligible set while its file is still absent from
+disk.
+
+The next run using `--enqueue-missing` would therefore re-enqueue it, fail it
+`filesystem_not_found`, retry it, and eventually record it as a terminal
+failure -- putting a non-corruption into the terminal-failure audit and
+silently undoing a deliberate retirement.
+
+This is not a defect in cancellation, which closed the job correctly and kept
+its evidence. It is the same structural gap the 2026-08-17 incident exposed,
+seen from another angle: **the eligibility predicate compares database rows to
+database rows and never stats the filesystem.** Measured across the whole
+eligible set on 2026-08-18, 226 of the 12,555 eligible archives -- 1.8% --
+point at a path that does not exist, and every one of them would fail on open.
+
+So the live-path existence gate is no longer only a protection against files
+moving mid-batch. It is a **precondition for using `--enqueue-missing` at
+all**. Until it lands, drain-only runs remain safe because they consume
+existing rows and cannot resurrect a retired archive.
 
 ### 2026-08-17 guarded batch and its findings
 
