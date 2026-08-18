@@ -43,8 +43,8 @@ audit.
 | Perceptual job rows | 45,700 |
 | Perceptual jobs completed | 45,500 |
 | Perceptual jobs failed | 121 |
-| Active perceptual jobs | 79 (78 unblocked by repair, 1 awaiting retirement) |
-| Production schema migrations | 1–10 |
+| Active perceptual jobs | 78 (repaired, runnable) |
+| Production schema migrations | 1–11 |
 | dHash rows, Version 1 | 2,334,288 |
 | pHash rows, Version 1 | 2,334,288 |
 | Pages with exactly one perceptual hash | 0 |
@@ -85,17 +85,28 @@ from 0 to 3,000: perceptual detection had never been run, not run and
 found nothing, and 3,000 is where a `--limit` stopped rather than where
 the candidates ran out.
 
-The 79 active perceptual jobs are not a queue backlog. They are the
+The 79 active perceptual jobs were not a queue backlog. They were the
 retry-scheduled remainder of the last batch, blocked on source files
 whose recorded locations were wrong, and they had to be resolved through
-location repair rather than retried. As of the 2026-08-18 repair, 78 of
-them have a current location that exists on disk. The remaining one is
-archive 45217, whose content survives under another archive's current
-location: repair can never resolve it, and closing its job needs a
-guarded retirement that does not exist yet — `JobStatus.CANCELLED` is
-defined in `comic_automation/jobs/models.py`, but no `JobQueue`
-transition reaches it. Zero active jobs remains a precondition for the
-next batch.
+location repair rather than retried. The 2026-08-18 repair gave 78 of
+them a current location that exists on disk; those are runnable and will
+drain on the next worker run.
+
+The seventy-ninth, archive 45217, was retired rather than repaired. Its
+51-page ordered-page signature survives on disk under two other archives
+— 45220 and 37972 — but its stored *archive* SHA-256 matches no unowned
+file, because those surviving containers differ byte for byte while
+holding identical pages. That distinction is the whole reason repair
+could not resolve it, and is worth keeping in mind whenever a duplicate
+question is asked: content signature is the identity of the pages, the
+archive hash is the identity of the bytes, and they answer different
+questions.
+
+Retiring it needed a transition that did not exist. `JobStatus.CANCELLED`
+was defined in `comic_automation/jobs/models.py` and treated as terminal
+by migration 010, but no `JobQueue` method reached it. `JobQueue.cancel()`
+now does, guarded (PR #67). Zero active jobs remains a precondition for
+the next batch.
 
 ### 2026-08-17 guarded batch and its findings
 
