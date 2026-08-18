@@ -43,7 +43,7 @@ audit.
 | Perceptual job rows | 45,700 |
 | Perceptual jobs completed | 45,500 |
 | Perceptual jobs failed | 121 |
-| Active perceptual jobs | 79 (location-blocked, see below) |
+| Active perceptual jobs | 79 (78 unblocked by repair, 1 awaiting retirement) |
 | Production schema migrations | 1–10 |
 | dHash rows, Version 1 | 2,334,288 |
 | pHash rows, Version 1 | 2,334,288 |
@@ -51,7 +51,7 @@ audit.
 | Perceptual page coverage | 79.0% (2,334,288 / 2,955,304) |
 | Eligible archives remaining | 12,554 |
 | Near-duplicate candidates | 3,000 |
-| Broken current locations | 3,578 |
+| Broken current locations | 1,066 (was 3,612 before the 2026-08-18 repair) |
 | Last guarded batch | 5,000 processed |
 | Last-batch outcomes | 4,919 succeeded, 2 terminal failures, 79 retries |
 | Last-batch terminal-failure rate | 0.04% |
@@ -87,9 +87,15 @@ the candidates ran out.
 
 The 79 active perceptual jobs are not a queue backlog. They are the
 retry-scheduled remainder of the last batch, blocked on source files
-whose recorded locations are wrong, and they must be resolved through
-location repair rather than retried. Zero active jobs remains a
-precondition for the next batch.
+whose recorded locations were wrong, and they had to be resolved through
+location repair rather than retried. As of the 2026-08-18 repair, 78 of
+them have a current location that exists on disk. The remaining one is
+archive 45217, whose content survives under another archive's current
+location: repair can never resolve it, and closing its job needs a
+guarded retirement that does not exist yet — `JobStatus.CANCELLED` is
+defined in `comic_automation/jobs/models.py`, but no `JobQueue`
+transition reaches it. Zero active jobs remains a precondition for the
+next batch.
 
 ### 2026-08-17 guarded batch and its findings
 
@@ -128,12 +134,39 @@ dependency-ordered stage enqueuer, arrived on
 `4ae3513ff0727826a1c2e35d3e3bfd8697e144e1`.
 
 Merging made that tooling available; it did not authorise a production
-run. The relocation-repair plan computed before those corrections is
+run. The relocation-repair plan computed before those corrections was
 **superseded** — the provenance gate, planning-time ownership rejection,
 canonical path comparison, canonical-collision refusal, and the narrowed
-`OSError` handling each move archives out of "repairable" — so it must be
-re-derived read-only and reviewed, against a freshly verified backup,
-before any of it is applied.
+`OSError` handling each move archives out of "repairable" — so it was
+re-derived read-only and reviewed against a freshly verified backup
+before any of it was applied.
+
+### 2026-08-18 location repair
+
+Applied 2026-08-18: **2,546 repairs, 0 skipped**, broken current
+locations **3,612 -> 1,066**. The apply re-derived the plan from disk and
+produced a digest identical to the reviewed one, so nothing moved between
+review and apply. `file_locations` grew by exactly the 2,171 `moved`
+repairs, which is the expected shape — a move retires the old row and
+records a new one, preserving archive identity and its evidence.
+
+Reviewing the first derivation caught a defect worth recording, because
+it is the existing "evidence is not a decision" rule pointing in a
+direction the guards did not cover. Seven repairs would have re-pointed
+an archive's current location into Syncthing's `.stversions`
+version-history area, and all twenty-one ambiguous cases were one live
+file tied with its own snapshot. Content proof accepted those files
+correctly — they *are* the same bytes. What content proof cannot
+establish is whether a path is somewhere the library may point.
+`--exclude` (PR #65) prunes such an area from the search; re-derived, the
+plan moved from 2,532 repairs with 21 ambiguities to 2,546 with none.
+
+The remaining 1,066 unresolved are not location questions: 584 have no
+matching file under the searched roots, 397 need guarded reinspection
+because archive hash and page signature describe different file states,
+and 78 are genuine content changes. Full record, including the
+disposition of every difference from the superseded plan, is in the
+external `relocation-repair-2026-08-18-outcome.md`.
 
 ### What this changes about sequencing
 
