@@ -42,6 +42,7 @@ from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from comic_automation.archive.page_hashing import calculate_page_hashes
 from scripts.cbz_routing import series_key
 
 
@@ -413,59 +414,33 @@ def _comicinfo_dup_key(cbz_path: Path) -> str | None:
 
 
 def _archive_content_fingerprint(cbz_path: Path) -> str | None:
-    """Return an ordered cryptographic digest of a CBZ's page content.
+    """Return the archive's canonical ordered-page digest, or None if unreadable.
 
-    SHA-256 over each page's own SHA-256, taken in page order. Two properties
-    matter and both are load-bearing for an irreversible delete:
+    Delegates to `comic_automation.archive.page_hashing.calculate_page_hashes`,
+    the same implementation that produces `archive_content_signatures.digest`,
+    rather than computing a second opinion here.
 
-    * **Cryptographic.** An earlier revision used CRC32 plus entry size read
-      from the zip central directory. That is a 32-bit checksum chosen for
-      detecting accidental corruption, and collisions are cheap to construct
-      and possible by chance across a library this size. A checksum collision
-      would have equated different bytes and deleted one of them.
-    * **Ordered.** That revision also sorted the entries, which discards page
-      order. The same pages bound in a different order are a different comic,
-      not a duplicate.
+    That reuse is the point. An earlier revision hand-rolled its own digest and
+    diverged from the canonical one in two ways review caught: it sorted entry
+    names lexicographically instead of by natural key, and it hashed every
+    non-ComicInfo entry instead of only image extensions. Both change page
+    order or page membership, so two archives the rest of the system considers
+    different could produce the same maintenance fingerprint -- for instance by
+    re-zero-padding page names and redistributing content, since lexicographic
+    order puts "10.jpg" before "2.jpg" and natural order does not.
 
-    Pages are ordered by entry name, which is how every reader and this
-    codebase's own inspection derive page order. Renaming pages without
-    changing their sort order therefore still compares equal, which is the
-    property that lets genuinely duplicate releases collapse.
+    A deletion guard that disagrees with the system's own definition of page
+    order is not a guard, so there is now one definition and this is a caller
+    of it.
 
-    ComicInfo.xml is excluded because update_comicinfo_xml rewrites it per
-    file; including it would make every archive unique and no real duplicate
-    would ever be found.
-
-    Returns None if the archive cannot be read, so the caller can isolate it
-    rather than treat it as matching other unreadable files. This reads and
-    decompresses every page, which is far more expensive than a central
-    directory scan -- that cost is deliberate, because the result authorises
-    deleting a file.
+    Returns None when the archive cannot be read or is not a CBZ, so the caller
+    isolates it rather than treating it as matching other unreadable files.
     """
     try:
-        with zipfile.ZipFile(cbz_path) as zf:
-            entries = [
-                info
-                for info in zf.infolist()
-                if not info.is_dir()
-                and os.path.basename(info.filename).lower() != "comicinfo.xml"
-            ]
-            entries.sort(key=lambda info: info.filename)
-            if not entries:
-                return None
-            chain = hashlib.sha256()
-            for info in entries:
-                with zf.open(info) as page:
-                    page_digest = hashlib.sha256()
-                    for block in iter(lambda: page.read(1 << 20), b""):
-                        page_digest.update(block)
-                # Length-prefixed so that concatenating page digests cannot be
-                # confused with a different partition of the same bytes.
-                chain.update(page_digest.digest())
-    except (zipfile.BadZipFile, OSError, RuntimeError) as error:
+        return calculate_page_hashes(cbz_path).content_digest
+    except (ValueError, zipfile.BadZipFile, OSError, RuntimeError) as error:
         log.debug("Content fingerprint failed for %s: %s", cbz_path, error)
         return None
-    return chain.hexdigest()
 
 
 def _split_group_by_content(group: list[Path]) -> list[list[Path]]:
