@@ -951,9 +951,103 @@ def test_canonical_collision_is_refused_not_resolved_by_iteration_order(
     assert current == 1
 
 
+def test_same_archive_claim_with_another_spelling_is_revived_not_duplicated(
+    database: Path, tmp_path: Path
+):
+    """Reviving must target the existing row, not conflict on the path string.
+
+    ownership_refusal permits a single claim belonging to the archive being
+    repaired. If that row's recorded spelling differs from the repair's target
+    -- "X:/Manga/A.cbz" against "X:\\\\Manga\\\\A.cbz" -- an `ON CONFLICT(path)`
+    upsert does not match it, because SQLite compares the exact string. The
+    insert then ADDED a second row, leaving two rows resolving to one file:
+    precisely the collision the next run refuses, manufactured by a repair that
+    reported success.
+
+    After the fix exactly one row holds the canonical path, it is current, it
+    belongs to this archive, and it is the same row that existed before.
+    """
+    library = tmp_path / "lib"
+    payload = b"same archive other spelling"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "elsewhere" / "b.cbz"
+    _write_archive(target, payload)
+
+    forward = str(target).replace("\\", "/")
+    assert forward != str(target)
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (moving_id,)
+            ).fetchone()[0]
+        )
+        # The SAME archive already has a retired row for this file, recorded
+        # with forward slashes.
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 0, ?, 3)
+            """,
+            (moving_id, forward, size),
+        )
+        existing_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE path = ?", (forward,)
+            ).fetchone()[0]
+        )
+        connection.commit()
+
+    original.unlink()
+
+    repair = Repair(
+        archive_id=moving_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        outcome = apply_repairs(connection, [repair])
+        connection.commit()
+
+        rows = connection.execute(
+            "SELECT id, path, is_current, archive_id FROM file_locations "
+            "WHERE archive_id = ?",
+            (moving_id,),
+        ).fetchall()
+        owners = path_owners(connection)
+
+    assert len(outcome["applied"]) == 1
+    # One row per canonical path -- no manufactured collision.
+    assert len(owners[canonical_path(target)]) == 1
+    current = [r for r in rows if int(r["is_current"])]
+    assert len(current) == 1
+    # The pre-existing row was revived, not superseded by a new one.
+    assert int(current[0]["id"]) == existing_id
+    assert canonical_path(current[0]["path"]) == canonical_path(target)
+
+
 def test_ownership_refusal_allows_the_archives_own_single_row():
     """The refusal must not block an archive reclaiming its own path."""
-    claims = [PathClaim(archive_id=7, is_current=False, recorded_path="p")]
+    claims = [
+        PathClaim(
+            location_id=1, archive_id=7, is_current=False, recorded_path="p"
+        )
+    ]
 
     assert ownership_refusal(claims, 7) is None
     assert ownership_refusal([], 7) is None
