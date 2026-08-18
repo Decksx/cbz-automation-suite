@@ -19,29 +19,17 @@ Implemented foundations:
 - conservative Tier C candidate blocking and ordered comparison;
 - persistent review-only near-duplicate candidates.
 
-Last reconciled production state on 2026-07-30:
+Coverage, job counts, eligible-archive backlog, terminal failures, and
+candidate totals are maintained in `docs/implementation_roadmap.md` under
+"Current production metrics", dated and attributed to the guarded run that
+produced them. They are not repeated here, so this document cannot
+disagree with the roadmap.
 
-```text
-page SHA-256 rows:            2,955,304
-perceptual job rows:             25,700
-completed:                       25,623
-terminally failed:                   77
-pending / claimed / running:          0
-dHash Version 1 rows:          1,279,247
-pHash Version 1 rows:          1,279,247
-eligible archives remaining:      32,554
-near-duplicate candidates:             0
-```
-
-The latest optimized guarded batch processed 5,000 archives with 4,991
-successes, 8 legitimate terminal image-decoding failures, one scheduled
-retry, and exact pre/post reconciliation. It averaged approximately
-1,241 archives/hour across 250,423 successfully profiled pages.
-
-The read-only terminal-failure audit classifies the cumulative 77
-failures as 40 corrupt archives and 37 corrupt images. The separate
-source-drift retry completed successfully after the guarded command
-refreshed its stale WebP inventory to the current JPEG content.
+One caution when reading any candidate count: a near-duplicate total is
+the size of a generation run, not the size of the population. The first
+perceptual detection run stopped at its `--limit` rather than at
+exhaustion, and an earlier recorded value of zero meant the detection had
+never been run — not that it had run and found nothing.
 
 ## Safety policy
 
