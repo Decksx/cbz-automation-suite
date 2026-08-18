@@ -24,6 +24,7 @@ Specialized tools that remain separate for now:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from comic_automation.archive.page_hashing import calculate_page_hashes
 from scripts.cbz_routing import series_key
 
 
@@ -411,6 +413,71 @@ def _comicinfo_dup_key(cbz_path: Path) -> str | None:
     return f"{series}|v{volume}|n{number}"
 
 
+def _archive_content_fingerprint(cbz_path: Path) -> str | None:
+    """Return the archive's canonical ordered-page digest, or None if unreadable.
+
+    Delegates to `comic_automation.archive.page_hashing.calculate_page_hashes`,
+    the same implementation that produces `archive_content_signatures.digest`,
+    rather than computing a second opinion here.
+
+    That reuse is the point. An earlier revision hand-rolled its own digest and
+    diverged from the canonical one in two ways review caught: it sorted entry
+    names lexicographically instead of by natural key, and it hashed every
+    non-ComicInfo entry instead of only image extensions. Both change page
+    order or page membership, so two archives the rest of the system considers
+    different could produce the same maintenance fingerprint -- for instance by
+    re-zero-padding page names and redistributing content, since lexicographic
+    order puts "10.jpg" before "2.jpg" and natural order does not.
+
+    A deletion guard that disagrees with the system's own definition of page
+    order is not a guard, so there is now one definition and this is a caller
+    of it.
+
+    Returns None when the archive cannot be read, is not a CBZ, or contains no
+    image pages at all, so the caller isolates it rather than treating it as
+    matching other archives in the same state.
+
+    The zero-page case is not a corner: `calculate_page_hashes` hashes an empty
+    page sequence to one fixed digest, so every image-less archive shares it.
+    Accepting that digest would group two archives that have no page evidence
+    whatsoever and delete one of them -- deletion justified by the *absence* of
+    evidence, which is the same defect the guard exists to prevent.
+    `content_duplicate_audit` excludes `page_count = 0` for the same reason.
+    """
+    try:
+        result = calculate_page_hashes(cbz_path)
+    except (ValueError, zipfile.BadZipFile, OSError, RuntimeError) as error:
+        log.debug("Content fingerprint failed for %s: %s", cbz_path, error)
+        return None
+    if not result.pages:
+        log.debug("No image pages to fingerprint in %s", cbz_path)
+        return None
+    return result.content_digest
+
+
+def _split_group_by_content(group: list[Path]) -> list[list[Path]]:
+    """Partition *group* into subgroups whose page content is byte-identical.
+
+    ComicInfo metadata is written by upstream sources and is frequently wrong:
+    distinct chapters routinely share a Series/Volume/Number triple, and on
+    2026-08-17 a production run deleted 1,922 archives on that basis of which
+    only 68 were genuine duplicates. Metadata may therefore *propose* a group,
+    but content decides it.
+
+    Archives whose fingerprint cannot be read are returned as singletons, so an
+    unreadable file is never deleted as somebody else's duplicate.
+    """
+    by_content: dict[str, list[Path]] = {}
+    unreadable: list[list[Path]] = []
+    for path in group:
+        fingerprint = _archive_content_fingerprint(path)
+        if fingerprint is None:
+            unreadable.append([path])
+        else:
+            by_content.setdefault(fingerprint, []).append(path)
+    return list(by_content.values()) + unreadable
+
+
 def _resolve_dup_group(
     folder: Path,
     group: list[Path],
@@ -446,10 +513,14 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
 
     Two passes:
       1. Filename: files whose normalise_archive_key matches (insensitive to spacing
-         and punctuation, e.g. "Ch.1" vs "Ch. 1").
+         and punctuation, e.g. "Ch.1" vs "Ch. 1"). Like pass 2, a matching name
+         only proposes a group; identical page content decides it.
       2. Metadata (when *use_metadata*): among the pass-1 survivors, CBZ files whose
          ComicInfo.xml resolves to the same Series + Volume + Number — catches the
-         same chapter saved under completely different filenames.
+         same chapter saved under completely different filenames. Metadata only
+         *proposes* a group; members are deleted only when their page content is
+         identical, because upstream ComicInfo routinely collides across genuinely
+         different chapters.
     """
     stats = MaintenanceStats()
     files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in {".cbz", ".cbr"}]
@@ -465,8 +536,26 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
     for group in by_key.values():
         if len(group) < 2:
             survivors.extend(group)
-        else:
-            survivors.append(_resolve_dup_group(folder, group, dry_run, stats, by="name"))
+            continue
+        # The filename key is tighter than the metadata key, but "tighter" is
+        # not a safety property: two files whose names normalise alike can hold
+        # different chapters. Deletion is irreversible, so this pass requires
+        # the same content proof the metadata pass does.
+        for subgroup in _split_group_by_content(group):
+            if len(subgroup) >= 2:
+                survivors.append(
+                    _resolve_dup_group(
+                        folder, subgroup, dry_run, stats, by="name+content"
+                    )
+                )
+                continue
+            survivors.extend(subgroup)
+            stats.skipped += 1
+            log.info(
+                "  Kept (filename matched but content differs) [%s]: %s",
+                folder.name,
+                subgroup[0].name,
+            )
 
     # Pass 2 — ComicInfo metadata duplicates among survivors.
     if use_metadata and len(survivors) > 1:
@@ -478,8 +567,22 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
             if key is not None:
                 by_meta.setdefault(key, []).append(f)
         for group in by_meta.values():
-            if len(group) >= 2:
-                _resolve_dup_group(folder, group, dry_run, stats, by="metadata")
+            if len(group) < 2:
+                continue
+            # Metadata proposed these as the same chapter; require identical
+            # page content before any of them is deleted.
+            for subgroup in _split_group_by_content(group):
+                if len(subgroup) >= 2:
+                    _resolve_dup_group(
+                        folder, subgroup, dry_run, stats, by="metadata+content"
+                    )
+                    continue
+                stats.skipped += 1
+                log.info(
+                    "  Kept (metadata matched but content differs) [%s]: %s",
+                    folder.name,
+                    subgroup[0].name,
+                )
 
     return stats
 
