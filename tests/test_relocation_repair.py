@@ -18,7 +18,9 @@ import pytest
 
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
+from comic_automation.library import relocation_repair
 from comic_automation.library.relocation_repair import (
+    LocationRepairError,
     PathClaim,
     Repair,
     apply_repairs,
@@ -1039,6 +1041,213 @@ def test_same_archive_claim_with_another_spelling_is_revived_not_duplicated(
     # The pre-existing row was revived, not superseded by a new one.
     assert int(current[0]["id"]) == existing_id
     assert canonical_path(current[0]["path"]) == canonical_path(target)
+
+
+def test_a_failed_repair_rolls_back_the_retired_original(
+    database: Path, tmp_path: Path, monkeypatch
+):
+    """A repair that fails midway must leave the database exactly as it was.
+
+    The sequence this pins is the one that previously corrupted state:
+    the old location is retired, claiming the new one affects zero rows,
+    LocationRepairError is raised -- and because connect_database opens with
+    isolation_level=None, every statement had already committed, so nothing was
+    undone and the archive was left with no current location at all.
+
+    Failure is injected by pointing the ownership claim at a location_id that
+    does not exist, so the revive UPDATE matches nothing. Assertions run on the
+    SAME connection, so they see the post-rollback state rather than a fresh
+    read that might mask an uncommitted change.
+    """
+    library = tmp_path / "lib"
+    payload = b"rollback payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "orig" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "new" / "a.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        archive_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (archive_id,)
+            ).fetchone()[0]
+        )
+        connection.commit()
+
+    original.unlink()
+
+    real_path_owners = relocation_repair.path_owners
+
+    def broken_owners(connection):
+        owners = real_path_owners(connection)
+        # A claim for the target that this archive owns, but whose row id does
+        # not exist: the revive UPDATE will affect zero rows.
+        owners[canonical_path(target)] = [
+            PathClaim(
+                location_id=999_999,
+                archive_id=archive_id,
+                is_current=False,
+                recorded_path=str(target),
+            )
+        ]
+        return owners
+
+    monkeypatch.setattr(relocation_repair, "path_owners", broken_owners)
+
+    repair = Repair(
+        archive_id=archive_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+
+        signature_before = connection.execute(
+            "SELECT source_file_size, source_modified_time_ns "
+            "FROM archive_content_signatures WHERE archive_id = ?",
+            (archive_id,),
+        ).fetchone()
+
+        with pytest.raises(LocationRepairError):
+            apply_repairs(connection, [repair])
+
+        # Same connection: this is the state the failed run actually left.
+        rows = connection.execute(
+            "SELECT path, is_current FROM file_locations WHERE archive_id = ?",
+            (archive_id,),
+        ).fetchall()
+        signature_after = connection.execute(
+            "SELECT source_file_size, source_modified_time_ns "
+            "FROM archive_content_signatures WHERE archive_id = ?",
+            (archive_id,),
+        ).fetchone()
+
+    # The original location is intact and still current -- not retired.
+    assert [(r["path"], int(r["is_current"])) for r in rows] == [(str(original), 1)]
+    # And no partial evidence refresh survived.
+    assert (
+        signature_after["source_file_size"],
+        signature_after["source_modified_time_ns"],
+    ) == (
+        signature_before["source_file_size"],
+        signature_before["source_modified_time_ns"],
+    )
+
+
+def test_a_later_failure_rolls_back_earlier_repairs_in_the_batch(
+    database: Path, tmp_path: Path, monkeypatch
+):
+    """All or nothing across the batch, not per repair.
+
+    A fatal error on the second repair must not leave the first committed. The
+    old code committed each statement as it ran, so "one transaction" was a
+    claim the implementation never made true.
+    """
+    library = tmp_path / "lib"
+    good_payload = b"first repair payload"
+    bad_payload = b"second repair payload"
+    good_digest = hashlib.sha256(good_payload).hexdigest()
+    bad_digest = hashlib.sha256(bad_payload).hexdigest()
+
+    good_original = library / "orig" / "good.cbz"
+    bad_original = library / "orig" / "bad.cbz"
+    _write_archive(good_original, good_payload)
+    _write_archive(bad_original, bad_payload)
+    good_target = library / "new" / "good.cbz"
+    bad_target = library / "new" / "bad.cbz"
+    _write_archive(good_target, good_payload)
+    _write_archive(bad_target, bad_payload)
+
+    with database_connection(database) as connection:
+        good_id = _seed(
+            connection,
+            path=good_original,
+            digest=good_digest,
+            size=good_original.stat().st_size,
+            mtime_ns=1,
+        )
+        bad_id = _seed(
+            connection,
+            path=bad_original,
+            digest=bad_digest,
+            size=bad_original.stat().st_size,
+            mtime_ns=2,
+        )
+        ids = {
+            int(row[0]): int(row[1])
+            for row in connection.execute(
+                "SELECT archive_id, id FROM file_locations"
+            )
+        }
+        connection.commit()
+
+    good_original.unlink()
+    bad_original.unlink()
+
+    real_path_owners = relocation_repair.path_owners
+
+    def broken_owners(connection):
+        owners = real_path_owners(connection)
+        owners[canonical_path(bad_target)] = [
+            PathClaim(
+                location_id=999_999,
+                archive_id=bad_id,
+                is_current=False,
+                recorded_path=str(bad_target),
+            )
+        ]
+        return owners
+
+    monkeypatch.setattr(relocation_repair, "path_owners", broken_owners)
+
+    repairs = [
+        Repair(
+            archive_id=good_id,
+            location_id=ids[good_id],
+            old_path=str(good_original),
+            new_path=str(good_target),
+            new_size=good_target.stat().st_size,
+            new_mtime_ns=good_target.stat().st_mtime_ns,
+            sha256=good_digest,
+            kind="moved",
+        ),
+        Repair(
+            archive_id=bad_id,
+            location_id=ids[bad_id],
+            old_path=str(bad_original),
+            new_path=str(bad_target),
+            new_size=bad_target.stat().st_size,
+            new_mtime_ns=bad_target.stat().st_mtime_ns,
+            sha256=bad_digest,
+            kind="moved",
+        ),
+    ]
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        with pytest.raises(LocationRepairError):
+            apply_repairs(connection, repairs)
+
+        good_rows = connection.execute(
+            "SELECT path, is_current FROM file_locations WHERE archive_id = ?",
+            (good_id,),
+        ).fetchall()
+
+    # The FIRST repair succeeded before the second failed, and must be gone.
+    assert [(r["path"], int(r["is_current"])) for r in good_rows] == [
+        (str(good_original), 1)
+    ]
 
 
 def test_ownership_refusal_allows_the_archives_own_single_row():
