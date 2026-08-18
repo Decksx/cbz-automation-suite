@@ -33,6 +33,28 @@ MIGRATIONS = (
     / "migrations"
 )
 
+# The audit stats every member's path, so seeded archives must exist on disk.
+# Tests still name archives with readable pseudo-paths; each is materialised as
+# a real file under a per-test library and _real() maps one to the other, so a
+# test can delete or corrupt a specific member.
+_LIBRARY: Path | None = None
+_REAL: dict[str, Path] = {}
+
+
+@pytest.fixture(autouse=True)
+def _library(tmp_path: Path):
+    global _LIBRARY
+    _LIBRARY = tmp_path / "library"
+    _LIBRARY.mkdir()
+    _REAL.clear()
+    yield
+    _LIBRARY = None
+
+
+def _real(fake_path: str) -> Path:
+    """The on-disk file standing in for a seeded pseudo-path."""
+    return _REAL[fake_path]
+
 
 def _seed(
     connection: sqlite3.Connection,
@@ -59,15 +81,24 @@ def _seed(
             "INSERT INTO archive_files (file_size) VALUES (?)", (file_size,)
         ).lastrowid
     )
+    source_mtime_ns = 1000
     if path is not None:
+        recorded_size = file_size if location_size is None else location_size
+        real = _LIBRARY / path.replace(":", "").replace("\\", "_").lstrip("_")
+        real.write_bytes(b"x" * recorded_size)
+        _REAL[path] = real
+        # The signature and the location must agree by default, so that
+        # signature_is_stale isolates deliberate drift rather than firing on
+        # every fixture. Tests induce drift via location_size.
+        source_mtime_ns = real.stat().st_mtime_ns
         connection.execute(
             """
             INSERT INTO file_locations (
                 archive_id, path, file_size, modified_time_ns, is_current
             )
-            VALUES (?, ?, ?, 1000, 1)
+            VALUES (?, ?, ?, ?, 1)
             """,
-            (archive_id, path, file_size if location_size is None else location_size),
+            (archive_id, str(real), recorded_size, source_mtime_ns),
         )
     connection.execute(
         """
@@ -75,7 +106,7 @@ def _seed(
             archive_id, algorithm, algorithm_version, digest,
             page_count, image_bytes, source_file_size, source_modified_time_ns
         )
-        VALUES (?, ?, ?, ?, ?, 1024, ?, 1000)
+        VALUES (?, ?, ?, ?, ?, 1024, ?, ?)
         """,
         (
             archive_id,
@@ -84,6 +115,7 @@ def _seed(
             digest,
             page_count,
             file_size,
+            source_mtime_ns,
         ),
     )
     if archive_sha256 is not None:
@@ -247,6 +279,62 @@ def test_summary_separates_actionable_from_total(database: Path):
     assert summary["group_count"] == 2
     assert summary["actionable_groups"] == 1
     assert summary["groups_with_stale_members"] == 1
+
+
+def test_member_missing_from_disk_makes_a_group_not_actionable(database: Path):
+    """The exact condition that failed 79 jobs on 2026-08-17.
+
+    The row is current and its recorded size and mtime still agree with the
+    signature -- no database drift at all -- but the file has been deleted
+    underneath it. Only a stat can see this, and an earlier revision that
+    checked provenance alone reported such a member as actionable.
+    """
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\present.cbz", digest="aaa")
+        _seed(connection, path=r"X:\deleted.cbz", digest="aaa")
+
+    _real(r"X:\deleted.cbz").unlink()
+
+    group = _groups(database)[0]
+
+    assert group["stale_member_count"] == 0  # no row drift whatsoever
+    assert group["absent_member_count"] == 1
+    assert group["actionable"] is False
+    states = sorted(m["live_state"] for m in group["members"])
+    assert states == ["missing", "present"]
+
+
+def test_member_whose_live_metadata_moved_is_not_actionable(database: Path):
+    """A file rewritten in place is not the file the signature describes."""
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\stable.cbz", digest="aaa")
+        _seed(connection, path=r"X:\rewritten.cbz", digest="aaa")
+
+    _real(r"X:\rewritten.cbz").write_bytes(b"y" * 4096)
+
+    group = _groups(database)[0]
+
+    assert group["absent_member_count"] == 1
+    assert group["actionable"] is False
+    assert "metadata_mismatch" in {m["live_state"] for m in group["members"]}
+
+
+def test_no_stat_marks_everything_unchecked_and_nothing_actionable(database: Path):
+    """Unchecked is not verified.
+
+    --no-stat exists for an unreachable library, and it must not be a way to
+    make groups look actionable by declining to look.
+    """
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\a.cbz", digest="aaa")
+        _seed(connection, path=r"X:\b.cbz", digest="aaa")
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        groups = collect_duplicate_groups(connection, stat_paths=False)
+
+    assert {m["live_state"] for m in groups[0]["members"]} == {"unchecked"}
+    assert groups[0]["actionable"] is False
 
 
 def test_byte_identical_flag_distinguishes_recompressed_copies(database: Path):
