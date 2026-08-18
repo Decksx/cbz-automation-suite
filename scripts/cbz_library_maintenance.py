@@ -24,6 +24,7 @@ Specialized tools that remain separate for now:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -412,31 +413,59 @@ def _comicinfo_dup_key(cbz_path: Path) -> str | None:
 
 
 def _archive_content_fingerprint(cbz_path: Path) -> str | None:
-    """Return a fingerprint of a CBZ's stored page content, or None if unreadable.
+    """Return an ordered cryptographic digest of a CBZ's page content.
 
-    Built from the zip central directory only -- each entry's CRC32 and
-    uncompressed size -- so it costs a directory read rather than a full
-    decompress, yet still distinguishes archives whose pages actually differ.
+    SHA-256 over each page's own SHA-256, taken in page order. Two properties
+    matter and both are load-bearing for an irreversible delete:
 
-    Entry *names* are deliberately excluded: the same pages renamed (a common
-    difference between scanlation releases of one chapter) must still compare
-    equal, otherwise the guard would reject genuine duplicates. ComicInfo.xml
-    is excluded for the same reason -- update_comicinfo_xml rewrites it per
-    file, so including it would make every archive unique.
+    * **Cryptographic.** An earlier revision used CRC32 plus entry size read
+      from the zip central directory. That is a 32-bit checksum chosen for
+      detecting accidental corruption, and collisions are cheap to construct
+      and possible by chance across a library this size. A checksum collision
+      would have equated different bytes and deleted one of them.
+    * **Ordered.** That revision also sorted the entries, which discards page
+      order. The same pages bound in a different order are a different comic,
+      not a duplicate.
+
+    Pages are ordered by entry name, which is how every reader and this
+    codebase's own inspection derive page order. Renaming pages without
+    changing their sort order therefore still compares equal, which is the
+    property that lets genuinely duplicate releases collapse.
+
+    ComicInfo.xml is excluded because update_comicinfo_xml rewrites it per
+    file; including it would make every archive unique and no real duplicate
+    would ever be found.
+
+    Returns None if the archive cannot be read, so the caller can isolate it
+    rather than treat it as matching other unreadable files. This reads and
+    decompresses every page, which is far more expensive than a central
+    directory scan -- that cost is deliberate, because the result authorises
+    deleting a file.
     """
     try:
         with zipfile.ZipFile(cbz_path) as zf:
-            entries = sorted(
-                (info.CRC, info.file_size)
+            entries = [
+                info
                 for info in zf.infolist()
                 if not info.is_dir()
                 and os.path.basename(info.filename).lower() != "comicinfo.xml"
-            )
-    except (zipfile.BadZipFile, OSError):
+            ]
+            entries.sort(key=lambda info: info.filename)
+            if not entries:
+                return None
+            chain = hashlib.sha256()
+            for info in entries:
+                with zf.open(info) as page:
+                    page_digest = hashlib.sha256()
+                    for block in iter(lambda: page.read(1 << 20), b""):
+                        page_digest.update(block)
+                # Length-prefixed so that concatenating page digests cannot be
+                # confused with a different partition of the same bytes.
+                chain.update(page_digest.digest())
+    except (zipfile.BadZipFile, OSError, RuntimeError) as error:
+        log.debug("Content fingerprint failed for %s: %s", cbz_path, error)
         return None
-    if not entries:
-        return None
-    return ";".join(f"{crc:08x}:{size}" for crc, size in entries)
+    return chain.hexdigest()
 
 
 def _split_group_by_content(group: list[Path]) -> list[list[Path]]:
@@ -497,7 +526,8 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
 
     Two passes:
       1. Filename: files whose normalise_archive_key matches (insensitive to spacing
-         and punctuation, e.g. "Ch.1" vs "Ch. 1").
+         and punctuation, e.g. "Ch.1" vs "Ch. 1"). Like pass 2, a matching name
+         only proposes a group; identical page content decides it.
       2. Metadata (when *use_metadata*): among the pass-1 survivors, CBZ files whose
          ComicInfo.xml resolves to the same Series + Volume + Number — catches the
          same chapter saved under completely different filenames. Metadata only
@@ -519,8 +549,26 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
     for group in by_key.values():
         if len(group) < 2:
             survivors.extend(group)
-        else:
-            survivors.append(_resolve_dup_group(folder, group, dry_run, stats, by="name"))
+            continue
+        # The filename key is tighter than the metadata key, but "tighter" is
+        # not a safety property: two files whose names normalise alike can hold
+        # different chapters. Deletion is irreversible, so this pass requires
+        # the same content proof the metadata pass does.
+        for subgroup in _split_group_by_content(group):
+            if len(subgroup) >= 2:
+                survivors.append(
+                    _resolve_dup_group(
+                        folder, subgroup, dry_run, stats, by="name+content"
+                    )
+                )
+                continue
+            survivors.extend(subgroup)
+            stats.skipped += 1
+            log.info(
+                "  Kept (filename matched but content differs) [%s]: %s",
+                folder.name,
+                subgroup[0].name,
+            )
 
     # Pass 2 — ComicInfo metadata duplicates among survivors.
     if use_metadata and len(survivors) > 1:
