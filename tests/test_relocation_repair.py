@@ -1250,6 +1250,89 @@ def test_a_later_failure_rolls_back_earlier_repairs_in_the_batch(
     ]
 
 
+class _FailingCommitConnection:
+    """Delegates to a real connection but makes COMMIT fail.
+
+    A proxy rather than a monkeypatched method because sqlite3.Connection is a
+    C type and does not accept attribute assignment. Only the surface
+    apply_repairs actually uses is forwarded, so a future call it does not
+    cover shows up as an AttributeError rather than silently bypassing the
+    injected failure.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def execute(self, sql: str, *args):
+        if sql.strip().upper().startswith("COMMIT"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, *args)
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+
+def test_a_failing_commit_still_rolls_back(database: Path, tmp_path: Path):
+    """COMMIT can fail on its own, and that must not skip the rollback.
+
+    A full disk or an I/O error at commit time is the case an earlier revision
+    missed by placing COMMIT after the try block: the exception escaped without
+    rollback, so the transaction stayed open and its uncommitted changes were
+    still visible on the connection -- the opposite of "the caller sees the
+    database as it was".
+    """
+    library = tmp_path / "lib"
+    payload = b"commit failure payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "orig" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "new" / "a.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        archive_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (archive_id,)
+            ).fetchone()[0]
+        )
+        connection.commit()
+
+    original.unlink()
+
+    repair = Repair(
+        archive_id=archive_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+
+        with pytest.raises(sqlite3.OperationalError):
+            apply_repairs(_FailingCommitConnection(connection), [repair])
+
+        # The transaction must be closed, not left open holding the changes.
+        assert connection.in_transaction is False
+
+        rows = connection.execute(
+            "SELECT path, is_current FROM file_locations WHERE archive_id = ?",
+            (archive_id,),
+        ).fetchall()
+
+    # Same connection: the original location survived the failed commit intact.
+    assert [(r["path"], int(r["is_current"])) for r in rows] == [(str(original), 1)]
+
+
 def test_ownership_refusal_allows_the_archives_own_single_row():
     """The refusal must not block an archive reclaiming its own path."""
     claims = [
