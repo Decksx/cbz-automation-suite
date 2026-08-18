@@ -302,13 +302,31 @@ def find_broken_locations(connection: sqlite3.Connection) -> list[BrokenLocation
     return broken
 
 
-def index_roots(roots: Iterable[Path]) -> dict[int, list[Path]]:
+def index_roots(
+    roots: Iterable[Path], exclude: Iterable[str] = ()
+) -> dict[int, list[Path]]:
     """Index archive files under *roots* by size.
 
     Size is a cheap, highly selective narrowing filter that costs one stat per
     file. It is never treated as identity -- every candidate it proposes is
     still hashed before use.
+
+    *exclude* names directories that are not library locations even though they
+    sit under a library root. A backup or version-history area holds bytes that
+    hash identically to a live archive, so without this the search treats it as
+    a move target: measured on 2026-08-18 against the real library, seven
+    repairs would have re-pointed an archive's current location into Syncthing's
+    ``.stversions`` -- a directory Syncthing prunes on its own schedule and
+    Komga does not serve -- and all twenty-one ambiguous cases were a live file
+    tied with its own version snapshot.
+
+    Matching is on the directory *name*, case-folded, not on a path substring:
+    a file named ``.stversions.cbz`` and a directory named ``my.stversions.bak``
+    are both still indexed. An excluded directory is pruned with its whole
+    subtree. Roots themselves are never excluded -- passing a root is an
+    explicit instruction to search it.
     """
+    excluded = {name.casefold() for name in exclude}
     by_size: dict[int, list[Path]] = {}
     for root in roots:
         stack = [str(root)]
@@ -319,7 +337,8 @@ def index_roots(roots: Iterable[Path]) -> dict[int, list[Path]]:
                     for entry in entries:
                         try:
                             if entry.is_dir(follow_symlinks=False):
-                                stack.append(entry.path)
+                                if entry.name.casefold() not in excluded:
+                                    stack.append(entry.path)
                                 continue
                             if not entry.is_file(follow_symlinks=False):
                                 continue
@@ -902,6 +921,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Library root to search for moved files. Repeatable.",
     )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="DIRNAME",
+        help=(
+            "Directory name that is not a library location, matched "
+            "case-insensitively against each directory found under a root and "
+            "pruned with its subtree. Repeatable. Use for backup and "
+            "version-history areas such as .stversions, whose contents hash "
+            "identically to live archives and would otherwise look like move "
+            "targets. Roots themselves are never excluded."
+        ),
+    )
     parser.add_argument("--limit", type=int, help="Cap repairs planned.")
     parser.add_argument(
         "--confirm",
@@ -925,7 +958,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing = [b for b in broken if b.state == "missing"]
         drifted = [b for b in broken if b.state == "metadata_drift"]
         unreadable = [b for b in broken if b.state == "unreadable"]
-        by_size = index_roots(args.root) if (missing and args.root) else {}
+        by_size = (
+            index_roots(args.root, args.exclude)
+            if (missing and args.root)
+            else {}
+        )
         plan = plan_repairs(broken, by_size, owners=owners)
 
         if args.limit is not None:
