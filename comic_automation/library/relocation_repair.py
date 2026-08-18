@@ -100,6 +100,15 @@ ARCHIVE_SUFFIXES = {".cbz", ".cbr"}
 HASH_CHUNK_BYTES = 8 << 20
 
 
+class LocationRepairError(RuntimeError):
+    """A repair could not be completed without corrupting location state.
+
+    Raised rather than collected into `skipped`, because the conditions that
+    produce it mean an invariant this module relies on is already broken. The
+    caller's transaction must be rolled back, not partially committed.
+    """
+
+
 @dataclass(frozen=True)
 class BrokenLocation:
     """An archive whose recorded current location does not describe reality."""
@@ -489,17 +498,25 @@ def apply_repairs(
                 }
             )
             continue
+        # Ownership is checked across EVERY row for this path, not only current
+        # ones. file_locations.path is UNIQUE, so a retired row belonging to
+        # another archive still occupies it. An earlier revision filtered on
+        # is_current = 1 and missed exactly that: the archive's old location was
+        # retired, the conditional upsert then matched nothing because the
+        # archive ids differed, and the archive was left with NO current
+        # location at all -- while the signature was still refreshed and the
+        # repair reported as applied.
         owner = connection.execute(
-            "SELECT archive_id FROM file_locations "
-            "WHERE path = ? AND is_current = 1",
+            "SELECT archive_id, is_current FROM file_locations WHERE path = ?",
             (repair.new_path,),
         ).fetchone()
         if owner is not None and int(owner[0]) != repair.archive_id:
+            state = "current" if int(owner[1]) else "retired"
             skipped.append(
                 {
                     "archive_id": repair.archive_id,
                     "reason": (
-                        f"path is the current location of archive {int(owner[0])}"
+                        f"path is the {state} location of archive {int(owner[0])}"
                     ),
                 }
             )
@@ -585,7 +602,7 @@ def apply_repairs(
             # There is deliberately no ON CONFLICT clause that reassigns
             # archive_id: an earlier revision had one, and it silently
             # transferred a live path from one archive to another.
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO file_locations (
                     archive_id, path, is_current, file_size, modified_time_ns,
@@ -601,6 +618,18 @@ def apply_repairs(
                 """,
                 (repair.archive_id, repair.new_path, stat.st_size, stat.st_mtime_ns),
             )
+            # The conditional upsert can legitimately match zero rows, and a
+            # silent no-op here is the failure mode that leaves an archive with
+            # its old location retired and no new one. The ownership check above
+            # should make this unreachable; if it is ever reached, the guard is
+            # wrong and the whole run must fail rather than commit a partial
+            # repair.
+            if cursor.rowcount != 1:
+                raise LocationRepairError(
+                    "Refusing to leave archive "
+                    f"{repair.archive_id} without a current location: claiming "
+                    f"{repair.new_path!r} affected {cursor.rowcount} rows."
+                )
         # Re-establish the signature's source metadata. Two things had to be
         # true before reaching here, and neither alone is sufficient: the live
         # bytes match the stored archive digest, AND the archive hash and the
