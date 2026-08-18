@@ -36,16 +36,32 @@ Both are repaired only on proof: the candidate's SHA-256 must equal the digest
 stored in ``archive_hashes``. Filename and size are used to *narrow* the
 search cheaply; they never establish identity.
 
-Why refreshing recorded metadata is safe here, and only here
-------------------------------------------------------------
+Why refreshing recorded metadata needs two proofs, not one
+----------------------------------------------------------
 
 ``docs`` and the batch preflight both warn against "fitting fresh metadata
 around stale evidence" -- updating ``archive_content_signatures.source_*`` to
-agree with a live file asserts a consistency nobody verified. That warning
-applies when the file's content is *unknown*. It does not apply here: this
-module refreshes recorded size and mtime only after proving, by full-file
-SHA-256, that the bytes are the ones the signature was computed from. The
-evidence is re-established, not assumed.
+agree with a live file asserts a consistency nobody verified.
+
+An earlier revision of this module answered that warning with a single check:
+the live file's SHA-256 equals ``archive_hashes.digest``. Review rejected that
+reasoning and was right to. That check proves which bytes the *archive hash
+row* describes. It proves nothing about ``archive_content_signatures``, which
+is written by a different stage: if a file changed and only the archive hash
+was recomputed, the hash describes the new bytes while the page signature still
+describes the old ones, and refreshing ``source_*`` would launder that stale
+page evidence into looking current.
+
+Two conditions are therefore required before any refresh:
+
+1. the live file's SHA-256 equals the stored archive digest, and
+2. ``archive_hashes`` and ``archive_content_signatures`` record the *same*
+   observed file size and mtime -- see ``BrokenLocation.evidence_is_coherent``.
+
+The second is what makes the two rows descriptions of one file state rather
+than two unrelated observations. An archive failing it is reported as needing
+reinspection and is never repaired: recomputing page evidence is a different
+operation with a different cost, and it is not this module's job to fake it.
 
 Guarding
 --------
@@ -63,6 +79,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -71,6 +88,8 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from comic_automation.database.connection import database_connection
+
+log = logging.getLogger(__name__)
 
 SHA256_ALGORITHM = "sha256"
 SHA256_VERSION = "1"
@@ -91,7 +110,36 @@ class BrokenLocation:
     recorded_size: int | None
     recorded_mtime_ns: int | None
     stored_sha256: str | None
-    state: str  # "missing" | "metadata_drift"
+    state: str  # "missing" | "metadata_drift" | "unreadable"
+    # Provenance: the file state each evidence row was computed from. Repair
+    # may only refresh the page signature when these agree, because agreeing
+    # is what makes them descriptions of the same bytes rather than two
+    # unrelated observations.
+    hash_file_size: int | None = None
+    hash_mtime_ns: int | None = None
+    signature_source_size: int | None = None
+    signature_source_mtime_ns: int | None = None
+
+    @property
+    def evidence_is_coherent(self) -> bool:
+        """True when the archive hash and the page signature describe one state.
+
+        `archive_hashes` and `archive_content_signatures` are written by
+        separate stages and can drift apart: if a file changed and only the
+        archive hash was recomputed, the hash describes the new bytes while the
+        page signature still describes the old ones. Verifying a live file
+        against the hash digest then proves nothing about the signature.
+
+        Requiring both rows to record the same observed size and mtime is what
+        turns "these bytes match the hash row" into "these bytes are what the
+        page evidence was computed from".
+        """
+        return (
+            self.hash_file_size is not None
+            and self.signature_source_size is not None
+            and self.hash_file_size == self.signature_source_size
+            and self.hash_mtime_ns == self.signature_source_mtime_ns
+        )
 
 
 @dataclass(frozen=True)
@@ -152,51 +200,64 @@ def find_broken_locations(connection: sqlite3.Connection) -> list[BrokenLocation
             fl.path             AS path,
             fl.file_size        AS recorded_size,
             fl.modified_time_ns AS recorded_mtime_ns,
-            ah.digest           AS stored_sha256
+            ah.digest           AS stored_sha256,
+            ah.file_size        AS hash_file_size,
+            ah.modified_time_ns AS hash_mtime_ns,
+            acs.source_file_size        AS signature_source_size,
+            acs.source_modified_time_ns AS signature_source_mtime_ns
         FROM file_locations AS fl
         LEFT JOIN archive_hashes AS ah
           ON ah.archive_id = fl.archive_id
          AND ah.algorithm = ?
          AND ah.algorithm_version = ?
+        LEFT JOIN archive_content_signatures AS acs
+          ON acs.archive_id = fl.archive_id
         WHERE fl.is_current = 1
         ORDER BY fl.archive_id
         """,
         (SHA256_ALGORITHM, SHA256_VERSION),
     ).fetchall()
 
+    def _broken(row, state: str) -> BrokenLocation:
+        return BrokenLocation(
+            archive_id=int(row["archive_id"]),
+            location_id=int(row["location_id"]),
+            recorded_path=str(row["path"]),
+            recorded_size=row["recorded_size"],
+            recorded_mtime_ns=row["recorded_mtime_ns"],
+            stored_sha256=row["stored_sha256"],
+            state=state,
+            hash_file_size=row["hash_file_size"],
+            hash_mtime_ns=row["hash_mtime_ns"],
+            signature_source_size=row["signature_source_size"],
+            signature_source_mtime_ns=row["signature_source_mtime_ns"],
+        )
+
     broken: list[BrokenLocation] = []
     for row in rows:
         path = str(row["path"])
         try:
             stat = os.stat(path)
-        except OSError:
-            broken.append(
-                BrokenLocation(
-                    archive_id=int(row["archive_id"]),
-                    location_id=int(row["location_id"]),
-                    recorded_path=path,
-                    recorded_size=row["recorded_size"],
-                    recorded_mtime_ns=row["recorded_mtime_ns"],
-                    stored_sha256=row["stored_sha256"],
-                    state="missing",
-                )
-            )
+        except FileNotFoundError:
+            # Genuinely absent: the only state a relocation search should act
+            # on.
+            broken.append(_broken(row, "missing"))
+            continue
+        except OSError as error:
+            # A permission failure or a transient I/O error says nothing about
+            # whether the file is there. Treating it as "missing" would send
+            # repair hunting for a replacement for a file that exists and is
+            # merely unreadable right now, and could re-point the archive at a
+            # different copy. Classified separately so it is reported and
+            # skipped rather than acted on.
+            broken.append(_broken(row, "unreadable"))
+            log.debug("Cannot stat %s: %s", path, error)
             continue
         if (
             stat.st_size != row["recorded_size"]
             or stat.st_mtime_ns != row["recorded_mtime_ns"]
         ):
-            broken.append(
-                BrokenLocation(
-                    archive_id=int(row["archive_id"]),
-                    location_id=int(row["location_id"]),
-                    recorded_path=path,
-                    recorded_size=row["recorded_size"],
-                    recorded_mtime_ns=row["recorded_mtime_ns"],
-                    stored_sha256=row["stored_sha256"],
-                    state="metadata_drift",
-                )
-            )
+            broken.append(_broken(row, "metadata_drift"))
     return broken
 
 
@@ -246,9 +307,27 @@ def plan_repairs(
     never point two archives at one file.
     """
     known = {p.lower() for p in (known_paths or set())}
+    # Targets claimed by earlier repairs in this same plan. Without this, two
+    # archives that share a stored digest -- which is exactly what a duplicate
+    # pair is, and there are 886 such groups in production -- can both select
+    # the same unclaimed file, and the apply would hand it to whichever ran
+    # last.
+    reserved: set[str] = set()
     plan = RepairPlan()
 
     for item in broken:
+        if item.state == "unreadable":
+            plan.unresolved.append(
+                {
+                    "archive_id": item.archive_id,
+                    "path": item.recorded_path,
+                    "state": item.state,
+                    "reason": "path could not be read (permission or I/O), "
+                    "which is not evidence of absence",
+                }
+            )
+            continue
+
         if not item.stored_sha256:
             plan.unresolved.append(
                 {
@@ -256,6 +335,27 @@ def plan_repairs(
                     "path": item.recorded_path,
                     "state": item.state,
                     "reason": "no stored sha256 to verify against",
+                }
+            )
+            continue
+
+        if not item.evidence_is_coherent:
+            # The archive hash and the page signature were computed from
+            # different observed file states, so verifying against the hash
+            # proves nothing about the page evidence. Refreshing source_* here
+            # would launder stale page evidence into looking current.
+            plan.unresolved.append(
+                {
+                    "archive_id": item.archive_id,
+                    "path": item.recorded_path,
+                    "state": item.state,
+                    "reason": "archive hash and page signature describe "
+                    "different file states; needs reinspection, not repair",
+                    "hash_state": [item.hash_file_size, item.hash_mtime_ns],
+                    "signature_state": [
+                        item.signature_source_size,
+                        item.signature_source_mtime_ns,
+                    ],
                 }
             )
             continue
@@ -306,6 +406,7 @@ def plan_repairs(
             candidate
             for candidate in by_size.get(item.recorded_size or -1, [])
             if str(candidate).lower() not in known
+            and str(candidate).lower() not in reserved
         ]
         verified = []
         for candidate in candidates:
@@ -318,6 +419,8 @@ def plan_repairs(
         if len(verified) == 1:
             target = verified[0]
             stat = target.stat()
+            # Claim it, so no later archive in this plan can select it too.
+            reserved.add(str(target).lower())
             plan.repairs.append(
                 Repair(
                     archive_id=item.archive_id,
@@ -368,11 +471,61 @@ def apply_repairs(
     applied: list[dict] = []
     skipped: list[dict] = []
 
+    applied_paths: set[str] = set()
+
     for repair in repairs:
         target = Path(repair.new_path)
+
+        # A path may be claimed by only one archive. Two archives that share a
+        # stored digest can both have selected this file, and a path can also
+        # be claimed by a scan that ran after the plan was made. Refuse rather
+        # than transfer: silently re-pointing a live location at a different
+        # archive merges two identities and strands one archive's evidence.
+        if repair.new_path.lower() in applied_paths:
+            skipped.append(
+                {
+                    "archive_id": repair.archive_id,
+                    "reason": "another repair in this run already claimed this path",
+                }
+            )
+            continue
+        owner = connection.execute(
+            "SELECT archive_id FROM file_locations "
+            "WHERE path = ? AND is_current = 1",
+            (repair.new_path,),
+        ).fetchone()
+        if owner is not None and int(owner[0]) != repair.archive_id:
+            skipped.append(
+                {
+                    "archive_id": repair.archive_id,
+                    "reason": (
+                        f"path is the current location of archive {int(owner[0])}"
+                    ),
+                }
+            )
+            continue
+
+        # The location row must still be the one that was planned against. If
+        # it is no longer current, something else repaired, quarantined or
+        # retired this archive in the meantime and this plan is describing a
+        # state that has moved.
+        location = connection.execute(
+            "SELECT path, is_current FROM file_locations WHERE id = ?",
+            (repair.location_id,),
+        ).fetchone()
+        if location is None or not int(location[1]) or str(location[0]) != repair.old_path:
+            skipped.append(
+                {
+                    "archive_id": repair.archive_id,
+                    "reason": "original location changed since planning",
+                }
+            )
+            continue
+
         try:
-            stat = target.stat()
+            stat_before = target.stat()
             actual = sha256_file(target)
+            stat_after = target.stat()
         except OSError as error:
             skipped.append(
                 {"archive_id": repair.archive_id, "reason": f"unreadable: {error}"}
@@ -386,6 +539,20 @@ def apply_repairs(
                 }
             )
             continue
+        if (
+            stat_before.st_size,
+            stat_before.st_mtime_ns,
+        ) != (stat_after.st_size, stat_after.st_mtime_ns):
+            # The file changed while it was being read, so the digest just
+            # computed describes neither the before nor the after state.
+            skipped.append(
+                {
+                    "archive_id": repair.archive_id,
+                    "reason": "file changed while it was being hashed",
+                }
+            )
+            continue
+        stat = stat_after
 
         if repair.new_path == repair.old_path:
             # The file never moved; only its recorded metadata was stale. There
@@ -412,6 +579,12 @@ def apply_repairs(
                 """,
                 (repair.location_id,),
             )
+            # A retired row for this path may already exist (this archive, or
+            # another, was seen here before). Reviving it is safe only because
+            # the ownership check above proved no *current* row claims it.
+            # There is deliberately no ON CONFLICT clause that reassigns
+            # archive_id: an earlier revision had one, and it silently
+            # transferred a live path from one archive to another.
             connection.execute(
                 """
                 INSERT INTO file_locations (
@@ -420,17 +593,22 @@ def apply_repairs(
                 )
                 VALUES (?, ?, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT(path) DO UPDATE SET
-                    archive_id = excluded.archive_id,
                     is_current = 1,
                     file_size = excluded.file_size,
                     modified_time_ns = excluded.modified_time_ns,
                     last_seen_at = CURRENT_TIMESTAMP
+                WHERE file_locations.archive_id = excluded.archive_id
                 """,
                 (repair.archive_id, repair.new_path, stat.st_size, stat.st_mtime_ns),
             )
-        # Re-establish the signature's source metadata. Safe only because the
-        # content was just proven identical by full-file SHA-256; without that
-        # proof this would assert a consistency nobody verified.
+        # Re-establish the signature's source metadata. Two things had to be
+        # true before reaching here, and neither alone is sufficient: the live
+        # bytes match the stored archive digest, AND the archive hash and the
+        # page signature were computed from the same observed file state
+        # (BrokenLocation.evidence_is_coherent). Without the second, matching
+        # the hash would prove only which bytes the hash row describes, and
+        # this UPDATE would launder a stale page signature into looking
+        # current.
         connection.execute(
             """
             UPDATE archive_content_signatures
@@ -439,6 +617,7 @@ def apply_repairs(
             """,
             (stat.st_size, stat.st_mtime_ns, repair.archive_id),
         )
+        applied_paths.add(repair.new_path.lower())
         applied.append(
             {
                 "archive_id": repair.archive_id,
