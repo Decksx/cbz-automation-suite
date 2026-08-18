@@ -16,11 +16,11 @@ import pytest
 
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
-from comic_automation.jobs import ingest_pipeline
-from comic_automation.jobs.ingest_pipeline import (
+from comic_automation.jobs import enqueue_missing_stages as stages_module
+from comic_automation.jobs.enqueue_missing_stages import (
     STAGE_JOB_TYPES,
     STAGE_ORDER,
-    run_pipeline,
+    enqueue_missing_stages,
 )
 
 
@@ -40,6 +40,43 @@ def database(tmp_path: Path) -> Path:
     return path
 
 
+def test_nothing_is_executed_only_enqueued(database: Path):
+    """The contract is enqueue-only, and it is worth pinning.
+
+    An earlier revision documented this module as running each stage's worker
+    and as carrying an archive from discovery to fully hashed in one
+    invocation. Neither was true of the code. A caller who believed it would
+    conclude imports had progressed when nothing had run, so the absence of
+    execution is asserted rather than assumed.
+    """
+    with database_connection(database) as connection:
+        archive_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (10)"
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO jobs (job_type, archive_id, status, priority, attempts,
+                              max_attempts, available_at, created_at, updated_at)
+            VALUES ('hash_archive_pages_perceptual', ?, 'pending', 100, 0, 3,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (archive_id,),
+        )
+        connection.commit()
+
+    enqueue_missing_stages(database=database)
+
+    with database_connection(database) as connection:
+        statuses = dict(
+            connection.execute("SELECT status, COUNT(*) FROM jobs GROUP BY 1")
+        )
+
+    # Still pending: no worker claimed it, ran it, completed it or failed it.
+    assert statuses == {"pending": 1}
+
+
 def test_stages_run_in_dependency_order(database: Path, monkeypatch):
     """Order is fixed by data dependencies, not by the caller's argument order.
 
@@ -53,10 +90,10 @@ def test_stages_run_in_dependency_order(database: Path, monkeypatch):
         called.append(stage)
         return 0
 
-    monkeypatch.setattr(ingest_pipeline, "_enqueue_for_stage", fake_enqueue)
+    monkeypatch.setattr(stages_module, "_enqueue_for_stage", fake_enqueue)
 
     # Deliberately reversed: the sequencer must ignore this ordering.
-    run_pipeline(database=database, stages=list(reversed(STAGE_ORDER)))
+    enqueue_missing_stages(database=database, stages=list(reversed(STAGE_ORDER)))
 
     assert called == list(STAGE_ORDER)
 
@@ -64,12 +101,12 @@ def test_stages_run_in_dependency_order(database: Path, monkeypatch):
 def test_restricting_stages_runs_only_those(database: Path, monkeypatch):
     called: list[str] = []
     monkeypatch.setattr(
-        ingest_pipeline,
+        stages_module,
         "_enqueue_for_stage",
         lambda connection, stage, limit: called.append(stage) or 0,
     )
 
-    run_pipeline(database=database, stages=["perceptual_hash", "page_hash"])
+    enqueue_missing_stages(database=database, stages=["perceptual_hash", "page_hash"])
 
     assert called == ["page_hash", "perceptual_hash"]
 
@@ -77,19 +114,19 @@ def test_restricting_stages_runs_only_those(database: Path, monkeypatch):
 def test_unknown_stage_is_rejected(database: Path):
     """A typo must fail loudly rather than silently enqueueing nothing."""
     with pytest.raises(ValueError, match="Unknown stage"):
-        run_pipeline(database=database, stages=["not_a_stage"])
+        enqueue_missing_stages(database=database, stages=["not_a_stage"])
 
 
 def test_limit_is_passed_through_to_each_stage(database: Path, monkeypatch):
     """A bounded run must stay bounded at every stage, not just the first."""
     seen: list[int | None] = []
     monkeypatch.setattr(
-        ingest_pipeline,
+        stages_module,
         "_enqueue_for_stage",
         lambda connection, stage, limit: seen.append(limit) or 0,
     )
 
-    run_pipeline(database=database, limit=25)
+    enqueue_missing_stages(database=database, limit=25)
 
     assert seen == [25] * len(STAGE_ORDER)
 
@@ -102,7 +139,7 @@ def test_inspect_stage_enqueues_nothing_itself(database: Path):
     third source here would double-enqueue; the report says so explicitly
     rather than silently reporting zero.
     """
-    report = run_pipeline(database=database, stages=["inspect"])
+    report = enqueue_missing_stages(database=database, stages=["inspect"])
 
     stage = report["stages"][0]
     assert stage["enqueued"] == 0
@@ -112,10 +149,10 @@ def test_inspect_stage_enqueues_nothing_itself(database: Path):
 def test_report_records_queue_movement_per_stage(database: Path, monkeypatch):
     """The report must show which queue moved, not only that a function ran."""
     monkeypatch.setattr(
-        ingest_pipeline, "_enqueue_for_stage", lambda connection, stage, limit: 3
+        stages_module, "_enqueue_for_stage", lambda connection, stage, limit: 3
     )
 
-    report = run_pipeline(database=database)
+    report = enqueue_missing_stages(database=database)
 
     assert report["total_enqueued"] == 3 * len(STAGE_ORDER)
     for stage in report["stages"]:
@@ -148,7 +185,7 @@ def test_pending_counts_reflect_real_queue_state(database: Path):
         )
         connection.commit()
 
-    report = run_pipeline(database=database, stages=["perceptual_hash"])
+    report = enqueue_missing_stages(database=database, stages=["perceptual_hash"])
 
     assert report["stages"][0]["pending_before"] == 1
 
@@ -157,7 +194,7 @@ def test_pipeline_applies_migrations_so_a_fresh_database_works(tmp_path: Path):
     """A database that has never been migrated must not crash the sequencer."""
     fresh = tmp_path / "fresh.db"
 
-    report = run_pipeline(database=fresh, stages=["perceptual_hash"])
+    report = enqueue_missing_stages(database=fresh, stages=["perceptual_hash"])
 
     assert report["stages"][0]["enqueued"] == 0
     with sqlite3.connect(fresh) as connection:
