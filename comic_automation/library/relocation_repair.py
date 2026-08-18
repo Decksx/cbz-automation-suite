@@ -110,6 +110,15 @@ class LocationRepairError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class PathClaim:
+    """One `file_locations` row's claim on a canonical path."""
+
+    archive_id: int
+    is_current: bool
+    recorded_path: str
+
+
+@dataclass(frozen=True)
 class BrokenLocation:
     """An archive whose recorded current location does not describe reality."""
 
@@ -324,7 +333,7 @@ def plan_repairs(
     broken: Sequence[BrokenLocation],
     by_size: dict[int, list[Path]],
     *,
-    owners: dict[str, tuple[int, bool]] | None = None,
+    owners: dict[str, list[PathClaim]] | None = None,
 ) -> RepairPlan:
     """Verify each broken location against candidate files and build a plan.
 
@@ -431,17 +440,18 @@ def plan_repairs(
 
         # state == "missing": search for the content elsewhere.
         candidates = []
-        blocked_by_owner: list[tuple[Path, int, bool]] = []
+        blocked_by_owner: list[tuple[Path, str]] = []
         for candidate in by_size.get(item.recorded_size or -1, []):
             key = canonical_path(candidate)
             if key in reserved:
                 continue
-            owner = owned.get(key)
-            if owner is not None and owner[0] != item.archive_id:
-                # Held by another archive. Recorded here rather than silently
-                # dropped, so a candidate that matches by content but cannot be
-                # claimed is explained instead of reported as "no match".
-                blocked_by_owner.append((candidate, owner[0], owner[1]))
+            refusal = ownership_refusal(owned.get(key, []), item.archive_id)
+            if refusal is not None:
+                # Held by another archive, or ambiguously held by several rows.
+                # Recorded rather than silently dropped, so a candidate that
+                # matches by content but cannot be claimed is explained instead
+                # of reported as "no match".
+                blocked_by_owner.append((candidate, refusal))
                 continue
             candidates.append(candidate)
 
@@ -455,26 +465,22 @@ def plan_repairs(
 
         if not verified and blocked_by_owner:
             blocked_matches = []
-            for candidate, owner_id, owner_current in blocked_by_owner:
+            for candidate, refusal in blocked_by_owner:
                 try:
                     if sha256_file(candidate) == item.stored_sha256:
-                        blocked_matches.append(
-                            (str(candidate), owner_id, owner_current)
-                        )
+                        blocked_matches.append((str(candidate), refusal))
                 except OSError:
                     continue
             if blocked_matches:
-                path_text, owner_id, owner_current = blocked_matches[0]
-                state = "current" if owner_current else "retired"
+                path_text, refusal = blocked_matches[0]
                 plan.unresolved.append(
                     {
                         "archive_id": item.archive_id,
                         "path": item.recorded_path,
                         "state": item.state,
                         "reason": (
-                            "content found at a path held by archive "
-                            f"{owner_id} ({state} location); needs duplicate "
-                            "resolution, not relocation"
+                            f"content found at an unclaimable path: {refusal}; "
+                            "needs duplicate resolution, not relocation"
                         ),
                         "blocked_path": path_text,
                     }
@@ -536,6 +542,9 @@ def apply_repairs(
     applied: list[dict] = []
     skipped: list[dict] = []
 
+    # Canonical ownership as it stands right now, kept current as repairs land
+    # so a later repair in the same run sees an earlier one's claim.
+    owners = path_owners(connection)
     applied_paths: set[str] = set()
 
     for repair in repairs:
@@ -562,31 +571,17 @@ def apply_repairs(
         # archive ids differed, and the archive was left with NO current
         # location at all -- while the signature was still refreshed and the
         # repair reported as applied.
-        # COLLATE NOCASE narrows to case-variant candidates in SQL; the
-        # decision is then made with canonical_path, so the comparison matches
-        # planning exactly rather than relying on SQLite's ASCII-only folding.
+        # Ownership is resolved against a canonical map of every row, never a
+        # SQL prefilter. An earlier revision narrowed with
+        # `WHERE path = ? COLLATE NOCASE` before applying canonical_path, which
+        # folds case but NOT separators -- so a recorded "X:/Manga/A.cbz" never
+        # reached the canonical comparison when the repair targeted
+        # "X:\Manga\A.cbz", and SQLite would then hold both spellings for what
+        # Windows resolves to one file.
         target_key = canonical_path(repair.new_path)
-        conflict = None
-        for owner_id, is_current, owner_path in connection.execute(
-            "SELECT archive_id, is_current, path FROM file_locations "
-            "WHERE path = ? COLLATE NOCASE",
-            (repair.new_path,),
-        ):
-            if canonical_path(owner_path) != target_key:
-                continue
-            if int(owner_id) != repair.archive_id:
-                conflict = (int(owner_id), bool(is_current))
-                break
-        if conflict is not None:
-            state = "current" if conflict[1] else "retired"
-            skipped.append(
-                {
-                    "archive_id": repair.archive_id,
-                    "reason": (
-                        f"path is the {state} location of archive {conflict[0]}"
-                    ),
-                }
-            )
+        refusal = ownership_refusal(owners.get(target_key, []), repair.archive_id)
+        if refusal is not None:
+            skipped.append({"archive_id": repair.archive_id, "reason": refusal})
             continue
 
         # The location row must still be the one that was planned against. If
@@ -713,7 +708,14 @@ def apply_repairs(
             """,
             (stat.st_size, stat.st_mtime_ns, repair.archive_id),
         )
-        applied_paths.add(canonical_path(repair.new_path))
+        applied_paths.add(target_key)
+        owners.setdefault(target_key, []).append(
+            PathClaim(
+                archive_id=repair.archive_id,
+                is_current=True,
+                recorded_path=repair.new_path,
+            )
+        )
         applied.append(
             {
                 "archive_id": repair.archive_id,
@@ -726,22 +728,62 @@ def apply_repairs(
     return {"applied": applied, "skipped": skipped}
 
 
-def path_owners(connection: sqlite3.Connection) -> dict[str, tuple[int, bool]]:
-    """Map every recorded path to the archive that holds it, and whether it is current.
+def path_owners(connection: sqlite3.Connection) -> dict[str, list[PathClaim]]:
+    """Map every canonical path to *all* recorded rows that resolve to it.
 
     Deliberately includes retired rows. ``file_locations.path`` is UNIQUE, so a
     retired row still occupies its path and a repair cannot claim it. Planning
     that only knew about *current* paths would propose a repair the apply stage
-    is already guaranteed to refuse, and that proposal would then be counted in
-    the plan's expected count and digest -- the operator would review, approve
-    and apply a plan containing targets known in advance to be unclaimable.
+    is already guaranteed to refuse, and that proposal would be counted in the
+    plan's expected count and digest -- an operator would review, approve and
+    apply a plan containing targets known in advance to be unclaimable.
+
+    A *list* rather than one owner per path, because SQLite's uniqueness is
+    case- and separator-sensitive while the filesystem's is not: ``X:/Manga/A.cbz``
+    and ``X:\\Manga\\A.cbz`` are two rows and one file. An earlier revision
+    stored a single tuple per canonical path and silently kept whichever row the
+    query happened to yield last. If the survivor belonged to the archive being
+    repaired, another archive's claim on the same file simply disappeared from
+    view. Collisions are now represented and refused rather than resolved by
+    iteration order.
     """
-    owners: dict[str, tuple[int, bool]] = {}
+    owners: dict[str, list[PathClaim]] = {}
     for path, archive_id, is_current in connection.execute(
         "SELECT path, archive_id, is_current FROM file_locations"
     ):
-        owners[canonical_path(path)] = (int(archive_id), bool(is_current))
+        owners.setdefault(canonical_path(path), []).append(
+            PathClaim(
+                archive_id=int(archive_id),
+                is_current=bool(is_current),
+                recorded_path=str(path),
+            )
+        )
     return owners
+
+
+def ownership_refusal(claims: Sequence[PathClaim], archive_id: int) -> str | None:
+    """Why *archive_id* may not claim a path, or None if it may.
+
+    Used by planning and by apply, so the two cannot disagree about what
+    ownership means.
+    """
+    if not claims:
+        return None
+    if len(claims) > 1:
+        spellings = ", ".join(sorted(repr(c.recorded_path) for c in claims))
+        holders = sorted({c.archive_id for c in claims})
+        # Two rows resolving to one file is already an inconsistent database
+        # state. Which row to revive is not this module's guess to make, even
+        # when every row belongs to the archive being repaired.
+        return (
+            f"{len(claims)} recorded rows resolve to this path "
+            f"(archives {holders}): {spellings}"
+        )
+    claim = claims[0]
+    if claim.archive_id != archive_id:
+        state = "current" if claim.is_current else "retired"
+        return f"path is the {state} location of archive {claim.archive_id}"
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
