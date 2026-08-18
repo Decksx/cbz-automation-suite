@@ -1513,3 +1513,143 @@ def test_healthy_locations_are_not_reported_as_broken(database: Path, tmp_path: 
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         assert find_broken_locations(connection) == []
+
+
+def _seed_one_moved(database, original, payload):
+    """Seed one archive at *original*, then delete the file so it reads as moved."""
+    digest = _write_archive(original, payload)
+    stat = original.stat()
+    with database_connection(database) as connection:
+        _seed(
+            connection,
+            path=original,
+            digest=digest,
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+        )
+        connection.commit()
+    original.unlink()
+    return digest
+
+
+def _plan(database, roots, exclude=()):
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        return plan_repairs(
+            find_broken_locations(connection),
+            index_roots(roots, exclude),
+            owners=path_owners(connection),
+        )
+
+
+def test_excluded_directory_is_not_offered_as_a_move_target(
+    database: Path, tmp_path: Path
+):
+    """A version-history copy hashes identically, so content alone cannot reject it.
+
+    Without the exclusion the search re-points the archive's current location
+    into Syncthing's .stversions, which Syncthing prunes on its own schedule
+    and Komga does not serve. Measured against the real library on 2026-08-18,
+    seven repairs would have done exactly that.
+    """
+    library = tmp_path / "lib"
+    payload = b"versioned payload"
+    _seed_one_moved(database, library / "Series" / "a.cbz", payload)
+    snapshot = library / ".stversions" / "Series" / "a~20260714.cbz"
+    _write_archive(snapshot, payload)
+
+    # Bypass: without the exclusion the snapshot is accepted as the move target.
+    bypass = _plan(database, [library])
+    assert [Path(r.new_path) for r in bypass.repairs] == [snapshot]
+
+    guarded = _plan(database, [library], exclude=[".stversions"])
+    assert guarded.repairs == []
+    assert guarded.ambiguous == []
+    assert "no file under the searched roots" in guarded.unresolved[0]["reason"]
+
+
+def test_exclusion_resolves_a_live_file_tied_with_its_own_snapshot(
+    database: Path, tmp_path: Path
+):
+    """The 21 ambiguous cases in the real library were all this shape.
+
+    A live copy and its version snapshot are byte-identical, so repair refuses
+    to guess. Excluding the snapshot area leaves exactly one candidate, which
+    is a repair rather than a question.
+    """
+    library = tmp_path / "lib"
+    payload = b"tied payload"
+    _seed_one_moved(database, library / "Old" / "a.cbz", payload)
+    live = library / "New" / "a.cbz"
+    _write_archive(live, payload)
+    _write_archive(library / ".stversions" / "Old" / "a~20260714.cbz", payload)
+
+    # Bypass: without the exclusion this is a tie and nothing is repaired.
+    bypass = _plan(database, [library])
+    assert bypass.repairs == []
+    assert len(bypass.ambiguous) == 1
+
+    guarded = _plan(database, [library], exclude=[".stversions"])
+    assert guarded.ambiguous == []
+    assert [Path(r.new_path) for r in guarded.repairs] == [live]
+
+
+def test_exclusion_folds_case_like_the_filesystem(database: Path, tmp_path: Path):
+    """Windows directory names are case-insensitive; the exclusion must be too."""
+    library = tmp_path / "lib"
+    payload = b"case payload"
+    _seed_one_moved(database, library / "Series" / "a.cbz", payload)
+    _write_archive(library / ".STVersions" / "a~20260714.cbz", payload)
+
+    plan = _plan(database, [library], exclude=[".stversions"])
+    assert plan.repairs == []
+    assert plan.ambiguous == []
+
+
+def test_exclusion_matches_a_directory_name_not_a_path_substring(
+    database: Path, tmp_path: Path
+):
+    """Substring matching would silently drop real library content.
+
+    A directory merely containing the excluded name, and a file named after it,
+    are both ordinary library objects.
+    """
+    library = tmp_path / "lib"
+    payload = b"substring payload"
+    _seed_one_moved(database, library / "Series" / "a.cbz", payload)
+    decoy = library / "my.stversions.bak" / ".stversions.cbz"
+    _write_archive(decoy, payload)
+
+    plan = _plan(database, [library], exclude=[".stversions"])
+    assert [Path(r.new_path) for r in plan.repairs] == [decoy]
+
+
+def test_exclusion_prunes_the_whole_subtree(database: Path, tmp_path: Path):
+    """Pruning only the top level would still reach snapshots nested below it."""
+    library = tmp_path / "lib"
+    payload = b"nested payload"
+    _seed_one_moved(database, library / "Series" / "a.cbz", payload)
+    _write_archive(
+        library / ".stversions" / "deep" / "deeper" / "a~20260714.cbz", payload
+    )
+
+    plan = _plan(database, [library], exclude=[".stversions"])
+    assert plan.repairs == []
+    assert plan.ambiguous == []
+
+
+def test_a_root_is_never_excluded_by_its_own_name(database: Path, tmp_path: Path):
+    """Passing a root is an explicit instruction to search it.
+
+    Otherwise an operator recovering *from* a snapshot area would get an empty
+    index and no explanation.
+    """
+    library = tmp_path / "lib"
+    payload = b"root payload"
+    _seed_one_moved(database, library / "Series" / "a.cbz", payload)
+    snapshot_root = library / ".stversions"
+    recovered = snapshot_root / "a~20260714.cbz"
+    _write_archive(recovered, payload)
+
+    plan = _plan(database, [snapshot_root], exclude=[".stversions"])
+    assert [Path(r.new_path) for r in plan.repairs] == [recovered]
