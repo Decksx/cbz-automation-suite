@@ -19,9 +19,11 @@ import pytest
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
 from comic_automation.library.relocation_repair import (
+    PathClaim,
     Repair,
     apply_repairs,
     canonical_path,
+    ownership_refusal,
     path_owners,
     find_broken_locations,
     index_roots,
@@ -628,8 +630,8 @@ def test_retired_row_owner_is_unresolved_at_planning(database: Path, tmp_path: P
     assert plan.repairs == []
     assert len(plan.unresolved) == 1
     reason = plan.unresolved[0]["reason"]
-    assert f"held by archive {other_id}" in reason
-    assert "retired location" in reason
+    assert f"retired location of archive {other_id}" in reason
+    assert "duplicate resolution" in reason
 
 
 def test_apply_still_refuses_a_retired_row_owner(database: Path, tmp_path: Path):
@@ -778,6 +780,184 @@ def test_apply_ownership_is_case_insensitive_like_planning(
     assert "location of archive" in outcome["skipped"][0]["reason"]
     assert [int(r["archive_id"]) for r in owners_of_variant] == [other_id]
     assert current == 1
+
+
+def test_apply_ownership_survives_separator_variants(database: Path, tmp_path: Path):
+    """A claim recorded with forward slashes still blocks a backslash target.
+
+    canonical_path equates the two spellings, but an earlier revision narrowed
+    candidates in SQL with `WHERE path = ? COLLATE NOCASE` first. That folds
+    case and NOT separators, so a recorded "X:/Manga/A.cbz" never reached the
+    canonical comparison when the repair targeted "X:\\Manga\\A.cbz" -- and
+    SQLite would then hold both spellings for one Windows file.
+    """
+    library = tmp_path / "lib"
+    payload = b"separator variant payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "elsewhere" / "b.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (moving_id,)
+            ).fetchone()[0]
+        )
+        other_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
+            ).lastrowid
+        )
+        # Same file, recorded with forward slashes. Case is identical, so a
+        # NOCASE prefilter cannot match it against the backslash spelling.
+        variant = str(target).replace("\\", "/")
+        assert variant != str(target)
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 1, ?, 7)
+            """,
+            (other_id, variant, size),
+        )
+        connection.commit()
+
+    original.unlink()
+
+    repair = Repair(
+        archive_id=moving_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        outcome = apply_repairs(connection, [repair])
+        connection.commit()
+        rows = connection.execute(
+            "SELECT archive_id FROM file_locations WHERE path IN (?, ?)",
+            (variant, str(target)),
+        ).fetchall()
+        current = connection.execute(
+            "SELECT COUNT(*) FROM file_locations "
+            "WHERE archive_id = ? AND is_current = 1",
+            (moving_id,),
+        ).fetchone()[0]
+
+    assert outcome["applied"] == []
+    assert f"location of archive {other_id}" in outcome["skipped"][0]["reason"]
+    # Only the original spelling exists: no second row for the same file.
+    assert [int(r["archive_id"]) for r in rows] == [other_id]
+    assert current == 1
+
+
+def test_canonical_collision_is_refused_not_resolved_by_iteration_order(
+    database: Path, tmp_path: Path
+):
+    """Two rows resolving to one file is refused, whoever owns them.
+
+    SQLite's uniqueness is case- and separator-sensitive, so this state is
+    reachable. An earlier revision stored one owner per canonical path and kept
+    whichever row the query yielded last; if that survivor belonged to the
+    archive being repaired, another archive's claim vanished from view. Which
+    row to revive is not a guess this module may make -- even when every
+    colliding row belongs to the same archive.
+    """
+    library = tmp_path / "lib"
+    payload = b"collision payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "elsewhere" / "b.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (moving_id,)
+            ).fetchone()[0]
+        )
+        other_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
+            ).lastrowid
+        )
+        # Two spellings of the same file: one owned by the archive being
+        # repaired, one by another archive. Ordering must not decide this.
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 0, ?, 3)
+            """,
+            (moving_id, str(target).replace("\\", "/"), size),
+        )
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 0, ?, 4)
+            """,
+            (other_id, str(target).upper(), size),
+        )
+        connection.commit()
+
+        owners = path_owners(connection)
+        assert len(owners[canonical_path(target)]) == 2
+
+    original.unlink()
+
+    repair = Repair(
+        archive_id=moving_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        outcome = apply_repairs(connection, [repair])
+        connection.commit()
+        current = connection.execute(
+            "SELECT COUNT(*) FROM file_locations "
+            "WHERE archive_id = ? AND is_current = 1",
+            (moving_id,),
+        ).fetchone()[0]
+
+    assert outcome["applied"] == []
+    assert "rows resolve to this path" in outcome["skipped"][0]["reason"]
+    assert current == 1
+
+
+def test_ownership_refusal_allows_the_archives_own_single_row():
+    """The refusal must not block an archive reclaiming its own path."""
+    claims = [PathClaim(archive_id=7, is_current=False, recorded_path="p")]
+
+    assert ownership_refusal(claims, 7) is None
+    assert ownership_refusal([], 7) is None
+    assert ownership_refusal(claims, 8) is not None
 
 
 def test_canonical_path_folds_case_and_separators():
