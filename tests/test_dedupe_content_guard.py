@@ -131,18 +131,81 @@ def test_unreadable_archive_is_never_deleted_as_a_duplicate(tmp_path):
     assert sorted(len(s) for s in subgroups) == [1, 1, 1]
 
 
-def test_filename_pass_is_unaffected_by_the_content_guard(tmp_path):
-    """Pass 1 (filename key) keeps its existing behaviour.
+def test_filename_pass_also_requires_content_proof(tmp_path):
+    """Pass 1 (filename key) must not delete differing content either.
 
-    The guard was scoped to the metadata pass because the filename key is a far
-    tighter grouping: the same production run made 1,922 metadata deletions but
-    only 11 by filename.
+    An earlier revision left this pass unguarded on the grounds that the
+    filename key is "tighter" and produced only 11 deletions during the
+    incident. Neither is a safety property: two files whose names normalise
+    alike can hold different chapters, and deletion is irreversible. This test
+    replaces one that asserted the unguarded behaviour.
     """
     _make_cbz(tmp_path / "Chapter 1.cbz", {"001.jpg": b"small"})
     _make_cbz(tmp_path / "Chapter  1.cbz", {"001.jpg": b"considerably larger page"})
 
     stats = dedupe_archives_in_dir(tmp_path, dry_run=False, use_metadata=False)
 
-    # Normalised filename keys collide, so one is removed even though the
-    # content differs -- unchanged pre-existing behaviour.
+    assert stats.deleted == 0
+    assert (tmp_path / "Chapter 1.cbz").exists()
+    assert (tmp_path / "Chapter  1.cbz").exists()
+
+
+def test_filename_pass_still_collapses_identical_content(tmp_path):
+    """Guarding pass 1 must not disable it."""
+    pages = {"001.jpg": b"same page bytes"}
+    _make_cbz(tmp_path / "Chapter 1.cbz", pages)
+    _make_cbz(tmp_path / "Chapter  1.cbz", pages)
+
+    stats = dedupe_archives_in_dir(tmp_path, dry_run=False, use_metadata=False)
+
     assert stats.deleted == 1
+
+
+def test_page_order_changes_the_fingerprint(tmp_path):
+    """Reordered pages are a different comic, not a duplicate.
+
+    The previous fingerprint sorted its entries before hashing, so an archive
+    whose pages were bound in a different order compared equal and could be
+    deleted. Page order is derived from entry name, so renaming pages such that
+    their order changes must change the fingerprint.
+    """
+    forward = tmp_path / "forward.cbz"
+    reversed_pages = tmp_path / "reversed.cbz"
+    _make_cbz(forward, {"001.jpg": b"page A", "002.jpg": b"page B"})
+    # Same two page payloads, opposite reading order.
+    _make_cbz(reversed_pages, {"001.jpg": b"page B", "002.jpg": b"page A"})
+
+    assert _archive_content_fingerprint(forward) != _archive_content_fingerprint(
+        reversed_pages
+    )
+
+
+def test_fingerprint_is_cryptographic_not_a_checksum(tmp_path):
+    """The digest must be a SHA-256 chain, not a CRC.
+
+    CRC32 is a 32-bit accidental-corruption check whose collisions are cheap to
+    construct. A collision would equate different bytes and authorise deleting
+    one of them, so the fingerprint's width is a safety property worth pinning.
+    """
+    archive = tmp_path / "a.cbz"
+    _make_cbz(archive, {"001.jpg": b"page"})
+
+    fingerprint = _archive_content_fingerprint(archive)
+
+    assert fingerprint is not None
+    assert len(fingerprint) == 64  # SHA-256 hex
+    int(fingerprint, 16)  # and it is hex
+
+
+def test_identical_pages_in_differently_named_files_still_match(tmp_path):
+    """Renaming pages without changing their order keeps archives equal.
+
+    This is the property that lets genuinely duplicate releases collapse, and
+    it must survive the move to an ordered digest.
+    """
+    first = tmp_path / "a.cbz"
+    second = tmp_path / "b.cbz"
+    _make_cbz(first, {"001.jpg": b"page one", "002.jpg": b"page two"})
+    _make_cbz(second, {"aaa.jpg": b"page one", "bbb.jpg": b"page two"})
+
+    assert _archive_content_fingerprint(first) == _archive_content_fingerprint(second)
