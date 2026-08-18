@@ -165,6 +165,44 @@ def test_filename_pass_still_collapses_identical_content(tmp_path):
     assert stats.deleted == 1
 
 
+def test_image_less_archives_are_never_grouped_as_duplicates(tmp_path):
+    """Two archives with no pages must not be duplicates of each other.
+
+    calculate_page_hashes hashes an empty page sequence to one fixed digest, so
+    every image-less archive shares it. Accepting that digest would delete one
+    of two archives that have no page evidence at all -- deletion justified by
+    the absence of evidence, which is the defect this guard exists to prevent.
+
+    The two files below hold different non-image payloads, so they are not even
+    the same bytes.
+    """
+    first = tmp_path / "Chapter 1.cbz"
+    second = tmp_path / "Chapter  1.cbz"
+    _make_cbz(first, {"notes.txt": b"alpha"})
+    _make_cbz(second, {"readme.txt": b"beta beta beta"})
+
+    assert _archive_content_fingerprint(first) is None
+    assert _archive_content_fingerprint(second) is None
+
+    stats = dedupe_archives_in_dir(tmp_path, dry_run=False, use_metadata=False)
+
+    assert stats.deleted == 0
+    assert first.exists()
+    assert second.exists()
+
+
+def test_image_less_archives_are_isolated_by_the_splitter(tmp_path):
+    """Each no-page archive becomes its own subgroup, like an unreadable one."""
+    first = tmp_path / "a.cbz"
+    second = tmp_path / "b.cbz"
+    _make_cbz(first, {"notes.txt": b"alpha"})
+    _make_cbz(second, {"notes.txt": b"alpha"})  # identical bytes, still no pages
+
+    subgroups = _split_group_by_content([first, second])
+
+    assert sorted(len(g) for g in subgroups) == [1, 1]
+
+
 def test_page_order_changes_the_fingerprint(tmp_path):
     """Reordered pages are a different comic, not a duplicate.
 
