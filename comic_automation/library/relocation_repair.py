@@ -537,22 +537,73 @@ def apply_repairs(
     connection: sqlite3.Connection,
     repairs: Sequence[Repair],
 ) -> dict:
-    """Apply verified repairs in one transaction.
+    """Apply verified repairs atomically, or apply none of them.
 
-    Each repair is re-verified against the live file immediately before its own
-    write, so a file that moved or changed between plan and apply is skipped
-    rather than trusted. A location is retired and replaced rather than
-    mutated, matching how quarantine treats a departing location and preserving
-    the history that makes a later move traceable.
+    This function owns its transaction. `connect_database` opens connections
+    with ``isolation_level=None``, so sqlite3 starts no implicit transaction
+    and every statement would otherwise commit on execution. An earlier
+    revision relied on a trailing ``connection.commit()`` and on raising
+    `LocationRepairError` to undo a half-finished repair; neither did anything.
+    A repair could retire an archive's old location, fail to claim the new one,
+    raise -- and leave the archive with no current location committed to disk.
+    The same gap meant a failure on repair 500 left repairs 1-499 committed
+    while this docstring claimed one transaction.
+
+    ``BEGIN IMMEDIATE`` rather than ``BEGIN``: it takes the write lock up
+    front, so the ownership snapshot taken next cannot be invalidated by
+    another writer claiming a canonical path midway through the batch. A
+    deferred transaction would only acquire that lock at the first write, which
+    is after `path_owners` has already been read.
+
+    Each repair is additionally re-verified against the live file immediately
+    before its own write, so a file that moved or changed between plan and
+    apply is skipped rather than trusted. A genuine move retires the old
+    location and revives or inserts the new one, matching how quarantine
+    treats a departing location and preserving traceable history.
+
+    Raises on any failure that must not be partially applied; the transaction
+    is rolled back first, so the caller sees the database as it was.
     """
     applied: list[dict] = []
     skipped: list[dict] = []
-
-    # Canonical ownership as it stands right now, kept current as repairs land
-    # so a later repair in the same run sees an earlier one's claim.
-    owners = path_owners(connection)
     applied_paths: set[str] = set()
 
+    # Write lock first, then the ownership snapshot, so no other writer can
+    # claim a canonical path between reading ownership and acting on it.
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # Canonical ownership as it stands right now, kept current as repairs
+        # land so a later repair in the same run sees an earlier one's claim.
+        owners = path_owners(connection)
+        _apply_within_transaction(
+            connection, repairs, owners, applied, skipped, applied_paths
+        )
+    except BaseException:
+        # Includes LocationRepairError, whose whole purpose is to abandon a
+        # half-finished repair. Rolling back is what makes that purpose real.
+        try:
+            connection.execute("ROLLBACK")
+        except sqlite3.Error:  # pragma: no cover - rollback of a dead txn
+            pass
+        raise
+    connection.execute("COMMIT")
+
+    return {"applied": applied, "skipped": skipped}
+
+
+def _apply_within_transaction(
+    connection: sqlite3.Connection,
+    repairs: Sequence[Repair],
+    owners: dict[str, list[PathClaim]],
+    applied: list[dict],
+    skipped: list[dict],
+    applied_paths: set[str],
+) -> None:
+    """The per-repair work, run inside the caller's open transaction.
+
+    Split out so that `apply_repairs` reads as begin / do / commit-or-rollback
+    and the transaction boundary cannot drift away from the work it protects.
+    """
     for repair in repairs:
         target = Path(repair.new_path)
 
@@ -768,8 +819,6 @@ def apply_repairs(
             }
         )
 
-    return {"applied": applied, "skipped": skipped}
-
 
 def path_owners(connection: sqlite3.Connection) -> dict[str, list[PathClaim]]:
     """Map every canonical path to *all* recorded rows that resolve to it.
@@ -913,8 +962,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Re-run the read-only plan and review it again."
                 )
                 return 1
+            # apply_repairs owns its transaction and has already committed.
             outcome = apply_repairs(connection, plan.repairs)
-            connection.commit()
             result["applied"] = outcome
             print(f"\n  applied  : {len(outcome['applied']):,}")
             print(f"  skipped  : {len(outcome['skipped']):,}")
