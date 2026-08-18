@@ -122,9 +122,18 @@ repository could have caught it**, and a live-path existence check
 belongs in the next batch's preflight.
 
 Both corrections, plus a read-only exact-duplicate audit and a
-dependency-ordered stage enqueuer, are on `fix/dedupe-require-content-proof`
-(PR #63). That branch is under exact-head review and is **not yet
-merged**; nothing in it may be applied to production before it is.
+dependency-ordered stage enqueuer, arrived on
+`fix/dedupe-require-content-proof` (PR #63), merged into `master` on
+2026-08-18 as `3c1b802` after exact-head approval of
+`4ae3513ff0727826a1c2e35d3e3bfd8697e144e1`.
+
+Merging made that tooling available; it did not authorise a production
+run. The relocation-repair plan computed before those corrections is
+**superseded** — the provenance gate, planning-time ownership rejection,
+canonical path comparison, canonical-collision refusal, and the narrowed
+`OSError` handling each move archives out of "repairable" — so it must be
+re-derived read-only and reviewed, against a freshly verified backup,
+before any of it is applied.
 
 ### What this changes about sequencing
 
