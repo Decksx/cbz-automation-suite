@@ -187,6 +187,23 @@ class RepairPlan:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def canonical_path(path: str | Path) -> str:
+    """The comparison form for a filesystem path.
+
+    ``os.path.normcase`` folds case and separator style on Windows and is a
+    no-op on POSIX, so this is the one place that knows how paths compare on
+    the host. Planning, same-run reservation and apply-time ownership all use
+    it, because a check that compares paths differently from the check beside
+    it is not a check.
+
+    The library lives on a case-insensitive volume, where ``X:\\A.cbz`` and
+    ``x:\\a.cbz`` are one file. SQLite's UNIQUE index is case-sensitive and
+    would happily hold both spellings as separate rows, so an ownership query
+    using exact equality could miss a row that already claims the same file.
+    """
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
 def sha256_file(path: Path, chunk: int = HASH_CHUNK_BYTES) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -307,15 +324,17 @@ def plan_repairs(
     broken: Sequence[BrokenLocation],
     by_size: dict[int, list[Path]],
     *,
-    known_paths: set[str] | None = None,
+    owners: dict[str, tuple[int, bool]] | None = None,
 ) -> RepairPlan:
     """Verify each broken location against candidate files and build a plan.
 
-    ``known_paths`` are paths already claimed by some current location; a
-    candidate among them is not offered as a relocation target, so repair can
-    never point two archives at one file.
+    ``owners`` maps canonical paths to the archive holding them, from
+    `path_owners`. A candidate held by a *different* archive is never offered
+    as a relocation target, whether that archive's row is current or retired,
+    so repair can never point two archives at one file and never plans a
+    target the apply stage would refuse.
     """
-    known = {p.lower() for p in (known_paths or set())}
+    owned = dict(owners or {})
     # Targets claimed by earlier repairs in this same plan. Without this, two
     # archives that share a stored digest -- which is exactly what a duplicate
     # pair is, and there are 886 such groups in production -- can both select
@@ -411,12 +430,21 @@ def plan_repairs(
             continue
 
         # state == "missing": search for the content elsewhere.
-        candidates = [
-            candidate
-            for candidate in by_size.get(item.recorded_size or -1, [])
-            if str(candidate).lower() not in known
-            and str(candidate).lower() not in reserved
-        ]
+        candidates = []
+        blocked_by_owner: list[tuple[Path, int, bool]] = []
+        for candidate in by_size.get(item.recorded_size or -1, []):
+            key = canonical_path(candidate)
+            if key in reserved:
+                continue
+            owner = owned.get(key)
+            if owner is not None and owner[0] != item.archive_id:
+                # Held by another archive. Recorded here rather than silently
+                # dropped, so a candidate that matches by content but cannot be
+                # claimed is explained instead of reported as "no match".
+                blocked_by_owner.append((candidate, owner[0], owner[1]))
+                continue
+            candidates.append(candidate)
+
         verified = []
         for candidate in candidates:
             try:
@@ -425,11 +453,39 @@ def plan_repairs(
             except OSError:
                 continue
 
+        if not verified and blocked_by_owner:
+            blocked_matches = []
+            for candidate, owner_id, owner_current in blocked_by_owner:
+                try:
+                    if sha256_file(candidate) == item.stored_sha256:
+                        blocked_matches.append(
+                            (str(candidate), owner_id, owner_current)
+                        )
+                except OSError:
+                    continue
+            if blocked_matches:
+                path_text, owner_id, owner_current = blocked_matches[0]
+                state = "current" if owner_current else "retired"
+                plan.unresolved.append(
+                    {
+                        "archive_id": item.archive_id,
+                        "path": item.recorded_path,
+                        "state": item.state,
+                        "reason": (
+                            "content found at a path held by archive "
+                            f"{owner_id} ({state} location); needs duplicate "
+                            "resolution, not relocation"
+                        ),
+                        "blocked_path": path_text,
+                    }
+                )
+                continue
+
         if len(verified) == 1:
             target = verified[0]
             stat = target.stat()
             # Claim it, so no later archive in this plan can select it too.
-            reserved.add(str(target).lower())
+            reserved.add(canonical_path(target))
             plan.repairs.append(
                 Repair(
                     archive_id=item.archive_id,
@@ -490,7 +546,7 @@ def apply_repairs(
         # be claimed by a scan that ran after the plan was made. Refuse rather
         # than transfer: silently re-pointing a live location at a different
         # archive merges two identities and strands one archive's evidence.
-        if repair.new_path.lower() in applied_paths:
+        if canonical_path(repair.new_path) in applied_paths:
             skipped.append(
                 {
                     "archive_id": repair.archive_id,
@@ -506,17 +562,28 @@ def apply_repairs(
         # archive ids differed, and the archive was left with NO current
         # location at all -- while the signature was still refreshed and the
         # repair reported as applied.
-        owner = connection.execute(
-            "SELECT archive_id, is_current FROM file_locations WHERE path = ?",
+        # COLLATE NOCASE narrows to case-variant candidates in SQL; the
+        # decision is then made with canonical_path, so the comparison matches
+        # planning exactly rather than relying on SQLite's ASCII-only folding.
+        target_key = canonical_path(repair.new_path)
+        conflict = None
+        for owner_id, is_current, owner_path in connection.execute(
+            "SELECT archive_id, is_current, path FROM file_locations "
+            "WHERE path = ? COLLATE NOCASE",
             (repair.new_path,),
-        ).fetchone()
-        if owner is not None and int(owner[0]) != repair.archive_id:
-            state = "current" if int(owner[1]) else "retired"
+        ):
+            if canonical_path(owner_path) != target_key:
+                continue
+            if int(owner_id) != repair.archive_id:
+                conflict = (int(owner_id), bool(is_current))
+                break
+        if conflict is not None:
+            state = "current" if conflict[1] else "retired"
             skipped.append(
                 {
                     "archive_id": repair.archive_id,
                     "reason": (
-                        f"path is the {state} location of archive {int(owner[0])}"
+                        f"path is the {state} location of archive {conflict[0]}"
                     ),
                 }
             )
@@ -646,7 +713,7 @@ def apply_repairs(
             """,
             (stat.st_size, stat.st_mtime_ns, repair.archive_id),
         )
-        applied_paths.add(repair.new_path.lower())
+        applied_paths.add(canonical_path(repair.new_path))
         applied.append(
             {
                 "archive_id": repair.archive_id,
@@ -659,13 +726,22 @@ def apply_repairs(
     return {"applied": applied, "skipped": skipped}
 
 
-def current_paths(connection: sqlite3.Connection) -> set[str]:
-    return {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT path FROM file_locations WHERE is_current = 1"
-        )
-    }
+def path_owners(connection: sqlite3.Connection) -> dict[str, tuple[int, bool]]:
+    """Map every recorded path to the archive that holds it, and whether it is current.
+
+    Deliberately includes retired rows. ``file_locations.path`` is UNIQUE, so a
+    retired row still occupies its path and a repair cannot claim it. Planning
+    that only knew about *current* paths would propose a repair the apply stage
+    is already guaranteed to refuse, and that proposal would then be counted in
+    the plan's expected count and digest -- the operator would review, approve
+    and apply a plan containing targets known in advance to be unclaimable.
+    """
+    owners: dict[str, tuple[int, bool]] = {}
+    for path, archive_id, is_current in connection.execute(
+        "SELECT path, archive_id, is_current FROM file_locations"
+    ):
+        owners[canonical_path(path)] = (int(archive_id), bool(is_current))
+    return owners
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -703,11 +779,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     with database_connection(args.database) as connection:
         connection.row_factory = sqlite3.Row
         broken = find_broken_locations(connection)
-        known = current_paths(connection)
+        owners = path_owners(connection)
 
         missing = [b for b in broken if b.state == "missing"]
+        drifted = [b for b in broken if b.state == "metadata_drift"]
+        unreadable = [b for b in broken if b.state == "unreadable"]
         by_size = index_roots(args.root) if (missing and args.root) else {}
-        plan = plan_repairs(broken, by_size, known_paths=known)
+        plan = plan_repairs(broken, by_size, owners=owners)
 
         if args.limit is not None:
             plan.repairs = plan.repairs[: args.limit]
@@ -716,7 +794,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Location repair plan (content-verified).")
         print(f"  broken current locations : {len(broken):,}")
         print(f"    missing from disk      : {len(missing):,}")
-        print(f"    metadata drift         : {len(broken) - len(missing):,}")
+        print(f"    metadata drift         : {len(drifted):,}")
+        print(f"    unreadable             : {len(unreadable):,}")
         print(f"  repairs planned          : {len(plan.repairs):,}")
         print(f"    moved                  : "
               f"{sum(1 for r in plan.repairs if r.kind == 'moved'):,}")
