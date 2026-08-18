@@ -35,6 +35,12 @@ class Job:
     failure_category: str | None
     created_at: str
     updated_at: str
+    # Cancellation is recorded separately from failure so that closing a
+    # job out never overwrites why its last attempt failed. See
+    # database/migrations/011_job_cancellation.sql. Both default to None
+    # because every row predating that migration has neither.
+    cancelled_at: str | None = None
+    cancellation_reason: str | None = None
 
     @property
     def payload(self) -> dict[str, Any]:
