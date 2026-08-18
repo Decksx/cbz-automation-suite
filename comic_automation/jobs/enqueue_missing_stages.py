@@ -1,24 +1,46 @@
-"""Run the ingest stages in dependency order so new imports finish arriving.
+"""Enqueue missing work for every ingest stage in one pass. **Enqueue only.**
 
-The problem
------------
+What this does and does not do
+------------------------------
 
-Every stage in this system uses a *pull* model: ``enqueue_missing()`` scans for
-archives that are eligible for that stage and enqueues them. Nothing pushes
-work from one stage to the next when a job completes. Discovery enqueues
-``inspect_archive``; the remaining three stages only receive work when an
-operator runs their CLI with ``--enqueue-missing``.
+It calls each stage's own ``enqueue_missing()`` in dependency order and
+returns what each one queued. **It runs no workers and executes no jobs.**
 
-That design is sound -- it makes every stage restartable and idempotent, and it
-means a crashed run loses nothing. What it lacks is a way to say "carry the
-newly imported archives all the way through", which is why the perceptual
-backfill behaves like a treadmill: imports keep arriving, and the backlog is
-only drained when somebody remembers to run four commands in the right order.
+An earlier revision of this module claimed each stage included "the same
+``enqueue_missing()`` plus worker drain an operator would run by hand" and that
+running the stages in order "lets one invocation take an archive from just
+discovered to fully hashed". Neither was true of the code, and review caught
+it. Both claims are removed rather than softened, because a caller who believed
+them would conclude that newly imported archives had progressed end-to-end when
+nothing had been executed at all.
 
-This module is that missing step. It is deliberately a thin sequencer over the
-existing stage implementations, not a scheduler and not a new execution model:
-each stage is the same ``enqueue_missing()`` plus worker drain an operator
-would run by hand, in the order the data dependencies require.
+Why one pass cannot carry a new import through
+----------------------------------------------
+
+Each stage's eligibility depends on the *previous stage's worker having run*,
+not on its jobs having been queued. A freshly discovered archive has no
+inspection, so ``calculate_archive_hash`` does not consider it; with no archive
+hash there is no content signature, so ``hash_archive_pages_perceptual`` does
+not consider it either. Enqueuing all four stages back to back therefore
+queues, at most, the work each stage is eligible for *right now*.
+
+Carrying a new import from discovery to perceptual hashes requires alternating
+enqueue and execute:
+
+::
+
+    python -m comic_automation.jobs.enqueue_missing_stages --database DB
+    python -m comic_automation.archive.cli --database DB                # inspect
+    python -m comic_automation.jobs.enqueue_missing_stages --database DB
+    python -m comic_automation.archive.hash_cli --database DB           # archive hash
+    python -m comic_automation.jobs.enqueue_missing_stages --database DB
+    python -m comic_automation.archive.page_hash_cli --database DB      # page hash
+    python -m comic_automation.jobs.enqueue_missing_stages --database DB
+    python -m comic_automation.archive.perceptual_hash_cli --database DB
+
+What this module removes is the need to remember four different
+``--enqueue-missing`` invocations and the order they belong in. It does not
+remove the need to run the workers.
 
 Order and why it is fixed
 -------------------------
@@ -31,15 +53,13 @@ Order and why it is fixed
     hash_archive_pages_perceptual   dHash/pHash; needs the signature to exist
 
 Running these out of order is not an error, it is a no-op: a later stage's
-eligibility predicate simply matches nothing yet. Running them in order is what
-lets one invocation take an archive from "just discovered" to "fully hashed".
+eligibility predicate simply matches nothing yet.
 
 Bounded by construction
 -----------------------
 
-Every stage takes the same ``--limit``, so a run does a bounded amount of work
-and stops. This is not a daemon: it processes at most ``limit`` archives per
-stage and exits, which keeps it safe to schedule and safe to interrupt.
+Every stage takes the same ``--limit``, so a run enqueues a bounded amount of
+work and exits. This is not a daemon.
 """
 
 from __future__ import annotations
@@ -129,18 +149,21 @@ def _enqueue_for_stage(connection, stage: str, limit: int | None) -> int:
     raise ValueError(f"Unknown stage: {stage}")
 
 
-def run_pipeline(
+def enqueue_missing_stages(
     *,
     database: Path,
     limit: int | None = None,
     stages: Sequence[str] = STAGE_ORDER,
 ) -> dict:
-    """Enqueue missing work for each stage in dependency order.
+    """Enqueue missing work for each stage in dependency order. Enqueue only.
 
-    Returns a per-stage report. This function enqueues only -- it does not run
-    workers, so that "what work exists" and "do the work" stay separable
-    exactly as the individual stage CLIs keep them separable via
-    ``--report-only``.
+    Returns a per-stage report. No worker is started and no job is executed:
+    "what work exists" and "do the work" stay separable exactly as the
+    individual stage CLIs keep them separable via ``--report-only``.
+
+    Because a stage's eligibility depends on the previous stage's worker having
+    run, a single call cannot advance a freshly discovered archive past the
+    first stage it qualifies for. See the module docstring.
     """
     unknown = [stage for stage in stages if stage not in STAGE_JOB_TYPES]
     if unknown:
@@ -190,9 +213,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Enqueue missing work for every ingest stage in dependency order, "
-            "so newly imported archives progress from discovery through "
-            "perceptual hashing instead of waiting for four separate commands. "
-            "Enqueues only; run each stage's worker to execute."
+            "replacing four separate --enqueue-missing invocations. ENQUEUE "
+            "ONLY: no worker is started and no job is executed. A stage's "
+            "eligibility depends on the previous stage's worker having run, so "
+            "carrying a new import from discovery to perceptual hashes means "
+            "alternating this command with each stage's worker."
         )
     )
     parser.add_argument("--database", type=Path, required=True)
@@ -213,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def print_summary(report: dict) -> None:
-    print("Ingest pipeline: enqueue missing work by stage.")
+    print("Enqueued missing work by stage. No worker was run; nothing executed.")
     print(f"  database: {report['database']}")
     for stage in report["stages"]:
         note = f"   ({stage['skipped_reason']})" if stage["skipped_reason"] else ""
@@ -226,7 +251,7 @@ def print_summary(report: dict) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = run_pipeline(
+    report = enqueue_missing_stages(
         database=args.database,
         limit=args.limit,
         stages=args.stage or STAGE_ORDER,
