@@ -19,8 +19,10 @@ import pytest
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
 from comic_automation.library.relocation_repair import (
+    Repair,
     apply_repairs,
-    current_paths,
+    canonical_path,
+    path_owners,
     find_broken_locations,
     index_roots,
     plan_repairs,
@@ -140,7 +142,7 @@ def test_moved_file_is_found_by_content_and_repointed(database: Path, tmp_path: 
         broken = find_broken_locations(connection)
         assert [b.state for b in broken] == ["missing"]
 
-        plan = plan_repairs(broken, index_roots([library]), known_paths=current_paths(connection))
+        plan = plan_repairs(broken, index_roots([library]), owners=path_owners(connection))
         assert len(plan.repairs) == 1
         assert plan.repairs[0].kind == "moved"
         assert plan.repairs[0].new_path == str(moved)
@@ -189,7 +191,7 @@ def test_restored_file_with_new_mtime_is_repaired_in_place(
         broken = find_broken_locations(connection)
         assert [b.state for b in broken] == ["metadata_drift"]
 
-        plan = plan_repairs(broken, {}, known_paths=current_paths(connection))
+        plan = plan_repairs(broken, {}, owners=path_owners(connection))
         assert len(plan.repairs) == 1
         assert plan.repairs[0].kind == "metadata_drift"
 
@@ -237,7 +239,7 @@ def test_content_mismatch_is_never_repaired(database: Path, tmp_path: Path):
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
 
     assert plan.repairs == []
@@ -278,7 +280,7 @@ def test_multiple_matching_copies_are_ambiguous_not_guessed(
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
 
     assert plan.repairs == []
@@ -314,7 +316,7 @@ def test_a_file_already_claimed_by_another_archive_is_not_stolen(
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
 
     assert plan.repairs == []
@@ -359,7 +361,7 @@ def test_same_size_different_content_is_not_accepted_as_the_move_target(
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
 
     assert plan.repairs == []
@@ -392,7 +394,7 @@ def test_archive_without_stored_hash_cannot_be_verified(database: Path, tmp_path
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
 
     assert plan.repairs == []
@@ -414,7 +416,7 @@ def test_apply_skips_a_file_that_changed_after_planning(database: Path, tmp_path
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
         assert len(plan.repairs) == 1
 
@@ -450,7 +452,7 @@ def test_plan_digest_changes_when_the_plan_changes(database: Path, tmp_path: Pat
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan_a = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
         digest_a = plan_a.digest()
 
@@ -459,7 +461,7 @@ def test_plan_digest_changes_when_the_plan_changes(database: Path, tmp_path: Pat
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan_b = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
 
     assert digest_a != plan_b.digest()
@@ -500,7 +502,7 @@ def test_two_archives_cannot_both_claim_one_file(database: Path, tmp_path: Path)
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
 
     # Exactly one archive may claim the survivor; the other is left unresolved.
@@ -539,7 +541,7 @@ def test_apply_refuses_a_path_claimed_by_another_archive(
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
         assert len(plan.repairs) == 1
 
@@ -574,17 +576,14 @@ def test_apply_refuses_a_path_claimed_by_another_archive(
     assert other_id != moving_id
 
 
-def test_apply_refuses_a_path_held_by_another_archives_retired_row(
-    database: Path, tmp_path: Path
-):
-    """A retired row still occupies the path, because path is UNIQUE.
+def test_retired_row_owner_is_unresolved_at_planning(database: Path, tmp_path: Path):
+    """A target held by another archive's retired row is rejected while planning.
 
-    An earlier revision checked ownership only among is_current = 1 rows. With a
-    retired row for another archive sitting on the target path, the repair
-    retired the archive's old location, the conditional upsert then matched
-    nothing because the archive ids differed, and the archive was left with NO
-    current location -- while its signature was refreshed and the repair was
-    reported as applied.
+    file_locations.path is UNIQUE, so a retired row still occupies its path and
+    a repair can never claim it. An earlier revision only discovered this at
+    apply time: the plan proposed the repair, the apply refused it, and the
+    unclaimable target had already been counted in the expected count and plan
+    digest the operator reviewed and approved.
     """
     library = tmp_path / "lib"
     payload = b"payload behind a retired row"
@@ -597,16 +596,14 @@ def test_apply_refuses_a_path_held_by_another_archives_retired_row(
     _write_archive(target, payload)
 
     with database_connection(database) as connection:
-        moving_id = _seed(
-            connection, path=original, digest=digest, size=size, mtime_ns=1
-        )
-        # Another archive once lived at the target path and its row was retired
-        # rather than deleted, which is what mark_missing and quarantine do.
+        _seed(connection, path=original, digest=digest, size=size, mtime_ns=1)
         other_id = int(
             connection.execute(
                 "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
             ).lastrowid
         )
+        # Another archive lived at the target path and its row was retired
+        # rather than deleted, which is what mark_missing and quarantine do.
         connection.execute(
             """
             INSERT INTO file_locations (
@@ -625,13 +622,74 @@ def test_apply_refuses_a_path_held_by_another_archives_retired_row(
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
-        assert len(plan.repairs) == 1
 
-        outcome = apply_repairs(connection, plan.repairs)
+    assert plan.repairs == []
+    assert len(plan.unresolved) == 1
+    reason = plan.unresolved[0]["reason"]
+    assert f"held by archive {other_id}" in reason
+    assert "retired location" in reason
+
+
+def test_apply_still_refuses_a_retired_row_owner(database: Path, tmp_path: Path):
+    """The apply-time guard stands on its own, not merely behind planning.
+
+    The repair is constructed directly, bypassing planning, so this fails if
+    the apply-time ownership check is ever weakened on the assumption that
+    planning already filtered such targets.
+    """
+    library = tmp_path / "lib"
+    payload = b"directly constructed repair"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "elsewhere" / "b.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (moving_id,)
+            ).fetchone()[0]
+        )
+        other_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 0, ?, 5)
+            """,
+            (other_id, str(target), size),
+        )
         connection.commit()
 
+    original.unlink()
+
+    repair = Repair(
+        archive_id=moving_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        outcome = apply_repairs(connection, [repair])
+        connection.commit()
         current = connection.execute(
             "SELECT COUNT(*) FROM file_locations "
             "WHERE archive_id = ? AND is_current = 1",
@@ -640,8 +698,92 @@ def test_apply_refuses_a_path_held_by_another_archives_retired_row(
 
     assert outcome["applied"] == []
     assert "retired location of archive" in outcome["skipped"][0]["reason"]
-    # The decisive assertion: the archive still has a current location.
     assert current == 1
+
+
+def test_apply_ownership_is_case_insensitive_like_planning(
+    database: Path, tmp_path: Path
+):
+    """A case-variant spelling of a claimed path must not evade the check.
+
+    The library lives on a case-insensitive volume, so X:\\A.cbz and x:\\a.cbz
+    are one file -- but SQLite's UNIQUE index is case-sensitive and will hold
+    both spellings as separate rows. Planning and same-run reservation compare
+    canonically; an apply-time check using exact equality would miss a row that
+    already claims the same file and would hand it to a second archive.
+    """
+    library = tmp_path / "lib"
+    payload = b"case variant payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    original = library / "gone" / "a.cbz"
+    _write_archive(original, payload)
+    size = original.stat().st_size
+    target = library / "elsewhere" / "Target.cbz"
+    _write_archive(target, payload)
+
+    with database_connection(database) as connection:
+        moving_id = _seed(
+            connection, path=original, digest=digest, size=size, mtime_ns=1
+        )
+        location_id = int(
+            connection.execute(
+                "SELECT id FROM file_locations WHERE archive_id = ?", (moving_id,)
+            ).fetchone()[0]
+        )
+        other_id = int(
+            connection.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (size,)
+            ).lastrowid
+        )
+        # Claimed under a DIFFERENT spelling of the same file.
+        variant = str(target).upper()
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, is_current, file_size, modified_time_ns
+            )
+            VALUES (?, ?, 1, ?, 7)
+            """,
+            (other_id, variant, size),
+        )
+        connection.commit()
+
+    original.unlink()
+
+    repair = Repair(
+        archive_id=moving_id,
+        location_id=location_id,
+        old_path=str(original),
+        new_path=str(target),
+        new_size=size,
+        new_mtime_ns=target.stat().st_mtime_ns,
+        sha256=digest,
+        kind="moved",
+    )
+
+    with database_connection(database) as connection:
+        connection.row_factory = sqlite3.Row
+        outcome = apply_repairs(connection, [repair])
+        connection.commit()
+        owners_of_variant = connection.execute(
+            "SELECT archive_id FROM file_locations WHERE path = ?", (variant,)
+        ).fetchall()
+        current = connection.execute(
+            "SELECT COUNT(*) FROM file_locations "
+            "WHERE archive_id = ? AND is_current = 1",
+            (moving_id,),
+        ).fetchone()[0]
+
+    assert outcome["applied"] == []
+    assert "location of archive" in outcome["skipped"][0]["reason"]
+    assert [int(r["archive_id"]) for r in owners_of_variant] == [other_id]
+    assert current == 1
+
+
+def test_canonical_path_folds_case_and_separators():
+    """The one place that knows how paths compare on this host."""
+    assert canonical_path(r"X:\Manga\A.cbz") == canonical_path(r"x:/manga/a.cbz")
+    assert canonical_path(r"X:\Manga\A.cbz") != canonical_path(r"X:\Manga\B.cbz")
 
 
 def test_apply_never_leaves_an_archive_without_a_current_location(
@@ -675,7 +817,7 @@ def test_apply_never_leaves_an_archive_without_a_current_location(
         plan = plan_repairs(
             find_broken_locations(connection),
             index_roots([library]),
-            known_paths=current_paths(connection),
+            owners=path_owners(connection),
         )
         apply_repairs(connection, plan.repairs)
         connection.commit()
@@ -717,7 +859,7 @@ def test_incoherent_evidence_is_never_repaired(database: Path, tmp_path: Path):
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
 
     assert plan.repairs == []
@@ -740,7 +882,7 @@ def test_coherent_evidence_is_repaired(database: Path, tmp_path: Path):
     with database_connection(database) as connection:
         connection.row_factory = sqlite3.Row
         plan = plan_repairs(
-            find_broken_locations(connection), {}, known_paths=current_paths(connection)
+            find_broken_locations(connection), {}, owners=path_owners(connection)
         )
 
     assert len(plan.repairs) == 1
@@ -780,7 +922,7 @@ def test_permission_error_is_not_treated_as_absence(
 
     assert [b.state for b in broken] == ["unreadable"]
 
-    plan = plan_repairs(broken, {}, known_paths=set())
+    plan = plan_repairs(broken, {}, owners={})
     assert plan.repairs == []
     assert "not evidence of absence" in plan.unresolved[0]["reason"]
 
