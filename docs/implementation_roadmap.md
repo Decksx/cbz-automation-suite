@@ -1,16 +1,29 @@
 # Implementation Roadmap
 
-## Status as of 2026-07-31
+## Status as of 2026-08-18
 
 The project has moved beyond a collection of standalone scripts into a
 SQLite-backed automation platform for discovering, inspecting, hashing,
 comparing, reviewing, quarantining, and eventually publishing comic
 archives.
 
-The current active workstream is production-scale per-page perceptual
-hashing. Structural changes to archive identity, revision ownership, and
-hash foreign keys are intentionally deferred until the Version 1
-perceptual-hash backfill and its final coverage audit are complete.
+The active workstream is still production-scale per-page perceptual
+hashing, but 2026-08-17 changed what that workstream depends on. A
+guarded 5,000-archive batch completed with clean integrity, and the same
+day surfaced two defects that the backfill's own gates could not see:
+a metadata-driven deduplication run that deleted archives it could not
+prove were duplicates, and a class of archive whose recorded location no
+longer describes the disk. Both are corrected in code under review; the
+second blocks further batches until applied. See §"2026-08-17 guarded
+batch and its findings" below.
+
+Structural changes to archive identity, revision ownership, and hash
+foreign keys remain deferred until the Version 1 perceptual-hash
+backfill and its final coverage audit are complete. That deferral is
+unchanged and was reaffirmed in review: full coverage and the final
+audit remain roadmap requirements before revision work, and are not
+descoped by the fact that duplicate detection turned out not to depend
+on them.
 
 ### Current production metrics
 
@@ -24,22 +37,26 @@ audit.
 | Current file locations/archives | 59,377 |
 | Archive SHA-256 rows | 59,541 |
 | Archive content signatures | 58,437 |
-| Exact duplicate groups | 2 |
+| Exact duplicate groups | 886 |
+| Redundant copies in those groups | 1,085 |
 | Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 40,700 |
-| Perceptual jobs completed | 40,581 |
-| Perceptual jobs failed | 119 |
-| Active perceptual jobs | 0 |
+| Perceptual job rows | 45,700 |
+| Perceptual jobs completed | 45,500 |
+| Perceptual jobs failed | 121 |
+| Active perceptual jobs | 79 (location-blocked, see below) |
 | Production schema migrations | 1–10 |
-| dHash rows, Version 1 | 2,075,992 |
-| pHash rows, Version 1 | 2,075,992 |
-| Eligible archives remaining | 17,554 |
-| Near-duplicate candidates | 0 |
+| dHash rows, Version 1 | 2,334,288 |
+| pHash rows, Version 1 | 2,334,288 |
+| Pages with exactly one perceptual hash | 0 |
+| Perceptual page coverage | 79.0% (2,334,288 / 2,955,304) |
+| Eligible archives remaining | 12,554 |
+| Near-duplicate candidates | 3,000 |
+| Broken current locations | 3,578 |
 | Last guarded batch | 5,000 processed |
-| Last-batch outcomes | 4,991 succeeded, 9 terminal failures, 0 retries |
-| Last-batch terminal-failure rate | 0.18% |
-| Last-batch throughput | 1,222.13 archives/hour |
-| Estimated active processing time remaining | approximately 14.36 hours |
+| Last-batch outcomes | 4,919 succeeded, 2 terminal failures, 79 retries |
+| Last-batch terminal-failure rate | 0.04% |
+| Last-batch throughput | 1,514.51 archives/hour |
+| Estimated active processing time remaining | approximately 8.29 hours |
 
 Throughput is calculated from the guarded batch result:
 
@@ -58,17 +75,70 @@ completion date. It varies with archive size, page count, image
 complexity, storage performance, cache opportunity, and terminal
 failures.
 
-The source-drift recovery for archive `23258` is complete. Its stale
-6.9 MB WebP-based exact inventory was atomically replaced with the
-current 18.2 MB, 31-page JPEG inventory. The original perceptual job
-then completed successfully on attempt 2, leaving no active perceptual
-jobs.
+The "exact duplicate groups" figure moved from 2 to 886 because it is
+now *measured* rather than incidental. The earlier value counted two
+duplicates that a previous investigation had happened to identify; the
+new figure comes from grouping every archive by its stored
+ordered-page content signature. Nothing about the library changed — the
+measurement did. The same applies to near-duplicate candidates moving
+from 0 to 3,000: perceptual detection had never been run, not run and
+found nothing, and 3,000 is where a `--limit` stopped rather than where
+the candidates ran out.
 
-The guarded runner already reports `processed` and `elapsed_seconds`.
-Preserve those fields in future runner revisions. Before adding a
-perceptual-hashing-specific run table, determine whether the existing
-`processing_runs` model can store or reference batch limits, outcomes,
-timestamps, elapsed time, and phase timing.
+The 79 active perceptual jobs are not a queue backlog. They are the
+retry-scheduled remainder of the last batch, blocked on source files
+whose recorded locations are wrong, and they must be resolved through
+location repair rather than retried. Zero active jobs remains a
+precondition for the next batch.
+
+### 2026-08-17 guarded batch and its findings
+
+The batch itself reconciled cleanly: 5,000 processed, integrity intact,
+`dhash = phash` exactly, no pages left holding one hash of a pair, and
+the protected backup verified byte-identical afterwards. The repository's
+own `jobs/batch_postflight` reported `overall_pass: true`, 16/16 gates in
+production mode.
+
+Two findings came out of it, both about evidence rather than about
+hashing:
+
+**Deletion without proof.** A `cbz_library_maintenance` run grouped
+archives by ComicInfo Series/Volume/Number and deleted every member but
+the largest. Upstream ComicInfo routinely assigns distinct chapters the
+same triple, so entire runs collapsed onto one keeper: 1,922 archives
+deleted, of which only 68 were duplicates by stored content evidence.
+864 files were restored from a tower backup, all SHA-256 verified. The
+guard added in response requires identical page content, computed with
+the same canonical ordered-page digest the database itself stores.
+
+**Recorded location is not live location.** 79 jobs failed
+`filesystem_not_found` because the library was reorganised while the
+batch ran. Investigating that found 3,578 archives — 6% of the library —
+whose current `file_locations` row does not describe the disk. None of
+this was visible to any gate, because the eligibility predicate compares
+database rows to database rows and never stats the filesystem. That is a
+structural gap, not an oversight in one run: **no preflight in this
+repository could have caught it**, and a live-path existence check
+belongs in the next batch's preflight.
+
+Both corrections, plus a read-only exact-duplicate audit and a
+dependency-ordered stage enqueuer, are on `fix/dedupe-require-content-proof`
+(PR #63). That branch is under exact-head review and is **not yet
+merged**; nothing in it may be applied to production before it is.
+
+### What this changes about sequencing
+
+Duplicate *control* turned out not to depend on finishing the backfill.
+Exact duplicates are decidable from `archive_content_signatures` alone,
+and near-duplicate detection produces high-confidence candidates at the
+current 79% coverage. That does not descope Step 1: full coverage and
+the final terminal-failure audit remain prerequisites for the revision
+work in Steps 2–4, and changing that is a review decision rather than
+something a measurement settles.
+
+What it does change is that duplicate control can proceed in parallel
+rather than waiting, and that location repair is now a prerequisite for
+the next batch rather than a cleanup task after it.
 
 ## Architectural principles
 
