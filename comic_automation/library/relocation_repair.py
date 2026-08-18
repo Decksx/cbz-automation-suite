@@ -111,8 +111,14 @@ class LocationRepairError(RuntimeError):
 
 @dataclass(frozen=True)
 class PathClaim:
-    """One `file_locations` row's claim on a canonical path."""
+    """One `file_locations` row's claim on a canonical path.
 
+    Carries `location_id` because apply must be able to revive *this* row
+    rather than depend on SQLite matching a path string: the recorded spelling
+    and the repair's target spelling can differ while naming one file.
+    """
+
+    location_id: int
     archive_id: int
     is_current: bool
     recorded_path: str
@@ -658,34 +664,63 @@ def apply_repairs(
                 """,
                 (repair.location_id,),
             )
-            # A retired row for this path may already exist (this archive, or
-            # another, was seen here before). Reviving it is safe only because
-            # the ownership check above proved no *current* row claims it.
-            # There is deliberately no ON CONFLICT clause that reassigns
-            # archive_id: an earlier revision had one, and it silently
-            # transferred a live path from one archive to another.
-            cursor = connection.execute(
-                """
-                INSERT INTO file_locations (
-                    archive_id, path, is_current, file_size, modified_time_ns,
-                    first_seen_at, last_seen_at
+            # ownership_refusal above proved this canonical path is either
+            # unclaimed or held by exactly one row belonging to this archive.
+            existing = (owners.get(target_key) or [None])[0]
+            if existing is not None:
+                # Revive THAT row by id, and normalise its recorded spelling to
+                # the path actually verified on disk. An earlier revision used
+                # `ON CONFLICT(path) DO UPDATE`, which matches on the exact
+                # string: a retired row recorded as "X:/Manga/A.cbz" did not
+                # conflict with a target of "X:\Manga\A.cbz", so the insert
+                # ADDED a second row and left two rows resolving to one file --
+                # manufacturing the collision the next run would refuse, and
+                # producing two current rows if the existing one was current.
+                # UNIQUE(path) cannot be violated here because a second row for
+                # this canonical path would have been a collision refusal.
+                cursor = connection.execute(
+                    """
+                    UPDATE file_locations
+                    SET path = ?, is_current = 1, file_size = ?,
+                        modified_time_ns = ?, last_seen_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        repair.new_path,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        existing.location_id,
+                    ),
                 )
-                VALUES (?, ?, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT(path) DO UPDATE SET
-                    is_current = 1,
-                    file_size = excluded.file_size,
-                    modified_time_ns = excluded.modified_time_ns,
-                    last_seen_at = CURRENT_TIMESTAMP
-                WHERE file_locations.archive_id = excluded.archive_id
-                """,
-                (repair.archive_id, repair.new_path, stat.st_size, stat.st_mtime_ns),
-            )
-            # The conditional upsert can legitimately match zero rows, and a
-            # silent no-op here is the failure mode that leaves an archive with
-            # its old location retired and no new one. The ownership check above
-            # should make this unreachable; if it is ever reached, the guard is
-            # wrong and the whole run must fail rather than commit a partial
-            # repair.
+            else:
+                try:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO file_locations (
+                            archive_id, path, is_current, file_size,
+                            modified_time_ns, first_seen_at, last_seen_at
+                        )
+                        VALUES (?, ?, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            repair.archive_id,
+                            repair.new_path,
+                            stat.st_size,
+                            stat.st_mtime_ns,
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    # A row appeared for this path that the ownership map did
+                    # not have. The map is built inside this transaction, so
+                    # this should be unreachable; reaching it means the map is
+                    # wrong and nothing in this run may be trusted.
+                    raise LocationRepairError(
+                        f"Claiming {repair.new_path!r} for archive "
+                        f"{repair.archive_id} violated UNIQUE(path): {error}"
+                    ) from error
+            # A silent no-op here is the failure mode that leaves an archive
+            # with its old location retired and no new one, so it is fatal
+            # rather than collected.
             if cursor.rowcount != 1:
                 raise LocationRepairError(
                     "Refusing to leave archive "
@@ -709,13 +744,21 @@ def apply_repairs(
             (stat.st_size, stat.st_mtime_ns, repair.archive_id),
         )
         applied_paths.add(target_key)
-        owners.setdefault(target_key, []).append(
+        # Replace rather than append: the write either revived the single
+        # existing row or inserted the only one, so exactly one claim now holds
+        # this canonical path. Appending would fabricate a collision that the
+        # next repair in this run would refuse.
+        claimed = owners.get(target_key) or []
+        owners[target_key] = [
             PathClaim(
+                location_id=(
+                    claimed[0].location_id if claimed else int(cursor.lastrowid or 0)
+                ),
                 archive_id=repair.archive_id,
                 is_current=True,
                 recorded_path=repair.new_path,
             )
-        )
+        ]
         applied.append(
             {
                 "archive_id": repair.archive_id,
@@ -748,11 +791,12 @@ def path_owners(connection: sqlite3.Connection) -> dict[str, list[PathClaim]]:
     iteration order.
     """
     owners: dict[str, list[PathClaim]] = {}
-    for path, archive_id, is_current in connection.execute(
-        "SELECT path, archive_id, is_current FROM file_locations"
+    for location_id, path, archive_id, is_current in connection.execute(
+        "SELECT id, path, archive_id, is_current FROM file_locations"
     ):
         owners.setdefault(canonical_path(path), []).append(
             PathClaim(
+                location_id=int(location_id),
                 archive_id=int(archive_id),
                 is_current=bool(is_current),
                 recorded_path=str(path),
