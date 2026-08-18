@@ -101,7 +101,7 @@ def test_backup_round_trip_succeeds_and_verifies(tmp_path: Path) -> None:
     assert report["source_quick_check_after"] == "ok"
     assert report["backup_quick_check"] == "ok"
     assert report["source_schema_versions"] == report["backup_schema_versions"]
-    assert report["source_schema_versions"] == list(range(1, 11))
+    assert report["source_schema_versions"] == list(range(1, 12))
     assert set(report["source_index_names"]) == set(report["backup_index_names"])
     assert report["source_table_counts"] == report["backup_table_counts"]
     assert report["source_table_counts"]["jobs"] == 2
@@ -494,7 +494,7 @@ def test_discovered_tables_cover_every_migration_table(
     assert set(report["source_tables"]) == expected
     assert set(report["tables_compared"]) == expected
     assert "schema_migrations" in report["tables_compared"]
-    assert report["source_table_counts"]["schema_migrations"] == 10
+    assert report["source_table_counts"]["schema_migrations"] == 11
 
 
 def test_excludes_sqlite_internal_tables_from_discovery(
