@@ -433,14 +433,26 @@ def _archive_content_fingerprint(cbz_path: Path) -> str | None:
     order is not a guard, so there is now one definition and this is a caller
     of it.
 
-    Returns None when the archive cannot be read or is not a CBZ, so the caller
-    isolates it rather than treating it as matching other unreadable files.
+    Returns None when the archive cannot be read, is not a CBZ, or contains no
+    image pages at all, so the caller isolates it rather than treating it as
+    matching other archives in the same state.
+
+    The zero-page case is not a corner: `calculate_page_hashes` hashes an empty
+    page sequence to one fixed digest, so every image-less archive shares it.
+    Accepting that digest would group two archives that have no page evidence
+    whatsoever and delete one of them -- deletion justified by the *absence* of
+    evidence, which is the same defect the guard exists to prevent.
+    `content_duplicate_audit` excludes `page_count = 0` for the same reason.
     """
     try:
-        return calculate_page_hashes(cbz_path).content_digest
+        result = calculate_page_hashes(cbz_path)
     except (ValueError, zipfile.BadZipFile, OSError, RuntimeError) as error:
         log.debug("Content fingerprint failed for %s: %s", cbz_path, error)
         return None
+    if not result.pages:
+        log.debug("No image pages to fingerprint in %s", cbz_path)
+        return None
+    return result.content_digest
 
 
 def _split_group_by_content(group: list[Path]) -> list[list[Path]]:
