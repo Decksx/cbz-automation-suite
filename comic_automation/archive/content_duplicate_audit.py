@@ -44,20 +44,40 @@ are also byte-identical.
 Recorded state is not live state
 --------------------------------
 
-Only locations with ``is_current = 1`` are counted, but that is a claim about
-the row, not about the disk: 3,578 current locations were measured on
-2026-08-17 that no longer described the file at their path. This audit does not
-stat the filesystem -- it is safe to point at a protected backup, which
-statting would break -- so it reports the staleness it *can* see from stored
-data: a member whose ``archive_content_signatures.source_*`` no longer matches
-its ``file_locations`` size and mtime is flagged ``signature_is_stale``, and
-any group containing one is reported as not ``actionable``.
+``is_current = 1`` is a claim about the row, not about the disk: 3,578 current
+locations were measured on 2026-08-17 that no longer described the file at
+their path, and 79 batch jobs failed on exactly that.
 
-Such groups are still listed rather than hidden. The evidence is real; it is
-just not safe to resolve until the location is repaired or re-verified against
-the filesystem. **A caller resolving duplicates must re-verify against live
-bytes regardless** -- this report is grounds for review, never for deletion on
-its own.
+Two independent checks are therefore applied to every member:
+
+``signature_is_stale``
+    ``archive_content_signatures.source_*`` no longer matches the member's
+    ``file_locations`` size and mtime -- database-row drift, visible without
+    touching the filesystem.
+``live_state``
+    the member's path is stat()ed. ``present`` means it exists and its live
+    size and mtime match what ``file_locations`` records; ``missing``,
+    ``unreadable`` and ``metadata_mismatch`` are the three ways that fails.
+
+Row drift alone does not catch the condition that broke the batch: a current
+row whose recorded size and mtime still agree with the signature while the file
+has been deleted or moved underneath it. An earlier revision checked only the
+first and marked such members actionable. Only a stat can see it, so the audit
+stats.
+
+Statting does not weaken the read-only guarantee. What is opened read-only is
+the *database*; the paths being stat()ed are library files, which this module
+never opens, writes, or modifies. Pointing the audit at a protected backup
+remains safe -- though the paths inside it describe a library that may since
+have moved, which is precisely what ``live_state`` reports. Pass ``--no-stat``
+when the library is genuinely unreachable; every member is then reported
+``live_state: "unchecked"`` and no group is actionable, because unchecked is
+not the same as verified.
+
+Groups containing a stale or non-present member are listed rather than hidden.
+The evidence is real; it is just not safe to resolve. **A caller resolving
+duplicates must still re-verify against live bytes at the moment it acts** --
+this report is grounds for review, never for deletion on its own.
 
 Reads go through ``read_guards.read_consistent_snapshot``: one deferred
 read transaction bracketed by ``PRAGMA data_version`` readings taken
@@ -70,6 +90,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -90,7 +111,44 @@ SIGNATURE_ALGORITHM = "ordered-page-sha256"
 SIGNATURE_VERSION = "1"
 
 
-def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
+def _live_state(
+    path: str,
+    recorded_size: int | None,
+    recorded_mtime_ns: int | None,
+    *,
+    stat_paths: bool,
+) -> str:
+    """Classify what is actually at *path* right now.
+
+    Returns "present" only when the file exists and its live size and mtime
+    match what file_locations records. "missing", "unreadable" and
+    "metadata_mismatch" are the three distinct ways that fails, kept apart
+    because they call for different remedies: relocation repair, an access or
+    I/O investigation, and re-hashing respectively.
+
+    "unchecked" is returned when statting is disabled. It is deliberately not
+    treated as "present" anywhere -- an unchecked path is unverified, and a
+    report that conflated the two would be the defect this function exists to
+    close.
+    """
+    if not stat_paths:
+        return "unchecked"
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        # A permission or I/O failure says nothing about whether the file is
+        # there, so it is neither "missing" nor "present".
+        return "unreadable"
+    if stat.st_size != recorded_size or stat.st_mtime_ns != recorded_mtime_ns:
+        return "metadata_mismatch"
+    return "present"
+
+
+def collect_duplicate_groups(
+    connection: sqlite3.Connection, *, stat_paths: bool = True
+) -> list[dict]:
     """Return every group of >=2 currently-located archives sharing a signature.
 
     Each group is returned with its members ordered largest-page-count first,
@@ -151,6 +209,12 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
                 "image_bytes": int(row["image_bytes"] or 0),
                 "archive_sha256": row["archive_sha256"],
                 "signature_is_stale": bool(stale),
+                "live_state": _live_state(
+                    str(row["path"]),
+                    row["location_size"],
+                    row["location_mtime_ns"],
+                    stat_paths=stat_paths,
+                ),
             }
         )
 
@@ -165,7 +229,12 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
         # the strength of evidence that did not exist for every member.
         byte_identical = all(hashes) and len(set(hashes)) == 1
         stale_members = [m for m in members if m["signature_is_stale"]]
-        fresh_members = [m for m in members if not m["signature_is_stale"]]
+        absent_members = [m for m in members if m["live_state"] != "present"]
+        fresh_members = [
+            m
+            for m in members
+            if not m["signature_is_stale"] and m["live_state"] == "present"
+        ]
         # Everything past the first copy is redundant. Sizes can differ between
         # members (different compression of identical pages), so the reclaimable
         # figure is measured against the largest, which is the copy most likely
@@ -179,10 +248,18 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
                 "page_count": members[0]["page_count"],
                 "byte_identical": byte_identical,
                 "stale_member_count": len(stale_members),
-                # Only a group whose every member's signature still describes
-                # its recorded location is safe to act on without re-verifying
-                # against the filesystem first.
-                "actionable": not stale_members and len(fresh_members) >= 2,
+                "absent_member_count": len(absent_members),
+                # Actionable requires BOTH: every member's signature still
+                # describes its recorded location (no row drift), and every
+                # member's file is actually present with matching live
+                # metadata. Row drift alone misses a current row whose recorded
+                # metadata still agrees while the file has gone -- the exact
+                # condition that failed 79 jobs on 2026-08-17.
+                "actionable": (
+                    not stale_members
+                    and not absent_members
+                    and len(fresh_members) >= 2
+                ),
                 "reclaimable_bytes": sum(m["file_size"] for m in members) - largest,
                 "members": members,
             }
@@ -192,6 +269,16 @@ def collect_duplicate_groups(connection: sqlite3.Connection) -> list[dict]:
     # per decision made.
     groups.sort(key=lambda g: (-g["reclaimable_bytes"], g["signature"]))
     return groups
+
+
+def _live_state_counts(groups: list[dict]) -> dict:
+    """How many members are in each live state, across every group."""
+    counts: dict[str, int] = {}
+    for group in groups:
+        for member in group["members"]:
+            state = member["live_state"]
+            counts[state] = counts.get(state, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def summarize(groups: list[dict]) -> dict:
@@ -214,6 +301,10 @@ def summarize(groups: list[dict]) -> dict:
         "groups_with_stale_members": sum(
             1 for g in groups if g["stale_member_count"]
         ),
+        "groups_with_absent_members": sum(
+            1 for g in groups if g["absent_member_count"]
+        ),
+        "members_by_live_state": _live_state_counts(groups),
     }
 
 
@@ -241,6 +332,7 @@ def _write_csv(path: Path, groups: list[dict]) -> Path:
                 "actionable",
                 "byte_identical",
                 "signature_is_stale",
+                "live_state",
                 "archive_id",
                 "page_count",
                 "file_size",
@@ -257,6 +349,7 @@ def _write_csv(path: Path, groups: list[dict]) -> Path:
                         "yes" if group["actionable"] else "no",
                         "yes" if group["byte_identical"] else "no",
                         "yes" if member["signature_is_stale"] else "",
+                        member["live_state"],
                         member["archive_id"],
                         member["page_count"],
                         member["file_size"],
@@ -272,6 +365,7 @@ def run_audit(
     database: Path,
     json_output: Path | None = None,
     csv_output: Path | None = None,
+    stat_paths: bool = True,
 ) -> dict:
     """Produce the read-only exact-duplicate report.
 
@@ -290,7 +384,7 @@ def run_audit(
     files_before = fingerprint_database_files(database)
 
     def read(connection: sqlite3.Connection) -> list[dict]:
-        return collect_duplicate_groups(connection)
+        return collect_duplicate_groups(connection, stat_paths=stat_paths)
 
     snapshot = read_consistent_snapshot(
         database,
@@ -315,6 +409,7 @@ def run_audit(
         "database": str(database),
         "signature_algorithm": SIGNATURE_ALGORITHM,
         "signature_version": SIGNATURE_VERSION,
+        "paths_stat_checked": stat_paths,
         "quick_check": snapshot.quick_check,
         "data_version_before": snapshot.data_version_before,
         "data_version_after": snapshot.data_version_after,
@@ -351,6 +446,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json-output", type=Path)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument(
+        "--no-stat",
+        action="store_true",
+        help="Skip stat()ing library paths. Every member is then reported "
+        "live_state=unchecked and NO group is actionable, because unchecked "
+        "is not verified. Use only when the library is unreachable.",
+    )
+    parser.add_argument(
         "--top",
         type=int,
         default=15,
@@ -382,9 +484,16 @@ def print_summary(output: dict, top: int = 15) -> None:
         f"{summary['actionable_reclaimable_bytes'] / (1024 ** 3):,.2f} GiB"
     )
     print(
-        f"  held back:         {summary['groups_with_stale_members']:,} groups "
+        f"  held back (drift): {summary['groups_with_stale_members']:,} groups "
         "contain a member whose recorded location has drifted"
     )
+    print(
+        f"  held back (disk):  {summary['groups_with_absent_members']:,} groups "
+        "contain a member not present on disk as recorded"
+    )
+    print(f"  members by live state: {summary['members_by_live_state']}")
+    if not output.get("paths_stat_checked", True):
+        print("  NOTE: --no-stat was used; no group can be actionable.")
 
     if output["groups"]:
         print(f"\nLargest reclaims (top {top}):")
@@ -408,6 +517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         database=args.database,
         json_output=args.json_output,
         csv_output=args.csv_output,
+        stat_paths=not args.no_stat,
     )
     print_summary(output, top=args.top)
     return 0
