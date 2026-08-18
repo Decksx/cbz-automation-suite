@@ -411,6 +411,57 @@ def _comicinfo_dup_key(cbz_path: Path) -> str | None:
     return f"{series}|v{volume}|n{number}"
 
 
+def _archive_content_fingerprint(cbz_path: Path) -> str | None:
+    """Return a fingerprint of a CBZ's stored page content, or None if unreadable.
+
+    Built from the zip central directory only -- each entry's CRC32 and
+    uncompressed size -- so it costs a directory read rather than a full
+    decompress, yet still distinguishes archives whose pages actually differ.
+
+    Entry *names* are deliberately excluded: the same pages renamed (a common
+    difference between scanlation releases of one chapter) must still compare
+    equal, otherwise the guard would reject genuine duplicates. ComicInfo.xml
+    is excluded for the same reason -- update_comicinfo_xml rewrites it per
+    file, so including it would make every archive unique.
+    """
+    try:
+        with zipfile.ZipFile(cbz_path) as zf:
+            entries = sorted(
+                (info.CRC, info.file_size)
+                for info in zf.infolist()
+                if not info.is_dir()
+                and os.path.basename(info.filename).lower() != "comicinfo.xml"
+            )
+    except (zipfile.BadZipFile, OSError):
+        return None
+    if not entries:
+        return None
+    return ";".join(f"{crc:08x}:{size}" for crc, size in entries)
+
+
+def _split_group_by_content(group: list[Path]) -> list[list[Path]]:
+    """Partition *group* into subgroups whose page content is byte-identical.
+
+    ComicInfo metadata is written by upstream sources and is frequently wrong:
+    distinct chapters routinely share a Series/Volume/Number triple, and on
+    2026-08-17 a production run deleted 1,922 archives on that basis of which
+    only 68 were genuine duplicates. Metadata may therefore *propose* a group,
+    but content decides it.
+
+    Archives whose fingerprint cannot be read are returned as singletons, so an
+    unreadable file is never deleted as somebody else's duplicate.
+    """
+    by_content: dict[str, list[Path]] = {}
+    unreadable: list[list[Path]] = []
+    for path in group:
+        fingerprint = _archive_content_fingerprint(path)
+        if fingerprint is None:
+            unreadable.append([path])
+        else:
+            by_content.setdefault(fingerprint, []).append(path)
+    return list(by_content.values()) + unreadable
+
+
 def _resolve_dup_group(
     folder: Path,
     group: list[Path],
@@ -449,7 +500,10 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
          and punctuation, e.g. "Ch.1" vs "Ch. 1").
       2. Metadata (when *use_metadata*): among the pass-1 survivors, CBZ files whose
          ComicInfo.xml resolves to the same Series + Volume + Number — catches the
-         same chapter saved under completely different filenames.
+         same chapter saved under completely different filenames. Metadata only
+         *proposes* a group; members are deleted only when their page content is
+         identical, because upstream ComicInfo routinely collides across genuinely
+         different chapters.
     """
     stats = MaintenanceStats()
     files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in {".cbz", ".cbr"}]
@@ -478,8 +532,22 @@ def dedupe_archives_in_dir(folder: Path, dry_run: bool, use_metadata: bool = Tru
             if key is not None:
                 by_meta.setdefault(key, []).append(f)
         for group in by_meta.values():
-            if len(group) >= 2:
-                _resolve_dup_group(folder, group, dry_run, stats, by="metadata")
+            if len(group) < 2:
+                continue
+            # Metadata proposed these as the same chapter; require identical
+            # page content before any of them is deleted.
+            for subgroup in _split_group_by_content(group):
+                if len(subgroup) >= 2:
+                    _resolve_dup_group(
+                        folder, subgroup, dry_run, stats, by="metadata+content"
+                    )
+                    continue
+                stats.skipped += 1
+                log.info(
+                    "  Kept (metadata matched but content differs) [%s]: %s",
+                    folder.name,
+                    subgroup[0].name,
+                )
 
     return stats
 
