@@ -1,0 +1,47 @@
+-- Migration 011: job cancellation evidence.
+--
+-- Adds the two columns a cancelled job needs to record *why* it was
+-- cancelled and *when*, without overwriting why it previously failed.
+--
+-- JobStatus.CANCELLED has existed in comic_automation/jobs/models.py
+-- since the status enum was written, and migration 010 already treats
+-- 'cancelled' as a terminal status outside the unique-active-job index.
+-- No JobQueue transition ever reached it, so no job could be cancelled
+-- and these columns had nothing to hold. The blocked job for archive
+-- 45217 is the first case that needs one: its content survives under
+-- another archive's current location, so location repair can never
+-- resolve it and it cannot reach a terminal status any other way.
+--
+-- Why new columns instead of reusing error_message/failure_category:
+-- those two hold the *failure* evidence, and on the rows most likely to
+-- be cancelled they are already populated with something worth keeping.
+-- The 79 jobs blocked by the 2026-08-17 relocation incident carry
+-- failure_category = 'filesystem_not_found' and the error message from
+-- their last attempt. Writing a cancellation reason over that would
+-- destroy the record of the incident in the act of closing it out, and
+-- would also conflate two different questions -- "why did this job's
+-- last attempt fail" and "why did an operator retire it" -- in one
+-- column, which is exactly the one-definition-per-question problem this
+-- codebase has been bitten by before.
+--
+-- completed_at is likewise left alone. A cancelled job did not
+-- complete, so cancelled_at is its own terminal timestamp and
+-- completed_at stays NULL. Reading "terminal at" therefore means
+-- COALESCE(completed_at, cancelled_at), which is honest about which of
+-- the two happened rather than claiming a completion that never
+-- occurred.
+--
+-- Scope: two nullable columns. This migration deliberately does NOT
+-- cancel, rewrite, or backfill any row, and adds no index -- cancelled
+-- rows are already outside idx_jobs_unique_active's predicate, so
+-- cancelling a blocked job frees its (job_type, archive_id) identity
+-- for a future enqueue with no further schema support. Both columns are
+-- NULL for every existing row, which is correct: nothing has ever been
+-- cancelled.
+--
+-- Additive and non-destructive. apply_migrations() wraps each file in
+-- BEGIN IMMEDIATE ... COMMIT, so a failure rolls back without recording
+-- version 11 and without adding either column.
+ALTER TABLE jobs ADD COLUMN cancelled_at TEXT;
+
+ALTER TABLE jobs ADD COLUMN cancellation_reason TEXT;
