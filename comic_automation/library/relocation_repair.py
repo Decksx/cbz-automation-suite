@@ -578,15 +578,21 @@ def apply_repairs(
         _apply_within_transaction(
             connection, repairs, owners, applied, skipped, applied_paths
         )
+        # COMMIT belongs inside the try: it can fail on its own -- a full disk,
+        # an I/O error, a lock it cannot upgrade. An earlier revision placed it
+        # after the block, so a failing commit escaped without the rollback this
+        # function promises, leaving the transaction open and its uncommitted
+        # changes still visible on this connection.
+        connection.execute("COMMIT")
     except BaseException:
         # Includes LocationRepairError, whose whole purpose is to abandon a
         # half-finished repair. Rolling back is what makes that purpose real.
-        try:
+        # Guarded by in_transaction because a failed COMMIT may or may not have
+        # already ended the transaction, and ROLLBACK without one is itself an
+        # error that would mask the original.
+        if connection.in_transaction:
             connection.execute("ROLLBACK")
-        except sqlite3.Error:  # pragma: no cover - rollback of a dead txn
-            pass
         raise
-    connection.execute("COMMIT")
 
     return {"applied": applied, "skipped": skipped}
 
