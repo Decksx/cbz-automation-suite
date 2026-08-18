@@ -42,12 +42,17 @@ def _seed(
     page_count: int = 10,
     file_size: int = 2048,
     archive_sha256: str | None = None,
+    location_size: int | None = None,
 ) -> int:
     """Insert one archive with a content signature and optional current location.
 
     path=None models an archive whose location is not current -- moved, deleted,
     or otherwise unresolvable. Such an archive must never be offered as a
     deletable duplicate, because nothing proves the file is still there.
+
+    location_size defaults to the signature's source size, which is the
+    coherent case. Passing a different value models a location that has drifted
+    since the signature was computed.
     """
     archive_id = int(
         connection.execute(
@@ -62,7 +67,7 @@ def _seed(
             )
             VALUES (?, ?, ?, 1000, 1)
             """,
-            (archive_id, path, file_size),
+            (archive_id, path, file_size if location_size is None else location_size),
         )
     connection.execute(
         """
@@ -165,6 +170,83 @@ def test_reclaimable_bytes_measured_against_the_largest_member(database: Path):
 
     assert group["member_count"] == 3
     assert group["reclaimable_bytes"] == 700  # 1000+400+300 minus the 1000 kept
+
+
+def test_byte_identical_requires_every_member_to_have_a_hash(database: Path):
+    """A missing hash is absence of evidence, not agreement.
+
+    An earlier revision filtered out members without a hash before comparing,
+    so a group where one member had no archive hash and the rest agreed was
+    reported byte-identical on evidence that did not exist for every member.
+    """
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\a.cbz", digest="aaa", archive_sha256="ff00")
+        _seed(connection, path=r"X:\b.cbz", digest="aaa", archive_sha256=None)
+
+    group = _groups(database)[0]
+
+    assert group["member_count"] == 2
+    assert group["byte_identical"] is False
+
+
+def test_stale_signature_member_makes_a_group_not_actionable(database: Path):
+    """is_current = 1 is a claim about the row, not about the disk.
+
+    3,578 current locations were measured that no longer described the file at
+    their path. A member whose signature provenance disagrees with its
+    recorded location may be describing bytes that are no longer there, so the
+    group must not be presented as safe to resolve.
+    """
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\fresh.cbz", digest="aaa", file_size=500)
+        # Location says the file is a different size than the signature saw.
+        _seed(
+            connection,
+            path=r"X:\drifted.cbz",
+            digest="aaa",
+            file_size=500,
+            location_size=999,
+        )
+
+    group = _groups(database)[0]
+
+    assert group["member_count"] == 2
+    assert group["stale_member_count"] == 1
+    assert group["actionable"] is False
+    assert [m["signature_is_stale"] for m in group["members"]].count(True) == 1
+
+
+def test_group_with_all_fresh_members_is_actionable(database: Path):
+    """The staleness gate must not suppress the ordinary case."""
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\a.cbz", digest="aaa")
+        _seed(connection, path=r"X:\b.cbz", digest="aaa")
+
+    group = _groups(database)[0]
+
+    assert group["stale_member_count"] == 0
+    assert group["actionable"] is True
+
+
+def test_summary_separates_actionable_from_total(database: Path):
+    """A reviewer needs to know how much of the total is safe to act on."""
+    with database_connection(database) as connection:
+        _seed(connection, path=r"X:\a.cbz", digest="aaa")
+        _seed(connection, path=r"X:\b.cbz", digest="aaa")
+        _seed(connection, path=r"X:\c.cbz", digest="ccc", file_size=800)
+        _seed(
+            connection,
+            path=r"X:\d.cbz",
+            digest="ccc",
+            file_size=800,
+            location_size=1,
+        )
+
+    summary = summarize(_groups(database))
+
+    assert summary["group_count"] == 2
+    assert summary["actionable_groups"] == 1
+    assert summary["groups_with_stale_members"] == 1
 
 
 def test_byte_identical_flag_distinguishes_recompressed_copies(database: Path):
