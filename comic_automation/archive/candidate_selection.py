@@ -143,6 +143,15 @@ def current_locations(
     return locations
 
 
+# The one call that touches the disk, bound here rather than called as
+# os.stat() inside the function. A test proving that a retired archive is
+# refused *without* consulting the filesystem has to replace this call; doing
+# that by patching os.stat globally reaches pytest's own tmpdir cleanup and
+# breaks the run. An explicit module-level seam keeps the substitution inside
+# this module, where it belongs.
+_stat = os.stat
+
+
 def _inspect_path(path: str) -> tuple[str, str] | None:
     """Return (reason, detail) if *path* is not an accessible regular file.
 
@@ -152,7 +161,7 @@ def _inspect_path(path: str) -> tuple[str, str] | None:
     replacement file that was never gone.
     """
     try:
-        result = os.stat(path)
+        result = _stat(path)
     except FileNotFoundError:
         return PATH_MISSING, path
     except OSError as error:

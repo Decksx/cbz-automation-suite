@@ -162,10 +162,10 @@ def test_an_unreadable_path_is_not_reported_as_missing(
 
     import comic_automation.archive.candidate_selection as module
 
-    def refuse(path):
+    def refuse(path, **kwargs):
         raise PermissionError(13, "Access is denied")
 
-    monkeypatch.setattr(module.os, "stat", refuse)
+    monkeypatch.setattr(module, "_stat", refuse)
 
     rejection = only_rejection(select_candidates(connection, [archive_id]))
 
@@ -232,10 +232,10 @@ def test_retirement_is_checked_before_the_filesystem(
 
     import comic_automation.archive.candidate_selection as module
 
-    def explode(path):
+    def explode(path, **kwargs):
         raise AssertionError("the filesystem was consulted for a retired archive")
 
-    monkeypatch.setattr(module.os, "stat", explode)
+    monkeypatch.setattr(module, "_stat", explode)
 
     rejection = only_rejection(select_candidates(connection, [archive_id]))
 
