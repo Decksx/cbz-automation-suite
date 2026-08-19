@@ -29,6 +29,12 @@
 --     only in application code. A retirement with no reason is
 --     indistinguishable later from a mistake, and this table exists
 --     precisely for records a future reader will question.
+--
+--     The CHECK passes an explicit character set to trim(). SQLite's
+--     one-argument trim() strips spaces and nothing else, so
+--     `length(trim(reason)) > 0` accepts a lone tab or newline as a
+--     reason -- which is blank to every reader but not to the database.
+--     A test caught that; the character set closes it.
 --   * evidence is free-form and optional, for the digests, paths, and
 --     surviving-copy identifiers that justify the decision. It is
 --     deliberately not parsed by anything: it is there to be read by a
@@ -48,7 +54,11 @@
 CREATE TABLE IF NOT EXISTS archive_retirements (
     archive_id INTEGER PRIMARY KEY,
     retired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    reason TEXT NOT NULL CHECK (
+        length(
+            trim(reason, char(32) || char(9) || char(10) || char(13))
+        ) > 0
+    ),
     evidence TEXT,
     FOREIGN KEY (archive_id) REFERENCES archive_files(id)
         ON DELETE CASCADE
