@@ -37,7 +37,7 @@ INDEX_NAME = "idx_jobs_unique_active"
 ACTIVE_STATUSES = ("pending", "claimed", "running")
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "blocked")
 
-ALL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+ALL_MIGRATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
 
 def migrated_database(tmp_path: Path, name: str = "jobs.db") -> Path:
@@ -521,7 +521,7 @@ def test_upgrade_from_migrations_one_through_nine_preserves_rows(
             (INDEX_NAME,),
         ).fetchone()[0]
 
-    assert upgraded == [10, 11]
+    assert upgraded == [10, 11, 12]
     assert index_exists == 1
     # Column-for-column comparison across every column of every row.
     # Migration 010 adds an index and 011 adds two nullable columns; neither

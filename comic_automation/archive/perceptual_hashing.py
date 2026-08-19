@@ -13,6 +13,11 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
+from comic_automation.archive.candidate_selection import (
+    Selection,
+    revalidate_for_enqueue,
+    select_candidates,
+)
 from comic_automation.archive.inspection import IMAGE_EXTENSIONS
 from comic_automation.archive.page_hashing import _natural_key
 from comic_automation.archive.repository import (
@@ -758,15 +763,44 @@ class ArchivePerceptualHashRepository:
             ],
         ).fetchall()
 
+    def select_enqueueable(self, *, limit: int | None = None) -> Selection:
+        """Database-eligible archives, filtered by the shared selection path.
+
+        Read-only, and the single source for "what would `enqueue_missing()`
+        actually enqueue". A preflight calls this and reports
+        `selection.rejected`; `enqueue_missing()` calls it and enqueues
+        `selection.accepted`. Before this existed the two answered the
+        question differently, and the difference was invisible until a
+        worker opened a file that was not there.
+
+        `limit` is applied to the *database* predicate, so a bounded run
+        still costs a bounded amount of work. That means the accepted count
+        can be smaller than `limit` when some of those candidates are
+        rejected here -- which is honest: the alternative is scanning an
+        unbounded number of archives to fill a quota.
+        """
+        eligible = [
+            int(row["archive_id"])
+            for row in self._eligible_archive_rows(limit=limit)
+        ]
+        return select_candidates(self.connection, eligible)
+
     def enqueue_missing(self, *, limit: int | None = None) -> int:
-        rows = self._eligible_archive_rows(limit=limit)
+        selection = self.select_enqueueable(limit=limit)
         queue = JobQueue(self.connection)
         created = 0
 
-        for row in rows:
+        for candidate in selection.accepted:
+            # The database can move between selection and enqueue -- an
+            # archive retired by another operator, a location row rewritten
+            # by repair -- and those are cheap to re-read. The filesystem is
+            # deliberately not re-checked here; see revalidate_for_enqueue().
+            if revalidate_for_enqueue(self.connection, candidate.archive_id):
+                continue
+
             outcome = queue.enqueue_if_absent(
                 "hash_archive_pages_perceptual",
-                archive_id=int(row["archive_id"]),
+                archive_id=candidate.archive_id,
                 priority=250,
             )
 
@@ -778,13 +812,20 @@ class ArchivePerceptualHashRepository:
         return created
 
     def count_eligible(self) -> int:
-        """Read-only count of archives `enqueue_missing()` would enqueue.
+        """Read-only count of archives satisfying the *database* rules alone.
 
-        Uses the exact same eligibility predicate as `enqueue_missing()`
-        (`_eligible_archive_rows`) but issues only a SELECT, so it is
-        safe to call on a connection opened with SQLite's `mode=ro` URI
-        flag plus `PRAGMA query_only = ON` -- unlike `enqueue_missing()`
-        itself, which writes new job rows.
+        Deliberately not the count of what `enqueue_missing()` would
+        enqueue: that is `len(select_enqueueable().accepted)`, and the two
+        differ by every archive that is retired, has no single current
+        location, or points at a path that is not an accessible regular
+        file. On 2026-08-18 the difference was 226 of 12,555.
+
+        Keeping the database-only count available matters for diagnosis --
+        a gap between the two numbers is the measurement of how far the
+        recorded state has drifted from the disk.
+
+        Issues only a SELECT, so it is safe on a connection opened with
+        SQLite's `mode=ro` URI flag plus `PRAGMA query_only = ON`.
         """
         return len(self._eligible_archive_rows(limit=None))
 
