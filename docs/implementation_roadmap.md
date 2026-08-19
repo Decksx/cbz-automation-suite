@@ -44,12 +44,14 @@ audit.
 | Perceptual jobs completed | 45,578 |
 | Perceptual jobs failed | 121 |
 | Active perceptual jobs | 0 |
-| Production schema migrations | 1–11 |
+| Production schema migrations | 1–12 |
 | dHash rows, Version 1 | 2,339,340 |
 | pHash rows, Version 1 | 2,339,340 |
 | Pages with exactly one perceptual hash | 0 |
 | Perceptual page coverage | 79.16% (2,339,340 / 2,955,304) |
-| Eligible archives remaining | 12,555 (226 of them absent from disk) |
+| Database-eligible archives | 12,555 |
+| Enqueueable after selection | 12,329 |
+| Refused: retired / path missing | 1 / 225 |
 | Near-duplicate candidates | 3,000 |
 | Broken current locations | 1,066 (was 3,612 before the 2026-08-18 repair) |
 | Last guarded batch | 5,000 processed |
@@ -136,8 +138,55 @@ point at a path that does not exist, and every one of them would fail on open.
 
 So the live-path existence gate is no longer only a protection against files
 moving mid-batch. It is a **precondition for using `--enqueue-missing` at
-all**. Until it lands, drain-only runs remain safe because they consume
-existing rows and cannot resurrect a retired archive.
+all**.
+
+### One selection path, and retirement as a stored fact
+
+Both were built on 2026-08-18 (PR #70) and the gate alone would not have been
+enough.
+
+An existence check keeps archive 45217 out only while its file is absent, which
+makes retirement an accident of the filesystem: restore the file, re-sync it, or
+rename something back, and a deliberately retired archive silently returns to
+the queue. Cancelling its job could not carry the decision either, because
+cancellation is job-scoped and the eligibility predicate only excludes archives
+holding an *active* job.
+
+Migration 012 therefore adds `archive_retirements` -- archive-scoped, with a
+non-blank reason enforced by CHECK and free-form evidence -- and
+`comic_automation/archive/candidate_selection.py` applies one shared sequence:
+database eligibility, then **retirement before anything touches the disk**, then
+exactly one current location, then an accessible regular file. Rejections carry
+explicit reasons instead of being dropped, because a candidate that vanishes
+silently between preflight and enqueue cannot be told from one that was never
+eligible.
+
+`select_enqueueable()` is now the single source for what `enqueue_missing()`
+would enqueue, and a preflight reports the same object. `count_eligible()`
+deliberately still means the database rules alone: the gap between the two
+numbers measures how far recorded state has drifted from the disk, and
+collapsing them would delete the diagnostic.
+
+Measured on production after applying migration 012 and retiring 45217:
+
+```text
+database-eligible archives     12,555
+enqueueable after selection    12,329
+refused: archive_retired            1   (45217, not its missing file)
+refused: path_missing             225
+```
+
+The 225 are the residue of the same drift the location repair addressed. They
+are now refused rather than enqueued -- before this, all 226 would have been
+enqueued and failed in a worker -- and they are candidates for a future repair
+pass, not for retirement.
+
+Two distinctions worth keeping. Cancelling a job says "this unit of work is
+over"; retiring an archive says "this archive is out of scope", and the first
+does not imply the second. And a guard that depends on the filesystem expires
+when the filesystem changes: the existence check is necessary, but anything
+meant to persist has to be stored as a fact rather than inferred from the state
+of a disk.
 
 ### 2026-08-17 guarded batch and its findings
 
