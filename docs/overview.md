@@ -66,13 +66,17 @@ them.
 ## Current pipeline
 
 ```text
-Incoming
+Incoming (cloud-synced queue)
   ↓
 Watcher or batch workflow
   ↓
 Filename and ComicInfo normalization
   ↓
 Series organization / review staging
+  ↓
+Staging root  (X:\_staging\...)
+  ↓
+Promotion     (scripts/cbz_promote_staging.py, operator-run)
   ↓
 Final library
   ↓
@@ -91,6 +95,7 @@ Komga / Komf
 | `scripts/cbz_workflows.py` | Multi-stage orchestration |
 | `scripts/cbz_compilation_resolver.py` | Page-level compilation overlap resolver |
 | `scripts/cbz_gap_checker.py` | Missing chapter CSV report |
+| `scripts/cbz_promote_staging.py` | Promotes staged series directories into the library, read-only without `--apply` |
 | `comic_automation/` package | SQLite-backed service foundation: persistent job queue (`jobs/`), library discovery (`library/`), archive inspection/hashing/quarantine/near-duplicate detection (`archive/`), long-running service runner (`service.py`) -- see `docs/implementation_roadmap.md` for current status |
 
 ## Current limitations
@@ -144,4 +149,5 @@ The target architecture adds:
 - quality scoring
 - OpenCLIP embeddings on the RTX 3080
 - [x] quarantine-first duplicate resolution
-- staging before publication to Komga
+- [x] staging before publication to Komga (staging root and promotion exist;
+      promotion is operator-run and does not yet inventory what it promotes)

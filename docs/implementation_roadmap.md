@@ -1,6 +1,6 @@
 # Implementation Roadmap
 
-## Status as of 2026-08-18
+## Status as of 2026-08-20
 
 The project has moved beyond a collection of standalone scripts into a
 SQLite-backed automation platform for discovering, inspecting, hashing,
@@ -41,24 +41,25 @@ audit.
 | Redundant copies in those groups | 1,085 |
 | Page SHA-256 rows | 2,955,304 |
 | Perceptual job rows | 45,700 |
-| Perceptual jobs completed | 45,578 |
-| Perceptual jobs failed | 121 |
+| Perceptual jobs completed | 57,896 |
+| Perceptual jobs failed | 132 |
 | Active perceptual jobs | 0 |
 | Production schema migrations | 1–12 |
-| dHash rows, Version 1 | 2,339,340 |
-| pHash rows, Version 1 | 2,339,340 |
+| dHash rows, Version 1 | 2,932,841 |
+| pHash rows, Version 1 | 2,932,841 |
 | Pages with exactly one perceptual hash | 0 |
-| Perceptual page coverage | 79.16% (2,339,340 / 2,955,304) |
-| Database-eligible archives | 12,555 |
-| Enqueueable after selection | 12,329 |
+| Perceptual page coverage | 99.24% (2,932,841 / 2,955,391) |
+| Database-eligible archives | 226 |
+| Enqueueable after selection | 0 |
 | Refused: retired / path missing | 1 / 225 |
+| Archives whose file changed under them | 95 |
 | Near-duplicate candidates | 3,000 |
-| Broken current locations | 1,066 (was 3,612 before the 2026-08-18 repair) |
-| Last guarded batch | 5,000 processed |
-| Last-batch outcomes | 4,919 succeeded, 2 terminal failures, 79 retries |
-| Last-batch terminal-failure rate | 0.04% |
-| Last-batch throughput | 1,514.51 archives/hour |
-| Estimated active processing time remaining | approximately 8.29 hours |
+| Broken current locations | 1,081 |
+| Last guarded batch | 2,550 processed (remainder) |
+| Backfill totals, 2026-08-19 | 12,329 processed, 12,313 succeeded, 11 terminal |
+| Backfill terminal-failure rate | 0.09% |
+| Backfill throughput | approximately 1,270 archives/hour |
+| Estimated active processing time remaining | none; the V1 backfill is complete |
 
 Throughput is calculated from the guarded batch result:
 
@@ -187,6 +188,59 @@ does not imply the second. And a guard that depends on the filesystem expires
 when the filesystem changes: the existence check is necessary, but anything
 meant to persist has to be stored as a fact rather than inferred from the state
 of a disk.
+
+### Ingest is now staging-first
+
+Two changes on 2026-08-19 and 2026-08-20 closed the source of new broken
+locations. Both came out of measuring the watcher's own logs rather than from
+the roadmap.
+
+**A minimum replacement gain.** On a filename collision the watcher keeps the
+larger archive and deletes the other. That policy is unchanged and correct --
+for the same chapter name a bigger archive is normally the better scan -- but it
+used to apply to *any* gain. Measured across 1,261 conflict replacements in the
+watcher logs from 2026-03 to 2026-08, **15.1% gained under 1 KB**, and the
+smallest were +1, +2 and +6 bytes. A gain that size is a repack, a rewritten
+`ComicInfo.xml`, or different zip metadata around identical pages: it destroyed
+a working archive *and* invalidated the recorded inventory, hash and signature
+of a file the database had already inspected, for nothing.
+`REPLACEMENT_MIN_GAIN_BYTES` is 10 KB, which is where the observed distribution
+turns -- it blocks 19.1% of past replacements while 20 KB blocks only 0.9% more
+and 100 KB starts refusing gains large enough to be genuine (PR #72).
+
+**A staging root.** `routing.json` destinations now point at
+`X:\_staging\Comix` and `X:\_staging\Manga` rather than at the library, so an
+arrival can no longer overwrite an inventoried file at all.
+`scripts/cbz_promote_staging.py` moves staged series directories onward,
+reusing the watcher's own `_merge_directories` so promotion and ingest resolve
+a collision by the same rule. Read-only without `--apply`, and the dry run
+reports how many library archives a promotion *would replace* -- the cost that
+used to be paid silently (PR #73).
+
+Note that `routing.json` is gitignored local configuration, so the staging
+redirect lives on the machine and not in this repository. A restored or
+freshly-cloned checkout routes straight into the library again unless that file
+is re-pointed.
+
+### Archives whose file changed underneath them
+
+**95 archives hold recorded evidence that describes bytes no longer at their
+path.** Their page inventory, archive hash, and content signature were all
+written at inspection time and the file has since been replaced. 47 grew, 48
+shrank.
+
+No gate catches this, and the reason is structural: the eligibility predicate
+compares `archive_content_signatures.source_file_size` to
+`file_locations.file_size` -- **two database rows, both written at inspection
+time** -- so they still agree with each other after the file changes. The
+live-path existence check added on 2026-08-18 passes too, because the path
+exists. Only reading the file catches it, which is why five of these surfaced at
+a worker during the 2026-08-19 backfill rather than at any preflight.
+
+Those five were repaired with `source_drift_recovery`, one job at a time, each
+pinned to its own expected size and mtime. The tool is per-*job*, and the
+remaining 90 have no job, so closing them out needs a batch re-inspection path
+that does not exist yet.
 
 ### 2026-08-17 guarded batch and its findings
 
@@ -370,12 +424,19 @@ After each active guarded batch completes:
 
 Before the next structural database migration:
 
-- complete the remaining Version 1 backfill;
+- ~~complete the remaining Version 1 backfill;~~ **done 2026-08-19** — three
+  guarded batches, 12,329 processed, coverage 79.16% -> 99.24%, and
+  `enqueueable` now 0;
 - audit full-library coverage;
 - classify legitimate terminal failures;
 - capture a final database backup;
 - verify the backup independently;
 - update the production metrics and development log.
+
+The backfill itself is finished. **The audit is not**, and it is the remaining
+gate on Step 2. The 22,550 pages still without a Version 1 hash belong to the
+226 refused archives and the 132 terminal failures, and the audit has to say so
+archive by archive rather than by subtraction.
 
 ### Step 1A — Phase 5 performance optimization
 
