@@ -41,9 +41,12 @@ refuses.
 
 The one thing this module owns is the reversal-reason handshake: a ``DELETE``
 trigger cannot be handed an argument, so a reversal writes its reason into
-``disposition_reversal_context`` first, deletes the row, and clears the
-context -- all inside one transaction, so a caller cannot leave a stale reason
-behind for the next reversal to borrow.
+``disposition_reversal_context`` first and then deletes the row. That runs
+inside a ``SAVEPOINT``, because ``connect_database`` sets
+``isolation_level=None`` and the statements would otherwise autocommit one by
+one, leaving a usable context row on disk if anything interrupted the sequence.
+The context is consumed by migration 013's own trigger, so a raw-SQL reversal
+cannot leave one behind either.
 
 History is not written here either. Migration 013's triggers append to
 ``archive_disposition_events`` in the same statement that changes the
@@ -65,13 +68,14 @@ SUPERSEDED = "superseded"
 
 DISPOSITIONS = (RETIRED, SUPERSEDED)
 
-# Bound on how far `resolve_successor` will walk before declaring the chain
-# unusable. Migration 013's cycle trigger makes a true cycle unreachable
-# through any path that respects the schema, so hitting this bound means the
-# constraint was bypassed (a database restored from before 013, or a table
-# rewritten out from under it). Walking forever would turn that into a hang;
-# raising turns it into a report.
-MAX_CHAIN_DEPTH = 64
+# The SAVEPOINT name used to make a reversal atomic. A savepoint rather than
+# BEGIN/COMMIT because `connect_database` sets isolation_level=None: without
+# one, the three statements of the reversal handshake would autocommit
+# separately when no caller-supplied transaction is open, and an interruption
+# between them could leave a usable context row behind. SAVEPOINT works
+# identically in autocommit and inside an existing transaction, which is what
+# lets this be correct for both callers.
+_REVERSAL_SAVEPOINT = "disposition_reversal"
 
 
 class DispositionError(RuntimeError):
@@ -79,7 +83,22 @@ class DispositionError(RuntimeError):
 
 
 class SupersessionChainError(DispositionError):
-    """A successor chain does not terminate within MAX_CHAIN_DEPTH."""
+    """A successor chain revisits a node, so it does not terminate.
+
+    Migration 013's cycle trigger makes this unreachable through any path
+    that respects the schema. It is still detected rather than assumed away,
+    because a database restored from before 013 has the rows and none of the
+    triggers.
+    """
+
+
+class ConflictingDispositionError(DispositionError):
+    """One archive holds both a retirement and a supersession.
+
+    Migration 013 forbids this in both insertion orders. Reaching it means the
+    constraint was bypassed, and the two records disagree about what was
+    decided -- which is not something a reader can be handed silently.
+    """
 
 
 @dataclass(frozen=True)
@@ -124,31 +143,51 @@ def _reversal_reason(
     disposition: str,
     reason: str,
 ) -> Iterator[None]:
-    """Publish a reversal reason for the DELETE trigger, then clear it.
+    """Publish a reversal reason for the DELETE trigger, atomically.
 
     The context row names the archive and the disposition it authorises, and
     migration 013's BEFORE DELETE trigger refuses any deletion it does not
     match. That is what stops a reason left behind by one reversal from
     silently labelling the next.
 
-    Cleared in a `finally` so a failed delete cannot leave the row in place.
-    The caller is expected to hold a transaction; if the transaction rolls
-    back, the context row goes with it either way.
+    The whole handshake runs inside a SAVEPOINT, which is what makes the
+    atomicity claim true rather than aspirational. `connect_database` sets
+    `isolation_level=None`, so without one the context insert, the delete and
+    the cleanup would each autocommit separately whenever no caller-supplied
+    transaction was open -- and an interruption between them would leave a
+    usable context row committed on disk. A SAVEPOINT behaves the same way in
+    autocommit mode (where it opens a transaction and RELEASE commits it) and
+    inside an existing transaction (where it nests), so both callers get the
+    same guarantee.
+
+    On success the deletion's AFTER DELETE trigger has already consumed the
+    context row; the explicit cleanup here covers the case where the deletion
+    matched nothing, so no trigger fired and there is nothing to consume it.
     """
-    connection.execute("DELETE FROM disposition_reversal_context")
-    connection.execute(
-        """
-        INSERT INTO disposition_reversal_context
-            (id, archive_id, disposition, reason)
-        VALUES (1, ?, ?, ?)
-        """,
-        (int(archive_id), disposition, reason),
-    )
+    connection.execute(f"SAVEPOINT {_REVERSAL_SAVEPOINT}")
 
     try:
-        yield
-    finally:
         connection.execute("DELETE FROM disposition_reversal_context")
+        connection.execute(
+            """
+            INSERT INTO disposition_reversal_context
+                (id, archive_id, disposition, reason)
+            VALUES (1, ?, ?, ?)
+            """,
+            (int(archive_id), disposition, reason),
+        )
+
+        yield
+
+        connection.execute("DELETE FROM disposition_reversal_context")
+    except BaseException:
+        # ROLLBACK TO leaves the savepoint on the stack, so it still has to be
+        # released afterwards or every later savepoint nests inside a dead one.
+        connection.execute(f"ROLLBACK TO SAVEPOINT {_REVERSAL_SAVEPOINT}")
+        connection.execute(f"RELEASE SAVEPOINT {_REVERSAL_SAVEPOINT}")
+        raise
+
+    connection.execute(f"RELEASE SAVEPOINT {_REVERSAL_SAVEPOINT}")
 
 
 def retire(
@@ -316,9 +355,15 @@ def resolve_successor(
     Returns *archive_id* itself when it has not been superseded. Pass
     `successors` to resolve many archives without re-reading the table.
 
-    Raises `SupersessionChainError` rather than looping if the chain does not
-    terminate, which can only happen if migration 013's cycle trigger was
+    Raises `SupersessionChainError` rather than looping if the chain revisits
+    a node, which can only happen if migration 013's cycle trigger was
     bypassed.
+
+    The walk is unbounded on purpose. `successors` is a finite mapping and
+    `seen` guarantees termination, so any hop limit would only be a second,
+    weaker termination condition -- one that cannot tell a cycle from a long
+    but perfectly valid chain, and would start rejecting real data at whatever
+    length was guessed.
     """
     if successors is None:
         successors = successor_map(connection)
@@ -326,7 +371,7 @@ def resolve_successor(
     current = int(archive_id)
     seen = {current}
 
-    for _ in range(MAX_CHAIN_DEPTH):
+    while True:
         nxt = successors.get(current)
 
         if nxt is None:
@@ -340,11 +385,6 @@ def resolve_successor(
 
         seen.add(nxt)
         current = nxt
-
-    raise SupersessionChainError(
-        f"Supersession chain from archive {archive_id} did not terminate "
-        f"within {MAX_CHAIN_DEPTH} hops."
-    )
 
 
 def dispositions_for(
@@ -384,10 +424,18 @@ def dispositions_for(
 
         if wanted is None or archive_id in wanted:
             # Migration 013 forbids an archive holding both dispositions, so
-            # this cannot overwrite a retirement recorded above. If it ever
-            # does, the constraint was bypassed and the classifier's invariant
-            # check is what reports it -- silently preferring one here would
-            # hide exactly that.
+            # reaching this means the constraint was bypassed. Overwriting the
+            # retirement recorded above would hand the caller one of two
+            # contradictory decisions and no way to tell that the other exists,
+            # so this refuses instead. `conflicting_dispositions()` is the
+            # read that reports the same condition without raising, for a
+            # census that needs to survive it.
+            if archive_id in found:
+                raise ConflictingDispositionError(
+                    f"Archive {archive_id} is both retired and superseded; "
+                    "migration 013's constraints have been bypassed."
+                )
+
             found[archive_id] = Disposition(
                 archive_id=archive_id,
                 disposition=SUPERSEDED,
