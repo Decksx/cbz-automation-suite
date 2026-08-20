@@ -608,6 +608,40 @@ def test_every_job_history_stays_distinguishable(
     assert only(C.classify(connection), 1).perceptual_work == expected
 
 
+@pytest.mark.parametrize(
+    "statuses, expected",
+    [
+        # A later completion must not bury an earlier cancellation: the
+        # cancellation is the thing still holding a decision, and an archive
+        # whose work was called off is not the same as one that finished.
+        (("completed", "cancelled"), C.WORK_CANCELLED),
+        (("cancelled", "completed"), C.WORK_CANCELLED),
+        (("completed", "failed"), C.WORK_FAILED),
+        (("failed", "completed"), C.WORK_FAILED),
+        # Anything in flight outranks any history, because it will change.
+        (("failed", "running"), C.WORK_ACTIVE),
+        (("cancelled", "pending"), C.WORK_ACTIVE),
+        (("completed", "completed"), C.WORK_COMPLETED),
+    ],
+)
+def test_work_state_ordering_keeps_histories_distinguishable(
+    connection, statuses: tuple[str, ...], expected: str
+) -> None:
+    """An archive with several perceptual jobs resolves to one state.
+
+    Ordered by what still needs a decision, not by recency. Without this the
+    ordering is free to change unnoticed -- a completion could swallow a
+    cancellation and no test would object, which is exactly what a bypass run
+    found.
+    """
+    add_archive(connection, 1)
+
+    for status in statuses:
+        add_job(connection, 1, C.PERCEPTUAL_JOB_TYPE, status)
+
+    assert only(C.classify(connection), 1).perceptual_work == expected
+
+
 def test_the_45217_shape_is_cancelled_and_retired_at_once(
     connection, tmp_path: Path
 ) -> None:
