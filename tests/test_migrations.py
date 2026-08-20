@@ -6,7 +6,11 @@ up the application's schema, and confirming re-applying them is a no-op.
 from pathlib import Path
 
 from comic_automation.database.connection import database_connection
-from comic_automation.database.migrations import apply_migrations
+from comic_automation.database.migrations import (
+    apply_migrations,
+    discover_migrations,
+    migration_version,
+)
 
 
 MIGRATION_DIRECTORY = (
@@ -17,13 +21,25 @@ MIGRATION_DIRECTORY = (
 )
 
 
+def all_versions() -> list[int]:
+    """Every migration on disk, in order.
+
+    Derived rather than hard-coded: this list was previously written out
+    literally, so every new migration failed these two tests for no reason
+    other than being new. What they are actually asserting is that
+    apply_migrations() applies all of them once and none of them twice.
+    """
+    return [migration_version(path)
+            for path in discover_migrations(MIGRATION_DIRECTORY)]
+
+
 def test_apply_migrations_creates_foundation_schema(
     tmp_path: Path,
 ) -> None:
-    """Applying all migrations to a brand-new database should apply
-    migrations 1 through 10 in order and create every table the package
-    currently depends on -- spanning the operational foundation (jobs,
-    processing runs, file tracking) as well as the archive/perceptual-hash
+    """Applying all migrations to a brand-new database should apply every
+    migration on disk in order and create every table the package currently
+    depends on -- spanning the operational foundation (jobs, processing runs,
+    file tracking) as well as the archive, perceptual-hash and disposition
     tables added by later migrations.
     """
     database_path = tmp_path / "comics.db"
@@ -42,7 +58,7 @@ def test_apply_migrations_creates_foundation_schema(
             ).fetchall()
         }
 
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert applied == all_versions()
 
     expected_tables = {
         "schema_migrations",
@@ -60,6 +76,10 @@ def test_apply_migrations_creates_foundation_schema(
         "archive_content_signatures",
         "near_duplicate_candidates",
         "archive_quarantine",
+        "archive_retirements",
+        "archive_supersessions",
+        "archive_disposition_events",
+        "disposition_reversal_context",
     }
 
     # Subset check (not equality) so future migrations adding more tables
@@ -68,9 +88,9 @@ def test_apply_migrations_creates_foundation_schema(
 
 
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
-    """Applying the full migration set twice should apply all 10 the first
-    time and zero the second time, with schema_migrations ending up with
-    exactly one row per migration (no duplicate/re-applied entries).
+    """Applying the full migration set twice should apply all of them the
+    first time and zero the second time, with schema_migrations ending up
+    with exactly one row per migration (no duplicate/re-applied entries).
     """
     database_path = tmp_path / "comics.db"
 
@@ -82,6 +102,6 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
 
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert first == all_versions()
     assert second == []
-    assert migration_count == 12
+    assert migration_count == len(all_versions())
