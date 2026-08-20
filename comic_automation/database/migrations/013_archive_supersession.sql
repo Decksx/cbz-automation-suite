@@ -103,6 +103,14 @@
 -- contemporaneous record. Nothing else is written, no existing row is altered,
 -- and no archive is retired or superseded by this migration.
 --
+-- The backfill is also the invariant's enforcement point for legacy data. It
+-- copies every existing retirement through archive_disposition_events.evidence,
+-- which is NOT NULL and CHECKed non-blank, so a schema-12 retirement recorded
+-- without evidence aborts this migration rather than upgrading into a state
+-- the new rules forbid. That is deliberate: an upgrade that silently preserves
+-- a violation of the rule it is introducing is worse than one that stops and
+-- names the row.
+--
 -- Additive and non-destructive. apply_migrations() wraps the file in
 -- BEGIN IMMEDIATE ... COMMIT, so a failure rolls back without recording
 -- version 13 and without leaving any object behind.
@@ -121,7 +129,23 @@ CREATE TABLE IF NOT EXISTS archive_disposition_events (
             trim(reason, char(32) || char(9) || char(10) || char(13))
         ) > 0
     ),
-    evidence TEXT,
+    -- NOT NULL and non-blank, matching reason, and this is load-bearing for
+    -- the backfill rather than merely tidy. Migration 012 allowed retirement
+    -- evidence to be NULL, and 013's trg_retirement_requires_evidence only
+    -- guards *future* inserts -- so a schema-12 database holding a retirement
+    -- with null or whitespace-only evidence would otherwise upgrade cleanly
+    -- and keep a disposition that violates the invariant this migration is
+    -- introducing. Because the backfill below copies every existing
+    -- retirement through this column, that legacy row now fails the CHECK and
+    -- aborts the whole migration transaction instead of surviving inside it.
+    -- Failing the upgrade is the correct outcome: the operator is told which
+    -- record is unreviewable and supplies the missing proof, rather than
+    -- discovering years later that one retirement never had any.
+    evidence TEXT NOT NULL CHECK (
+        length(
+            trim(evidence, char(32) || char(9) || char(10) || char(13))
+        ) > 0
+    ),
     -- 'runtime' means the row was produced by a trigger firing on a live
     -- statement. It deliberately does NOT claim the statement came from
     -- application code: a trigger cannot tell whether disposition.py or an
