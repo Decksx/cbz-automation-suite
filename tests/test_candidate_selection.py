@@ -96,10 +96,18 @@ def add_location(conn, archive_id: int, path: Path | str, *, current: int = 1):
     )
 
 
-def retire(conn, archive_id: int, reason: str = "duplicate; keeper elsewhere"):
+def retire(
+    conn,
+    archive_id: int,
+    reason: str = "duplicate; keeper elsewhere",
+    evidence: str = "ordered-page signature held by archive 999",
+):
+    # Evidence is mandatory as of migration 013: a retirement is a recorded
+    # decision, and one without proof is not reviewable later.
     conn.execute(
-        "INSERT INTO archive_retirements (archive_id, reason) VALUES (?, ?)",
-        (archive_id, reason),
+        "INSERT INTO archive_retirements (archive_id, reason, evidence) "
+        "VALUES (?, ?, ?)",
+        (archive_id, reason, evidence),
     )
 
 
@@ -277,9 +285,9 @@ def test_a_blank_retirement_reason_is_refused_by_the_database(
     for blank in ("", "   ", "\t"):
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                "INSERT INTO archive_retirements (archive_id, reason) "
-                "VALUES (?, ?)",
-                (archive_id, blank),
+                "INSERT INTO archive_retirements "
+                "(archive_id, reason, evidence) VALUES (?, ?, ?)",
+                (archive_id, blank, "evidence"),
             )
 
 
