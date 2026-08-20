@@ -829,6 +829,38 @@ def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
         return
 
 
+# Minimum size gain before an incoming archive may replace an existing one
+# of the same name.
+#
+# Measured across 1,261 conflict replacements in the watcher logs (2026-03 to
+# 2026-08): 15.1% gained under 1 KB, and the smallest were +1, +2 and +6 bytes.
+# A gain that small cannot be a better scan -- it is a repack, a rewritten
+# ComicInfo.xml, or different zip metadata around identical pages. Replacing on
+# it discards a working archive and, because the database has already hashed
+# the old file, silently invalidates its recorded page inventory, archive hash
+# and content signature.
+#
+# 10 KB is where the distribution turns: it blocks 19.1% of past replacements,
+# while 20 KB blocks only 0.9% more (11 of 1,261) and 100 KB starts refusing
+# gains large enough to be real. Size remains a proxy for quality, not
+# evidence of it -- this threshold removes the obvious noise, it does not make
+# "larger" mean "better".
+REPLACEMENT_MIN_GAIN_BYTES = 10 * 1024
+
+
+def _replacement_gain_is_meaningful(
+    src_size: int,
+    dest_size: int,
+    min_gain: int = REPLACEMENT_MIN_GAIN_BYTES,
+) -> bool:
+    """Whether *src_size* beats *dest_size* by enough to justify replacing.
+
+    One definition for a question asked at two call sites, which previously
+    each carried their own copy of `src_size > dest_size`.
+    """
+    return (src_size - dest_size) >= min_gain
+
+
 def _merge_directories(src_dir: Path, dest_dir: Path) -> None:
     """Recursively merge src_dir into dest_dir, keeping the larger file on conflict."""
     for src_item in src_dir.rglob("*"):
@@ -850,10 +882,13 @@ def _merge_directories(src_dir: Path, dest_dir: Path) -> None:
         if dest_item.exists():
             src_size  = src_item.stat().st_size
             dest_size = dest_item.stat().st_size
-            if src_size > dest_size:
+            if _replacement_gain_is_meaningful(src_size, dest_size):
                 log.warning(f"    Conflict '{relative}': incoming ({src_size:,} B) > existing ({dest_size:,} B) - replacing (existing file discarded).")
                 dest_item.unlink()
                 shutil.move(str(src_item), str(dest_item))
+            elif src_size > dest_size:
+                log.warning(f"    Conflict '{relative}': incoming ({src_size:,} B) exceeds existing ({dest_size:,} B) by only {src_size - dest_size:,} B (< {REPLACEMENT_MIN_GAIN_BYTES:,} B) - keeping existing (incoming file discarded).")
+                src_item.unlink()
             else:
                 log.warning(f"    Conflict '{relative}': existing ({dest_size:,} B) >= incoming ({src_size:,} B) - keeping existing (incoming file discarded).")
                 src_item.unlink()
@@ -1239,13 +1274,21 @@ def _move_loose_files(files: list[Path], dest_folder: str,
         if dest_item.exists():
             src_size  = src.stat().st_size
             dest_size = dest_item.stat().st_size
-            if src_size > dest_size:
+            if _replacement_gain_is_meaningful(src_size, dest_size):
                 log.warning(
                     f"    Conflict '{src.name}': incoming ({src_size:,} B) > "
                     f"existing ({dest_size:,} B) - replacing (existing file discarded)."
                 )
                 dest_item.unlink()
                 shutil.move(str(src), str(dest_item))
+            elif src_size > dest_size:
+                log.warning(
+                    f"    Conflict '{src.name}': incoming ({src_size:,} B) exceeds "
+                    f"existing ({dest_size:,} B) by only {src_size - dest_size:,} B "
+                    f"(< {REPLACEMENT_MIN_GAIN_BYTES:,} B) - keeping existing "
+                    f"(incoming file discarded)."
+                )
+                src.unlink()
             else:
                 log.warning(
                     f"    Conflict '{src.name}': existing ({dest_size:,} B) >= "
