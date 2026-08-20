@@ -105,3 +105,36 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
     assert first == all_versions()
     assert second == []
     assert migration_count == len(all_versions())
+
+
+# --- the sequence sentinel -----------------------------------------------
+#
+# Deriving the version list in the consumer tests above removed five
+# repetitive edits per migration, but it also removed the only thing that was
+# checking the sequence itself. `discover_migrations()` sorts filenames; it
+# does not verify that the numbers are unique or contiguous, so a duplicate
+# `013_` or a missing `011_` would now be normalized into whatever the
+# consumers expect and pass silently.
+#
+# This is the one place that knows what the sequence should be. A new
+# migration updates HIGHEST_MIGRATION here and nothing else.
+
+HIGHEST_MIGRATION = 13
+
+
+def test_migration_versions_are_unique_and_contiguous() -> None:
+    """The authoritative statement of what the migration set must look like.
+
+    Checked against the filenames on disk rather than against an applied
+    database, so a numbering mistake is caught before anything runs it.
+    """
+    paths = discover_migrations(MIGRATION_DIRECTORY)
+    versions = [migration_version(path) for path in paths]
+
+    assert versions == list(range(1, HIGHEST_MIGRATION + 1)), (
+        "migration versions must be unique and contiguous from 1 to "
+        f"{HIGHEST_MIGRATION}; found {versions}"
+    )
+    # One file per version. A second `013_*.sql` would otherwise be applied
+    # silently, and only one of the two would be recorded under version 13.
+    assert len(paths) == len(set(versions))
