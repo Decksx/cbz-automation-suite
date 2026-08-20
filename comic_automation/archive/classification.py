@@ -41,6 +41,14 @@ The six axes
     `candidate_selection`'s reasons, ``excluded`` with the eligibility
     predicate's reasons, or ``unexplained``.
 
+    An archive this run could not observe -- under an unreachable root, under
+    no declared root, or in a run with no scope at all -- is never stat()ed
+    and never reported eligible. It is refused with a `scope_*` reason of this
+    module's own, which says the precondition could not be tested. Handing it
+    to the filesystem check instead produced ``path_missing``, which turns "I
+    cannot look there" into "the file is gone" -- the exact conflation the
+    availability axis exists to prevent.
+
 ``quarantine``
     Reported alongside, never as a disposition. ``pending_redownload`` means
     "we intend to get this back", which is in-scope-and-broken. Treating it as
@@ -61,6 +69,13 @@ Under a correct database ``unexplained`` is always zero, because
 `_eligible_archive_rows()` and `_archive_exclusion_reasons()` partition the
 library. A non-zero count means those two disagree, which is a defect in this
 code rather than in the data, and is reported as such.
+
+That partition is a property the two queries have to be kept in, not one they
+have for free. They lost it once: the eligibility predicate joined every
+current location without requiring exactly one, so an archive with two
+matching current rows came out eligible while the explanation reported
+``multiple_current_locations``, and classification aborted. The predicate now
+refuses ambiguity, which is what the selection path always did.
 
 Failing closed
 --------------
@@ -83,7 +98,7 @@ import os
 import sqlite3
 import stat as stat_module
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 from comic_automation.archive import disposition as disposition_module
@@ -201,6 +216,30 @@ SELECTIONS = (
     SELECTION_UNEXPLAINED,
 )
 
+# Refusal reasons this module contributes, distinct from
+# `candidate_selection.REJECTION_REASONS` and namespaced so the two are never
+# confused. They all mean the same thing: this run could not test the
+# filesystem precondition for that archive, so it will not assert the archive
+# is enqueueable -- and, just as importantly, will not claim the file is
+# missing. A worker running with the same scope really would refuse these; the
+# reason simply has to say why honestly.
+REFUSAL_SCOPE_UNAVAILABLE = "scope_unavailable"
+REFUSAL_SCOPE_UNDECLARED = "scope_undeclared"
+REFUSAL_SCOPE_NOT_OBSERVED = "scope_not_observed"
+
+CLASSIFIER_REFUSAL_REASONS = (
+    REFUSAL_SCOPE_UNAVAILABLE,
+    REFUSAL_SCOPE_UNDECLARED,
+    REFUSAL_SCOPE_NOT_OBSERVED,
+)
+
+# Which refusal each unobservable availability produces.
+_SCOPE_REFUSAL_FOR = {
+    AVAILABILITY_UNAVAILABLE_SCOPE: REFUSAL_SCOPE_UNAVAILABLE,
+    AVAILABILITY_UNDECLARED_SCOPE: REFUSAL_SCOPE_UNDECLARED,
+    AVAILABILITY_NOT_OBSERVED: REFUSAL_SCOPE_NOT_OBSERVED,
+}
+
 PERCEPTUAL_JOB_TYPE = "hash_archive_pages_perceptual"
 INSPECT_JOB_TYPE = "inspect_archive"
 ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
@@ -272,14 +311,21 @@ class DeclaredScope:
     def containing_root(self, path: str) -> tuple[str, bool] | None:
         """The declared root holding `path`, and whether it is reachable."""
         candidate = str(path).replace("/", "\\").casefold()
+        best: tuple[str, bool] | None = None
+        best_length = -1
 
         for root, reachable in zip(self.roots, self.reachable):
             prefix = root.replace("/", "\\").casefold() + "\\"
 
-            if candidate.startswith(prefix):
-                return root, reachable
+            # Longest prefix wins, not the first declared. With X:\ and
+            # X:\Horrorsplat both declared, first-match made the answer depend
+            # on argument order -- so whether a path was judged against the
+            # volume or against the folder was decided by how the caller
+            # happened to type the list.
+            if candidate.startswith(prefix) and len(prefix) > best_length:
+                best, best_length = (root, reachable), len(prefix)
 
-        return None
+        return best
 
     def as_dict(self) -> dict:
         return {
@@ -313,6 +359,11 @@ class ArchiveClassification:
     current_path: str | None = None
     total_pages: int = 0
     outstanding_pages: int = 0
+    # History kept beside the scalar state. `perceptual_work` says what is
+    # true now; these say what has ever been true, so a report can ask "ever
+    # failed" without the current state having to lie about chronology.
+    ever_failed: bool = False
+    ever_cancelled: bool = False
 
     @property
     def dispositioned(self) -> bool:
@@ -335,6 +386,8 @@ class ArchiveClassification:
             "current_path": self.current_path,
             "total_pages": self.total_pages,
             "outstanding_pages": self.outstanding_pages,
+            "ever_failed": self.ever_failed,
+            "ever_cancelled": self.ever_cancelled,
         }
 
 
@@ -397,20 +450,99 @@ def _page_totals(connection: sqlite3.Connection) -> dict[int, int]:
     }
 
 
-def _job_states(
+@dataclass(frozen=True)
+class JobHistory:
+    """One archive's jobs of a single type, current state and history apart.
+
+    Reducing jobs to status counts throws away chronology, and chronology is
+    the difference between "this failed" and "this failed and was then
+    reprocessed successfully". Both shapes exist -- a retried archive and an
+    archive whose latest attempt failed -- and a report that calls them the
+    same thing sends an operator to fix work that is already done.
+
+    So `current` is the scalar state, and `counts` keeps the history beside
+    it for a report that legitimately wants "ever failed".
+    """
+
+    counts: Counter = field(default_factory=Counter)
+    latest_terminal: str | None = None
+
+    @property
+    def current(self) -> str:
+        """The scalar state: active work first, then the latest terminal job.
+
+        Active outranks everything because it will change; nothing else is
+        worth reporting about an archive a worker currently holds. Among
+        terminal jobs the most recent one wins, which is the only ordering
+        that distinguishes failed-then-completed from completed-then-failed.
+        """
+        if any(self.counts.get(status) for status in ACTIVE_JOB_STATUSES):
+            return WORK_ACTIVE
+
+        if self.latest_terminal in (WORK_FAILED, WORK_CANCELLED,
+                                    WORK_COMPLETED):
+            return self.latest_terminal
+
+        return WORK_NEVER_ENQUEUED
+
+    def ever(self, status: str) -> bool:
+        """Whether this archive ever held a job in `status`."""
+        return bool(self.counts.get(status))
+
+    @property
+    def any_jobs(self) -> bool:
+        return bool(sum(self.counts.values()))
+
+
+def _job_histories(
     connection: sqlite3.Connection, job_type: str
-) -> dict[int, Counter]:
-    states: dict[int, Counter] = defaultdict(Counter)
+) -> dict[int, JobHistory]:
+    """Per-archive job history, with the latest terminal job identified.
+
+    `completed_at` and `cancelled_at` are separate columns -- migration 011
+    deliberately left `completed_at` NULL on a cancelled job, because a
+    cancelled job did not complete -- so "when did this job end" is
+    COALESCE over both, exactly as that migration's comment says. Ties fall
+    back to job id, which is monotonic.
+    """
+    counts: dict[int, Counter] = defaultdict(Counter)
+    newest: dict[int, tuple] = {}
 
     for row in connection.execute(
-        "SELECT archive_id, status, COUNT(*) AS n FROM jobs "
-        "WHERE job_type = ? AND archive_id IS NOT NULL "
-        "GROUP BY archive_id, status",
+        """
+        SELECT
+            archive_id,
+            status,
+            COUNT(*) AS n,
+            MAX(COALESCE(completed_at, cancelled_at, '')) AS ended_at,
+            MAX(id) AS newest_id
+        FROM jobs
+        WHERE job_type = ? AND archive_id IS NOT NULL
+        GROUP BY archive_id, status
+        """,
         (job_type,),
     ):
-        states[int(row["archive_id"])][str(row["status"])] = int(row["n"])
+        archive_id = int(row["archive_id"])
+        status = str(row["status"])
+        counts[archive_id][status] = int(row["n"])
 
-    return states
+        if status not in (WORK_COMPLETED, WORK_FAILED, WORK_CANCELLED):
+            continue
+
+        key = (str(row["ended_at"] or ""), int(row["newest_id"]))
+
+        if archive_id not in newest or key > newest[archive_id][0]:
+            newest[archive_id] = (key, status)
+
+    return {
+        archive_id: JobHistory(
+            counts=archive_counts,
+            latest_terminal=(
+                newest[archive_id][1] if archive_id in newest else None
+            ),
+        )
+        for archive_id, archive_counts in counts.items()
+    }
 
 
 def _quarantine_statuses(connection: sqlite3.Connection) -> dict[int, str]:
@@ -422,35 +554,8 @@ def _quarantine_statuses(connection: sqlite3.Connection) -> dict[int, str]:
     }
 
 
-def _work_state(statuses: Counter) -> str:
-    """Collapse one archive's perceptual jobs into a single work state.
-
-    Ordered by what a reader needs to act on, not by recency. A failure
-    outranks a completion because it is the thing still requiring a decision;
-    a cancellation outranks a completion for the same reason. Archive 45217 is
-    exactly this case -- cancelled *and* retired -- and both facts survive,
-    because they live on different axes.
-    """
-    if not statuses:
-        return WORK_NEVER_ENQUEUED
-
-    if any(statuses.get(status) for status in ACTIVE_JOB_STATUSES):
-        return WORK_ACTIVE
-
-    if statuses.get("failed"):
-        return WORK_FAILED
-
-    if statuses.get("cancelled"):
-        return WORK_CANCELLED
-
-    if statuses.get("completed"):
-        return WORK_COMPLETED
-
-    return WORK_NEVER_ENQUEUED
-
-
 def _not_inventoried_subreason(
-    inspect_statuses: Counter,
+    inspection: JobHistory,
     quarantine_status: str | None,
     signature_page_count: int | None,
 ) -> str:
@@ -460,6 +565,12 @@ def _not_inventoried_subreason(
     statement available: `pending_redownload` says an operator already looked
     at this archive and is waiting on a replacement, which is more useful than
     repeating that its inspection failed.
+
+    The inspection's *current* state is what decides, on the same precedence
+    the perceptual axis uses. An archive whose inspection failed and was then
+    re-run successfully is not "inspection_failed"; it inspected fine and
+    holds no images, and telling an operator otherwise sends them to fix work
+    that is already done.
 
     The last two cases are the ones worth separating. When inspection
     completed and no pages exist, the content signature is the only other
@@ -471,19 +582,21 @@ def _not_inventoried_subreason(
     if quarantine_status == "pending_redownload":
         return NOT_INVENTORIED_QUARANTINE_PENDING_REDOWNLOAD
 
-    if not inspect_statuses:
+    current = inspection.current
+
+    if not inspection.any_jobs:
         return NOT_INVENTORIED_INSPECTION_NEVER_ENQUEUED
 
-    if any(inspect_statuses.get(status) for status in ACTIVE_JOB_STATUSES):
+    if current == WORK_ACTIVE:
         return NOT_INVENTORIED_INSPECTION_ACTIVE
 
-    if inspect_statuses.get("failed"):
+    if current == WORK_FAILED:
         return NOT_INVENTORIED_INSPECTION_FAILED
 
-    if inspect_statuses.get("cancelled"):
+    if current == WORK_CANCELLED:
         return NOT_INVENTORIED_INSPECTION_CANCELLED
 
-    if inspect_statuses.get("completed"):
+    if current == WORK_COMPLETED:
         if (signature_page_count or 0) > 0:
             return NOT_INVENTORIED_COMPLETED_INVENTORY_ABSENT
 
@@ -630,8 +743,8 @@ def classify(
     structural = _structural_rows(connection)
     totals = _page_totals(connection)
     outstanding = repository.outstanding_page_counts()
-    perceptual_jobs = _job_states(connection, PERCEPTUAL_JOB_TYPE)
-    inspect_jobs = _job_states(connection, INSPECT_JOB_TYPE)
+    perceptual_jobs = _job_histories(connection, PERCEPTUAL_JOB_TYPE)
+    inspect_jobs = _job_histories(connection, INSPECT_JOB_TYPE)
     quarantine = _quarantine_statuses(connection)
 
     eligible_ids = {
@@ -669,16 +782,54 @@ def classify(
     # calls, so a refusal reported here is a refusal that would actually
     # happen. check_filesystem follows the declared scope, because a refusal
     # this run could not test must not be asserted.
+    #
+    # Availability is computed first, because it decides which archives may be
+    # stat()ed at all. An archive under an unreachable or undeclared root is
+    # never handed to the filesystem check: doing so turned "I cannot look
+    # there" into `path_missing`, which is the precise contradiction this
+    # contract exists to prevent.
+    availabilities = {
+        archive_id: _availability(structural[archive_id], declared)
+        for archive_id in structural
+    }
+
+    observable = [
+        archive_id
+        for archive_id in sorted(eligible_ids)
+        if availabilities[archive_id][0] not in AVAILABILITY_UNOBSERVABLE
+    ]
+    unobservable = [
+        archive_id
+        for archive_id in sorted(eligible_ids)
+        if availabilities[archive_id][0] in AVAILABILITY_UNOBSERVABLE
+    ]
+
     selection = select_candidates(
-        connection,
-        sorted(eligible_ids),
-        check_filesystem=declared.consulted,
+        connection, observable, check_filesystem=True
     )
     accepted_ids = set(selection.accepted_ids)
     refusals: dict[int, list[str]] = defaultdict(list)
 
     for rejection in selection.rejected:
         refusals[int(rejection.archive_id)].append(rejection.reason)
+
+    # The unobservable ones still get the database-side checks -- retirement
+    # and supersession must bite regardless of what is mounted -- but never
+    # the disk. Whatever survives those is refused for the honest reason that
+    # this run could not verify it, rather than being reported enqueueable on
+    # the strength of a file nobody looked at.
+    if unobservable:
+        database_only = select_candidates(
+            connection, unobservable, check_filesystem=False
+        )
+
+        for rejection in database_only.rejected:
+            refusals[int(rejection.archive_id)].append(rejection.reason)
+
+        for archive_id in database_only.accepted_ids:
+            refusals[int(archive_id)].append(
+                _SCOPE_REFUSAL_FOR[availabilities[int(archive_id)][0]]
+            )
 
     # --- assemble -----------------------------------------------------
     classifications: list[ArchiveClassification] = []
@@ -693,7 +844,7 @@ def classify(
         if total_pages == 0:
             inventory = INVENTORY_NOT_INVENTORIED
             subreason = _not_inventoried_subreason(
-                inspect_jobs.get(archive_id, Counter()),
+                inspect_jobs.get(archive_id, JobHistory()),
                 quarantine_status,
                 info["signature_page_count"],
             )
@@ -717,7 +868,7 @@ def classify(
             selection_state = SELECTION_UNEXPLAINED
             reasons = ()
 
-        availability, detail = _availability(info, declared)
+        availability, detail = availabilities[archive_id]
 
         classifications.append(
             ArchiveClassification(
@@ -732,9 +883,15 @@ def classify(
                 availability_detail=detail,
                 inventory=inventory,
                 not_inventoried_subreason=subreason,
-                perceptual_work=_work_state(
-                    perceptual_jobs.get(archive_id, Counter())
-                ),
+                perceptual_work=perceptual_jobs.get(
+                    archive_id, JobHistory()
+                ).current,
+                ever_failed=perceptual_jobs.get(
+                    archive_id, JobHistory()
+                ).ever(WORK_FAILED),
+                ever_cancelled=perceptual_jobs.get(
+                    archive_id, JobHistory()
+                ).ever(WORK_CANCELLED),
                 selection=selection_state,
                 selection_reasons=reasons,
                 quarantine_status=quarantine_status,
@@ -822,7 +979,8 @@ def selection_reason_totals(
 
     return {
         "refused": {
-            reason: refused.get(reason, 0) for reason in REJECTION_REASONS
+            reason: refused.get(reason, 0)
+            for reason in REJECTION_REASONS + CLASSIFIER_REFUSAL_REASONS
         },
         "excluded": {
             reason: excluded.get(reason, 0) for reason in EXCLUSION_REASONS
