@@ -578,7 +578,7 @@ def test_the_event_names_the_successor(connection) -> None:
 
     assert event["counterpart_archive_id"] == 2
     assert event["evidence"] == "sha256 abc"
-    assert event["source"] == "application"
+    assert event["source"] == "runtime"
 
 
 def test_history_is_atomic_with_the_disposition(connection) -> None:
@@ -599,6 +599,29 @@ def test_raw_sql_writes_are_recorded_too(connection) -> None:
 
 
 # --- chain resolution ---------------------------------------------------
+
+
+def test_a_chain_longer_than_sixty_four_resolves(connection) -> None:
+    """No hop limit: a long chain is valid data, not a suspected cycle.
+
+    resolve_successor used to stop after 64 hops, which would have rejected
+    this. Termination comes from the visited set over a finite mapping, so the
+    limit bought nothing and cost correctness.
+    """
+    length = 80
+
+    for archive_id in range(9, length + 10):
+        connection.execute(
+            "INSERT INTO archive_files (id, file_size) VALUES (?, 1024)",
+            (archive_id,),
+        )
+
+    for predecessor in range(9, length + 9):
+        connection.execute(
+            INSERT_SUPERSESSION, (predecessor, predecessor + 1, "r", "e")
+        )
+
+    assert disposition.resolve_successor(connection, 9) == length + 9
 
 
 def test_resolve_successor_reports_a_bypassed_cycle_rather_than_looping(
@@ -625,6 +648,250 @@ def test_conflicting_dispositions_are_detectable_after_a_bypass(
     connection.execute(INSERT_RETIREMENT, (1, "r", "e"))
 
     assert disposition.conflicting_dispositions(connection) == [1]
+
+
+# --- review corrections: atomicity, context consumption, append-only ------
+
+
+def test_the_reversal_context_is_never_committed_mid_handshake(
+    tmp_path: Path,
+) -> None:
+    """The discriminating test for the SAVEPOINT.
+
+    `connect_database` sets isolation_level=None, so without a savepoint the
+    context INSERT autocommits the moment it runs -- and a reusable reason is
+    then durably on disk for as long as the handshake takes, surviving any
+    interruption that stops the cleanup from running.
+
+    A second connection is what makes that observable. Under a savepoint the
+    row is uncommitted and invisible to it; without one it is committed and
+    plainly visible. Asserting only the end state would pass either way,
+    because the writer's own `finally` tidies up on the happy path.
+    """
+    database = tmp_path / "atomic.db"
+    writer = connect_database(database)
+    apply_migrations(writer, MIGRATIONS)
+    seed_archives(writer)
+    writer.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+
+    observer = connect_database(database)
+
+    try:
+        assert not writer.in_transaction
+
+        with disposition._reversal_reason(
+            writer, archive_id=1, disposition="superseded", reason="undo"
+        ):
+            visible = observer.execute(
+                "SELECT COUNT(*) FROM disposition_reversal_context"
+            ).fetchone()[0]
+
+        assert visible == 0, (
+            "the reversal context was committed mid-handshake, so an "
+            "interruption would leave a reusable reason on disk"
+        )
+        assert not writer.in_transaction
+    finally:
+        observer.close()
+        writer.close()
+
+
+def test_a_failed_reversal_leaves_no_context_behind(connection) -> None:
+    """Archive 3 is not superseded, so the delete inside the handshake fails."""
+    assert not connection.in_transaction
+
+    with pytest.raises(disposition.DispositionError):
+        disposition.reverse_supersession(connection, 3, reason="undo")
+
+    assert connection.execute(
+        "SELECT COUNT(*) FROM disposition_reversal_context"
+    ).fetchone()[0] == 0
+    assert not connection.in_transaction
+
+
+def test_a_reversal_nests_inside_a_caller_transaction(connection) -> None:
+    """Rolling the caller's transaction back must undo the whole handshake."""
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+
+    connection.execute("BEGIN")
+    disposition.reverse_supersession(connection, 1, reason="undo")
+    connection.execute("ROLLBACK")
+
+    assert disposition.successor_map(connection) == {1: 2}
+    assert connection.execute(
+        "SELECT COUNT(*) FROM disposition_reversal_context"
+    ).fetchone()[0] == 0
+
+
+def test_a_failed_reversal_leaves_no_savepoint_on_the_stack(
+    connection,
+) -> None:
+    """ROLLBACK TO does not pop the savepoint; RELEASE has to follow it.
+
+    If it did not, the next reversal would nest inside a dead savepoint.
+    """
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+
+    with pytest.raises(disposition.DispositionError):
+        disposition.reverse_supersession(connection, 3, reason="undo")
+
+    disposition.reverse_supersession(connection, 1, reason="undo")
+
+    assert disposition.successor_map(connection) == {}
+    assert not connection.in_transaction
+
+
+def test_a_raw_sql_reversal_consumes_its_own_context(connection) -> None:
+    """The trigger spends the context, not disposition.py.
+
+    A raw-SQL reversal never runs the writer's cleanup, so before this the
+    context row survived -- and if the same archive were dispositioned again,
+    that stale reason would authorise and mislabel the next deletion.
+    """
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+    connection.execute(
+        "INSERT INTO disposition_reversal_context "
+        "(id, archive_id, disposition, reason) "
+        "VALUES (1, 1, 'superseded', 'raw sql reversal')"
+    )
+
+    connection.execute(
+        "DELETE FROM archive_supersessions WHERE predecessor_archive_id = 1"
+    )
+
+    assert connection.execute(
+        "SELECT COUNT(*) FROM disposition_reversal_context"
+    ).fetchone()[0] == 0
+    assert (
+        disposition.disposition_history(connection, 1)[-1]["reason"]
+        == "raw sql reversal"
+    )
+
+
+def test_a_raw_sql_retirement_reversal_consumes_its_own_context(
+    connection,
+) -> None:
+    connection.execute(INSERT_RETIREMENT, (1, "r", "e"))
+    connection.execute(
+        "INSERT INTO disposition_reversal_context "
+        "(id, archive_id, disposition, reason) "
+        "VALUES (1, 1, 'retired', 'raw sql reversal')"
+    )
+
+    connection.execute("DELETE FROM archive_retirements WHERE archive_id = 1")
+
+    assert connection.execute(
+        "SELECT COUNT(*) FROM disposition_reversal_context"
+    ).fetchone()[0] == 0
+
+
+def test_a_spent_context_cannot_authorise_a_second_reversal(
+    connection,
+) -> None:
+    """The exact failure that trigger-side consumption closes."""
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+    connection.execute(
+        "INSERT INTO disposition_reversal_context "
+        "(id, archive_id, disposition, reason) "
+        "VALUES (1, 1, 'superseded', 'first reversal')"
+    )
+    connection.execute(
+        "DELETE FROM archive_supersessions WHERE predecessor_archive_id = 1"
+    )
+
+    # Same archive, dispositioned again. The old reason must not still be live.
+    connection.execute(INSERT_SUPERSESSION, (1, 3, "r", "e"))
+
+    with pytest.raises(sqlite3.IntegrityError, match="reversal reason"):
+        connection.execute(
+            "DELETE FROM archive_supersessions "
+            "WHERE predecessor_archive_id = 1"
+        )
+
+
+def test_history_rows_cannot_be_updated(connection) -> None:
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        connection.execute(
+            "UPDATE archive_disposition_events SET reason = 'rewritten'"
+        )
+
+
+def test_history_rows_cannot_be_deleted(connection) -> None:
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        connection.execute("DELETE FROM archive_disposition_events")
+
+    assert len(disposition.disposition_history(connection)) == 1
+
+
+@pytest.mark.parametrize("blank", BLANK_VARIANTS)
+def test_a_history_row_needs_a_non_blank_reason(
+    connection, blank: str
+) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO archive_disposition_events "
+            "(archive_id, disposition, action, reason) "
+            "VALUES (1, 'retired', 'recorded', ?)",
+            (blank,),
+        )
+
+
+def test_history_source_records_runtime_not_a_claim_about_the_caller(
+    connection,
+) -> None:
+    """A trigger cannot tell disposition.py from an operator's SQL prompt.
+
+    Both paths are recorded as 'runtime' precisely because the schema must not
+    claim to know which one it was.
+    """
+    disposition.supersede(connection, 1, 2, reason="r", evidence="e")
+    connection.execute(INSERT_SUPERSESSION, (3, 4, "r", "e"))
+
+    sources = {
+        row["source"] for row in disposition.disposition_history(connection)
+    }
+
+    assert sources == {"runtime"}
+
+
+def test_dispositions_for_refuses_a_bypassed_conflict(connection) -> None:
+    """The read side must not hand back one of two contradictory decisions.
+
+    It previously loaded the retirement and then overwrote it with the
+    supersession, so a caller saw a single confident answer with no sign that
+    the other record existed.
+    """
+    connection.execute(
+        "DROP TRIGGER trg_retirement_not_superseded_predecessor"
+    )
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+    connection.execute(INSERT_RETIREMENT, (1, "r", "e"))
+
+    with pytest.raises(disposition.ConflictingDispositionError):
+        disposition.dispositions_for(connection)
+
+    # The census read still answers, because a report has to survive the
+    # condition it is reporting.
+    assert disposition.conflicting_dispositions(connection) == [1]
+
+
+def test_a_scoped_read_that_excludes_the_conflict_still_succeeds(
+    connection,
+) -> None:
+    connection.execute(
+        "DROP TRIGGER trg_retirement_not_superseded_predecessor"
+    )
+    connection.execute(INSERT_SUPERSESSION, (1, 2, "r", "e"))
+    connection.execute(INSERT_RETIREMENT, (1, "r", "e"))
+    connection.execute(INSERT_RETIREMENT, (5, "r", "e"))
+
+    found = disposition.dispositions_for(connection, [5])
+
+    assert set(found) == {5}
 
 
 # --- selection ----------------------------------------------------------
