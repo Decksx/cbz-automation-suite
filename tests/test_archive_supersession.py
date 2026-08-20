@@ -90,6 +90,27 @@ def connection(tmp_path: Path):
         conn.close()
 
 
+def schema_snapshot(conn: sqlite3.Connection) -> list[tuple]:
+    """Every object in sqlite_master, deterministically ordered.
+
+    `sql` is included, not just the names: an object recreated with different
+    text is as much a survivor as one that was never dropped, and a name-only
+    comparison would call the two databases identical. Autoindexes come along
+    with everything else -- they carry a NULL `sql`, which compares fine and
+    is one more thing a rollback must not disturb.
+    """
+    return [
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            ORDER BY type, name, tbl_name, COALESCE(sql, '')
+            """
+        )
+    ]
+
+
 def apply_through(conn: sqlite3.Connection, limit: int) -> None:
     """Apply every migration up to and including `limit`.
 
@@ -234,6 +255,8 @@ def test_upgrade_aborts_on_a_legacy_retirement_without_evidence(
         (1, "2026-08-19 04:55:30", "legacy retirement", evidence),
     )
 
+    before = schema_snapshot(conn)
+
     with pytest.raises(sqlite3.IntegrityError):
         apply_migrations(conn, MIGRATIONS)
 
@@ -247,27 +270,13 @@ def test_upgrade_aborts_on_a_legacy_retirement_without_evidence(
     assert versions[-1] == 12
     assert 13 not in versions
 
-    # ...no object migration 013 creates survives...
-    leftovers = {
-        row["name"]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type IN "
-            "('table', 'index', 'trigger')"
-        )
-    } & {
-        "archive_supersessions",
-        "archive_disposition_events",
-        "disposition_reversal_context",
-        "idx_archive_supersessions_successor",
-        "idx_archive_supersessions_superseded_at",
-        "idx_archive_disposition_events_archive",
-        "idx_archive_disposition_events_occurred_at",
-        "trg_supersession_no_cycle",
-        "trg_retirement_requires_evidence",
-        "trg_disposition_events_no_update",
-        "trg_disposition_events_no_delete",
-    }
-    assert leftovers == set()
+    # ...and the schema is byte-for-byte what it was before the attempt.
+    #
+    # Compared in full rather than against a list of names migration 013 is
+    # known to create. Such a list has to be kept in step with the migration
+    # by hand, and anything it failed to mention would survive the rollback
+    # unnoticed -- which is the one thing this test exists to detect.
+    assert schema_snapshot(conn) == before
 
     # ...and the retirement itself is untouched, so the operator can read it
     # and supply the missing proof.
