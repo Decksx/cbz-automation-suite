@@ -47,11 +47,19 @@ INSERT_RETIREMENT = (
     "VALUES (?, ?, ?)"
 )
 
-# Whitespace that SQLite's one-argument trim() does NOT strip. Migration 012
-# shipped with `length(trim(reason)) > 0`, which accepted every one of these
-# as a reason; 013 reuses the corrected form and these prove it holds for
-# evidence too.
-BLANK_VARIANTS = [" ", "\t", "\n", "\r", " \t\n\r "]
+# Values that are blank to a reader but not to a naive constraint.
+#
+# The empty string is here because `NOT NULL` does not reject it -- '' is a
+# perfectly good non-null TEXT value, so only the CHECK stands between it and
+# the table. An earlier version of this list omitted it on the assumption that
+# NOT NULL covered the case, which was simply wrong.
+#
+# The rest are whitespace that SQLite's *one-argument* trim() does not strip:
+# it removes spaces and nothing else, so migration 012's original
+# `length(trim(reason)) > 0` accepted a lone tab or newline as a reason. 013
+# passes trim() an explicit character set, and these prove the corrected form
+# holds for evidence as well as reason.
+BLANK_VARIANTS = ["", " ", "\t", "\n", "\r", " \t\n\r "]
 
 
 # --- fixtures ------------------------------------------------------------
@@ -202,6 +210,74 @@ def test_backfill_does_not_duplicate_on_re_application(
     apply_migrations(conn, MIGRATIONS)
 
     assert len(disposition.disposition_history(conn)) == 1
+
+
+@pytest.mark.parametrize("evidence", [None, *BLANK_VARIANTS])
+def test_upgrade_aborts_on_a_legacy_retirement_without_evidence(
+    tmp_path: Path, evidence: str | None
+) -> None:
+    """A schema-12 retirement with no usable evidence must block the upgrade.
+
+    Migration 012 allowed NULL evidence and 013's trigger only guards future
+    inserts, so without this the database would upgrade cleanly and keep a
+    disposition that violates the invariant 013 introduces -- and nothing
+    would ever look at it again. The backfill copies every retirement through
+    archive_disposition_events.evidence, which is NOT NULL and CHECKed
+    non-blank, so the row fails there and takes the whole migration with it.
+    """
+    conn = connect_database(tmp_path / "legacy.db")
+    apply_through(conn, 12)
+    seed_archives(conn, 2)
+    conn.execute(
+        "INSERT INTO archive_retirements "
+        "(archive_id, retired_at, reason, evidence) VALUES (?, ?, ?, ?)",
+        (1, "2026-08-19 04:55:30", "legacy retirement", evidence),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        apply_migrations(conn, MIGRATIONS)
+
+    # The transaction rolled back: version 13 was never recorded...
+    versions = [
+        row[0]
+        for row in conn.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        )
+    ]
+    assert versions[-1] == 12
+    assert 13 not in versions
+
+    # ...no object migration 013 creates survives...
+    leftovers = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN "
+            "('table', 'index', 'trigger')"
+        )
+    } & {
+        "archive_supersessions",
+        "archive_disposition_events",
+        "disposition_reversal_context",
+        "idx_archive_supersessions_successor",
+        "idx_archive_supersessions_superseded_at",
+        "idx_archive_disposition_events_archive",
+        "idx_archive_disposition_events_occurred_at",
+        "trg_supersession_no_cycle",
+        "trg_retirement_requires_evidence",
+        "trg_disposition_events_no_update",
+        "trg_disposition_events_no_delete",
+    }
+    assert leftovers == set()
+
+    # ...and the retirement itself is untouched, so the operator can read it
+    # and supply the missing proof.
+    row = conn.execute(
+        "SELECT retired_at, reason, evidence FROM archive_retirements "
+        "WHERE archive_id = 1"
+    ).fetchone()
+    assert row["retired_at"] == "2026-08-19 04:55:30"
+    assert row["reason"] == "legacy retirement"
+    assert row["evidence"] == evidence
 
 
 def test_upgrade_with_no_retirements_backfills_nothing(
@@ -831,12 +907,39 @@ def test_history_rows_cannot_be_deleted(connection) -> None:
 def test_a_history_row_needs_a_non_blank_reason(
     connection, blank: str
 ) -> None:
+    """Valid evidence is supplied so this fails for the reason under test.
+
+    evidence is NOT NULL as well, so omitting it would make every one of these
+    pass without the reason CHECK existing at all.
+    """
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO archive_disposition_events "
+            "(archive_id, disposition, action, reason, evidence) "
+            "VALUES (1, 'retired', 'recorded', ?, 'valid evidence')",
+            (blank,),
+        )
+
+
+@pytest.mark.parametrize("blank", BLANK_VARIANTS)
+def test_a_history_row_needs_non_blank_evidence(
+    connection, blank: str
+) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO archive_disposition_events "
+            "(archive_id, disposition, action, reason, evidence) "
+            "VALUES (1, 'retired', 'recorded', 'valid reason', ?)",
+            (blank,),
+        )
+
+
+def test_a_history_row_cannot_omit_evidence(connection) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "INSERT INTO archive_disposition_events "
             "(archive_id, disposition, action, reason) "
-            "VALUES (1, 'retired', 'recorded', ?)",
-            (blank,),
+            "VALUES (1, 'retired', 'recorded', 'valid reason')"
         )
 
 
