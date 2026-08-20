@@ -747,6 +747,22 @@ class ArchivePerceptualHashRepository:
               ON fl.archive_id = acs.archive_id
              AND fl.is_current = 1
             WHERE acs.page_count > 0
+              -- Exactly one current location, not merely at least one.
+              -- Without this an archive with two matching current rows joins
+              -- twice and appears eligible, while select_candidates() would
+              -- refuse it as ambiguous and _archive_exclusion_reasons() would
+              -- report multiple_current_locations -- so the predicate and its
+              -- explanation contradicted each other and the classifier had to
+              -- abort. Refusing ambiguity here makes the two agree, and
+              -- matches what the selection path has always done: zero current
+              -- locations is unresolvable and more than one is ambiguous, and
+              -- neither may be guessed at.
+              AND (
+                  SELECT COUNT(*)
+                  FROM file_locations AS fl2
+                  WHERE fl2.archive_id = acs.archive_id
+                    AND fl2.is_current = 1
+              ) = 1
               AND acs.source_file_size = fl.file_size
               AND acs.source_modified_time_ns = fl.modified_time_ns
               AND EXISTS (
@@ -907,13 +923,22 @@ class ArchivePerceptualHashRepository:
                     LIMIT 1
                 ) AS location_modified_time_ns,
                 (
-                    SELECT j.status FROM jobs AS j
-                    WHERE j.archive_id = af.id
-                      AND j.job_type = 'hash_archive_pages_perceptual'
-                      AND j.status IN
-                          ('pending', 'claimed', 'running', 'failed')
-                    ORDER BY j.id LIMIT 1
-                ) AS blocking_job_status
+                    -- Every distinct blocking status, not the first by id.
+                    -- An archive can hold a failed job and a running one at
+                    -- once, and LIMIT 1 hid whichever lost the race --
+                    -- breaking the promise that an archive keeps every reason
+                    -- that applies, and hiding the more actionable of the two
+                    -- roughly half the time.
+                    SELECT GROUP_CONCAT(status, ',') FROM (
+                        SELECT DISTINCT j.status AS status
+                        FROM jobs AS j
+                        WHERE j.archive_id = af.id
+                          AND j.job_type = 'hash_archive_pages_perceptual'
+                          AND j.status IN
+                              ('pending', 'claimed', 'running', 'failed')
+                        ORDER BY j.status
+                    )
+                ) AS blocking_job_statuses
             FROM archive_files AS af
             LEFT JOIN archive_content_signatures AS acs
               ON acs.archive_id = af.id
@@ -958,11 +983,11 @@ class ArchivePerceptualHashRepository:
             if outstanding.get(archive_id, 0) == 0:
                 found.append(EXCLUSION_NO_OUTSTANDING_PAGES)
 
-            if row["blocking_job_status"] is not None:
-                found.append(
-                    "%s:%s"
-                    % (EXCLUSION_BLOCKING_JOB, row["blocking_job_status"])
-                )
+            if row["blocking_job_statuses"]:
+                for status in str(row["blocking_job_statuses"]).split(","):
+                    found.append(
+                        "%s:%s" % (EXCLUSION_BLOCKING_JOB, status)
+                    )
 
             if found:
                 reasons[archive_id] = tuple(found)
