@@ -19,10 +19,15 @@ The order of checks is deliberate:
 
 1. **Database eligibility** -- supplied by the caller, because it is job-type
    specific (which hashes are missing, which job statuses block re-enqueue).
-2. **Retirement** -- checked before anything touches the disk, so a retired
-   archive is excluded *independently of filesystem state*. This is the whole
-   point of retirement being durable: an archive stays out because someone
-   decided it should, not because its file happens to be missing today.
+2. **Recorded disposition** -- retirement and supersession, both checked
+   before anything touches the disk, so a dispositioned archive is excluded
+   *independently of filesystem state*. This is the whole point of a
+   disposition being durable: an archive stays out because someone decided it
+   should, not because its file happens to be missing today. Supersession is
+   kept separate from retirement rather than folded into it, because the two
+   answer different questions -- "out of scope" versus "the work continues as
+   archive N" -- and only one of them can tell a later reader where the
+   content went.
 3. **Exactly one current location** -- zero is unresolvable and more than one
    is ambiguous; neither may be guessed at.
 4. **An accessible regular file** -- the only check that touches the disk, and
@@ -47,10 +52,16 @@ import stat as stat_module
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
+from comic_automation.archive.disposition import (
+    retired_archive_ids,
+    superseded_archive_ids,
+)
+
 
 # Stable rejection slugs. These are written into reports and compared in
 # tests, so they are part of the contract, not display strings.
 ARCHIVE_RETIRED = "archive_retired"
+ARCHIVE_SUPERSEDED = "archive_superseded"
 NO_CURRENT_LOCATION = "no_current_location"
 MULTIPLE_CURRENT_LOCATIONS = "multiple_current_locations"
 PATH_MISSING = "path_missing"
@@ -59,6 +70,7 @@ PATH_UNREADABLE = "path_unreadable"
 
 REJECTION_REASONS = (
     ARCHIVE_RETIRED,
+    ARCHIVE_SUPERSEDED,
     NO_CURRENT_LOCATION,
     MULTIPLE_CURRENT_LOCATIONS,
     PATH_MISSING,
@@ -108,14 +120,11 @@ class Selection:
         return grouped
 
 
-def retired_archive_ids(connection: sqlite3.Connection) -> set[int]:
-    """Every durably retired archive. Read-only."""
-    return {
-        int(row[0])
-        for row in connection.execute(
-            "SELECT archive_id FROM archive_retirements"
-        )
-    }
+# Read-only disposition lookups live in `comic_automation/archive/disposition.py`
+# alongside the writers, so there is one definition of "retired" and one of
+# "superseded" rather than a copy here that can drift. `retired_archive_ids`
+# stays importable from this module because callers and tests already import it
+# from here.
 
 
 def current_locations(
@@ -187,11 +196,12 @@ def select_candidates(
     documented at module level.
 
     `check_filesystem=False` skips only step 4, for a caller that wants the
-    database-level answer alone. Retirement and location checks always run:
+    database-level answer alone. Disposition and location checks always run:
     they are the ones that must not depend on the disk.
     """
     ordered = list(dict.fromkeys(int(a) for a in archive_ids))
     retired = retired_archive_ids(connection)
+    superseded = superseded_archive_ids(connection)
     locations = current_locations(connection, ordered)
 
     accepted: list[Candidate] = []
@@ -204,6 +214,17 @@ def select_candidates(
                     archive_id,
                     ARCHIVE_RETIRED,
                     "retired at archive level; filesystem state not consulted",
+                )
+            )
+            continue
+
+        if archive_id in superseded:
+            rejected.append(
+                Rejection(
+                    archive_id,
+                    ARCHIVE_SUPERSEDED,
+                    "superseded at archive level; filesystem state not "
+                    "consulted",
                 )
             )
             continue
@@ -247,9 +268,9 @@ def revalidate_for_enqueue(
     """Re-check the database conditions at enqueue time.
 
     Selection and enqueue are separated by however long the caller takes,
-    and the database can move in between -- an archive retired by another
-    operator, a location row rewritten by repair. Those are cheap to
-    re-read and are therefore checked again here.
+    and the database can move in between -- an archive retired or superseded
+    by another operator, a location row rewritten by repair. Those are cheap
+    to re-read and are therefore checked again here.
 
     The filesystem is deliberately *not* re-checked. Re-statting would only
     move the race, not remove it, and would make enqueue cost a syscall per
@@ -267,6 +288,20 @@ def revalidate_for_enqueue(
             archive_id,
             ARCHIVE_RETIRED,
             "retired between selection and enqueue: %s" % (retired[0],),
+        )
+
+    superseded = connection.execute(
+        "SELECT successor_archive_id, reason FROM archive_supersessions "
+        "WHERE predecessor_archive_id = ?",
+        (archive_id,),
+    ).fetchone()
+
+    if superseded is not None:
+        return Rejection(
+            archive_id,
+            ARCHIVE_SUPERSEDED,
+            "superseded by archive %s between selection and enqueue: %s"
+            % (superseded[0], superseded[1]),
         )
 
     paths = [

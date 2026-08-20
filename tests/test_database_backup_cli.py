@@ -18,7 +18,28 @@ from comic_automation.database.backup_cli import (
     run_backup,
 )
 from comic_automation.database.connection import database_connection
-from comic_automation.database.migrations import apply_migrations
+from comic_automation.database.migrations import (
+    apply_migrations,
+    discover_migrations,
+    migration_version,
+)
+
+
+def all_migration_versions() -> list[int]:
+    """Every migration on disk, in order.
+
+    Derived rather than written out, so a new migration does not fail a
+    test that is really asserting "backup and source agree".
+    """
+    directory = (
+        Path(__file__).resolve().parents[1]
+        / "comic_automation"
+        / "database"
+        / "migrations"
+    )
+    return [
+        migration_version(path) for path in discover_migrations(directory)
+    ]
 
 
 MIGRATION_DIRECTORY = (
@@ -101,7 +122,7 @@ def test_backup_round_trip_succeeds_and_verifies(tmp_path: Path) -> None:
     assert report["source_quick_check_after"] == "ok"
     assert report["backup_quick_check"] == "ok"
     assert report["source_schema_versions"] == report["backup_schema_versions"]
-    assert report["source_schema_versions"] == list(range(1, 13))
+    assert report["source_schema_versions"] == all_migration_versions()
     assert set(report["source_index_names"]) == set(report["backup_index_names"])
     assert report["source_table_counts"] == report["backup_table_counts"]
     assert report["source_table_counts"]["jobs"] == 2
@@ -494,7 +515,9 @@ def test_discovered_tables_cover_every_migration_table(
     assert set(report["source_tables"]) == expected
     assert set(report["tables_compared"]) == expected
     assert "schema_migrations" in report["tables_compared"]
-    assert report["source_table_counts"]["schema_migrations"] == 12
+    assert report["source_table_counts"]["schema_migrations"] == len(
+        all_migration_versions()
+    )
 
 
 def test_excludes_sqlite_internal_tables_from_discovery(
