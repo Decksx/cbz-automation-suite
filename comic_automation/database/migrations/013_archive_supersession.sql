@@ -78,14 +78,18 @@
 --
 -- History is written by trigger, never by application code, so it cannot be
 -- skipped and is atomic with the row it describes by construction -- the same
--- statement writes both. Exactly one history row is produced per action.
+-- statement writes both. Exactly one history row is produced per action, and
+-- archive_disposition_events is append-only in fact as well as in description:
+-- BEFORE UPDATE and BEFORE DELETE triggers refuse to let any statement rewrite
+-- or erase a recorded decision.
 --
 -- Reversal requires its own reason, enforced by the database. A DELETE trigger
 -- cannot be handed an argument, so the reason arrives through a single-row
 -- context table that the reversing transaction populates first; the BEFORE
 -- DELETE trigger refuses any deletion whose context does not match the exact
--- row being removed, which also prevents a stale context from silently
--- labelling the next reversal.
+-- row being removed. The AFTER DELETE trigger then *consumes* that context in
+-- the same trigger body, so a reversal issued as raw SQL cannot leave a
+-- reusable reason behind for some later deletion to borrow.
 --
 -- archive_disposition_events carries NO foreign key, deliberately. Requirement:
 -- disposition evidence must survive the deletion of the archive it describes.
@@ -112,10 +116,21 @@ CREATE TABLE IF NOT EXISTS archive_disposition_events (
         disposition IN ('retired', 'superseded')
     ),
     action TEXT NOT NULL CHECK (action IN ('recorded', 'reversed')),
-    reason TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (
+        length(
+            trim(reason, char(32) || char(9) || char(10) || char(13))
+        ) > 0
+    ),
     evidence TEXT,
-    source TEXT NOT NULL DEFAULT 'application' CHECK (
-        source IN ('application', 'migration_backfill')
+    -- 'runtime' means the row was produced by a trigger firing on a live
+    -- statement. It deliberately does NOT claim the statement came from
+    -- application code: a trigger cannot tell whether disposition.py or an
+    -- operator's sqlite3 prompt issued the INSERT, and a value that implied
+    -- otherwise would be a lie the schema tells every future reader.
+    -- 'migration_backfill' is the only value that means something narrower,
+    -- because only a migration can write it.
+    source TEXT NOT NULL DEFAULT 'runtime' CHECK (
+        source IN ('runtime', 'migration_backfill')
     ),
     occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -125,6 +140,23 @@ CREATE INDEX IF NOT EXISTS idx_archive_disposition_events_archive
 
 CREATE INDEX IF NOT EXISTS idx_archive_disposition_events_occurred_at
     ON archive_disposition_events(occurred_at);
+
+-- Append-only is enforced, not merely described. Without these an operator or
+-- a stray statement could rewrite or erase the record of a decision, which is
+-- the one thing this table exists to make impossible.
+CREATE TRIGGER IF NOT EXISTS trg_disposition_events_no_update
+BEFORE UPDATE ON archive_disposition_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'archive_disposition_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_disposition_events_no_delete
+BEFORE DELETE ON archive_disposition_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'archive_disposition_events is append-only');
+END;
 
 -- -------------------------------------------------------- reversal context
 CREATE TABLE IF NOT EXISTS disposition_reversal_context (
@@ -311,7 +343,7 @@ BEGIN
     )
     VALUES (
         NEW.predecessor_archive_id, NEW.successor_archive_id,
-        'superseded', 'recorded', NEW.reason, NEW.evidence, 'application'
+        'superseded', 'recorded', NEW.reason, NEW.evidence, 'runtime'
     );
 END;
 
@@ -327,8 +359,17 @@ BEGIN
         OLD.predecessor_archive_id, OLD.successor_archive_id,
         'superseded', 'reversed',
         (SELECT reason FROM disposition_reversal_context WHERE id = 1),
-        OLD.evidence, 'application'
+        OLD.evidence, 'runtime'
     );
+
+    -- Consume the context in the same trigger body that spends it. A raw-SQL
+    -- reversal that never clears it would otherwise leave a reusable reason
+    -- behind, and if the same archive were dispositioned again that stale
+    -- reason would authorise -- and mislabel -- the next deletion.
+    DELETE FROM disposition_reversal_context
+    WHERE id = 1
+      AND archive_id = OLD.predecessor_archive_id
+      AND disposition = 'superseded';
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_retirement_recorded_history
@@ -341,7 +382,7 @@ BEGIN
     )
     VALUES (
         NEW.archive_id, NULL, 'retired', 'recorded',
-        NEW.reason, NEW.evidence, 'application'
+        NEW.reason, NEW.evidence, 'runtime'
     );
 END;
 
@@ -356,8 +397,14 @@ BEGIN
     VALUES (
         OLD.archive_id, NULL, 'retired', 'reversed',
         (SELECT reason FROM disposition_reversal_context WHERE id = 1),
-        OLD.evidence, 'application'
+        OLD.evidence, 'runtime'
     );
+
+    -- Same reasoning as the supersession reversal: the context is spent here.
+    DELETE FROM disposition_reversal_context
+    WHERE id = 1
+      AND archive_id = OLD.archive_id
+      AND disposition = 'retired';
 END;
 
 -- ---------------------------------------------------------------- backfill
