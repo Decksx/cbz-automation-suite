@@ -161,11 +161,34 @@ def add_job(
     archive_id: int,
     job_type: str,
     status: str,
+    *,
+    ended_at: str | None = None,
 ) -> int:
-    cursor = conn.execute(
-        "INSERT INTO jobs (job_type, archive_id, status) VALUES (?, ?, ?)",
-        (job_type, archive_id, status),
-    )
+    """Add one job.
+
+    `ended_at` sets the terminal timestamp -- `completed_at` for a completed
+    job, `cancelled_at` for a cancelled one, matching migration 011's rule
+    that a cancelled job did not complete and so leaves `completed_at` NULL.
+    Chronology tests set it explicitly rather than relying on insertion order.
+    """
+    column = {
+        "completed": "completed_at",
+        "failed": "completed_at",
+        "cancelled": "cancelled_at",
+    }.get(status)
+
+    if ended_at is not None and column is not None:
+        cursor = conn.execute(
+            f"INSERT INTO jobs (job_type, archive_id, status, {column}) "
+            "VALUES (?, ?, ?, ?)",
+            (job_type, archive_id, status, ended_at),
+        )
+    else:
+        cursor = conn.execute(
+            "INSERT INTO jobs (job_type, archive_id, status) VALUES (?, ?, ?)",
+            (job_type, archive_id, status),
+        )
+
     return int(cursor.lastrowid)
 
 
@@ -609,37 +632,147 @@ def test_every_job_history_stays_distinguishable(
 
 
 @pytest.mark.parametrize(
-    "statuses, expected",
+    "first, second, expected",
     [
-        # A later completion must not bury an earlier cancellation: the
-        # cancellation is the thing still holding a decision, and an archive
-        # whose work was called off is not the same as one that finished.
-        (("completed", "cancelled"), C.WORK_CANCELLED),
-        (("cancelled", "completed"), C.WORK_CANCELLED),
-        (("completed", "failed"), C.WORK_FAILED),
-        (("failed", "completed"), C.WORK_FAILED),
-        # Anything in flight outranks any history, because it will change.
-        (("failed", "running"), C.WORK_ACTIVE),
-        (("cancelled", "pending"), C.WORK_ACTIVE),
-        (("completed", "completed"), C.WORK_COMPLETED),
+        # The latest terminal job decides. Reducing jobs to status counts
+        # threw chronology away, so failed-only, failed-then-completed and
+        # completed-then-failed all came out `failed` -- and an operator was
+        # sent to fix work that had already been redone.
+        (("failed", "2026-01-01"), ("completed", "2026-02-01"),
+         C.WORK_COMPLETED),
+        (("completed", "2026-01-01"), ("failed", "2026-02-01"),
+         C.WORK_FAILED),
+        (("cancelled", "2026-01-01"), ("completed", "2026-02-01"),
+         C.WORK_COMPLETED),
+        (("completed", "2026-01-01"), ("cancelled", "2026-02-01"),
+         C.WORK_CANCELLED),
     ],
 )
-def test_work_state_ordering_keeps_histories_distinguishable(
+def test_the_latest_terminal_job_decides_the_current_state(
+    connection,
+    first: tuple[str, str],
+    second: tuple[str, str],
+    expected: str,
+) -> None:
+    """Both orders, with explicit timestamps rather than insertion order."""
+    add_archive(connection, 1)
+    add_archive(connection, 2)
+
+    # Seeded in one order for archive 1 and the reverse for archive 2, so a
+    # implementation that silently fell back to row id would disagree with
+    # one of them.
+    for status, ended in (first, second):
+        add_job(connection, 1, C.PERCEPTUAL_JOB_TYPE, status, ended_at=ended)
+
+    for status, ended in (second, first):
+        add_job(connection, 2, C.PERCEPTUAL_JOB_TYPE, status, ended_at=ended)
+
+    result = C.classify(connection)
+
+    assert only(result, 1).perceptual_work == expected
+    assert only(result, 2).perceptual_work == expected
+
+
+@pytest.mark.parametrize(
+    "statuses, expected",
+    [
+        (("failed", "running"), C.WORK_ACTIVE),
+        (("cancelled", "pending"), C.WORK_ACTIVE),
+        (("completed", "claimed"), C.WORK_ACTIVE),
+    ],
+)
+def test_active_work_outranks_any_terminal_history(
     connection, statuses: tuple[str, ...], expected: str
 ) -> None:
-    """An archive with several perceptual jobs resolves to one state.
-
-    Ordered by what still needs a decision, not by recency. Without this the
-    ordering is free to change unnoticed -- a completion could swallow a
-    cancellation and no test would object, which is exactly what a bypass run
-    found.
-    """
+    """Anything in flight outranks history, because it is about to change."""
     add_archive(connection, 1)
 
     for status in statuses:
         add_job(connection, 1, C.PERCEPTUAL_JOB_TYPE, status)
 
     assert only(C.classify(connection), 1).perceptual_work == expected
+
+
+def test_history_survives_beside_the_current_state(connection) -> None:
+    """"Ever failed" stays answerable without the scalar state lying.
+
+    An archive that failed and was then reprocessed reads `completed` now --
+    which is true -- while `ever_failed` keeps the fact that it once did.
+    """
+    add_archive(connection, 1)
+    add_job(
+        connection, 1, C.PERCEPTUAL_JOB_TYPE, "failed", ended_at="2026-01-01"
+    )
+    add_job(
+        connection, 1, C.PERCEPTUAL_JOB_TYPE, "cancelled",
+        ended_at="2026-01-15",
+    )
+    add_job(
+        connection, 1, C.PERCEPTUAL_JOB_TYPE, "completed",
+        ended_at="2026-02-01",
+    )
+
+    archive = only(C.classify(connection), 1)
+
+    assert archive.perceptual_work == C.WORK_COMPLETED
+    assert archive.ever_failed is True
+    assert archive.ever_cancelled is True
+
+
+def test_a_failed_inspection_followed_by_a_clean_one_is_not_failed(
+    connection,
+) -> None:
+    """The same chronology rule, applied to the inventory sub-reason.
+
+    An archive whose inspection failed and was then re-run successfully holds
+    no images; it is not `inspection_failed`, and reporting it that way sends
+    an operator to re-run work that already succeeded.
+    """
+    add_archive(connection, 1)
+    add_job(connection, 1, C.INSPECT_JOB_TYPE, "failed", ended_at="2026-01-01")
+    add_job(
+        connection, 1, C.INSPECT_JOB_TYPE, "completed", ended_at="2026-02-01"
+    )
+
+    assert (
+        only(C.classify(connection), 1).not_inventoried_subreason
+        == C.NOT_INVENTORIED_COMPLETED_NO_IMAGES
+    )
+
+
+def test_a_running_inspection_outranks_an_earlier_failure(
+    connection,
+) -> None:
+    add_archive(connection, 1)
+    add_job(connection, 1, C.INSPECT_JOB_TYPE, "failed", ended_at="2026-01-01")
+    add_job(connection, 1, C.INSPECT_JOB_TYPE, "running")
+
+    assert (
+        only(C.classify(connection), 1).not_inventoried_subreason
+        == C.NOT_INVENTORIED_INSPECTION_ACTIVE
+    )
+
+
+def test_every_blocking_status_is_reported_not_just_the_first(
+    connection, tmp_path: Path
+) -> None:
+    """A failed job and a running one at once are two reasons, not one.
+
+    `ORDER BY j.id LIMIT 1` returned whichever happened to be written first,
+    which hid the more actionable of the two roughly half the time and broke
+    the promise that an archive keeps every reason that applies.
+    """
+    add_archive(connection, 1)
+    add_location(connection, 1, tmp_path / "a.cbz")
+    add_signature(connection, 1)
+    add_pages(connection, 1, 2, hashed=0)
+    add_job(connection, 1, C.PERCEPTUAL_JOB_TYPE, "failed", ended_at="2026-01")
+    add_job(connection, 1, C.PERCEPTUAL_JOB_TYPE, "running")
+
+    reasons = only(C.classify(connection), 1).selection_reasons
+
+    assert f"{EXCLUSION_BLOCKING_JOB}:failed" in reasons
+    assert f"{EXCLUSION_BLOCKING_JOB}:running" in reasons
 
 
 def test_the_45217_shape_is_cancelled_and_retired_at_once(
@@ -884,14 +1017,15 @@ def test_unexplained_is_residue_and_not_a_predicate(
     assert C.axis_totals(result)["selection"][C.SELECTION_UNEXPLAINED] == 1
 
 
-def test_without_a_scope_refusals_are_not_asserted(
+def test_without_a_scope_nothing_is_claimed_enqueueable(
     connection, tmp_path: Path
 ) -> None:
-    """A refusal this run could not test must not be claimed.
+    """A precondition this run could not test must not be asserted either way.
 
-    With no scope declared the filesystem is never consulted, so an archive
-    whose file is absent is reported eligible-by-the-database rather than
-    refused for a reason nothing checked.
+    With no scope declared the filesystem is never consulted, so the archive
+    is neither called eligible (nobody looked at the file) nor called
+    path_missing (nobody looked at the file). It is refused for the honest
+    reason that this run could not observe it.
     """
     add_archive(connection, 1)
     add_location(connection, 1, tmp_path / "gone.cbz")
@@ -901,12 +1035,164 @@ def test_without_a_scope_refusals_are_not_asserted(
     result = C.classify(connection)
 
     assert result.filesystem_consulted is False
-    assert only(result, 1).selection == C.SELECTION_ELIGIBLE
+    assert only(result, 1).selection == C.SELECTION_REFUSED
+    assert only(result, 1).selection_reasons == (C.REFUSAL_SCOPE_NOT_OBSERVED,)
+    assert PATH_MISSING not in only(result, 1).selection_reasons
 
     scoped = C.classify(connection, scope=[str(tmp_path)])
 
     assert scoped.filesystem_consulted is True
-    assert only(scoped, 1).selection == C.SELECTION_REFUSED
+    assert only(scoped, 1).selection_reasons == (PATH_MISSING,)
+
+
+def test_an_eligible_archive_under_an_unreachable_root_is_not_path_missing(
+    connection, tmp_path: Path, monkeypatch
+) -> None:
+    """The contradiction this contract exists to prevent.
+
+    The archive is eligible in every database sense, and its root is not
+    mounted. Statting it would raise FileNotFoundError and the refusal would
+    read `path_missing` -- turning "I cannot look there" into "the file is
+    gone", which is exactly the conflation the census found had already
+    happened once.
+    """
+    absent_root = tmp_path / "not-mounted"
+
+    add_archive(connection, 1)
+    add_location(connection, 1, absent_root / "series" / "a.cbz")
+    add_signature(connection, 1)
+    add_pages(connection, 1, 2, hashed=0)
+
+    def explode(path, *args, **kwargs):
+        raise AssertionError(
+            "classification must not stat a path under an unreachable root"
+        )
+
+    monkeypatch.setattr(C, "_stat", explode)
+
+    archive = only(C.classify(connection, scope=[str(absent_root)]), 1)
+
+    assert archive.availability == C.AVAILABILITY_UNAVAILABLE_SCOPE
+    assert archive.selection == C.SELECTION_REFUSED
+    assert archive.selection_reasons == (C.REFUSAL_SCOPE_UNAVAILABLE,)
+    assert PATH_MISSING not in archive.selection_reasons
+
+
+def test_an_eligible_archive_outside_every_root_is_not_stat_ed(
+    connection, tmp_path: Path, monkeypatch
+) -> None:
+    declared = tmp_path / "declared"
+    declared.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "a.cbz").write_bytes(b"x" * 4096)
+
+    add_archive(connection, 1)
+    add_location(connection, 1, elsewhere / "a.cbz")
+    add_signature(connection, 1)
+    add_pages(connection, 1, 2, hashed=0)
+
+    def explode(path, *args, **kwargs):
+        raise AssertionError("must not stat outside the declared scope")
+
+    monkeypatch.setattr(C, "_stat", explode)
+
+    archive = only(C.classify(connection, scope=[str(declared)]), 1)
+
+    assert archive.availability == C.AVAILABILITY_UNDECLARED_SCOPE
+    assert archive.selection_reasons == (C.REFUSAL_SCOPE_UNDECLARED,)
+
+
+def test_a_disposition_still_bites_under_an_unreachable_root(
+    connection, tmp_path: Path, monkeypatch
+) -> None:
+    """Retirement must not depend on what happens to be mounted."""
+    absent_root = tmp_path / "not-mounted"
+
+    add_archive(connection, 1)
+    add_location(connection, 1, absent_root / "a.cbz")
+    add_signature(connection, 1)
+    add_pages(connection, 1, 2, hashed=0)
+    disposition.retire(connection, 1, reason="r", evidence="e")
+
+    monkeypatch.setattr(
+        C, "_stat", lambda *a, **k: pytest.fail("must not stat")
+    )
+
+    archive = only(C.classify(connection, scope=[str(absent_root)]), 1)
+
+    assert archive.selection_reasons == (ARCHIVE_RETIRED,)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_the_most_specific_root_wins_regardless_of_order(
+    tmp_path: Path, reverse: bool
+) -> None:
+    """Nested roots must not resolve by declaration order.
+
+    With `X:\\` and `X:\\Horrorsplat` both declared, first-match made the
+    answer depend on how the caller happened to type the list -- so a path
+    could be judged against the mounted volume or the vanished folder
+    arbitrarily.
+    """
+    parent = tmp_path / "volume"
+    child = parent / "child"
+    parent.mkdir()
+    # `child` is deliberately not created, so the two roots differ in
+    # reachability and the choice between them is observable.
+    roots = [str(parent), str(child)]
+
+    scope = C.DeclaredScope.declare(list(reversed(roots)) if reverse else roots)
+    found = scope.containing_root(str(child / "series" / "a.cbz"))
+
+    assert found == (str(child), False)
+
+    # A path under the parent but outside the child still resolves to the
+    # parent, so the specific root does not swallow its neighbours.
+    assert scope.containing_root(str(parent / "other.cbz")) == (
+        str(parent), True
+    )
+
+
+def test_multiple_current_locations_do_not_break_classification(
+    connection, tmp_path: Path
+) -> None:
+    """Two matching current rows used to make the contract abort.
+
+    The eligibility predicate joined every current location without requiring
+    exactly one, so the archive was eligible *and* carried
+    multiple_current_locations -- a contradiction that raised PartitionError
+    and took the whole report down with it. The predicate now refuses
+    ambiguity, which is what the selection path has always done.
+    """
+    root = tmp_path / "lib"
+    root.mkdir()
+    first = root / "one.cbz"
+    second = root / "two.cbz"
+    first.write_bytes(b"x" * 4096)
+    second.write_bytes(b"x" * 4096)
+    mtime = first.stat().st_mtime_ns
+
+    add_archive(connection, 1)
+    add_location(connection, 1, first, file_size=4096, mtime=mtime)
+    add_location(connection, 1, second, file_size=4096, mtime=mtime)
+    add_signature(connection, 1, file_size=4096, mtime=mtime)
+    add_pages(connection, 1, 2, hashed=0)
+
+    result = C.classify(connection, scope=[str(root)])
+    archive = only(result, 1)
+
+    assert archive.availability == C.AVAILABILITY_MULTIPLE_CURRENT_LOCATIONS
+    assert archive.selection == C.SELECTION_EXCLUDED
+    assert EXCLUSION_MULTIPLE_CURRENT_LOCATIONS in archive.selection_reasons
+
+    repository = ArchivePerceptualHashRepository(connection)
+    eligible = {
+        int(row["archive_id"])
+        for row in repository._eligible_archive_rows(limit=None)
+    }
+
+    assert eligible == set()
 
 
 # --- presentation precedence --------------------------------------------
