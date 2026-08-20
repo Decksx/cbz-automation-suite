@@ -19,6 +19,10 @@ from pathlib import Path
 
 import pytest
 
+from comic_automation.database.migrations import (
+    discover_migrations,
+    migration_version,
+)
 from comic_automation.database.connection import (
     connect_database,
     database_connection,
@@ -133,6 +137,21 @@ operating_mode = "audit"
     return config_path
 
 
+def all_migration_versions() -> list[int]:
+    """Every migration on disk, in order.
+
+    Derived rather than written out, so a new migration does not fail a test
+    that is really asserting "initialize() applied all of them".
+    """
+    directory = (
+        Path(__file__).resolve().parents[1]
+        / "comic_automation"
+        / "database"
+        / "migrations"
+    )
+    return [migration_version(path) for path in discover_migrations(directory)]
+
+
 def test_service_initialize_creates_workspace_and_database(
     tmp_path: Path,
 ) -> None:
@@ -145,7 +164,7 @@ def test_service_initialize_creates_workspace_and_database(
 
     applied = service.initialize()
 
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert applied == all_migration_versions()
     assert service.config.workspace.root.is_dir()
     assert service.config.workspace.cache.is_dir()
     assert service.config.workspace.embeddings.is_dir()
@@ -169,7 +188,7 @@ def test_service_initialize_is_idempotent(
     first = service.initialize()
     second = service.initialize()
 
-    assert first == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert first == all_migration_versions()
     assert second == []
 
 
