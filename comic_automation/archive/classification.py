@@ -83,7 +83,7 @@ import os
 import sqlite3
 import stat as stat_module
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from comic_automation.archive import disposition as disposition_module
@@ -375,6 +375,10 @@ def _structural_rows(connection: sqlite3.Connection) -> dict[int, dict]:
                 WHERE fl.archive_id = af.id AND fl.is_current = 1
                 ORDER BY fl.id LIMIT 1
             ) AS location_modified_time_ns
+            ,(
+                SELECT acs.page_count FROM archive_content_signatures AS acs
+                WHERE acs.archive_id = af.id
+            ) AS signature_page_count
         FROM archive_files AS af
         ORDER BY af.id
         """
@@ -448,6 +452,7 @@ def _work_state(statuses: Counter) -> str:
 def _not_inventoried_subreason(
     inspect_statuses: Counter,
     quarantine_status: str | None,
+    signature_page_count: int | None,
 ) -> str:
     """Why an archive has no pages.
 
@@ -455,6 +460,13 @@ def _not_inventoried_subreason(
     statement available: `pending_redownload` says an operator already looked
     at this archive and is waiting on a replacement, which is more useful than
     repeating that its inspection failed.
+
+    The last two cases are the ones worth separating. When inspection
+    completed and no pages exist, the content signature is the only other
+    witness: if it promises pages, the inventory is absent and something lost
+    it; if it promises none, or does not exist, the archive simply holds no
+    images. Reporting both as "no images" would hide a data-loss shape behind
+    an ordinary one.
     """
     if quarantine_status == "pending_redownload":
         return NOT_INVENTORIED_QUARANTINE_PENDING_REDOWNLOAD
@@ -472,13 +484,22 @@ def _not_inventoried_subreason(
         return NOT_INVENTORIED_INSPECTION_CANCELLED
 
     if inspect_statuses.get("completed"):
-        # Inspection ran and wrote no pages. Whether that means "this archive
-        # holds no images" or "the inventory was lost afterwards" is not
-        # something the job row can settle, so both are named and neither is
-        # asserted: the signature is the only other witness.
+        if (signature_page_count or 0) > 0:
+            return NOT_INVENTORIED_COMPLETED_INVENTORY_ABSENT
+
         return NOT_INVENTORIED_COMPLETED_NO_IMAGES
 
     return NOT_INVENTORIED_UNKNOWN
+
+
+# The one call that inspects a file, bound at module level rather than called
+# as os.stat() inside the function. A test proving that an unreadable path is
+# not reported as missing has to replace this call, and doing that by patching
+# os.stat globally also breaks os.path.isdir -- which this module uses to
+# decide whether a declared root is reachable, so the test would silently
+# measure the wrong thing. `candidate_selection` carries the same seam for the
+# same reason.
+_stat = os.stat
 
 
 def _availability(
@@ -522,7 +543,7 @@ def _availability(
         )
 
     try:
-        result = os.stat(path)
+        result = _stat(path)
     except FileNotFoundError:
         return AVAILABILITY_MISSING, path
     except OSError as error:
@@ -672,7 +693,9 @@ def classify(
         if total_pages == 0:
             inventory = INVENTORY_NOT_INVENTORIED
             subreason = _not_inventoried_subreason(
-                inspect_jobs.get(archive_id, Counter()), quarantine_status
+                inspect_jobs.get(archive_id, Counter()),
+                quarantine_status,
+                info["signature_page_count"],
             )
         elif outstanding_pages == 0:
             inventory, subreason = INVENTORY_COVERED, None
