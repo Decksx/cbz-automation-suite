@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -120,9 +121,20 @@ def build_cbz(
         for name, payload in entries:
             info = zipfile.ZipInfo(filename=name, date_time=date_time)
             info.compress_type = compression
-            # External attributes are otherwise platform-dependent, which
+            # Every field below is otherwise derived from the host, which
             # would make the same corpus differ between a developer machine
             # and CI while every logical property held.
+            #
+            # `create_system` is the one that actually bites: ZipInfo sets
+            # it to 0 on Windows and 3 on everything else, so the bytes --
+            # and therefore every frozen digest here -- would differ purely
+            # by operating system. Pinned to 0 rather than to the host's
+            # value, because "reproducible on this machine" is not the
+            # claim being made.
+            info.create_system = 0
+            info.create_version = 20
+            info.extract_version = 20
+            info.internal_attr = 0
             info.external_attr = 0o600 << 16
             archive.writestr(info, payload)
 
@@ -366,8 +378,77 @@ def _malformed_comicinfo(path: Path) -> Path:
     )
 
 
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        len(data).to_bytes(4, "big")
+        + tag
+        + data
+        + (zlib.crc32(tag + data) & 0xFFFFFFFF).to_bytes(4, "big")
+    )
+
+
+def declared_size_png(width: int, height: int) -> bytes:
+    """A tiny PNG whose header *declares* an enormous image.
+
+    Decoders check the declared dimensions in the IHDR before allocating,
+    which is exactly how a decompression bomb is caught -- so a 68-byte file
+    exercises the decoded-pixel limit without a fixture that costs hundreds
+    of megabytes to build or store.
+
+    The pixel data is deliberately not real. This fixture is for the
+    *dimension* guard; anything that gets past that guard fails on the
+    truncated image data instead, which is a different case the corpus
+    already covers.
+    """
+    signature = b"\x89PNG\r\n\x1a\n"
+    header = _png_chunk(
+        b"IHDR",
+        width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + bytes([8, 2, 0, 0, 0]),
+    )
+    data = _png_chunk(b"IDAT", zlib.compress(b"\x00" * 16))
+    end = _png_chunk(b"IEND", b"")
+    return signature + header + data + end
+
+
+# Pillow warns above `Image.MAX_IMAGE_PIXELS` and only raises
+# `DecompressionBombError` above *twice* that value, which
+# `perceptual_hashing.py` documents and relies on. Both bands are
+# represented so a change to either threshold is visible.
+PIXEL_WARNING_DIMENSIONS = (12_000, 9_000)   # 108 MP, warning band
+PIXEL_BOMB_DIMENSIONS = (20_000, 9_000)      # 180 MP, error band
+
+
+def _decoded_pixel_warning(path: Path) -> Path:
+    return build_cbz(
+        path,
+        [
+            (COMIC_INFO, comic_info_xml()),
+            ("001.png", declared_size_png(*PIXEL_WARNING_DIMENSIONS)),
+        ],
+    )
+
+
+def _decoded_pixel_bomb(path: Path) -> Path:
+    return build_cbz(
+        path,
+        [
+            (COMIC_INFO, comic_info_xml()),
+            ("001.png", declared_size_png(*PIXEL_BOMB_DIMENSIONS)),
+        ],
+    )
+
+
 def _many_entries(path: Path) -> Path:
-    """More entries than any real chapter, for entry-count limits."""
+    """A legitimate high-entry-count archive, used as a control.
+
+    120 pages is more than a typical chapter and less than anything
+    pathological. This is **not** the roadmap's "excessive entries" case:
+    there is no entry-count limit in the codebase to exercise, so this
+    fixture pins that a large-but-ordinary archive is handled normally
+    rather than proving a guard. See `CORPUS_GAPS`.
+    """
     entries: list[tuple[str, bytes]] = [(COMIC_INFO, comic_info_xml())]
     entries.extend(
         (f"{index:04d}.png", page_image(index)) for index in range(1, 121)
@@ -411,9 +492,90 @@ CASES: tuple[Case, ...] = (
     Case("corrupt_zip", "Truncated ZIP with no central directory.",
          _corrupt_zip, expects_valid_zip=False, expects_images=False,
          tags=("corruption",)),
-    Case("many_entries", "120 pages, for entry-count limits.",
-         _many_entries, tags=("limits",)),
+    Case("many_entries",
+         "120 pages: a legitimate high-count control, not a limit test.",
+         _many_entries, tags=("control",)),
+    Case("decoded_pixel_warning",
+         "Header declares 108 MP: above the pixel limit, below the "
+         "raise threshold.",
+         _decoded_pixel_warning, tags=("limits", "resource")),
+    Case("decoded_pixel_bomb",
+         "Header declares 180 MP: above twice the limit, where Pillow "
+         "raises.",
+         _decoded_pixel_bomb, tags=("limits", "resource")),
 )
+
+
+# Roadmap shapes this corpus deliberately does not cover, and why. Recorded
+# here rather than left as an absence, because a missing fixture is
+# indistinguishable from an overlooked one.
+CORPUS_GAPS = {
+    "excessive_entries": (
+        "No entry-count limit exists anywhere in the codebase, so there is "
+        "no guard to exercise. `many_entries` is a legitimate high-count "
+        "control instead. Deferred to resource hardening, which is where "
+        "such a limit would be introduced."
+    ),
+    "real_pixel_payload": (
+        "`decoded_pixel_*` declare their dimensions in the PNG header "
+        "rather than carrying real pixel data. The dimension check is the "
+        "guard under test; a fixture with genuine payload would cost "
+        "hundreds of megabytes to gain nothing."
+    ),
+}
+
+EXPECTED_SHA256: dict[str, str] = {
+    "ordinary":
+        "32a91dcb9897101e5556fbf5d9248c0e89a4a28d1449707563359dd8099661c3",
+    "comicinfo_only_change":
+        "5cc738208f8e1cf0fc048ba12404847e78946bcf3a728c8527b57c0fa9eac1e4",
+    "reordered_pages":
+        "61e301f9d69b2a506b83fa7f558ecaaed3300e7ea51158dcc5374cd1e5e4071b",
+    "one_page_difference":
+        "2246d0dd84143f492c6a4f0af6a8f2cebd044bd58b43b24c9fb735a5d623c1f4",
+    "one_page_fewer":
+        "95e8ce9e4936840913d0c74859abf1089fe45edf4d416e7a385ea18ccf10b537",
+    "duplicate_pages":
+        "7bcb3c80bc7b97431862d249f907af980837e202eb9ca3ceace027a85d151448",
+    "unicode_paths":
+        "8726b50876cbdfbf2804f342b951cc20df6038c8b0b3293f5747bca40c53e338",
+    "unsafe_members":
+        "9fd556d7aad1a2c0f119fd06437e5d9c2e0691d605b46410bc8db1dc3f8e10c9",
+    "no_images":
+        "5da8b6b41db18dafa24dc9efc95b7e19477c386bacd5ad4284dac21e8ac1853d",
+    "empty_archive":
+        "8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85",
+    "truncated_image":
+        "0c8748c4e01bd6c18b37a7668613f1493a451dd6f0847019767cb5d45ebb183e",
+    "unidentified_image":
+        "ea157eba11a1b1f4059d0f9042b9030a30f186e9045afd2a888e2e39af1d75d9",
+    "malformed_comicinfo":
+        "e5d3a5d93f5440aa4dce14b05423905394619de4a821edfe721c0651a9926b46",
+    "corrupt_zip":
+        "ec385de8d2849a3b9a4b6d214bc32af957f08174e1c0c40a115451436ed7475d",
+    "many_entries":
+        "4c6ee6313f6e1edf4a7c975a0abe6a4f89cee2d738dd7d039ac23e777328d561",
+    "decoded_pixel_warning":
+        "3a6afb0cc39d806942d7979156e8426ac739adbfebec7cb7d776ef9551bc68f5",
+    "decoded_pixel_bomb":
+        "7ee2050a7ad11932d1e252032eb8bab707d5b674147765e72f2f9d878ab58019",
+}
+"""Frozen digest of every case, asserted by the corpus tests.
+
+Building each case twice inside one process proves the builder is not
+reading the clock; it proves nothing about drift *across* runs, machines
+or dependency versions, because both builds share the same Pillow and the
+same platform. These digests are the actual anchor.
+
+They are expected to break, and the break is the signal. `Pillow>=10.0.0`
+is unpinned, so an encoder change silently alters every page image and
+therefore every fixture; `create_system` differs by operating system.
+Either would leave every logical property passing while the corpus quietly
+became a different corpus. When one of these fails, work out *why* the
+bytes moved before updating the constant -- regenerating it to make the
+suite green discards the only warning this file exists to give.
+"""
+
 
 CASES_BY_NAME = {case.name: case for case in CASES}
 
