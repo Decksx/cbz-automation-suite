@@ -34,36 +34,88 @@ These values are the last fully reconciled production baseline,
 reconciled against the final coverage audit of 2026-08-21. Update this
 table after each major guarded run.
 
+Rows are grouped by **where the number comes from**, because they are not
+all the same kind of fact and mixing them is how a mid-backfill snapshot
+sat in a "current" table for four days.
+
+#### Database state — reconciled 2026-08-21 against the pre-revision backup
+
+Measured from
+`G:\ComicAutomation\backups\inspection-working.2026-08-21.post-audit-pre-revision.db`
+(sha256 `4c0654b7…86c17a`). That file is immutable, so these figures stay
+checkable after intake resumes.
+
 | Metric | Verified value |
 | --- | ---: |
 | Logical archive rows | 59,688 |
-| Current file locations/archives | 59,377 |
-| Archive SHA-256 rows | 59,541 |
+| Current file locations (`is_current = 1`) | 59,377 |
+| Archive SHA-256 rows (`archive_hashes`) | 59,541 |
 | Archive content signatures | 58,437 |
-| Exact duplicate groups | 886 |
-| Redundant copies in those groups | 1,085 |
-| Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 45,700 |
-| Perceptual jobs completed | 57,896 |
-| Perceptual jobs failed | 132 |
-| Active perceptual jobs | 0 |
-| Production schema migrations | 1–13 |
+| Page SHA-256 rows (`page_hashes`, sha256 v1) | 2,955,391 |
+| Archive pages | 2,955,391 |
 | dHash rows, Version 1 | 2,932,841 |
 | pHash rows, Version 1 | 2,932,841 |
 | Pages with exactly one perceptual hash | 0 |
+| Perceptual job rows (all statuses) | 58,029 |
+| Perceptual jobs completed | 57,896 |
+| Perceptual jobs failed | 132 |
+| Perceptual jobs cancelled | 1 |
+| Active perceptual jobs | 0 |
+| Distinct archives with a perceptual job | 58,029 |
+| Exact duplicate groups (by content digest) | 888 |
+| Redundant copies in those groups | 1,090 |
+| Near-duplicate candidate rows | 3,000 |
+| Archive retirements / supersessions | 1 / 0 |
+| Quarantine rows, `pending_redownload` | 35 |
+| `archive_files.sha256` populated | 0 (deliberately; see Step 2 notes) |
+| Production schema migrations | 1–13 |
+
+The perceptual job rows reconcile exactly: 58,029 = 57,896 completed + 132
+failed + 1 cancelled. The previously recorded 45,700 was a mid-backfill
+snapshot and could not have been current, since 45,700 rows cannot contain
+57,896 completed jobs.
+
+#### Coverage accounting — 2026-08-21 audit, scope `X:\`
+
+Scope digest `e51ea80488d072e1ef6beb143248bda4cc5383c0c2d848756c82ca98b4ffae89`.
+
+| Metric | Verified value |
+| --- | ---: |
 | Historical page coverage | 99.2370% (2,932,841 / 2,955,391) |
 | Operational page coverage | 99.2387% (2,932,841 / 2,955,340) |
 | Outstanding pages | 22,550 |
-| Archive identities reconciled | 59,688 (0 missing, 0 extra, 0 duplicate) |
+| Archive identities reconciled | 59,688 (0 missing, 0 extra, 0 duplicate, 0 incomplete) |
 | Unexplained residue | 0 |
 | Zero-page identities | 1,256 |
-| Archive retirements / supersessions | 1 / 0 |
-| Database-eligible archives | 226 |
-| Enqueueable after selection | 0 |
+| Selection: eligible / refused / excluded | 0 / 226 / 59,462 |
 | Refused: retired / path missing | 1 / 225 |
-| Archives whose file changed under them | 95 |
-| Near-duplicate candidates | 3,000 |
-| Broken current locations | 1,081 |
+
+#### Filesystem observations — 2026-08-21 audit, scope `X:\`
+
+**Scope-dependent.** These describe what the audit could see under the
+declared root at that moment, not properties of the content. A run under a
+different declared scope answers a different question and its numbers are
+not comparable — which is why the scope digest travels with them.
+
+| Metric | Observed value |
+| --- | ---: |
+| Present, metadata matching | 58,301 |
+| Present, size or mtime drifted | 301 |
+| Missing under the declared root | 775 |
+| No current location | 311 |
+| Beneath an unavailable declared root | 0 (volume mounted at audit time) |
+
+Signature-vs-location metadata mismatch, measured from the backup with no
+filesystem access, is 16 archives — the clean drift cases. The 301 above
+is the larger filesystem-observed figure and is not the same measurement.
+
+#### Backfill batch record — 2026-08-19 (historical, not current)
+
+These describe the completed backfill run and are retained as evidence.
+They are **not** current-state figures.
+
+| Metric | Recorded value |
+| --- | ---: |
 | Last guarded batch | 2,550 processed (remainder) |
 | Backfill totals, 2026-08-19 | 12,329 processed, 12,313 succeeded, 11 terminal |
 | Backfill terminal-failure rate | 0.09% |
@@ -443,7 +495,10 @@ Before the next structural database migration:
   92 corrupt page images);
 - ~~capture a final database backup;~~ **done 2026-08-21**;
 - ~~verify the backup independently;~~ **done 2026-08-21**;
-- update the production metrics and development log.
+- ~~update the production metrics and development log.~~ **done
+  2026-08-21** — the metrics table below is reconciled against the
+  pre-revision backup, and `docs/development_log_2026-08-21.md`
+  records the cycle.
 
 **Step 1 is complete.** It is no longer a gate on Step 2.
 
