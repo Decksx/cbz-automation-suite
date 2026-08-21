@@ -18,7 +18,9 @@ synthetic and built inside `tmp_path`.
 
 from __future__ import annotations
 
+import warnings
 import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -544,6 +546,59 @@ def test_a_declared_pixel_bomb_is_a_permanent_page_failure(
         calculate_perceptual_hashes(path)
 
     assert raised.value.category == "page_image_corrupt"
+
+
+def test_the_warning_band_warns_and_does_not_raise(
+    tmp_path: Path,
+) -> None:
+    """Behavioural proof, not arithmetic about the constants.
+
+    The two bands were previously only compared numerically against
+    `Image.MAX_IMAGE_PIXELS`, which asserts the fixtures were chosen
+    correctly and nothing about what Pillow actually does with them. If a
+    future Pillow raised at the lower band too, that comparison would still
+    pass while the distinction this corpus is built on had vanished.
+
+    Opening the warning-band page must emit `DecompressionBombWarning` and
+    must *not* raise `DecompressionBombError`. It fails afterwards on the
+    truncated pixel data -- a different defect, and the reason this asserts
+    on the warning rather than on a successful decode.
+    """
+    path = gc.build_case("decoded_pixel_warning", tmp_path)
+    payload = gc.member_payloads(path)["001.png"]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+
+        try:
+            Image.open(BytesIO(payload)).load()
+        except Image.DecompressionBombError:
+            pytest.fail(
+                "the warning band must not raise; it is defined as the "
+                "range above the limit and below twice it"
+            )
+        except OSError:
+            pass  # truncated payload, which is expected and not the point
+
+    assert any(
+        issubclass(entry.category, Image.DecompressionBombWarning)
+        for entry in caught
+    ), [entry.category for entry in caught]
+
+
+def test_the_bomb_band_raises_at_the_decoder(tmp_path: Path) -> None:
+    """The fatal band, asserted at the same level as the warning band.
+
+    `test_a_declared_pixel_bomb_is_a_permanent_page_failure` covers the
+    production wrapping of this into a `PermanentJobError`. This asserts the
+    underlying decoder behaviour the wrapping depends on, so a change in
+    Pillow is distinguishable from a change in our error handling.
+    """
+    path = gc.build_case("decoded_pixel_bomb", tmp_path)
+    payload = gc.member_payloads(path)["001.png"]
+
+    with pytest.raises(Image.DecompressionBombError):
+        Image.open(BytesIO(payload))
 
 
 def test_the_two_pixel_bands_straddle_the_documented_threshold() -> None:
