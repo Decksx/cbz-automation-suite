@@ -815,7 +815,13 @@ def test_unexplained_residue_fails_the_audit() -> None:
 
     historical = measure_historical(result.archives)
     operational = measure_operational(result.archives)
-    invariants = check_invariants(result, census, historical, operational)
+    invariants = check_invariants(
+        result,
+        census,
+        historical,
+        operational,
+        audit.reconcile_identities(result, [99]),
+    )
     failed = [
         invariant.name for invariant in invariants if not invariant.passed
     ]
@@ -876,7 +882,24 @@ def _census(**overrides) -> dict[str, int]:
     return census
 
 
-def _failed_invariants(result, census, identities=None) -> list[str]:
+def _sole_identity(result):
+    """Reconcile against the id set the notional database holds.
+
+    Written as a literal `[1]` rather than read back off `result`, so a
+    test that drops or invents an archive still has an independent
+    expectation to disagree with.
+    """
+    return audit.reconcile_identities(result, [1])
+
+
+def _failed_invariants(result, census, identities) -> list[str]:
+    """Run the invariants over a constructed state.
+
+    `identities` is required here for the same reason it is required on
+    `check_invariants` itself: a helper that defaulted it would let a
+    test reconcile the classification against its own ids and quietly
+    assert nothing about the census.
+    """
     historical = measure_historical(result.archives)
     operational = measure_operational(result.archives)
 
@@ -895,7 +918,9 @@ def test_the_baseline_invariant_fixture_passes_cleanly() -> None:
     Without this, a test asserting some invariant fails could be passing
     because the fixture was broken in some entirely different way.
     """
-    assert _failed_invariants(_one_archive_result(), _census()) == []
+    result = _one_archive_result()
+
+    assert _failed_invariants(result, _census(), _sole_identity(result)) == []
 
 
 def test_a_dropped_zero_page_identity_is_caught_by_the_census(
@@ -1141,7 +1166,7 @@ def test_an_axis_value_outside_the_vocabulary_fails_to_sum() -> None:
 
     assert (
         "every_axis_sums_to_the_identity_total"
-        in _failed_invariants(result, _census())
+        in _failed_invariants(result, _census(), _sole_identity(result))
     )
 
 
@@ -1152,8 +1177,11 @@ def test_page_totals_that_disagree_with_the_census_are_caught() -> None:
     is told the library holds ten. Two independent measurements of the
     same library disagreeing is exactly what must not pass silently.
     """
+    result = _one_archive_result()
     failed = _failed_invariants(
-        _one_archive_result(), _census(pages=10, covered_pages=3)
+        result,
+        _census(pages=10, covered_pages=3),
+        _sole_identity(result),
     )
 
     assert "historical_denominator_matches_the_page_census" in failed
@@ -1162,7 +1190,10 @@ def test_page_totals_that_disagree_with_the_census_are_caught() -> None:
 
 
 def test_a_covered_count_that_disagrees_with_the_census_is_caught() -> None:
-    failed = _failed_invariants(_one_archive_result(), _census(covered_pages=1))
+    result = _one_archive_result()
+    failed = _failed_invariants(
+        result, _census(covered_pages=1), _sole_identity(result)
+    )
 
     assert "covered_pages_match_the_page_census" in failed
 
