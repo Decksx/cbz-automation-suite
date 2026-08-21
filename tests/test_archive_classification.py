@@ -14,6 +14,7 @@ exercised only through the path that respects it has not been demonstrated.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -1122,6 +1123,130 @@ def test_a_disposition_still_bites_under_an_unreachable_root(
     archive = only(C.classify(connection, scope=[str(absent_root)]), 1)
 
     assert archive.selection_reasons == (ARCHIVE_RETIRED,)
+
+
+@pytest.mark.parametrize("job_type", [C.PERCEPTUAL_JOB_TYPE, C.INSPECT_JOB_TYPE])
+def test_the_latest_row_is_a_real_row_not_a_synthesized_one(
+    connection, job_type: str
+) -> None:
+    """Per-status maxima can come from different rows.
+
+    completed(id 10, Feb 1), completed(id 30, Jan 1), failed(id 20, Feb 1).
+    Taking MAX(ended_at) and MAX(id) per status invents completed(Feb 1, 30)
+    and declares the archive completed. The actual latest row by
+    (ended_at, id) is the failure at id 20, and the ids are seeded explicitly
+    so the shape cannot drift.
+    """
+    add_archive(connection, 1)
+
+    for job_id, status, ended in (
+        (10, "completed", "2026-02-01"),
+        (20, "failed", "2026-02-01"),
+        (30, "completed", "2026-01-01"),
+    ):
+        column = "cancelled_at" if status == "cancelled" else "completed_at"
+        connection.execute(
+            f"INSERT INTO jobs (id, job_type, archive_id, status, {column}) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, job_type, 1, status, ended),
+        )
+
+    archive = only(C.classify(connection), 1)
+
+    if job_type == C.PERCEPTUAL_JOB_TYPE:
+        assert archive.perceptual_work == C.WORK_FAILED
+        # Historical counts are computed separately and stay whole.
+        assert archive.ever_failed is True
+    else:
+        assert (
+            archive.not_inventoried_subreason
+            == C.NOT_INVENTORIED_INSPECTION_FAILED
+        )
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        pytest.param("drive_root", id="drive-root"),
+        pytest.param("filesystem_root", id="filesystem-root"),
+    ],
+)
+def test_an_anchor_survives_normalization(spelling: str) -> None:
+    """`rstrip("\\\\/")` destroys exactly the roots that matter.
+
+    It turns ``X:\\`` into ``X:``, which is drive-*relative* on Windows and
+    names whatever that drive's cursor points at, and ``/`` into the empty
+    string, which matches nothing. The authoritative scan root recorded in
+    `discovery_checkpoints` is ``X:\\``, so this is not a hypothetical.
+    """
+    if spelling == "drive_root":
+        declared, child = "X:\\", "X:\\Comix\\a.cbz"
+    else:
+        declared, child = os.sep, os.sep + "srv" + os.sep + "a.cbz"
+
+    normalized = C.normalize_root(declared)
+
+    assert normalized not in ("", "X:")
+    assert normalized.endswith(os.sep)
+
+    scope = C.DeclaredScope.declare([declared])
+    found = scope.containing_root(child)
+
+    assert found is not None and found[0] == normalized
+    # The root itself is contained by itself, not only its descendants.
+    assert scope.containing_root(normalized) is not None
+
+
+def test_a_bare_drive_letter_resolves_to_the_drive_root() -> None:
+    """`X:` cannot mean a scope root; it names a per-drive cursor."""
+    assert C.normalize_root("X:") == "X:" + os.sep
+
+
+def test_ordinary_trailing_separators_are_still_stripped() -> None:
+    assert C.normalize_root("X:\\Comix\\") == "X:\\Comix"
+    assert C.normalize_root("X:/Comix/") == "X:\\Comix"
+
+
+def test_the_scope_digest_is_a_set_fingerprint(tmp_path: Path) -> None:
+    """Identity of the declared scope, not of the caller's argument list."""
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+
+    forward = C.DeclaredScope.declare([str(first), str(second)])
+    backward = C.DeclaredScope.declare([str(second), str(first)])
+    duplicated = C.DeclaredScope.declare(
+        [str(second), str(first), str(first) + os.sep]
+    )
+
+    assert forward.digest == backward.digest
+    assert forward.digest == duplicated.digest
+    assert len(duplicated.roots) == 2
+
+
+def test_mounting_a_root_does_not_change_the_scope_identity(
+    tmp_path: Path,
+) -> None:
+    """Reachability is observation data, not scope identity.
+
+    Folding it into the digest meant a report taken before a drive came back
+    was labelled as covering a different scope than one taken after -- so two
+    reports of the same question looked incomparable.
+    """
+    absent = tmp_path / "later"
+    before = C.DeclaredScope.declare([str(absent)])
+
+    assert before.reachable == (False,)
+
+    absent.mkdir()
+    after = C.DeclaredScope.declare([str(absent)])
+
+    assert after.reachable == (True,)
+    assert after.digest == before.digest
+    # ...and the observation is still reported, just not as identity.
+    assert after.as_dict()["roots"][0]["reachable"] is True
+    assert before.as_dict()["roots"][0]["reachable"] is False
 
 
 @pytest.mark.parametrize("reverse", [False, True])
