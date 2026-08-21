@@ -51,6 +51,28 @@ def test_every_case_is_byte_reproducible(case, tmp_path: Path) -> None:
     assert first.read_bytes() == second.read_bytes()
 
 
+@pytest.mark.parametrize("case", gc.CASES, ids=lambda c: c.name)
+def test_every_member_timestamp_is_pinned(case, tmp_path: Path) -> None:
+    """The member timestamp must be the pinned constant, not "now".
+
+    Asserted directly rather than inferred from two builds matching:
+    consecutive builds share a wall-clock second, so an unpinned builder
+    still produces identical bytes when the reproducibility test runs and
+    only diverges once the tests straddle a second boundary. That is the
+    worst kind of failure -- intermittent, environment-dependent, and
+    arriving long after the change that caused it.
+    """
+    path = case.build(tmp_path / f"{case.name}.cbz")
+
+    if not zipfile.is_zipfile(path):
+        pytest.skip("case is deliberately not a readable archive")
+
+    with zipfile.ZipFile(path) as archive:
+        stamps = {info.date_time for info in archive.infolist()}
+
+    assert stamps <= {gc.FIXED_DATE_TIME}
+
+
 def test_page_images_are_deterministic_and_seed_distinct() -> None:
     """Same seed, same bytes; different seeds, different bytes.
 

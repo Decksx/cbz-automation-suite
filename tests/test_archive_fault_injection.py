@@ -446,6 +446,57 @@ def test_a_same_size_replacement_is_caught_by_the_content_check(
     assert path.read_bytes() == replacement
 
 
+def test_appended_bytes_are_caught_only_by_the_size_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the content fingerprint is blind to.
+
+    `zipfile` locates the end-of-central-directory record by searching
+    backwards from the end of the file, so bytes appended after it leave the
+    archive readable and its central directory byte-identical. The CRC
+    comparison therefore sees nothing, and only the size/mtime check
+    notices the file changed.
+
+    This exists because removing the size/mtime check failed no test while
+    the content check was present: every replacement that could be
+    constructed also changed a CRC. The two guards are not redundant, and
+    this is the case that shows it.
+    """
+    path = gc.build_case("ordinary", tmp_path)
+    fingerprint_before = cbz_library_maintenance._read_central_directory_fingerprint(
+        path
+    )
+
+    real_zipfile = zipfile.ZipFile
+    state = {"appended": False}
+
+    def appending_zipfile(file, mode="r", *args, **kwargs):
+        if mode == "w" and not state["appended"]:
+            state["appended"] = True
+
+            with path.open("ab") as stream:
+                stream.write(b"X" * 128)
+
+        return real_zipfile(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(
+        cbz_library_maintenance.zipfile, "ZipFile", appending_zipfile
+    )
+
+    result = write_comicinfo(path, gc.COMIC_INFO, NEW_XML, dry_run=False)
+
+    assert state["appended"] is True
+    assert result is False
+
+    # The blindness is the point: assert the content check genuinely could
+    # not have fired, so this test cannot be satisfied by the CRC guard.
+    assert zipfile.is_zipfile(path)
+    assert (
+        cbz_library_maintenance._read_central_directory_fingerprint(path)
+        == fingerprint_before
+    )
+
+
 # --- database non-mutation under failure ---------------------------------
 
 
