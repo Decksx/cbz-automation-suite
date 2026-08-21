@@ -135,6 +135,11 @@ def build_cbz(
             info.create_version = 20
             info.extract_version = 20
             info.internal_attr = 0
+            # Redundant on every current Python -- `ZipFile.writestr`
+            # already assigns exactly this when `external_attr` is zero --
+            # and stated anyway so the field is visible beside the others.
+            # A test records that it is redundant rather than load-bearing,
+            # so nobody later mistakes it for a guard.
             info.external_attr = 0o600 << 16
             archive.writestr(info, payload)
 

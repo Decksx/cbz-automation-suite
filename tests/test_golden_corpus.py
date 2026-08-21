@@ -107,6 +107,56 @@ def test_platform_dependent_zip_fields_are_pinned(
     assert {info.internal_attr for info in infos} <= {0}
 
 
+def test_create_system_is_pinned_even_when_the_host_default_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves the pin does work, which a Windows-only run cannot show.
+
+    `ZipInfo` sets `create_system` from `sys.platform`: 0 on Windows, 3
+    everywhere else. This suite runs on Windows, where the default already
+    equals the pinned value -- so deleting the pin changes nothing here and
+    a sabotage of it fails no test, while every digest would still shift the
+    moment the corpus were built on Linux.
+
+    Simulating the non-Windows default is the only way to demonstrate the
+    assignment is load-bearing without a second operating system.
+    """
+    real_zipinfo = zipfile.ZipInfo
+
+    class UnixDefaultZipInfo(real_zipinfo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.create_system = 3  # what a non-Windows host would give
+
+    monkeypatch.setattr(gc.zipfile, "ZipInfo", UnixDefaultZipInfo)
+
+    path = gc.build_case("ordinary", tmp_path)
+
+    with zipfile.ZipFile(path) as archive:
+        assert {info.create_system for info in archive.infolist()} == {0}
+
+    # And the digest is unmoved, which is the property that actually
+    # matters: the same corpus on either platform is the same bytes.
+    assert gc.sha256_file(path) == gc.EXPECTED_SHA256["ordinary"]
+
+
+def test_external_attr_matches_what_writestr_would_have_set() -> None:
+    """Recorded as redundant rather than quietly relied upon.
+
+    CPython's `ZipFile.writestr` already assigns `0o600 << 16` when
+    `external_attr` is zero, so pinning it changes no bytes on any current
+    Python and a sabotage of that line proves nothing. It is kept because
+    the value should be stated where the other fields are stated, not
+    because it is doing work -- and this test says which of those is true so
+    a later reader does not mistake it for a guard.
+    """
+    import inspect
+
+    source = inspect.getsource(zipfile.ZipFile.writestr)
+
+    assert "0o600 << 16" in source
+
+
 @pytest.mark.parametrize("case", gc.CASES, ids=lambda c: c.name)
 def test_every_member_timestamp_is_pinned(case, tmp_path: Path) -> None:
     """The member timestamp must be the pinned constant, not "now".
