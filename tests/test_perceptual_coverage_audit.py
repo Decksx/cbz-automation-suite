@@ -21,6 +21,7 @@ that respects it has not been demonstrated.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -457,6 +458,74 @@ def test_operational_coverage_moves_only_by_the_dispositioned_pages(
     )
 
 
+def _disposition_movement(database: Path, root: Path, apply) -> tuple:
+    """Measurements either side of a disposition, and the deltas."""
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    connection = connect_database(database)
+    try:
+        apply(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    after = run_audit(database=database, scope=[str(root)])["measurements"]
+    return before, after
+
+
+@pytest.mark.parametrize(
+    "name, apply",
+    [
+        (
+            "retirement",
+            lambda conn: disposition.retire(
+                conn, 2, reason="out of scope", evidence="operator"
+            ),
+        ),
+        (
+            "supersession",
+            lambda conn: disposition.supersede(
+                conn, 2, 1, reason="replaced", evidence="sha256"
+            ),
+        ),
+    ],
+)
+def test_a_disposition_moves_numerator_denominator_and_outstanding(
+    library, name, apply
+) -> None:
+    """Archive 2 is *partially* covered: 4 pages, 2 of them hashed.
+
+    That is the whole point of using it. The retirement this library
+    actually holds in production (archive 45217) has zero covered pages,
+    so an implementation that shrank the denominator while keeping the
+    full historical numerator would produce the right answer there and
+    be wrong everywhere else. A partially covered archive forces all
+    three numbers to move by known, different amounts.
+    """
+    database, root, facts = library
+    before, after = _disposition_movement(database, root, apply)
+
+    operational = after["operational"]
+
+    # Historical is untouched by either kind of decision.
+    assert after["historical"] == before["historical"]
+
+    assert operational["excluded_archives"] == 1
+    assert operational["excluded_pages"] == 4
+    assert operational["excluded_covered_pages"] == 2
+    assert operational["excluded_outstanding_pages"] == 2
+
+    assert operational["total_pages"] == facts["pages"] - 4
+    assert operational["covered_pages"] == facts["covered"] - 2
+    assert operational["outstanding_pages"] == facts["outstanding"] - 2
+
+    # And the numerator really did move -- not merely the denominator.
+    assert (
+        operational["covered_pages"]
+        < before["operational"]["covered_pages"]
+    )
+
+
 def test_operational_coverage_is_unmoved_by_a_file_going_missing(
     library,
 ) -> None:
@@ -484,23 +553,98 @@ def test_operational_coverage_is_unmoved_by_a_file_going_missing(
     assert availability[C.AVAILABILITY_MISSING] >= 1
 
 
-def test_operational_coverage_is_unmoved_by_an_unavailable_root(
-    library, tmp_path: Path
+def test_operational_coverage_is_unmoved_by_an_unavailable_declared_root(
+    library,
 ) -> None:
-    """A root that is not mounted says nothing about the content.
+    """A declared root that is not mounted, not an unrelated sibling.
 
-    Declaring a root that does not exist makes every archive beneath it
-    `unavailable_declared_scope`. That is a statement about the observer,
-    and it must leave both measurements exactly where they were.
+    The distinction is the entire point of the availability axis and it
+    is easy to fake by accident: declaring some *other* absent directory
+    while the archives live elsewhere puts them outside every declared
+    root, which is `undeclared_scope` -- a different value, reached by a
+    different code path, proving nothing about unavailability.
+
+    Here the archives stay beneath the declared root and the root itself
+    is removed, so the run genuinely cannot look. The emitted value is
+    asserted explicitly before any coverage claim, so this test cannot
+    silently drift back into testing the wrong thing.
     """
-    database, root, _ = library
+    database, root, facts = library
     before = run_audit(database=database, scope=[str(root)])["measurements"]
 
-    absent = tmp_path / "not-mounted"
-    after = run_audit(database=database, scope=[str(absent)])["measurements"]
+    shutil.rmtree(root)
+    assert not root.exists()
 
+    output = run_audit(database=database, scope=[str(root)])
+    availability = output["measurements"]["accountability"]["axis_totals"][
+        "availability"
+    ]
+
+    # Every identity is beneath the declared root, so every one of them
+    # must be unobservable -- and none may be called missing.
+    assert (
+        availability[C.AVAILABILITY_UNAVAILABLE_SCOPE]
+        == facts["identities"]
+    )
+    assert availability[C.AVAILABILITY_MISSING] == 0
+    assert availability[C.AVAILABILITY_UNDECLARED_SCOPE] == 0
+
+    after = output["measurements"]
     assert after["historical"] == before["historical"]
     assert after["operational"] == before["operational"]
+
+
+def test_a_path_outside_every_declared_root_is_undeclared_not_missing(
+    library, tmp_path: Path
+) -> None:
+    """The case the old unavailable-root test was accidentally exercising.
+
+    Kept deliberately, and named for what it actually proves: declaring
+    an unrelated root leaves the archives outside every declared root,
+    which is `undeclared_scope`. It must also move neither measurement.
+    """
+    database, root, facts = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    unrelated = tmp_path / "somewhere-else"
+    unrelated.mkdir()
+
+    output = run_audit(database=database, scope=[str(unrelated)])
+    availability = output["measurements"]["accountability"]["axis_totals"][
+        "availability"
+    ]
+
+    assert (
+        availability[C.AVAILABILITY_UNDECLARED_SCOPE] == facts["identities"]
+    )
+    assert availability[C.AVAILABILITY_MISSING] == 0
+
+    after = output["measurements"]
+    assert after["historical"] == before["historical"]
+    assert after["operational"] == before["operational"]
+
+
+@pytest.mark.parametrize("availability", C.AVAILABILITIES)
+def test_no_availability_value_moves_either_coverage(availability) -> None:
+    """Every value on the axis, pinned at the measurement level.
+
+    The database-level tests above cover the values a seeded library can
+    actually reach. This covers all ten -- including `unreadable`,
+    `non_regular` and `multiple_current_locations`, which need a
+    filesystem or a schema violation to reproduce -- so a future value
+    cannot quietly start moving a coverage number.
+    """
+    baseline = _one_archive_result(
+        availability=C.AVAILABILITY_PRESENT_MATCHING
+    )
+    observed = _one_archive_result(availability=availability)
+
+    assert measure_historical(observed.archives) == measure_historical(
+        baseline.archives
+    )
+    assert measure_operational(observed.archives) == measure_operational(
+        baseline.archives
+    )
 
 
 def test_a_run_with_no_scope_still_reports_the_same_coverage(
@@ -691,6 +835,15 @@ def _one_archive_result(**overrides):
     the classification directly is the only way to demonstrate that the
     check would catch one.
     """
+    return C.ClassificationResult(
+        archives=(C.ArchiveClassification(**_baseline_fields(**overrides)),),
+        scope=C.DeclaredScope.declare(None),
+        filesystem_consulted=False,
+    )
+
+
+def _baseline_fields(**overrides) -> dict:
+    """A legitimate single-archive tuple, before any deliberate defect."""
     fields = {
         "archive_id": 1,
         "disposition": C.DISPOSITION_ACTIVE,
@@ -707,12 +860,7 @@ def _one_archive_result(**overrides):
         "outstanding_pages": 1,
     }
     fields.update(overrides)
-
-    return C.ClassificationResult(
-        archives=(C.ArchiveClassification(**fields),),
-        scope=C.DeclaredScope.declare(None),
-        filesystem_consulted=False,
-    )
+    return fields
 
 
 def _census(**overrides) -> dict[str, int]:
@@ -728,14 +876,14 @@ def _census(**overrides) -> dict[str, int]:
     return census
 
 
-def _failed_invariants(result, census) -> list[str]:
+def _failed_invariants(result, census, identities=None) -> list[str]:
     historical = measure_historical(result.archives)
     operational = measure_operational(result.archives)
 
     return [
         invariant.name
         for invariant in check_invariants(
-            result, census, historical, operational
+            result, census, historical, operational, identities
         )
         if not invariant.passed
     ]
@@ -748,6 +896,134 @@ def test_the_baseline_invariant_fixture_passes_cleanly() -> None:
     because the fixture was broken in some entirely different way.
     """
     assert _failed_invariants(_one_archive_result(), _census()) == []
+
+
+def test_a_dropped_zero_page_identity_is_caught_by_the_census(
+    library,
+) -> None:
+    """The omission the page census structurally cannot see.
+
+    Archive 3 holds no pages, so removing it from the classification
+    leaves every page number in the report reconciling perfectly -- the
+    denominator, the numerator, the outstanding count and the whole
+    census all still agree. Only comparing against `archive_files`
+    notices that the library got smaller.
+    """
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        census = page_census(connection)
+        expected_ids = audit.identity_census(connection)
+
+    assert 3 in expected_ids
+
+    pruned = C.ClassificationResult(
+        archives=tuple(
+            archive for archive in result.archives if archive.archive_id != 3
+        ),
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+
+    # The page-based reconciliations still pass: this is exactly why the
+    # identity census had to be a separate measurement.
+    page_invariants = _failed_invariants(
+        pruned,
+        census,
+        audit.reconcile_identities(
+            pruned, [a.archive_id for a in pruned.archives]
+        ),
+    )
+    assert "historical_denominator_matches_the_page_census" not in (
+        page_invariants
+    )
+    assert "outstanding_pages_reconcile_by_archive" not in page_invariants
+
+    # Against the real identity set, the omission is caught.
+    identities = audit.reconcile_identities(pruned, expected_ids)
+    assert identities["missing_count"] == 1
+    assert identities["missing_archive_ids"] == [3]
+
+    assert (
+        "every_archive_has_exactly_one_complete_tuple"
+        in _failed_invariants(pruned, census, identities)
+    )
+
+
+def test_an_invented_identity_is_caught_by_the_census(library) -> None:
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        expected_ids = audit.identity_census(connection)
+
+    invented = C.ClassificationResult(
+        archives=result.archives
+        + (C.ArchiveClassification(**_baseline_fields(archive_id=9999)),),
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+    identities = audit.reconcile_identities(invented, expected_ids)
+
+    assert identities["extra_count"] == 1
+    assert identities["extra_archive_ids"] == [9999]
+
+
+def test_a_duplicated_classification_row_is_caught(library) -> None:
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        expected_ids = audit.identity_census(connection)
+
+    doubled = C.ClassificationResult(
+        archives=result.archives + (result.archives[0],),
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+    identities = audit.reconcile_identities(doubled, expected_ids)
+
+    assert identities["duplicate_count"] == 1
+    assert identities["duplicate_archive_ids"] == [
+        result.archives[0].archive_id
+    ]
+
+
+def test_an_incomplete_tuple_is_caught(library) -> None:
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        expected_ids = audit.identity_census(connection)
+
+    blanked = C.ClassificationResult(
+        archives=(
+            C.ArchiveClassification(
+                **_baseline_fields(archive_id=1, availability="")
+            ),
+        )
+        + result.archives[1:],
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+    identities = audit.reconcile_identities(blanked, expected_ids)
+
+    assert identities["incomplete_tuple_count"] == 1
+    assert identities["incomplete_tuple_archive_ids"] == [1]
+
+
+def test_the_identity_census_is_reported_in_the_output(library) -> None:
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+    identities = output["identity_census"]
+
+    assert identities["expected_identities"] == facts["identities"]
+    assert identities["classified_identities"] == facts["identities"]
+    assert identities["missing_count"] == 0
+    assert identities["extra_count"] == 0
+    assert identities["duplicate_count"] == 0
+    assert identities["incomplete_tuple_count"] == 0
 
 
 def test_an_axis_value_outside_the_vocabulary_fails_to_sum() -> None:
