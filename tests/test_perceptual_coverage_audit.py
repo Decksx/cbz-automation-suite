@@ -1013,6 +1013,110 @@ def test_an_incomplete_tuple_is_caught(library) -> None:
     assert identities["incomplete_tuple_archive_ids"] == [1]
 
 
+def test_run_audit_catches_an_identity_the_classifier_dropped(
+    library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end proof that run_audit uses the *independent* census.
+
+    The direct reconcile_identities tests above would still pass if
+    run_audit reconciled the classified rows against themselves, because
+    they never go through run_audit. This drops a zero-page identity
+    inside the snapshot and asserts the assembled report notices -- which
+    it can only do by having read archive_files separately.
+    """
+    database, root, facts = library
+    real_collect = audit.collect
+
+    def collect_dropping_archive_three(connection, *, scope):
+        result, census, expected_ids = real_collect(
+            connection, scope=scope
+        )
+        pruned = C.ClassificationResult(
+            archives=tuple(
+                archive
+                for archive in result.archives
+                if archive.archive_id != 3
+            ),
+            scope=result.scope,
+            filesystem_consulted=result.filesystem_consulted,
+        )
+        return pruned, census, expected_ids
+
+    monkeypatch.setattr(audit, "collect", collect_dropping_archive_three)
+
+    output = run_audit(database=database, scope=[str(root)])
+
+    assert output["invariants_passed"] is False
+    assert (
+        "every_archive_has_exactly_one_complete_tuple"
+        in output["failed_invariants"]
+    )
+    assert output["identity_census"]["missing_archive_ids"] == [3]
+    assert output["identity_census"]["expected_identities"] == (
+        facts["identities"]
+    )
+
+    # The page-based reconciliations are untouched, which is exactly why
+    # the identity census had to exist: archive 3 has no pages.
+    for name in (
+        "historical_denominator_matches_the_page_census",
+        "covered_pages_match_the_page_census",
+        "outstanding_pages_reconcile_by_archive",
+    ):
+        assert name not in output["failed_invariants"]
+
+
+def test_an_operational_numerator_that_was_not_subtracted_is_caught(
+    library,
+) -> None:
+    """The invariant, not the measurement, is what this proves.
+
+    `measure_operational` is asserted directly elsewhere. This builds a
+    Coverage whose denominator was correctly shrunk while the numerator
+    kept every historical covered page -- the precise bug that archive
+    45217 cannot reveal on production data -- and asserts the runtime
+    check refuses it.
+    """
+    result = _one_archive_result(
+        disposition=C.DISPOSITION_RETIRED,
+        total_pages=4,
+        outstanding_pages=1,
+    )
+    historical = measure_historical(result.archives)
+    assert (historical.total_pages, historical.covered_pages) == (4, 3)
+
+    unsubtracted = audit.Coverage(
+        name="operational",
+        covered_pages=historical.covered_pages,
+        total_pages=0,
+        excluded_pages=4,
+        excluded_archives=1,
+        excluded_covered_pages=3,
+        excluded_outstanding_pages=1,
+        basis="deliberately wrong numerator",
+    )
+    identities = audit.reconcile_identities(result, [1])
+    failed = [
+        invariant.name
+        for invariant in check_invariants(
+            result,
+            _census(pages=4, dhash_pages=3, phash_pages=3, covered_pages=3),
+            historical,
+            unsubtracted,
+            identities,
+        )
+        if not invariant.passed
+    ]
+
+    assert (
+        "operational_numerator_is_historical_minus_dispositioned" in failed
+    )
+    assert (
+        "operational_outstanding_is_historical_minus_dispositioned"
+        in failed
+    )
+
+
 def test_the_identity_census_is_reported_in_the_output(library) -> None:
     database, root, facts = library
     output = run_audit(database=database, scope=[str(root)])
