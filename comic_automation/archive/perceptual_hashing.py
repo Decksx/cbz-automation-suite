@@ -37,6 +37,35 @@ DHASH_ALGORITHM_VERSION = "1"
 PHASH_ALGORITHM = "phash"
 PHASH_ALGORITHM_VERSION = "1"
 DEFAULT_HASH_SIZE = 8
+
+# Stable slugs naming each way an archive can fall outside
+# `_eligible_archive_rows()`. One per clause of that predicate, so a reader
+# can map a reason back to the condition that produced it. These are written
+# into reports and compared in tests, so they are part of the contract rather
+# than display strings.
+#
+# EXCLUSION_BLOCKING_JOB is the only one that carries a suffix: the blocking
+# status matters, because "a worker is on it" and "it failed permanently" are
+# opposite situations that the predicate treats identically.
+EXCLUSION_NO_CONTENT_SIGNATURE = "no_content_signature"
+EXCLUSION_SIGNATURE_PAGE_COUNT_ZERO = "signature_page_count_zero"
+EXCLUSION_NO_CURRENT_LOCATION = "no_current_location"
+EXCLUSION_MULTIPLE_CURRENT_LOCATIONS = "multiple_current_locations"
+EXCLUSION_SIGNATURE_SIZE_MISMATCH = "signature_size_mismatch"
+EXCLUSION_SIGNATURE_MTIME_MISMATCH = "signature_mtime_mismatch"
+EXCLUSION_NO_OUTSTANDING_PAGES = "no_outstanding_pages"
+EXCLUSION_BLOCKING_JOB = "blocking_job"
+
+EXCLUSION_REASONS = (
+    EXCLUSION_NO_CONTENT_SIGNATURE,
+    EXCLUSION_SIGNATURE_PAGE_COUNT_ZERO,
+    EXCLUSION_NO_CURRENT_LOCATION,
+    EXCLUSION_MULTIPLE_CURRENT_LOCATIONS,
+    EXCLUSION_SIGNATURE_SIZE_MISMATCH,
+    EXCLUSION_SIGNATURE_MTIME_MISMATCH,
+    EXCLUSION_NO_OUTSTANDING_PAGES,
+    EXCLUSION_BLOCKING_JOB,
+)
 DEFAULT_HIGH_FREQUENCY_FACTOR = 4
 
 # Explicit, version-pinned pixel-decode policy. See
@@ -718,6 +747,22 @@ class ArchivePerceptualHashRepository:
               ON fl.archive_id = acs.archive_id
              AND fl.is_current = 1
             WHERE acs.page_count > 0
+              -- Exactly one current location, not merely at least one.
+              -- Without this an archive with two matching current rows joins
+              -- twice and appears eligible, while select_candidates() would
+              -- refuse it as ambiguous and _archive_exclusion_reasons() would
+              -- report multiple_current_locations -- so the predicate and its
+              -- explanation contradicted each other and the classifier had to
+              -- abort. Refusing ambiguity here makes the two agree, and
+              -- matches what the selection path has always done: zero current
+              -- locations is unresolvable and more than one is ambiguous, and
+              -- neither may be guessed at.
+              AND (
+                  SELECT COUNT(*)
+                  FROM file_locations AS fl2
+                  WHERE fl2.archive_id = acs.archive_id
+                    AND fl2.is_current = 1
+              ) = 1
               AND acs.source_file_size = fl.file_size
               AND acs.source_modified_time_ns = fl.modified_time_ns
               AND EXISTS (
@@ -828,6 +873,182 @@ class ArchivePerceptualHashRepository:
         SQLite's `mode=ro` URI flag plus `PRAGMA query_only = ON`.
         """
         return len(self._eligible_archive_rows(limit=None))
+
+    def _archive_exclusion_reasons(self) -> dict[int, tuple[str, ...]]:
+        """Why each archive is *not* in the eligible set, reason by reason.
+
+        `_eligible_archive_rows()` answers "which archives may be enqueued"
+        with a single predicate whose failures are indistinguishable from one
+        another: an archive is absent from the result and the query does not
+        say why. That was survivable while the only question was how much work
+        remained. It stopped being survivable when 162 archives turned out to
+        be missing a current location -- a fact the predicate knew and threw
+        away, leaving them pooled with every other kind of ineligibility and
+        visible in no report.
+
+        This returns the same information from the other side. Membership is
+        deliberately NOT recomputed here: the caller takes the eligible set
+        from `_eligible_archive_rows()` and uses this only to *explain* the
+        complement.
+
+        That keeps the two from drifting on *membership* by construction, but
+        it is not a proof that they agree -- and they did not, once. The
+        predicate joined every current location without requiring exactly one,
+        so an archive with two matching current rows was eligible while this
+        function reported `multiple_current_locations`; the classifier could
+        only abort. Both sides now refuse ambiguity, and a test asserts the
+        partition on a deliberately varied population rather than assuming it.
+
+        An archive may carry several reasons at once. They are all returned:
+        an archive with no signature *and* no current location has two
+        independent problems, and reporting one would send a reader looking
+        for a single fix that does not exist.
+
+        Issues only SELECTs, so it is safe on a connection opened with
+        SQLite's `mode=ro` URI flag plus `PRAGMA query_only = ON`.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT
+                af.id AS archive_id,
+                acs.id IS NOT NULL AS has_signature,
+                COALESCE(acs.page_count, 0) AS signature_page_count,
+                acs.source_file_size AS signature_file_size,
+                acs.source_modified_time_ns AS signature_modified_time_ns,
+                (
+                    SELECT COUNT(*) FROM file_locations AS fl
+                    WHERE fl.archive_id = af.id AND fl.is_current = 1
+                ) AS current_location_count,
+                (
+                    SELECT fl.file_size FROM file_locations AS fl
+                    WHERE fl.archive_id = af.id AND fl.is_current = 1
+                    LIMIT 1
+                ) AS location_file_size,
+                (
+                    SELECT fl.modified_time_ns FROM file_locations AS fl
+                    WHERE fl.archive_id = af.id AND fl.is_current = 1
+                    LIMIT 1
+                ) AS location_modified_time_ns,
+                (
+                    -- Every distinct blocking status, not the first by id.
+                    -- An archive can hold a failed job and a running one at
+                    -- once, and LIMIT 1 hid whichever lost the race --
+                    -- breaking the promise that an archive keeps every reason
+                    -- that applies, and hiding the more actionable of the two
+                    -- roughly half the time.
+                    SELECT GROUP_CONCAT(status, ',') FROM (
+                        SELECT DISTINCT j.status AS status
+                        FROM jobs AS j
+                        WHERE j.archive_id = af.id
+                          AND j.job_type = 'hash_archive_pages_perceptual'
+                          AND j.status IN
+                              ('pending', 'claimed', 'running', 'failed')
+                        ORDER BY j.status
+                    )
+                ) AS blocking_job_statuses
+            FROM archive_files AS af
+            LEFT JOIN archive_content_signatures AS acs
+              ON acs.archive_id = af.id
+            ORDER BY af.id
+            """
+        ).fetchall()
+
+        outstanding = self.outstanding_page_counts()
+        reasons: dict[int, tuple[str, ...]] = {}
+
+        for row in rows:
+            archive_id = int(row["archive_id"])
+            found: list[str] = []
+
+            if not row["has_signature"]:
+                found.append(EXCLUSION_NO_CONTENT_SIGNATURE)
+            elif int(row["signature_page_count"] or 0) <= 0:
+                found.append(EXCLUSION_SIGNATURE_PAGE_COUNT_ZERO)
+
+            locations = int(row["current_location_count"] or 0)
+
+            if locations == 0:
+                found.append(EXCLUSION_NO_CURRENT_LOCATION)
+            elif locations > 1:
+                found.append(EXCLUSION_MULTIPLE_CURRENT_LOCATIONS)
+
+            # Only meaningful when both sides exist; a missing signature or
+            # location is already reported above and comparing NULLs would
+            # invent a second, derivative reason for the same fact.
+            if row["has_signature"] and locations == 1:
+                if (
+                    row["signature_file_size"] != row["location_file_size"]
+                ):
+                    found.append(EXCLUSION_SIGNATURE_SIZE_MISMATCH)
+
+                if (
+                    row["signature_modified_time_ns"]
+                    != row["location_modified_time_ns"]
+                ):
+                    found.append(EXCLUSION_SIGNATURE_MTIME_MISMATCH)
+
+            if outstanding.get(archive_id, 0) == 0:
+                found.append(EXCLUSION_NO_OUTSTANDING_PAGES)
+
+            if row["blocking_job_statuses"]:
+                for status in str(row["blocking_job_statuses"]).split(","):
+                    found.append(
+                        "%s:%s" % (EXCLUSION_BLOCKING_JOB, status)
+                    )
+
+            if found:
+                reasons[archive_id] = tuple(found)
+
+        return reasons
+
+    def outstanding_page_counts(self) -> dict[int, int]:
+        """Pages per archive still missing a Version 1 hash or dimensions.
+
+        The same page condition `_eligible_archive_rows()` tests with EXISTS,
+        counted instead of merely detected, because a report has to say how
+        many pages a gap is worth and not only that one exists.
+
+        Written as one grouped scan rather than a per-archive subquery: the
+        correlated form takes minutes on a library this size, which is what
+        made an earlier version of this audit unusable.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT
+                ap.archive_id AS archive_id,
+                SUM(
+                    CASE
+                        WHEN dh.id IS NULL
+                          OR ph.id IS NULL
+                          OR ap.width IS NULL
+                          OR ap.height IS NULL
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS outstanding
+            FROM archive_pages AS ap
+            LEFT JOIN page_hashes AS dh
+              ON dh.page_id = ap.id
+             AND dh.algorithm = ?
+             AND dh.algorithm_version = ?
+            LEFT JOIN page_hashes AS ph
+              ON ph.page_id = ap.id
+             AND ph.algorithm = ?
+             AND ph.algorithm_version = ?
+            GROUP BY ap.archive_id
+            """,
+            (
+                DHASH_ALGORITHM,
+                DHASH_ALGORITHM_VERSION,
+                PHASH_ALGORITHM,
+                PHASH_ALGORITHM_VERSION,
+            ),
+        ).fetchall()
+
+        return {
+            int(row["archive_id"]): int(row["outstanding"] or 0)
+            for row in rows
+        }
 
 
 class HashArchivePagesPerceptualHandler:

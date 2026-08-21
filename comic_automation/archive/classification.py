@@ -1,0 +1,1136 @@
+"""The shared, read-only classification contract for archive identities.
+
+Every archive gets one row here, and that row answers six independent
+questions rather than one. The independence is the whole design: an archive
+can be simultaneously **active** (nobody decided anything about it),
+**unavailable** (its root is not mounted), **fully hashed** (its pages were
+covered while the root was there) and **not eligible** (nothing is left to
+enqueue). Collapsing those into a single "population" is what let 178 archives
+go unreported for three weeks, and what let 95 archives under a root that no
+longer exists be counted as complete.
+
+The six axes
+------------
+
+``disposition``
+    A recorded decision: ``active`` (no row in any disposition table),
+    ``retired``, or ``superseded`` by a named successor. This is the only axis
+    that is *stored*. See `comic_automation/archive/disposition.py`.
+
+``availability``
+    What the filesystem says right now. Never stored, never inferred from a
+    decision, and -- critically -- never allowed to *become* one. An
+    unreachable scope is reported as ``unavailable_declared_scope``, which is
+    a statement about the observer, not about the content: this module must
+    never call it missing or gone.
+
+``inventory``
+    Whether pages were inventoried and whether they are covered. When they
+    were not, a sub-reason says why, because "no pages" spans an archive that
+    was never inspected, one whose inspection failed, and one that genuinely
+    contains no images -- three different situations that a single count of
+    1,256 cannot distinguish.
+
+``perceptual_work``
+    What the perceptual job history shows: ``never_enqueued``, ``active``,
+    ``completed``, ``failed``, ``cancelled``. Kept distinguishable on purpose;
+    archive 45217 is cancelled *and* retired, and both facts matter.
+
+``selection``
+    What the real selection path would do: ``eligible``, ``refused`` with
+    `candidate_selection`'s reasons, ``excluded`` with the eligibility
+    predicate's reasons, or ``unexplained``.
+
+    An archive this run could not observe -- under an unreachable root, under
+    no declared root, or in a run with no scope at all -- is never stat()ed
+    and never reported eligible. It is refused with a `scope_*` reason of this
+    module's own, which says the precondition could not be tested. Handing it
+    to the filesystem check instead produced ``path_missing``, which turns "I
+    cannot look there" into "the file is gone" -- the exact conflation the
+    availability axis exists to prevent.
+
+``quarantine``
+    Reported alongside, never as a disposition. ``pending_redownload`` means
+    "we intend to get this back", which is in-scope-and-broken. Treating it as
+    a disposition would quietly remove archives from operational scope on the
+    strength of an intention.
+
+What ``unexplained`` means
+--------------------------
+
+Residue, and only residue: an archive that is neither in the eligible set nor
+explained by an exclusion reason. There is no predicate that produces it. This
+is the direct replacement for the ``never_enqueued_backlog`` flag, whose
+positive predicate ("eligible, zero coverage, no job") reported 225 fully
+explained archives as blocking gaps while staying silent on the 162 that had
+no explanation at all.
+
+Under a correct database ``unexplained`` is always zero, because
+`_eligible_archive_rows()` and `_archive_exclusion_reasons()` partition the
+library. A non-zero count means those two disagree, which is a defect in this
+code rather than in the data, and is reported as such.
+
+That partition is a property the two queries have to be kept in, not one they
+have for free. They lost it once: the eligibility predicate joined every
+current location without requiring exactly one, so an archive with two
+matching current rows came out eligible while the explanation reported
+``multiple_current_locations``, and classification aborted. The predicate now
+refuses ambiguity, which is what the selection path always did.
+
+Failing closed
+--------------
+
+Three conditions abort classification rather than being reported as findings,
+because each means a stored invariant has been bypassed and any report built
+on top of it would be describing a state the schema says cannot exist:
+conflicting dispositions, supersession cycles, and a broken eligible/excluded
+partition.
+
+This module never writes. It issues only SELECTs and `os.stat`, so it is safe
+on a connection opened with SQLite's ``mode=ro`` URI flag plus
+``PRAGMA query_only = ON``, and safe to point at a protected backup.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import sqlite3
+import stat as stat_module
+from pathlib import Path
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Iterable, Sequence
+
+from comic_automation.archive import disposition as disposition_module
+from comic_automation.archive.candidate_selection import (
+    REJECTION_REASONS,
+    select_candidates,
+)
+from comic_automation.archive.perceptual_hashing import (
+    EXCLUSION_REASONS,
+    ArchivePerceptualHashRepository,
+)
+
+
+# --- axis vocabularies ---------------------------------------------------
+#
+# Every value a report may emit, listed once. A report that prints a value not
+# in these tuples is printing something no reader has a definition for.
+
+DISPOSITION_ACTIVE = "active"
+DISPOSITION_RETIRED = "retired"
+DISPOSITION_SUPERSEDED = "superseded"
+
+DISPOSITIONS = (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_RETIRED,
+    DISPOSITION_SUPERSEDED,
+)
+
+AVAILABILITY_NOT_OBSERVED = "not_observed"
+AVAILABILITY_PRESENT_MATCHING = "present_matching"
+AVAILABILITY_PRESENT_DRIFTED = "present_drifted"
+AVAILABILITY_MISSING = "missing"
+AVAILABILITY_UNREADABLE = "unreadable"
+AVAILABILITY_NON_REGULAR = "non_regular"
+AVAILABILITY_UNAVAILABLE_SCOPE = "unavailable_declared_scope"
+AVAILABILITY_UNDECLARED_SCOPE = "undeclared_scope"
+AVAILABILITY_NO_CURRENT_LOCATION = "no_current_location"
+AVAILABILITY_MULTIPLE_CURRENT_LOCATIONS = "multiple_current_locations"
+
+AVAILABILITIES = (
+    AVAILABILITY_NOT_OBSERVED,
+    AVAILABILITY_PRESENT_MATCHING,
+    AVAILABILITY_PRESENT_DRIFTED,
+    AVAILABILITY_MISSING,
+    AVAILABILITY_UNREADABLE,
+    AVAILABILITY_NON_REGULAR,
+    AVAILABILITY_UNAVAILABLE_SCOPE,
+    AVAILABILITY_UNDECLARED_SCOPE,
+    AVAILABILITY_NO_CURRENT_LOCATION,
+    AVAILABILITY_MULTIPLE_CURRENT_LOCATIONS,
+)
+
+# Availability values that say something about the *observer* rather than the
+# content. A report must never describe these as missing or gone: the file may
+# be perfectly intact on a volume nobody asked about.
+AVAILABILITY_UNOBSERVABLE = (
+    AVAILABILITY_NOT_OBSERVED,
+    AVAILABILITY_UNAVAILABLE_SCOPE,
+    AVAILABILITY_UNDECLARED_SCOPE,
+)
+
+INVENTORY_COVERED = "inventoried_covered"
+INVENTORY_INCOMPLETE = "inventoried_incomplete"
+INVENTORY_NOT_INVENTORIED = "not_inventoried"
+
+INVENTORIES = (
+    INVENTORY_COVERED,
+    INVENTORY_INCOMPLETE,
+    INVENTORY_NOT_INVENTORIED,
+)
+
+NOT_INVENTORIED_INSPECTION_NEVER_ENQUEUED = "inspection_never_enqueued"
+NOT_INVENTORIED_INSPECTION_ACTIVE = "inspection_active"
+NOT_INVENTORIED_INSPECTION_FAILED = "inspection_failed"
+NOT_INVENTORIED_INSPECTION_CANCELLED = "inspection_cancelled"
+NOT_INVENTORIED_COMPLETED_NO_IMAGES = "completed_no_images"
+NOT_INVENTORIED_COMPLETED_INVENTORY_ABSENT = "completed_inventory_absent"
+NOT_INVENTORIED_QUARANTINE_PENDING_REDOWNLOAD = "quarantine_pending_redownload"
+NOT_INVENTORIED_UNKNOWN = "unknown_residue"
+
+NOT_INVENTORIED_SUBREASONS = (
+    NOT_INVENTORIED_INSPECTION_NEVER_ENQUEUED,
+    NOT_INVENTORIED_INSPECTION_ACTIVE,
+    NOT_INVENTORIED_INSPECTION_FAILED,
+    NOT_INVENTORIED_INSPECTION_CANCELLED,
+    NOT_INVENTORIED_COMPLETED_NO_IMAGES,
+    NOT_INVENTORIED_COMPLETED_INVENTORY_ABSENT,
+    NOT_INVENTORIED_QUARANTINE_PENDING_REDOWNLOAD,
+    NOT_INVENTORIED_UNKNOWN,
+)
+
+WORK_NEVER_ENQUEUED = "never_enqueued"
+WORK_ACTIVE = "active"
+WORK_COMPLETED = "completed"
+WORK_FAILED = "failed"
+WORK_CANCELLED = "cancelled"
+
+WORK_STATES = (
+    WORK_NEVER_ENQUEUED,
+    WORK_ACTIVE,
+    WORK_COMPLETED,
+    WORK_FAILED,
+    WORK_CANCELLED,
+)
+
+SELECTION_ELIGIBLE = "eligible"
+SELECTION_REFUSED = "refused"
+SELECTION_EXCLUDED = "excluded"
+SELECTION_UNEXPLAINED = "unexplained"
+
+SELECTIONS = (
+    SELECTION_ELIGIBLE,
+    SELECTION_REFUSED,
+    SELECTION_EXCLUDED,
+    SELECTION_UNEXPLAINED,
+)
+
+# Refusal reasons this module contributes, distinct from
+# `candidate_selection.REJECTION_REASONS` and namespaced so the two are never
+# confused. They all mean the same thing: this run could not test the
+# filesystem precondition for that archive, so it will not assert the archive
+# is enqueueable -- and, just as importantly, will not claim the file is
+# missing. A worker running with the same scope really would refuse these; the
+# reason simply has to say why honestly.
+REFUSAL_SCOPE_UNAVAILABLE = "scope_unavailable"
+REFUSAL_SCOPE_UNDECLARED = "scope_undeclared"
+REFUSAL_SCOPE_NOT_OBSERVED = "scope_not_observed"
+
+CLASSIFIER_REFUSAL_REASONS = (
+    REFUSAL_SCOPE_UNAVAILABLE,
+    REFUSAL_SCOPE_UNDECLARED,
+    REFUSAL_SCOPE_NOT_OBSERVED,
+)
+
+# Which refusal each unobservable availability produces.
+_SCOPE_REFUSAL_FOR = {
+    AVAILABILITY_UNAVAILABLE_SCOPE: REFUSAL_SCOPE_UNAVAILABLE,
+    AVAILABILITY_UNDECLARED_SCOPE: REFUSAL_SCOPE_UNDECLARED,
+    AVAILABILITY_NOT_OBSERVED: REFUSAL_SCOPE_NOT_OBSERVED,
+}
+
+PERCEPTUAL_JOB_TYPE = "hash_archive_pages_perceptual"
+INSPECT_JOB_TYPE = "inspect_archive"
+ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
+
+AXES = (
+    "disposition",
+    "availability",
+    "inventory",
+    "perceptual_work",
+    "selection",
+)
+
+
+class ClassificationInvariantError(RuntimeError):
+    """A stored invariant was violated, so no report can be trusted."""
+
+
+class PartitionError(ClassificationInvariantError):
+    """Eligible and excluded archives do not partition the library."""
+
+
+# --- declared scope ------------------------------------------------------
+
+
+def normalize_root(root: str) -> str:
+    """Strip ordinary trailing separators without destroying an anchor.
+
+    A plain ``rstrip("\\\\/")`` looks right and is not: it turns ``X:\\`` into
+    ``X:`` and ``/`` into the empty string. Neither survives as a root --
+    ``X:`` is drive-*relative* on Windows, naming whatever directory that
+    drive's process-wide cursor happens to point at, and an empty prefix
+    matches nothing. This matters directly here, because the authoritative
+    scan root recorded in `discovery_checkpoints` is exactly ``X:\\``.
+
+    `pathlib` already draws this distinction correctly -- it strips
+    ``X:\\Comix\\`` to ``X:\\Comix`` while leaving ``X:\\`` and ``\\`` intact --
+    so the anchor logic is borrowed rather than rewritten.
+
+    A bare drive spelling with no separator (``X:``) is resolved to that
+    drive's root. It cannot mean anything else in an argument that names a
+    scope root, and leaving it drive-relative would make containment depend on
+    the process's current directory.
+    """
+    text = str(root)
+
+    if not text:
+        raise ValueError("A declared scope root must not be empty.")
+
+    drive, remainder = os.path.splitdrive(text)
+
+    if drive and not remainder:
+        return drive + os.sep
+
+    return str(Path(text))
+
+
+def _comparison_key(path: str) -> str:
+    """Case-folded, separator-normalised form used for containment only."""
+    return str(path).replace("/", os.sep).casefold()
+
+
+@dataclass(frozen=True)
+class DeclaredScope:
+    """The filesystem roots this run was told to consider, and their state.
+
+    There is no configured root list anywhere in this project -- every
+    discovery scan this database has seen used a single `source_path` -- so
+    scope is an input to the run rather than a fact about the system. It is
+    carried explicitly, with each root's reachability, so two reports taken
+    under different scopes are visibly incomparable instead of quietly
+    disagreeing.
+
+    `roots=None` means the filesystem was not consulted at all, and every
+    archive with a location is reported ``not_observed``. That is an honest
+    answer, and a better one than a guess.
+    """
+
+    roots: tuple[str, ...] = ()
+    reachable: tuple[bool, ...] = ()
+
+    @classmethod
+    def declare(cls, roots: Iterable[str] | None) -> "DeclaredScope":
+        if roots is None:
+            return cls(roots=(), reachable=())
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for root in roots:
+            candidate = normalize_root(root)
+            key = _comparison_key(candidate)
+
+            # Deduplicated case-insensitively: the library lives on a
+            # case-insensitive volume, so X:\Comix and x:\comix are one root
+            # and declaring both must not make the scope look different.
+            if key not in seen:
+                seen.add(key)
+                normalized.append(candidate)
+
+        return cls(
+            roots=tuple(normalized),
+            reachable=tuple(os.path.isdir(root) for root in normalized),
+        )
+
+    @property
+    def consulted(self) -> bool:
+        """True when this run was given roots to look at."""
+        return bool(self.roots)
+
+    @property
+    def digest(self) -> str:
+        """Fingerprint of *which roots were declared*, and nothing else.
+
+        Canonicalised, deduplicated and sorted, so declaring the same set in a
+        different order gives the same digest. Reachability is deliberately
+        excluded: mounting a volume changes what this run could observe, not
+        which scope it was asked about, and folding it in meant a report taken
+        before a drive came back was labelled as covering a different scope
+        than one taken after. Reachability is observation data and lives in
+        `as_dict()`.
+        """
+        joined = "\n".join(sorted(_comparison_key(root) for root in self.roots))
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    def containing_root(self, path: str) -> tuple[str, bool] | None:
+        """The declared root holding `path`, and whether it is reachable."""
+        candidate = _comparison_key(path)
+        best: tuple[str, bool] | None = None
+        best_length = -1
+
+        for root, reachable in zip(self.roots, self.reachable):
+            key = _comparison_key(root)
+            # A root that is already an anchor (``X:\``, ``\``, a UNC share)
+            # ends with a separator and must not have another appended, or
+            # nothing beneath it would ever match.
+            prefix = key if key.endswith(os.sep) else key + os.sep
+
+            # Longest prefix wins, not the first declared. With X:\ and
+            # X:\Horrorsplat both declared, first-match made the answer depend
+            # on argument order -- so whether a path was judged against the
+            # volume or against the folder was decided by how the caller
+            # happened to type the list.
+            if (
+                candidate == key or candidate.startswith(prefix)
+            ) and len(prefix) > best_length:
+                best, best_length = (root, reachable), len(prefix)
+
+        return best
+
+    def as_dict(self) -> dict:
+        return {
+            "consulted": self.consulted,
+            "digest": self.digest,
+            "roots": [
+                {"root": root, "reachable": reachable}
+                for root, reachable in zip(self.roots, self.reachable)
+            ],
+        }
+
+
+# --- the classification --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ArchiveClassification:
+    """One archive identity, on every axis at once."""
+
+    archive_id: int
+    disposition: str
+    availability: str
+    inventory: str
+    perceptual_work: str
+    selection: str
+    successor_archive_id: int | None = None
+    availability_detail: str | None = None
+    not_inventoried_subreason: str | None = None
+    selection_reasons: tuple[str, ...] = ()
+    quarantine_status: str | None = None
+    current_path: str | None = None
+    total_pages: int = 0
+    outstanding_pages: int = 0
+    # History kept beside the scalar state. `perceptual_work` says what is
+    # true now; these say what has ever been true, so a report can ask "ever
+    # failed" without the current state having to lie about chronology.
+    ever_failed: bool = False
+    ever_cancelled: bool = False
+
+    @property
+    def dispositioned(self) -> bool:
+        """True when a decision was recorded about this archive."""
+        return self.disposition != DISPOSITION_ACTIVE
+
+    def as_dict(self) -> dict:
+        return {
+            "archive_id": self.archive_id,
+            "disposition": self.disposition,
+            "successor_archive_id": self.successor_archive_id,
+            "availability": self.availability,
+            "availability_detail": self.availability_detail,
+            "inventory": self.inventory,
+            "not_inventoried_subreason": self.not_inventoried_subreason,
+            "perceptual_work": self.perceptual_work,
+            "selection": self.selection,
+            "selection_reasons": list(self.selection_reasons),
+            "quarantine_status": self.quarantine_status,
+            "current_path": self.current_path,
+            "total_pages": self.total_pages,
+            "outstanding_pages": self.outstanding_pages,
+            "ever_failed": self.ever_failed,
+            "ever_cancelled": self.ever_cancelled,
+        }
+
+
+@dataclass(frozen=True)
+class ClassificationResult:
+    archives: tuple[ArchiveClassification, ...]
+    scope: DeclaredScope
+    filesystem_consulted: bool
+
+    def __len__(self) -> int:
+        return len(self.archives)
+
+
+# --- collection helpers --------------------------------------------------
+
+
+def _structural_rows(connection: sqlite3.Connection) -> dict[int, dict]:
+    rows = connection.execute(
+        """
+        SELECT
+            af.id AS archive_id,
+            (
+                SELECT COUNT(*) FROM file_locations AS fl
+                WHERE fl.archive_id = af.id AND fl.is_current = 1
+            ) AS current_location_count,
+            (
+                SELECT fl.path FROM file_locations AS fl
+                WHERE fl.archive_id = af.id AND fl.is_current = 1
+                ORDER BY fl.id LIMIT 1
+            ) AS current_path,
+            (
+                SELECT fl.file_size FROM file_locations AS fl
+                WHERE fl.archive_id = af.id AND fl.is_current = 1
+                ORDER BY fl.id LIMIT 1
+            ) AS location_file_size,
+            (
+                SELECT fl.modified_time_ns FROM file_locations AS fl
+                WHERE fl.archive_id = af.id AND fl.is_current = 1
+                ORDER BY fl.id LIMIT 1
+            ) AS location_modified_time_ns
+            ,(
+                SELECT acs.page_count FROM archive_content_signatures AS acs
+                WHERE acs.archive_id = af.id
+            ) AS signature_page_count
+        FROM archive_files AS af
+        ORDER BY af.id
+        """
+    ).fetchall()
+
+    return {int(row["archive_id"]): dict(row) for row in rows}
+
+
+def _page_totals(connection: sqlite3.Connection) -> dict[int, int]:
+    return {
+        int(row["archive_id"]): int(row["total_pages"])
+        for row in connection.execute(
+            "SELECT archive_id, COUNT(*) AS total_pages "
+            "FROM archive_pages GROUP BY archive_id"
+        )
+    }
+
+
+@dataclass(frozen=True)
+class JobHistory:
+    """One archive's jobs of a single type, current state and history apart.
+
+    Reducing jobs to status counts throws away chronology, and chronology is
+    the difference between "this failed" and "this failed and was then
+    reprocessed successfully". Both shapes exist -- a retried archive and an
+    archive whose latest attempt failed -- and a report that calls them the
+    same thing sends an operator to fix work that is already done.
+
+    So `current` is the scalar state, and `counts` keeps the history beside
+    it for a report that legitimately wants "ever failed".
+    """
+
+    counts: Counter = field(default_factory=Counter)
+    latest_terminal: str | None = None
+
+    @property
+    def current(self) -> str:
+        """The scalar state: active work first, then the latest terminal job.
+
+        Active outranks everything because it will change; nothing else is
+        worth reporting about an archive a worker currently holds. Among
+        terminal jobs the most recent one wins, which is the only ordering
+        that distinguishes failed-then-completed from completed-then-failed.
+        """
+        if any(self.counts.get(status) for status in ACTIVE_JOB_STATUSES):
+            return WORK_ACTIVE
+
+        if self.latest_terminal in (WORK_FAILED, WORK_CANCELLED,
+                                    WORK_COMPLETED):
+            return self.latest_terminal
+
+        return WORK_NEVER_ENQUEUED
+
+    def ever(self, status: str) -> bool:
+        """Whether this archive ever held a job in `status`."""
+        return bool(self.counts.get(status))
+
+    @property
+    def any_jobs(self) -> bool:
+        return bool(sum(self.counts.values()))
+
+
+def _job_histories(
+    connection: sqlite3.Connection, job_type: str
+) -> dict[int, JobHistory]:
+    """Per-archive job history, with the latest terminal job identified.
+
+    `completed_at` and `cancelled_at` are separate columns -- migration 011
+    deliberately left `completed_at` NULL on a cancelled job, because a
+    cancelled job did not complete -- so "when did this job end" is
+    COALESCE over both, exactly as that migration's comment says. Ties fall
+    back to job id, which is monotonic.
+
+    Two queries, and they must stay two. An earlier version aggregated
+    `MAX(ended_at)` and `MAX(id)` per status and compared the pairs, which
+    reads like a shortcut and is not one: those two maxima can come from
+    different rows, so the comparison is against a job that does not exist.
+    Given completed(id 10, Feb 1), completed(id 30, Jan 1) and
+    failed(id 20, Feb 1), it synthesised completed(Feb 1, id 30) and declared
+    the archive completed -- when the actual latest row is the failure. The
+    ordering has to be applied to real rows.
+    """
+    counts: dict[int, Counter] = defaultdict(Counter)
+
+    for row in connection.execute(
+        """
+        SELECT archive_id, status, COUNT(*) AS n
+        FROM jobs
+        WHERE job_type = ? AND archive_id IS NOT NULL
+        GROUP BY archive_id, status
+        """,
+        (job_type,),
+    ):
+        counts[int(row["archive_id"])][str(row["status"])] = int(row["n"])
+
+    latest: dict[int, str] = {}
+
+    for row in connection.execute(
+        """
+        SELECT archive_id, status
+        FROM (
+            SELECT
+                archive_id,
+                status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY archive_id
+                    ORDER BY
+                        COALESCE(completed_at, cancelled_at, '') DESC,
+                        id DESC
+                ) AS rank_in_archive
+            FROM jobs
+            WHERE job_type = ?
+              AND archive_id IS NOT NULL
+              AND status IN ('completed', 'failed', 'cancelled')
+        )
+        WHERE rank_in_archive = 1
+        """,
+        (job_type,),
+    ):
+        latest[int(row["archive_id"])] = str(row["status"])
+
+    return {
+        archive_id: JobHistory(
+            counts=archive_counts,
+            latest_terminal=latest.get(archive_id),
+        )
+        for archive_id, archive_counts in counts.items()
+    }
+
+
+def _quarantine_statuses(connection: sqlite3.Connection) -> dict[int, str]:
+    return {
+        int(row["archive_id"]): str(row["status"])
+        for row in connection.execute(
+            "SELECT archive_id, status FROM archive_quarantine"
+        )
+    }
+
+
+def _not_inventoried_subreason(
+    inspection: JobHistory,
+    quarantine_status: str | None,
+    signature_page_count: int | None,
+) -> str:
+    """Why an archive has no pages.
+
+    Quarantine is checked first only because it is the most specific
+    statement available: `pending_redownload` says an operator already looked
+    at this archive and is waiting on a replacement, which is more useful than
+    repeating that its inspection failed.
+
+    The inspection's *current* state is what decides, on the same precedence
+    the perceptual axis uses. An archive whose inspection failed and was then
+    re-run successfully is not "inspection_failed"; it inspected fine and
+    holds no images, and telling an operator otherwise sends them to fix work
+    that is already done.
+
+    The last two cases are the ones worth separating. When inspection
+    completed and no pages exist, the content signature is the only other
+    witness: if it promises pages, the inventory is absent and something lost
+    it; if it promises none, or does not exist, the archive simply holds no
+    images. Reporting both as "no images" would hide a data-loss shape behind
+    an ordinary one.
+    """
+    if quarantine_status == "pending_redownload":
+        return NOT_INVENTORIED_QUARANTINE_PENDING_REDOWNLOAD
+
+    current = inspection.current
+
+    if not inspection.any_jobs:
+        return NOT_INVENTORIED_INSPECTION_NEVER_ENQUEUED
+
+    if current == WORK_ACTIVE:
+        return NOT_INVENTORIED_INSPECTION_ACTIVE
+
+    if current == WORK_FAILED:
+        return NOT_INVENTORIED_INSPECTION_FAILED
+
+    if current == WORK_CANCELLED:
+        return NOT_INVENTORIED_INSPECTION_CANCELLED
+
+    if current == WORK_COMPLETED:
+        if (signature_page_count or 0) > 0:
+            return NOT_INVENTORIED_COMPLETED_INVENTORY_ABSENT
+
+        return NOT_INVENTORIED_COMPLETED_NO_IMAGES
+
+    return NOT_INVENTORIED_UNKNOWN
+
+
+# The one call that inspects a file, bound at module level rather than called
+# as os.stat() inside the function. A test proving that an unreadable path is
+# not reported as missing has to replace this call, and doing that by patching
+# os.stat globally also breaks os.path.isdir -- which this module uses to
+# decide whether a declared root is reachable, so the test would silently
+# measure the wrong thing. `candidate_selection` carries the same seam for the
+# same reason.
+_stat = os.stat
+
+
+def _availability(
+    info: dict,
+    scope: DeclaredScope,
+) -> tuple[str, str | None]:
+    """Where the file is, as observed -- never as decided."""
+    locations = int(info["current_location_count"] or 0)
+
+    if locations == 0:
+        return AVAILABILITY_NO_CURRENT_LOCATION, None
+
+    if locations > 1:
+        return (
+            AVAILABILITY_MULTIPLE_CURRENT_LOCATIONS,
+            f"{locations} current locations",
+        )
+
+    path = str(info["current_path"])
+
+    if not scope.consulted:
+        return AVAILABILITY_NOT_OBSERVED, "no scope declared for this run"
+
+    containing = scope.containing_root(path)
+
+    if containing is None:
+        return (
+            AVAILABILITY_UNDECLARED_SCOPE,
+            "path lies outside every declared root",
+        )
+
+    root, reachable = containing
+
+    if not reachable:
+        # Deliberately not "missing". The file may be perfectly intact on a
+        # volume that is simply not attached; saying otherwise would turn an
+        # observation about this machine into a claim about the content.
+        return (
+            AVAILABILITY_UNAVAILABLE_SCOPE,
+            f"declared root {root} is not reachable",
+        )
+
+    try:
+        result = _stat(path)
+    except FileNotFoundError:
+        return AVAILABILITY_MISSING, path
+    except OSError as error:
+        # An unreadable path is not evidence of absence. Treating a
+        # permission or I/O error as "missing" is what previously sent repair
+        # hunting for a replacement file that was never gone.
+        return AVAILABILITY_UNREADABLE, f"{path}: {error}"
+
+    if not stat_module.S_ISREG(result.st_mode):
+        kind = (
+            "directory"
+            if stat_module.S_ISDIR(result.st_mode)
+            else "special file"
+        )
+        return AVAILABILITY_NON_REGULAR, f"{path} ({kind})"
+
+    if (
+        result.st_size == info["location_file_size"]
+        and result.st_mtime_ns == info["location_modified_time_ns"]
+    ):
+        return AVAILABILITY_PRESENT_MATCHING, None
+
+    return (
+        AVAILABILITY_PRESENT_DRIFTED,
+        f"on disk {result.st_size} @ {result.st_mtime_ns}, recorded "
+        f"{info['location_file_size']} @ "
+        f"{info['location_modified_time_ns']}",
+    )
+
+
+# --- the contract --------------------------------------------------------
+
+
+def classify(
+    connection: sqlite3.Connection,
+    *,
+    scope: Iterable[str] | None = None,
+) -> ClassificationResult:
+    """Classify every archive identity on all six axes.
+
+    `scope` names the filesystem roots this run may look at. Omit it to skip
+    the filesystem entirely, in which case availability is ``not_observed``
+    and every archive that would otherwise be eligible is refused
+    ``scope_not_observed`` -- because a precondition nobody tested must not be
+    asserted in either direction. `ClassificationResult.filesystem_consulted`
+    labels the run so the distinction is never silent.
+
+    Raises `ClassificationInvariantError` when a stored invariant has been
+    bypassed: conflicting dispositions, a supersession cycle, or a broken
+    eligible/excluded partition. Those are not findings to report, they are
+    reasons the report cannot be built.
+    """
+    declared = DeclaredScope.declare(scope)
+
+    # --- fail closed on bypassed stored invariants --------------------
+    conflicts = disposition_module.conflicting_dispositions(connection)
+
+    if conflicts:
+        raise ClassificationInvariantError(
+            "Archives hold both a retirement and a supersession, which "
+            f"migration 013 forbids: {conflicts}. The database's own "
+            "constraints have been bypassed; no classification built on "
+            "these rows would be trustworthy."
+        )
+
+    dispositions = disposition_module.dispositions_for(connection)
+    successors = disposition_module.successor_map(connection)
+
+    for archive_id in successors:
+        try:
+            disposition_module.resolve_successor(
+                connection, archive_id, successors=successors
+            )
+        except disposition_module.SupersessionChainError as error:
+            # Re-raised as an invariant failure so a caller can catch one
+            # exception type for "this database cannot be classified",
+            # rather than having to know that a chain walk lives underneath.
+            raise ClassificationInvariantError(
+                f"Supersession chain from archive {archive_id} does not "
+                f"terminate: {error}. Migration 013's cycle trigger forbids "
+                "this, so the constraint has been bypassed."
+            ) from error
+
+    # --- facts --------------------------------------------------------
+    repository = ArchivePerceptualHashRepository(connection)
+    structural = _structural_rows(connection)
+    totals = _page_totals(connection)
+    outstanding = repository.outstanding_page_counts()
+    perceptual_jobs = _job_histories(connection, PERCEPTUAL_JOB_TYPE)
+    inspect_jobs = _job_histories(connection, INSPECT_JOB_TYPE)
+    quarantine = _quarantine_statuses(connection)
+
+    eligible_ids = {
+        int(row["archive_id"])
+        for row in repository._eligible_archive_rows(limit=None)
+    }
+    exclusions = repository._archive_exclusion_reasons()
+
+    # --- the partition ------------------------------------------------
+    #
+    # Overlap and residue are treated differently on purpose.
+    #
+    # An archive that is both eligible and excluded is a contradiction: the
+    # predicate and its explanation assert opposite things about the same row,
+    # and there is no honest way to report that as a finding, so it fails
+    # closed.
+    #
+    # An archive that is in neither is residue, and residue is exactly what
+    # the `unexplained` selection value exists to carry. Raising on it would
+    # make the value unreachable and hide the one condition a reader most
+    # needs to see -- which is how `never_enqueued_backlog` came to report 225
+    # explained archives as gaps while saying nothing about 162 unexplained
+    # ones. It is reported, counted, and asserted to be zero by tests.
+    overlap = eligible_ids & set(exclusions)
+
+    if overlap:
+        raise PartitionError(
+            "Archives are both eligible and excluded, so the eligibility "
+            f"predicate and its explanation disagree: {sorted(overlap)[:20]}"
+        )
+
+    # --- refusals, from the real selection path -----------------------
+    #
+    # Not a reimplementation: this is the same function enqueue_missing()
+    # calls, so a refusal reported here is a refusal that would actually
+    # happen. check_filesystem follows the declared scope, because a refusal
+    # this run could not test must not be asserted.
+    #
+    # Availability is computed first, because it decides which archives may be
+    # stat()ed at all. An archive under an unreachable or undeclared root is
+    # never handed to the filesystem check: doing so turned "I cannot look
+    # there" into `path_missing`, which is the precise contradiction this
+    # contract exists to prevent.
+    availabilities = {
+        archive_id: _availability(structural[archive_id], declared)
+        for archive_id in structural
+    }
+
+    observable = [
+        archive_id
+        for archive_id in sorted(eligible_ids)
+        if availabilities[archive_id][0] not in AVAILABILITY_UNOBSERVABLE
+    ]
+    unobservable = [
+        archive_id
+        for archive_id in sorted(eligible_ids)
+        if availabilities[archive_id][0] in AVAILABILITY_UNOBSERVABLE
+    ]
+
+    selection = select_candidates(
+        connection, observable, check_filesystem=True
+    )
+    accepted_ids = set(selection.accepted_ids)
+    refusals: dict[int, list[str]] = defaultdict(list)
+
+    for rejection in selection.rejected:
+        refusals[int(rejection.archive_id)].append(rejection.reason)
+
+    # The unobservable ones still get the database-side checks -- retirement
+    # and supersession must bite regardless of what is mounted -- but never
+    # the disk. Whatever survives those is refused for the honest reason that
+    # this run could not verify it, rather than being reported enqueueable on
+    # the strength of a file nobody looked at.
+    if unobservable:
+        database_only = select_candidates(
+            connection, unobservable, check_filesystem=False
+        )
+
+        for rejection in database_only.rejected:
+            refusals[int(rejection.archive_id)].append(rejection.reason)
+
+        for archive_id in database_only.accepted_ids:
+            refusals[int(archive_id)].append(
+                _SCOPE_REFUSAL_FOR[availabilities[int(archive_id)][0]]
+            )
+
+    # --- assemble -----------------------------------------------------
+    classifications: list[ArchiveClassification] = []
+
+    for archive_id in sorted(structural):
+        info = structural[archive_id]
+        recorded = dispositions.get(archive_id)
+        total_pages = totals.get(archive_id, 0)
+        outstanding_pages = outstanding.get(archive_id, 0)
+        quarantine_status = quarantine.get(archive_id)
+
+        if total_pages == 0:
+            inventory = INVENTORY_NOT_INVENTORIED
+            subreason = _not_inventoried_subreason(
+                inspect_jobs.get(archive_id, JobHistory()),
+                quarantine_status,
+                info["signature_page_count"],
+            )
+        elif outstanding_pages == 0:
+            inventory, subreason = INVENTORY_COVERED, None
+        else:
+            inventory, subreason = INVENTORY_INCOMPLETE, None
+
+        if archive_id in accepted_ids:
+            selection_state: str = SELECTION_ELIGIBLE
+            reasons: tuple[str, ...] = ()
+        elif archive_id in refusals:
+            selection_state = SELECTION_REFUSED
+            reasons = tuple(refusals[archive_id])
+        elif archive_id in exclusions:
+            selection_state = SELECTION_EXCLUDED
+            reasons = exclusions[archive_id]
+        else:
+            # Residue. Never produced by a predicate -- an archive lands here
+            # only by being in none of the sets above.
+            selection_state = SELECTION_UNEXPLAINED
+            reasons = ()
+
+        availability, detail = availabilities[archive_id]
+
+        classifications.append(
+            ArchiveClassification(
+                archive_id=archive_id,
+                disposition=(
+                    recorded.disposition if recorded else DISPOSITION_ACTIVE
+                ),
+                successor_archive_id=(
+                    recorded.successor_archive_id if recorded else None
+                ),
+                availability=availability,
+                availability_detail=detail,
+                inventory=inventory,
+                not_inventoried_subreason=subreason,
+                perceptual_work=perceptual_jobs.get(
+                    archive_id, JobHistory()
+                ).current,
+                ever_failed=perceptual_jobs.get(
+                    archive_id, JobHistory()
+                ).ever(WORK_FAILED),
+                ever_cancelled=perceptual_jobs.get(
+                    archive_id, JobHistory()
+                ).ever(WORK_CANCELLED),
+                selection=selection_state,
+                selection_reasons=reasons,
+                quarantine_status=quarantine_status,
+                current_path=info["current_path"],
+                total_pages=total_pages,
+                outstanding_pages=outstanding_pages,
+            )
+        )
+
+    return ClassificationResult(
+        archives=tuple(classifications),
+        scope=declared,
+        filesystem_consulted=declared.consulted,
+    )
+
+
+# --- reporting -----------------------------------------------------------
+
+
+def axis_totals(
+    result: ClassificationResult | Sequence[ArchiveClassification],
+) -> dict[str, dict[str, int]]:
+    """Counts per axis, each computed from that axis alone.
+
+    Every axis independently sums to the archive count, and no total here is
+    derived from `presentation_label` -- the axes are orthogonal, so counting
+    a single collapsed label would silently under-report every axis but the
+    one that happened to win precedence.
+    """
+    archives = _as_sequence(result)
+    totals: dict[str, dict[str, int]] = {}
+
+    for axis, vocabulary in (
+        ("disposition", DISPOSITIONS),
+        ("availability", AVAILABILITIES),
+        ("inventory", INVENTORIES),
+        ("perceptual_work", WORK_STATES),
+        ("selection", SELECTIONS),
+    ):
+        counts = Counter(getattr(archive, axis) for archive in archives)
+        # Every value present, including zeros: a category that vanishes when
+        # empty cannot be told from one nobody thought to report.
+        totals[axis] = {value: counts.get(value, 0) for value in vocabulary}
+
+    totals["not_inventoried_subreason"] = {
+        value: sum(
+            1
+            for archive in archives
+            if archive.not_inventoried_subreason == value
+        )
+        for value in NOT_INVENTORIED_SUBREASONS
+    }
+    totals["quarantine_status"] = dict(
+        Counter(
+            archive.quarantine_status
+            for archive in archives
+            if archive.quarantine_status
+        )
+    )
+
+    return totals
+
+
+def selection_reason_totals(
+    result: ClassificationResult | Sequence[ArchiveClassification],
+) -> dict[str, dict[str, int]]:
+    """Refusal and exclusion reasons counted separately.
+
+    An archive with several exclusion reasons is counted under each, so these
+    deliberately do not sum to the archive count -- unlike the axis totals,
+    which do.
+    """
+    archives = _as_sequence(result)
+    refused: Counter = Counter()
+    excluded: Counter = Counter()
+
+    for archive in archives:
+        target = (
+            refused if archive.selection == SELECTION_REFUSED else excluded
+        )
+
+        if archive.selection in (SELECTION_REFUSED, SELECTION_EXCLUDED):
+            for reason in archive.selection_reasons:
+                target[reason.split(":", 1)[0]] += 1
+
+    return {
+        "refused": {
+            reason: refused.get(reason, 0)
+            for reason in REJECTION_REASONS + CLASSIFIER_REFUSAL_REASONS
+        },
+        "excluded": {
+            reason: excluded.get(reason, 0) for reason in EXCLUSION_REASONS
+        },
+    }
+
+
+def outstanding_pages_by_axis(
+    result: ClassificationResult | Sequence[ArchiveClassification],
+    axis: str,
+) -> dict[str, int]:
+    """Unhashed pages attributed to each value of one axis.
+
+    The page column is what lets a report reconcile itself against the
+    measured gap; an archive count alone cannot.
+    """
+    archives = _as_sequence(result)
+    pages: Counter = Counter()
+
+    for archive in archives:
+        pages[getattr(archive, axis)] += archive.outstanding_pages
+
+    return dict(pages)
+
+
+# Presentation only. Nothing in this module counts by the value it returns,
+# and a test asserts that reordering it leaves every axis total unchanged.
+PRESENTATION_PRECEDENCE: tuple[tuple[str, str], ...] = (
+    ("disposition", DISPOSITION_RETIRED),
+    ("disposition", DISPOSITION_SUPERSEDED),
+    ("selection", SELECTION_UNEXPLAINED),
+    ("perceptual_work", WORK_FAILED),
+    ("availability", AVAILABILITY_UNAVAILABLE_SCOPE),
+    ("availability", AVAILABILITY_UNDECLARED_SCOPE),
+    ("availability", AVAILABILITY_NOT_OBSERVED),
+    ("availability", AVAILABILITY_NO_CURRENT_LOCATION),
+    ("availability", AVAILABILITY_MULTIPLE_CURRENT_LOCATIONS),
+    ("availability", AVAILABILITY_MISSING),
+    ("availability", AVAILABILITY_UNREADABLE),
+    ("availability", AVAILABILITY_NON_REGULAR),
+    ("availability", AVAILABILITY_PRESENT_DRIFTED),
+    ("inventory", INVENTORY_NOT_INVENTORIED),
+    ("inventory", INVENTORY_INCOMPLETE),
+)
+
+
+def presentation_label(
+    archive: ArchiveClassification,
+    precedence: Sequence[tuple[str, str]] = PRESENTATION_PRECEDENCE,
+) -> str:
+    """One headline label for an archive, for a summary line.
+
+    A convenience for humans reading a list, and nothing more. The full
+    six-axis tuple is always what gets emitted to JSON and CSV; this is an
+    extra column beside it, never a replacement for it.
+    """
+    for axis, value in precedence:
+        if getattr(archive, axis) == value:
+            return f"{axis}:{value}"
+
+    return "covered" if archive.outstanding_pages == 0 else "outstanding"
+
+
+def _as_sequence(
+    result: ClassificationResult | Sequence[ArchiveClassification],
+) -> Sequence[ArchiveClassification]:
+    return (
+        result.archives
+        if isinstance(result, ClassificationResult)
+        else result
+    )
