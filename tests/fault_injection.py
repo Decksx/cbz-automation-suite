@@ -9,9 +9,20 @@ finding was originally measured by racing and is now pinned deterministically
 approach so the next fault does not need its own bespoke scaffolding.
 
 Nothing here patches production code permanently or requires production code
-to grow a test hook. Each helper wraps a seam that already exists: a
-module-level attribute, `Path.stat`, `os.replace`, or a SQL statement issued
-through `sqlite3.Connection.execute`.
+to grow a test hook. Each helper wraps a seam that already exists: `Path.stat`,
+`Path.rename`, or a SQL statement issued through `sqlite3.Connection.execute`.
+
+Patches are undone on block exit
+--------------------------------
+
+Every context manager scopes its patching through `monkeypatch.context()`,
+so the patch is reverted when the `with` block ends rather than surviving
+until pytest tears the fixture down at the end of the test. The earlier
+version of this module patched before `yield` and never undid it, which
+silently contradicted the `with` API: a test that injected a fault, exited
+the block and then went on to assert something about normal behaviour was
+still running against the patched function. Restoration is asserted by
+`test_archive_fault_injection.py` rather than left to inspection.
 
 `sqlite3.Connection` is a C type whose methods cannot be monkeypatched, which
 is why `failing_execute` wraps a connection in a proxy rather than patching
@@ -21,11 +32,11 @@ easy to get subtly wrong.
 
 from __future__ import annotations
 
-import os
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 
 class InjectedFailure(RuntimeError):
@@ -36,38 +47,6 @@ class InjectedFailure(RuntimeError):
     same point -- which is how a fault-injection test quietly stops testing
     anything.
     """
-
-
-@contextmanager
-def fail_after_calls(
-    monkeypatch,
-    target: Any,
-    name: str,
-    *,
-    after: int = 0,
-    exception: type[BaseException] = InjectedFailure,
-) -> Iterator[dict[str, int]]:
-    """Let `after` calls of `target.name` through, then raise.
-
-    Yields a counter dict so a test can assert the failure fired at all.
-    A fault that never triggers leaves the code path passing for the wrong
-    reason, so the count is worth checking explicitly.
-    """
-    original = getattr(target, name)
-    state = {"calls": 0}
-
-    def wrapper(*args, **kwargs):
-        state["calls"] += 1
-
-        if state["calls"] > after:
-            raise exception(
-                f"injected failure at {name} call {state['calls']}"
-            )
-
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(target, name, wrapper)
-    yield state
 
 
 class _FailingExecuteConnection:
@@ -115,6 +94,9 @@ def failing_execute(
     Matching is a case-insensitive substring test on the SQL text, which is
     enough to single out `COMMIT`, `INSERT INTO schema_migrations`, or a
     named table without needing a parser.
+
+    Not a context manager: it patches nothing, it returns a different object.
+    The caller decides what to hand to the code under test.
     """
     return _FailingExecuteConnection(
         connection, fail_on=fail_on, after=after
@@ -144,36 +126,9 @@ def frozen_stat(monkeypatch, target: Path) -> Iterator[None]:
 
         return original_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", patched)
-    yield
-
-
-@contextmanager
-def failing_replace(
-    monkeypatch, *, after: int = 0
-) -> Iterator[dict[str, int]]:
-    """Make `os.replace` fail, simulating a crash before the final rename.
-
-    The read-rebuild rewrite paths write a temporary file and then rename it
-    over the original. Failing the rename is the closest deterministic stand-in
-    for the process dying at its most dangerous moment: after the new bytes
-    exist, before they are the ones anybody reads.
-    """
-    original = os.replace
-    state = {"calls": 0}
-
-    def wrapper(src, dst, *args, **kwargs):
-        state["calls"] += 1
-
-        if state["calls"] > after:
-            raise InjectedFailure(
-                f"injected failure replacing {src} -> {dst}"
-            )
-
-        return original(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(os, "replace", wrapper)
-    yield state
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "stat", patched)
+        yield
 
 
 @contextmanager
@@ -182,12 +137,15 @@ def failing_path_rename(
 ) -> Iterator[dict[str, int]]:
     """Make `Path.rename` fail after `after` successful calls.
 
-    Separate from `failing_replace` because the rewrite paths use
-    `Path.rename` rather than `os.replace`, and patching the wrong one
-    yields a test that passes because the fault never fired. `after` matters
-    here: `write_comicinfo` renames twice -- original to backup, then temp to
-    original -- and failing at each leaves the filesystem in a different
-    state.
+    Chosen over `os.replace` because the rewrite paths use `Path.rename`;
+    patching the wrong one yields a test that passes because the fault never
+    fired. `after` matters here: `write_comicinfo` renames twice -- original
+    to backup, then temp to original -- and failing at each leaves the
+    filesystem in a different state.
+
+    Yields a counter so a test can assert the failure actually fired. A
+    fault that never triggers leaves the code path passing for the wrong
+    reason.
     """
     original = Path.rename
     state = {"calls": 0}
@@ -203,53 +161,69 @@ def failing_path_rename(
 
         return original(self, target, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "rename", wrapper)
-    yield state
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rename", wrapper)
+        yield state
+
+
+# --- snapshots -----------------------------------------------------------
+
+
+def table_snapshot(
+    connection: sqlite3.Connection, tables: tuple[str, ...]
+) -> dict[str, Any]:
+    """Row counts plus a content digest for each table.
+
+    Deliberately does **not** include `PRAGMA data_version`.
+    `data_version` only changes when *another* connection commits; a write
+    made and committed by the very connection being sampled leaves it
+    untouched. Reporting it beside these counts implied a same-connection
+    mutation check that it cannot provide, and the control test passed on
+    the row count alone while appearing to validate the pragma.
+
+    The content digest covers the case row counts cannot see: a row updated
+    in place, or one deleted and another inserted. `observer_data_version`
+    is the honest tool for the cross-connection question.
+    """
+    snapshot: dict[str, Any] = {}
+
+    for table in tables:
+        rows = connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid"
+        ).fetchall()
+        digest = hashlib.sha256()
+
+        for row in rows:
+            digest.update(repr(tuple(row)).encode("utf-8"))
+
+        snapshot[table] = (len(rows), digest.hexdigest())
+
+    return snapshot
 
 
 @contextmanager
-def observed_calls(
-    monkeypatch, target: Any, name: str
-) -> Iterator[list[tuple]]:
-    """Record calls to `target.name` without changing behaviour.
+def observer_data_version(database: Path) -> Iterator[Any]:
+    """A *persistent* second connection that reports `PRAGMA data_version`.
 
-    Used to assert a dry run reached the point of *deciding* to write and
-    then did not write -- which is a different, stronger claim than the file
-    merely being unchanged, since a run that silently did nothing at all
-    would also leave it unchanged.
+    The observer connection has to stay open across the writes it is meant
+    to observe. `data_version` is per-connection state: a freshly opened
+    connection reports the current value with nothing to compare it to, so
+    sampling through a new connection each time returns the same number
+    either side of a commit and detects nothing. The first version of this
+    helper did exactly that and its test failed, which is the only reason
+    the distinction is documented here rather than being rediscovered.
+
+    Yields a zero-argument callable so the caller samples explicitly at the
+    points it cares about.
     """
-    original = getattr(target, name)
-    calls: list[tuple] = []
+    connection = sqlite3.connect(str(database))
 
-    def wrapper(*args, **kwargs):
-        calls.append((args, kwargs))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(target, name, wrapper)
-    yield calls
-
-
-def database_snapshot(
-    connection: sqlite3.Connection, tables: tuple[str, ...]
-) -> dict[str, Any]:
-    """Row counts plus `data_version`, for before/after comparison.
-
-    `data_version` is included because row counts alone cannot see a write
-    that was made and then undone by an equal and opposite write, and
-    cannot see changes to rows that leave the count identical.
-    """
-    snapshot: dict[str, Any] = {
-        "data_version": connection.execute(
+    try:
+        yield lambda: connection.execute(
             "PRAGMA data_version"
         ).fetchone()[0]
-    }
-
-    for table in tables:
-        snapshot[table] = connection.execute(
-            f"SELECT COUNT(*) FROM {table}"
-        ).fetchone()[0]
-
-    return snapshot
+    finally:
+        connection.close()
 
 
 def file_snapshot(paths: list[Path]) -> dict[str, tuple[int, bytes]]:
