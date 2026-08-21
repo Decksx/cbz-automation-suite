@@ -18,7 +18,6 @@ synthetic and built inside `tmp_path`.
 
 from __future__ import annotations
 
-import hashlib
 import zipfile
 from pathlib import Path
 
@@ -29,6 +28,12 @@ from comic_automation.archive import (
     UnsupportedArchiveFormatError,
     inspect_archive,
 )
+from comic_automation.archive.page_hashing import calculate_page_hashes
+from comic_automation.archive.perceptual_hashing import (
+    calculate_perceptual_hashes,
+)
+from comic_automation.jobs import PermanentJobError
+from PIL import Image
 from tests import golden_corpus as gc
 
 
@@ -49,6 +54,57 @@ def test_every_case_is_byte_reproducible(case, tmp_path: Path) -> None:
 
     assert gc.sha256_file(first) == gc.sha256_file(second)
     assert first.read_bytes() == second.read_bytes()
+
+
+@pytest.mark.parametrize("case", gc.CASES, ids=lambda c: c.name)
+def test_every_case_matches_its_frozen_digest(case, tmp_path: Path) -> None:
+    """The anchor. Two builds in one process cannot provide this.
+
+    Building a case twice in the same runtime proves the builder is not
+    reading the clock. It proves nothing about drift across runs, machines
+    or dependency versions, because both builds share one Pillow and one
+    platform -- an encoder change or a different `create_system` would move
+    every fixture in lockstep and leave every comparison passing.
+
+    A failure here is not automatically a bug in this file. Find out why the
+    bytes moved before touching the constant: regenerating it to go green
+    throws away the only warning the corpus can give.
+    """
+    path = case.build(tmp_path / f"{case.name}.cbz")
+
+    assert case.name in gc.EXPECTED_SHA256, (
+        f"{case.name} has no frozen digest; every case needs one or the "
+        "corpus is unanchored for that shape"
+    )
+    assert gc.sha256_file(path) == gc.EXPECTED_SHA256[case.name]
+
+
+def test_every_frozen_digest_names_a_real_case() -> None:
+    """No stale entries left behind by a renamed or deleted case."""
+    assert set(gc.EXPECTED_SHA256) == {case.name for case in gc.CASES}
+
+
+@pytest.mark.parametrize("case", gc.CASES, ids=lambda c: c.name)
+def test_platform_dependent_zip_fields_are_pinned(
+    case, tmp_path: Path
+) -> None:
+    """`create_system` alone would split the digests by operating system.
+
+    `ZipInfo` derives it from the host -- 0 on Windows, 3 elsewhere -- so
+    without pinning, the frozen digests above would be correct on exactly
+    one platform and CI would disagree with every developer machine.
+    """
+    path = case.build(tmp_path / f"{case.name}.cbz")
+
+    if not zipfile.is_zipfile(path):
+        pytest.skip("case is deliberately not a readable archive")
+
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+
+    assert {info.create_system for info in infos} <= {0}
+    assert {info.external_attr for info in infos} <= {0o600 << 16}
+    assert {info.internal_attr for info in infos} <= {0}
 
 
 @pytest.mark.parametrize("case", gc.CASES, ids=lambda c: c.name)
@@ -117,14 +173,25 @@ def test_case_names_are_unique() -> None:
 # --- identity: what must and must not change a page ----------------------
 
 
+def _hashes(path: Path):
+    """Production page hashing, not a test-local reimplementation.
+
+    The earlier version of this file hashed `member_payloads()` with
+    `hashlib` directly. That compares fixtures to each other and would go on
+    passing through any regression in production ordering or content-digest
+    construction -- the very things these relationships exist to protect.
+    """
+    return calculate_page_hashes(path)
+
+
 def _page_digests(path: Path) -> dict[str, str]:
-    """SHA-256 per image member, keyed by name."""
-    payloads = gc.member_payloads(path)
-    return {
-        name: hashlib.sha256(payload).hexdigest()
-        for name, payload in payloads.items()
-        if name.casefold().endswith(".png")
-    }
+    """SHA-256 per page, keyed by entry name, as production computes it."""
+    return {page.entry_name: page.digest for page in _hashes(path).pages}
+
+
+def _page_order(path: Path) -> list[str]:
+    """Entry names in production's page order, not archive order."""
+    return [page.entry_name for page in _hashes(path).pages]
 
 
 def test_a_comicinfo_only_change_leaves_every_page_identical(
@@ -140,6 +207,14 @@ def test_a_comicinfo_only_change_leaves_every_page_identical(
     changed = gc.build_case("comicinfo_only_change", tmp_path)
 
     assert _page_digests(ordinary) == _page_digests(changed)
+    assert _page_order(ordinary) == _page_order(changed)
+
+    # The strongest form of the claim: production's own content signature,
+    # which the archive_content_signatures row is built from, is unmoved.
+    assert (
+        _hashes(ordinary).content_digest
+        == _hashes(changed).content_digest
+    )
     assert gc.sha256_file(ordinary) != gc.sha256_file(changed)
 
 
@@ -152,9 +227,19 @@ def test_reordering_pages_preserves_the_page_set(tmp_path: Path) -> None:
     ordinary = gc.build_case("ordinary", tmp_path)
     reordered = gc.build_case("reordered_pages", tmp_path)
 
-    assert _page_digests(ordinary) == _page_digests(reordered)
+    # Physical archive order really is reversed...
     assert gc.member_names(ordinary) != gc.member_names(reordered)
     assert gc.sha256_file(ordinary) != gc.sha256_file(reordered)
+
+    # ...and production sorts by natural key, so page order and the content
+    # signature are both unaffected. Asserting the signature is what makes
+    # this a test of the ordering rule rather than of the fixtures.
+    assert _page_order(ordinary) == _page_order(reordered)
+    assert _page_digests(ordinary) == _page_digests(reordered)
+    assert (
+        _hashes(ordinary).content_digest
+        == _hashes(reordered).content_digest
+    )
 
 
 def test_sorted_member_order_is_stable_under_reordering(
@@ -172,23 +257,37 @@ def test_sorted_member_order_is_stable_under_reordering(
 def test_one_page_difference_changes_exactly_one_page(
     tmp_path: Path,
 ) -> None:
-    ordinary = _page_digests(gc.build_case("ordinary", tmp_path))
-    differing = _page_digests(
-        gc.build_case("one_page_difference", tmp_path)
-    )
+    base = gc.build_case("ordinary", tmp_path)
+    differing = gc.build_case("one_page_difference", tmp_path)
 
-    assert set(ordinary) == set(differing)
+    base_digests = _page_digests(base)
+    differing_digests = _page_digests(differing)
+
+    assert set(base_digests) == set(differing_digests)
     changed = [
-        name for name in ordinary if ordinary[name] != differing[name]
+        name
+        for name in base_digests
+        if base_digests[name] != differing_digests[name]
     ]
     assert changed == ["003.png"]
 
+    # One page moving must move the content signature; if it did not, a
+    # replaced page would be invisible to content-keyed identity.
+    assert (
+        _hashes(base).content_digest != _hashes(differing).content_digest
+    )
+
 
 def test_one_page_fewer_drops_exactly_one_page(tmp_path: Path) -> None:
-    ordinary = _page_digests(gc.build_case("ordinary", tmp_path))
-    fewer = _page_digests(gc.build_case("one_page_fewer", tmp_path))
+    base = gc.build_case("ordinary", tmp_path)
+    fewer = gc.build_case("one_page_fewer", tmp_path)
 
-    assert set(ordinary) - set(fewer) == {"003.png"}
+    assert set(_page_digests(base)) - set(_page_digests(fewer)) == {
+        "003.png"
+    }
+    assert _hashes(base).page_count == 3
+    assert _hashes(fewer).page_count == 2
+    assert _hashes(base).content_digest != _hashes(fewer).content_digest
 
 
 def test_duplicate_pages_share_one_digest(tmp_path: Path) -> None:
@@ -197,11 +296,16 @@ def test_duplicate_pages_share_one_digest(tmp_path: Path) -> None:
     Deduplication has to see this without treating the second name as a
     defect: the archive is legitimate.
     """
-    digests = _page_digests(gc.build_case("duplicate_pages", tmp_path))
+    path = gc.build_case("duplicate_pages", tmp_path)
+    digests = _page_digests(path)
 
     assert digests["001.png"] == digests["002.png"]
     assert digests["003.png"] != digests["001.png"]
     assert len(set(digests.values())) == 2
+
+    # Both duplicates are still counted as pages: deduplication is a
+    # downstream decision, not something the inventory may do silently.
+    assert _hashes(path).page_count == 3
 
 
 def test_moving_a_file_does_not_change_its_content(tmp_path: Path) -> None:
@@ -363,6 +467,77 @@ def test_non_cbz_suffix_is_rejected_before_reading(tmp_path: Path) -> None:
 
     with pytest.raises(UnsupportedArchiveFormatError):
         inspect_archive(renamed)
+
+
+# --- decoded-pixel limits ------------------------------------------------
+
+
+def test_a_declared_pixel_bomb_is_a_permanent_page_failure(
+    tmp_path: Path,
+) -> None:
+    """The decoded-pixel guard, exercised by a 68-byte fixture.
+
+    `perceptual_hashing.py` sets `Image.MAX_IMAGE_PIXELS` explicitly and
+    catches `DecompressionBombError` as a permanent, per-page failure. A
+    header declaring more than twice the limit reaches that path without a
+    fixture that costs hundreds of megabytes: decoders check the declared
+    dimensions before allocating, which is what makes bombs detectable at
+    all.
+
+    Classified `page_image_corrupt` rather than `archive_corrupt` -- the
+    archive is fine, one page is not, and that split is what the 40/92
+    terminal-failure breakdown rests on.
+    """
+    path = gc.build_case("decoded_pixel_bomb", tmp_path)
+
+    with pytest.raises(PermanentJobError) as raised:
+        calculate_perceptual_hashes(path)
+
+    assert raised.value.category == "page_image_corrupt"
+
+
+def test_the_two_pixel_bands_straddle_the_documented_threshold() -> None:
+    """Pillow warns above the limit and only raises above twice it.
+
+    `perceptual_hashing.py` documents this asymmetry and depends on it. The
+    corpus carries a fixture either side so that a change to Pillow's
+    behaviour, or to the configured limit, fails here with both numbers
+    visible rather than showing up later as an unexplained reclassification.
+    """
+    limit = Image.MAX_IMAGE_PIXELS
+    warning_pixels = (
+        gc.PIXEL_WARNING_DIMENSIONS[0] * gc.PIXEL_WARNING_DIMENSIONS[1]
+    )
+    bomb_pixels = gc.PIXEL_BOMB_DIMENSIONS[0] * gc.PIXEL_BOMB_DIMENSIONS[1]
+
+    assert limit < warning_pixels <= 2 * limit
+    assert bomb_pixels > 2 * limit
+
+
+def test_the_pixel_fixtures_stay_tiny_on_disk(tmp_path: Path) -> None:
+    """A guard against someone "fixing" these into real images.
+
+    The point of declaring the size in the header is that the fixture costs
+    nothing. If a later change starts generating genuine pixel data, the
+    corpus grows by hundreds of megabytes and this fails first.
+    """
+    for name in ("decoded_pixel_warning", "decoded_pixel_bomb"):
+        path = gc.build_case(name, tmp_path)
+        assert path.stat().st_size < 4096
+
+
+def test_the_corpus_records_what_it_does_not_cover() -> None:
+    """Excessive *entries* is deferred, and says so.
+
+    There is no entry-count limit anywhere in the codebase, so there is no
+    guard for a fixture to exercise; `many_entries` is a legitimate
+    high-count control instead. Recorded in `CORPUS_GAPS` rather than left
+    as an absence, because a missing fixture is otherwise indistinguishable
+    from an overlooked one.
+    """
+    assert "excessive_entries" in gc.CORPUS_GAPS
+    assert "control" in gc.CASES_BY_NAME["many_entries"].tags
+    assert "limits" not in gc.CASES_BY_NAME["many_entries"].tags
 
 
 # --- unsafe members: current behaviour, pinned ---------------------------
