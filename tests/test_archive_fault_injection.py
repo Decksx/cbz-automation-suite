@@ -58,6 +58,89 @@ def database(tmp_path: Path):
         connection.close()
 
 
+# --- the harness restores its own patches --------------------------------
+
+
+def test_frozen_stat_restores_path_stat_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving the block must put the real `Path.stat` back.
+
+    The first version of this harness patched before `yield` and never
+    undid it, so the patch survived until pytest tore the fixture down at
+    the end of the test. Anything after the `with` block ran against a
+    frozen stat while looking like ordinary code -- the failure mode being
+    that a later assertion in the same test silently observes stale
+    metadata.
+    """
+    path = gc.build_case("ordinary", tmp_path)
+    real_size = path.stat().st_size
+
+    with fi.frozen_stat(monkeypatch, path):
+        path.write_bytes(path.read_bytes() + b"XXXX")
+        assert path.stat().st_size == real_size  # frozen inside
+
+    assert path.stat().st_size == real_size + 4  # live again outside
+
+
+def test_failing_path_rename_restores_path_rename_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gc.build_case("ordinary", tmp_path)
+
+    with fi.failing_path_rename(monkeypatch, after=0):
+        with pytest.raises(fi.InjectedFailure):
+            path.rename(tmp_path / "never.cbz")
+
+    # The real rename works again immediately after the block.
+    destination = tmp_path / "renamed.cbz"
+    path.rename(destination)
+    assert destination.exists()
+
+
+def test_the_harness_patches_nothing_after_its_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity check, not a behavioural one.
+
+    Comparing the bound attribute before and after catches a helper that
+    restored *something* -- a differently-wrapped function, or a previous
+    layer of patching -- rather than the original.
+    """
+    path = gc.build_case("ordinary", tmp_path)
+    original_stat = Path.stat
+    original_rename = Path.rename
+
+    with fi.frozen_stat(monkeypatch, path):
+        assert Path.stat is not original_stat
+
+    assert Path.stat is original_stat
+
+    with fi.failing_path_rename(monkeypatch):
+        assert Path.rename is not original_rename
+
+    assert Path.rename is original_rename
+
+
+def test_nested_harness_blocks_unwind_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two faults active at once must each undo only their own patch."""
+    path = gc.build_case("ordinary", tmp_path)
+    original_stat = Path.stat
+    original_rename = Path.rename
+
+    with fi.frozen_stat(monkeypatch, path):
+        with fi.failing_path_rename(monkeypatch):
+            assert Path.stat is not original_stat
+            assert Path.rename is not original_rename
+
+        assert Path.rename is original_rename
+        assert Path.stat is not original_stat
+
+    assert Path.stat is original_stat
+
+
 # --- transaction rollback ------------------------------------------------
 
 
@@ -500,36 +583,106 @@ def test_appended_bytes_are_caught_only_by_the_size_check(
 # --- database non-mutation under failure ---------------------------------
 
 
-def test_an_injected_failure_leaves_the_database_row_counts_unchanged(
-    database, tmp_path: Path
+def test_an_injected_commit_failure_leaves_the_tables_unchanged(
+    tmp_path: Path
 ) -> None:
-    """Row counts plus `data_version`, before and after a failed write."""
+    """A genuine injected failure, not a hand-written ROLLBACK.
+
+    The earlier version of this test issued its own BEGIN/INSERT/ROLLBACK
+    and injected nothing, so it demonstrated that SQLite rolls back when
+    told to -- not that any code under test recovers. Here the failure comes
+    from `failing_execute` firing on COMMIT, and the assertion is that the
+    tables are untouched afterwards.
+    """
     tables = ("archive_files", "file_locations", "jobs")
-    before = fi.database_snapshot(database, tables)
+    real = connect_database(tmp_path / "injected.db")
 
-    database.execute("BEGIN IMMEDIATE")
-    database.execute(
-        "INSERT INTO archive_files (file_size) VALUES (?)", (4096,)
-    )
-    database.execute("ROLLBACK")
+    try:
+        apply_migrations(real, MIGRATIONS)
+        before = fi.table_snapshot(real, tables)
 
-    assert fi.database_snapshot(database, tables) == before
+        guarded = fi.failing_execute(real, fail_on="commit")
+        guarded.execute("BEGIN IMMEDIATE")
+        guarded.execute(
+            "INSERT INTO archive_files (file_size) VALUES (?)", (4096,)
+        )
+
+        with pytest.raises(fi.InjectedFailure):
+            guarded.execute("COMMIT")
+
+        real.execute("ROLLBACK")
+
+        assert guarded.matches == 1
+        assert fi.table_snapshot(real, tables) == before
+    finally:
+        real.close()
 
 
-def test_the_snapshot_helper_notices_a_real_write(
+def test_the_snapshot_helper_notices_an_in_place_update(
     database, tmp_path: Path
 ) -> None:
-    """The control for the helper itself.
+    """The control, chosen to exercise the digest rather than the count.
 
-    A snapshot comparison that could not detect a genuine change would make
-    every non-mutation assertion above meaningless.
+    An INSERT would move the row count, so a snapshot that compared counts
+    alone would pass this while being blind to a modified row. Updating a
+    row in place leaves the count identical, so only the content digest can
+    see it -- which is the part that needed proving.
     """
     tables = ("archive_files",)
-    before = fi.database_snapshot(database, tables)
-
     database.execute(
         "INSERT INTO archive_files (file_size) VALUES (?)", (4096,)
     )
     database.commit()
 
-    assert fi.database_snapshot(database, tables) != before
+    before = fi.table_snapshot(database, tables)
+    assert before[tables[0]][0] == 1
+
+    database.execute("UPDATE archive_files SET file_size = 8192")
+    database.commit()
+
+    after = fi.table_snapshot(database, tables)
+    assert after[tables[0]][0] == 1          # count unchanged...
+    assert after != before                   # ...digest is not
+
+
+def test_data_version_only_moves_for_another_connections_commit(
+    tmp_path: Path
+) -> None:
+    """Why `table_snapshot` no longer reports `data_version`.
+
+    `PRAGMA data_version` is defined to change when a *different* connection
+    commits. A write committed by the connection doing the sampling leaves
+    it untouched -- so reporting it beside same-connection row counts
+    implied a mutation check it cannot provide.
+
+    Both halves are asserted here so the removal is justified by measurement
+    rather than by assertion in a docstring.
+    """
+    database = tmp_path / "observer.db"
+    writer = connect_database(database)
+
+    try:
+        apply_migrations(writer, MIGRATIONS)
+
+        # Same connection: its own commit does not move its own reading.
+        own_before = writer.execute("PRAGMA data_version").fetchone()[0]
+        writer.execute(
+            "INSERT INTO archive_files (file_size) VALUES (?)", (4096,)
+        )
+        writer.commit()
+        own_after = writer.execute("PRAGMA data_version").fetchone()[0]
+
+        assert own_after == own_before
+
+        # A separate observer, held open across the write, does see it.
+        with fi.observer_data_version(database) as sample:
+            observed_before = sample()
+            writer.execute(
+                "INSERT INTO archive_files (file_size) VALUES (?)", (8192,)
+            )
+            writer.commit()
+            observed_after = sample()
+
+        assert observed_after != observed_before
+    finally:
+        writer.close()
