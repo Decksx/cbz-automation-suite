@@ -889,8 +889,15 @@ class ArchivePerceptualHashRepository:
         This returns the same information from the other side. Membership is
         deliberately NOT recomputed here: the caller takes the eligible set
         from `_eligible_archive_rows()` and uses this only to *explain* the
-        complement, so the two can never disagree about who is eligible --
-        only, at worst, about why someone is not, which a test catches.
+        complement.
+
+        That keeps the two from drifting on *membership* by construction, but
+        it is not a proof that they agree -- and they did not, once. The
+        predicate joined every current location without requiring exactly one,
+        so an archive with two matching current rows was eligible while this
+        function reported `multiple_current_locations`; the classifier could
+        only abort. Both sides now refuse ambiguity, and a test asserts the
+        partition on a deliberately varied population rather than assuming it.
 
         An archive may carry several reasons at once. They are all returned:
         an archive with no signature *and* no current location has two
