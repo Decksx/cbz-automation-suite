@@ -629,7 +629,7 @@ def check_invariants(
     census: dict[str, int],
     historical: Coverage,
     operational: Coverage,
-    identities: dict | None = None,
+    identities: dict,
 ) -> list[Invariant]:
     """Every claim this report makes about its own arithmetic.
 
@@ -637,11 +637,14 @@ def check_invariants(
     one fails -- an operator needs to see the numbers that did not
     reconcile. The exit code is what turns a failure into a refusal.
 
-    `identities` carries the independent `archive_files` census. Omitting
-    it falls back to reconciling the classified rows against themselves,
-    which still catches duplicates, extras and incomplete tuples but
-    *cannot* catch an omitted identity -- so `run_audit` always supplies
-    it, and only invariant-level unit tests leave it out.
+    `identities` is required, and must come from `reconcile_identities()`
+    against an *independently read* `archive_files` id set. There is
+    deliberately no default: reconciling the classified rows against
+    their own ids makes the expected and classified sets identical by
+    construction, so both the missing and the extra count are always
+    zero. That mode would leave the "every archive" invariant reporting
+    PASS while blind to the exact failure the census was added to catch,
+    and an optional argument is how such a mode gets used by accident.
     """
     archives = result.archives
     identity_total = len(archives)
@@ -652,16 +655,12 @@ def check_invariants(
 
     # 1. One complete tuple per identity, checked against the database's
     #    own identity set rather than against the returned rows.
-    #    Comparing the rows with themselves detects a duplicate but is
-    #    blind to an omission: a zero-page identity the classifier
+    #    Comparing the rows with themselves is blind to both an omission
+    #    and an invention, because it makes the expected and classified
+    #    sets equal by construction. A zero-page identity the classifier
     #    dropped contributes nothing to the page census either, so every
     #    other number in this report would still reconcile while the
     #    library had quietly shrunk.
-    if identities is None:
-        identities = reconcile_identities(
-            result, [archive.archive_id for archive in archives]
-        )
-
     record(
         "every_archive_has_exactly_one_complete_tuple",
         identities["missing_count"] == 0
