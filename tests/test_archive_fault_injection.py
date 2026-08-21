@@ -30,7 +30,10 @@ from pathlib import Path
 import pytest
 
 from comic_automation.database.connection import connect_database
-from comic_automation.database.migrations import apply_migrations
+from comic_automation.database.migrations import (
+    applied_versions,
+    apply_migrations,
+)
 from scripts import cbz_library_maintenance
 from scripts.cbz_library_maintenance import write_comicinfo
 from tests import fault_injection as fi
@@ -583,39 +586,86 @@ def test_appended_bytes_are_caught_only_by_the_size_check(
 # --- database non-mutation under failure ---------------------------------
 
 
-def test_an_injected_commit_failure_leaves_the_tables_unchanged(
+def test_a_commit_failure_inside_a_migration_restores_the_tables(
     tmp_path: Path
 ) -> None:
-    """A genuine injected failure, not a hand-written ROLLBACK.
+    """Production owns the rollback, and is the thing under test.
 
-    The earlier version of this test issued its own BEGIN/INSERT/ROLLBACK
-    and injected nothing, so it demonstrated that SQLite rolls back when
-    told to -- not that any code under test recovers. Here the failure comes
-    from `failing_execute` firing on COMMIT, and the assertion is that the
-    tables are untouched afterwards.
+    The previous version issued its own ROLLBACK after the injected COMMIT
+    failure, so it proved SQLite honours an explicit rollback -- not that
+    any code recovers on its own. Nothing in the test exercised a
+    production transaction boundary.
+
+    Here the boundary belongs to `apply_migrations`, which opens
+    BEGIN IMMEDIATE, and whose own `except` clause issues the ROLLBACK. The
+    test injects a failure at COMMIT and then asserts, without touching the
+    connection itself, that both the migration's table and its row are
+    absent and that every pre-existing table is byte-identical to before.
     """
     tables = ("archive_files", "file_locations", "jobs")
+    directory = tmp_path / "migrations"
+    _write_migration(
+        directory,
+        14,
+        "CREATE TABLE injected_rollback (id INTEGER PRIMARY KEY);\n"
+        "INSERT INTO archive_files (file_size) VALUES (4096);\n",
+    )
+
     real = connect_database(tmp_path / "injected.db")
 
     try:
         apply_migrations(real, MIGRATIONS)
         before = fi.table_snapshot(real, tables)
+        versions_before = applied_versions(real)
 
         guarded = fi.failing_execute(real, fail_on="commit")
-        guarded.execute("BEGIN IMMEDIATE")
-        guarded.execute(
-            "INSERT INTO archive_files (file_size) VALUES (?)", (4096,)
-        )
 
         with pytest.raises(fi.InjectedFailure):
-            guarded.execute("COMMIT")
-
-        real.execute("ROLLBACK")
+            apply_migrations(guarded, directory)
 
         assert guarded.matches == 1
+
+        # No manual recovery happens here: apply_migrations already did it.
+        assert real.in_transaction is False
+
+        names = {
+            row[0]
+            for row in real.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "injected_rollback" not in names
+
+        # The migration's INSERT targeted a real table, so a partial commit
+        # would show up as a changed digest rather than only a missing
+        # table -- which is the case a schema-only assertion would miss.
         assert fi.table_snapshot(real, tables) == before
+        assert applied_versions(real) == versions_before
     finally:
         real.close()
+
+
+def test_sqlite_rolls_back_when_told_to_is_only_a_control(
+    database,
+) -> None:
+    """Named for exactly what it proves, which is not much.
+
+    Kept as the baseline the test above is measured against: if SQLite did
+    not honour an explicit ROLLBACK, that test could pass for a reason
+    having nothing to do with `apply_migrations`. It asserts a property of
+    the database engine, and its name now says so rather than implying
+    production recovery.
+    """
+    tables = ("archive_files",)
+    before = fi.table_snapshot(database, tables)
+
+    database.execute("BEGIN IMMEDIATE")
+    database.execute(
+        "INSERT INTO archive_files (file_size) VALUES (?)", (4096,)
+    )
+    database.execute("ROLLBACK")
+
+    assert fi.table_snapshot(database, tables) == before
 
 
 def test_the_snapshot_helper_notices_an_in_place_update(
