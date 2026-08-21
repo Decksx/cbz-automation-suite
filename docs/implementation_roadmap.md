@@ -106,8 +106,33 @@ not comparable — which is why the scope digest travels with them.
 | Beneath an unavailable declared root | 0 (volume mounted at audit time) |
 
 Signature-vs-location metadata mismatch, measured from the backup with no
-filesystem access, is 16 archives — the clean drift cases. The 301 above
-is the larger filesystem-observed figure and is not the same measurement.
+filesystem access, is 16 archives / 768 pages. The 301 above is the larger
+filesystem-observed figure and is not the same measurement.
+
+**Those 16 are not one remediation population.** They split, and the split
+matters because the two halves need different handling:
+
+| Group | Archives | Pages | Handling |
+| --- | ---: | ---: | --- |
+| Ordinary drift | 15 | 727 | eligible for a guarded batch re-inspection that rewrites pages, content signature and archive hash together |
+| Archive **37704** | 1 | 41 | **excluded** — needs revision semantics first |
+
+Archive 37704 carries three byte generations. Re-inspecting it in place
+would overwrite one generation with another and destroy the evidence that
+they are distinct, which is the case that motivates immutable revisions in
+the first place. It must **not** be swept into the 15 by a query that
+selects on signature mismatch alone — that query returns all 16, and
+`37704` is the one it must not act on.
+
+Archive 58201 is the related revision-semantics case but does **not**
+appear in this set: its current location metadata matches its signature,
+so a drift query will not surface it at all. Supersession and revision are
+different relationships and 37704/58201 must not be merged on their shared
+historical digest.
+
+Verified against the pre-revision backup: the 16 archives are 10999,
+18348, 27218–27228, 28440, 28441 and 37704; removing 37704 leaves exactly
+15 archives and 727 pages, and 727 + 41 = 768.
 
 #### Backfill batch record — 2026-08-19 (historical, not current)
 
@@ -531,6 +556,11 @@ terminal perceptual failures (9,510 pages), 225 path-missing refusals
 (768), and retired archive 45217 (51). A further 1,256 zero-page
 identities hold no pages and so appear in accountability rather than in
 either ratio.
+
+The 16 signature-drift archives are **15 ordinary drift cases (727 pages)
+plus archive 37704 (41 pages)**, which needs revision semantics and must
+be kept out of any guarded re-inspection batch. See "Filesystem
+observations" above for why a mismatch query alone returns all 16.
 
 Operational coverage differs from historical by exactly the 51 pages of
 the single retirement. Note that archive 45217 has **zero covered
