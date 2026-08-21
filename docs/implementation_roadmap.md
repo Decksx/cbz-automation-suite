@@ -894,11 +894,17 @@ compared on their numbers alone.
 The `complete` / `incomplete` / `failed` / `stale` / `ineligible`
 population model is removed, along with the `never_enqueued_backlog`
 field and the `--stale-older-than-seconds` and
-`--expect-backfill-complete` flags. `--scope` replaces them. The backlog
-field was a *positive predicate*, so it reported archives that were fully
-explained by a path refusal while staying silent on the ones that had no
-explanation at all — which is why its replacement is residue rather than
-a population.
+`--expect-backfill-complete` flags. Nothing replaces their behaviour —
+the completion-gate and staleness modes are gone, not renamed.
+
+Separately, `--scope` was **added**. It is a new argument declaring which
+filesystem roots a run may observe, and it carries scope identity through
+the canonical digest; it is not a substitute for either removed flag.
+
+The backlog field was a *positive predicate*, so it reported archives that
+were fully explained by a path refusal while staying silent on the ones
+that had no explanation at all — which is why `unexplained` is residue
+rather than a population.
 
 Historical run logs and dated handoffs describing the previous audit's
 output are left as written; they record what that command actually
