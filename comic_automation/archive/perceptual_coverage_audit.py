@@ -244,6 +244,77 @@ def validate_output_paths(
 # --- the independent page census -----------------------------------------
 
 
+def identity_census(connection: sqlite3.Connection) -> list[int]:
+    """Every `archive_files` id, read independently of the classifier.
+
+    The page census cannot stand in for this one. An archive holding zero
+    pages contributes nothing to `archive_pages`, so a classifier that
+    dropped such an identity entirely would leave every page number in
+    this report reconciling perfectly -- the library would simply have
+    become smaller without anything saying so. Reading the identity set
+    straight from `archive_files` is the only way the audit can notice.
+    """
+    return [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM archive_files ORDER BY id"
+        )
+    ]
+
+
+def reconcile_identities(
+    result: ClassificationResult, expected_ids: Sequence[int]
+) -> dict:
+    """Compare the classified identity set against the database's own.
+
+    Four distinct ways this can go wrong, reported separately because
+    they have different causes: an identity the classifier dropped, one
+    it invented, one it emitted twice, and one whose axis tuple is
+    incomplete. Collapsing them into a single boolean would say the
+    report is untrustworthy without saying what to go and look at.
+    """
+    expected = set(expected_ids)
+    classified_ids = [archive.archive_id for archive in result.archives]
+    classified = set(classified_ids)
+
+    seen: set[int] = set()
+    duplicates: set[int] = set()
+
+    for archive_id in classified_ids:
+        if archive_id in seen:
+            duplicates.add(archive_id)
+
+        seen.add(archive_id)
+
+    incomplete = [
+        archive.archive_id
+        for archive in result.archives
+        if not all(
+            (
+                archive.disposition,
+                archive.availability,
+                archive.inventory,
+                archive.perceptual_work,
+                archive.selection,
+            )
+        )
+    ]
+
+    return {
+        "expected_identities": len(expected),
+        "classified_identities": len(classified_ids),
+        "classified_distinct_identities": len(classified),
+        "missing_count": len(expected - classified),
+        "missing_archive_ids": sorted(expected - classified),
+        "extra_count": len(classified - expected),
+        "extra_archive_ids": sorted(classified - expected),
+        "duplicate_count": len(duplicates),
+        "duplicate_archive_ids": sorted(duplicates),
+        "incomplete_tuple_count": len(incomplete),
+        "incomplete_tuple_archive_ids": sorted(incomplete),
+    }
+
+
 def page_census(connection: sqlite3.Connection) -> dict[str, int]:
     """Whole-table page facts, counted independently of the contract.
 
@@ -331,6 +402,15 @@ class Coverage:
     excluded_pages: int
     excluded_archives: int
     basis: str
+    # Split out so the derivation is visible rather than inferred. A
+    # denominator that shrank by the right amount says nothing about
+    # whether the numerator moved with it, and the retirement this
+    # library actually holds (archive 45217) has zero covered pages --
+    # so an implementation that shrank the denominator and kept the full
+    # historical numerator would produce the correct total on production
+    # data while being wrong.
+    excluded_covered_pages: int = 0
+    excluded_outstanding_pages: int = 0
 
     @property
     def percentage(self) -> float:
@@ -351,6 +431,8 @@ class Coverage:
             "outstanding_pages": self.outstanding_pages,
             "excluded_pages": self.excluded_pages,
             "excluded_archives": self.excluded_archives,
+            "excluded_covered_pages": self.excluded_covered_pages,
+            "excluded_outstanding_pages": self.excluded_outstanding_pages,
             "percentage": round(self.percentage, 6),
             "percentage_display": f"{self.percentage:.4f}%",
             "basis": self.basis,
@@ -425,6 +507,10 @@ def measure_operational(
         total_pages=sum(archive.total_pages for archive in retained),
         excluded_pages=sum(archive.total_pages for archive in excluded),
         excluded_archives=len(excluded),
+        excluded_covered_pages=sum(_covered(archive) for archive in excluded),
+        excluded_outstanding_pages=sum(
+            archive.outstanding_pages for archive in excluded
+        ),
         basis=MEASUREMENT_BASIS[MEASUREMENT_OPERATIONAL],
     )
 
@@ -543,12 +629,19 @@ def check_invariants(
     census: dict[str, int],
     historical: Coverage,
     operational: Coverage,
+    identities: dict | None = None,
 ) -> list[Invariant]:
     """Every claim this report makes about its own arithmetic.
 
     These are checks, not assertions, so the report is still written when
     one fails -- an operator needs to see the numbers that did not
     reconcile. The exit code is what turns a failure into a refusal.
+
+    `identities` carries the independent `archive_files` census. Omitting
+    it falls back to reconciling the classified rows against themselves,
+    which still catches duplicates, extras and incomplete tuples but
+    *cannot* catch an omitted identity -- so `run_audit` always supplies
+    it, and only invariant-level unit tests leave it out.
     """
     archives = result.archives
     identity_total = len(archives)
@@ -557,26 +650,33 @@ def check_invariants(
     def record(name: str, passed: bool, detail: str) -> None:
         invariants.append(Invariant(name=name, passed=passed, detail=detail))
 
-    # 1. One complete tuple per identity.
-    distinct_ids = {archive.archive_id for archive in archives}
-    incomplete_tuples = [
-        archive.archive_id
-        for archive in archives
-        if not all(
-            (
-                archive.disposition,
-                archive.availability,
-                archive.inventory,
-                archive.perceptual_work,
-                archive.selection,
-            )
+    # 1. One complete tuple per identity, checked against the database's
+    #    own identity set rather than against the returned rows.
+    #    Comparing the rows with themselves detects a duplicate but is
+    #    blind to an omission: a zero-page identity the classifier
+    #    dropped contributes nothing to the page census either, so every
+    #    other number in this report would still reconcile while the
+    #    library had quietly shrunk.
+    if identities is None:
+        identities = reconcile_identities(
+            result, [archive.archive_id for archive in archives]
         )
-    ]
+
     record(
         "every_archive_has_exactly_one_complete_tuple",
-        len(distinct_ids) == identity_total and not incomplete_tuples,
-        f"{identity_total} rows, {len(distinct_ids)} distinct ids, "
-        f"{len(incomplete_tuples)} incomplete tuples",
+        identities["missing_count"] == 0
+        and identities["extra_count"] == 0
+        and identities["duplicate_count"] == 0
+        and identities["incomplete_tuple_count"] == 0,
+        f"expected {identities['expected_identities']} identities, "
+        f"classified {identities['classified_identities']} "
+        f"({identities['classified_distinct_identities']} distinct); "
+        f"missing={identities['missing_count']} "
+        f"extra={identities['extra_count']} "
+        f"duplicate={identities['duplicate_count']} "
+        f"incomplete={identities['incomplete_tuple_count']}; "
+        f"missing_ids={identities['missing_archive_ids'][:10]} "
+        f"extra_ids={identities['extra_archive_ids'][:10]}",
     )
 
     # 2. Each axis independently sums to the identity total. Computed
@@ -690,6 +790,39 @@ def check_invariants(
         f"{historical.total_pages} excluded={operational.excluded_pages}",
     )
 
+    # 10. The numerator has to move with the denominator. Checking only
+    #     the denominator would pass an implementation that removed a
+    #     retired archive's pages from the total while keeping its
+    #     covered pages in the numerator -- and on this library that bug
+    #     is invisible, because the one retirement on record (archive
+    #     45217) has zero covered pages to keep.
+    excluded_covered = sum(
+        _covered(archive) for archive in dispositioned
+    )
+    excluded_outstanding = sum(
+        archive.outstanding_pages for archive in dispositioned
+    )
+    record(
+        "operational_numerator_is_historical_minus_dispositioned",
+        operational.covered_pages
+        == historical.covered_pages - excluded_covered
+        and operational.excluded_covered_pages == excluded_covered,
+        f"operational={operational.covered_pages} historical="
+        f"{historical.covered_pages} excluded_covered={excluded_covered} "
+        f"reported_excluded_covered="
+        f"{operational.excluded_covered_pages}",
+    )
+    record(
+        "operational_outstanding_is_historical_minus_dispositioned",
+        operational.outstanding_pages
+        == historical.outstanding_pages - excluded_outstanding
+        and operational.excluded_outstanding_pages == excluded_outstanding,
+        f"operational={operational.outstanding_pages} historical="
+        f"{historical.outstanding_pages} excluded_outstanding="
+        f"{excluded_outstanding} reported_excluded_outstanding="
+        f"{operational.excluded_outstanding_pages}",
+    )
+
     return invariants
 
 
@@ -698,17 +831,21 @@ def check_invariants(
 
 def collect(
     connection: sqlite3.Connection, *, scope: Sequence[str] | None
-) -> tuple[ClassificationResult, dict[str, int]]:
+) -> tuple[ClassificationResult, dict[str, int], list[int]]:
     """Every read this audit performs, inside one snapshot.
+
+    Three reads, deliberately: the classification, an independent page
+    census and an independent identity census. All three must come from
+    the same snapshot or the reconciliations between them would compare
+    different states of the library.
 
     Kept as a single module-level function, and looked up on the module
     at call time by `run_audit`, so the WAL regression tests can wrap it
-    and commit from another connection between the classification and
-    the census -- which is precisely the interleaving the data_version
-    bracket exists to catch.
+    and commit from another connection between the reads -- which is
+    precisely the interleaving the data_version bracket exists to catch.
     """
     result = classification_module.classify(connection, scope=scope)
-    return result, page_census(connection)
+    return result, page_census(connection), identity_census(connection)
 
 
 _CSV_FIELDNAMES = [
@@ -823,7 +960,7 @@ def run_audit(
 
     def read(
         connection: sqlite3.Connection,
-    ) -> tuple[ClassificationResult, dict[str, int]]:
+    ) -> tuple[ClassificationResult, dict[str, int], list[int]]:
         # Looked up on the module at call time, so tests can wrap it.
         return globals()["collect"](connection, scope=scope)
 
@@ -833,7 +970,7 @@ def run_audit(
         context="audit",
         integrity_check=quick_check,
     )
-    result, census = snapshot.result
+    result, census, expected_ids = snapshot.result
 
     # Re-stat *after* the connection is closed: if opening read-only or
     # running any SELECT touched the file (it should not -- mode=ro plus
@@ -856,7 +993,10 @@ def run_audit(
     historical = measure_historical(result.archives)
     operational = measure_operational(result.archives)
     accountability = build_accountability(result)
-    invariants = check_invariants(result, census, historical, operational)
+    identities = reconcile_identities(result, expected_ids)
+    invariants = check_invariants(
+        result, census, historical, operational, identities
+    )
     failed = [invariant for invariant in invariants if not invariant.passed]
 
     output = {
@@ -866,6 +1006,7 @@ def run_audit(
         "scope_digest": result.scope.digest,
         "filesystem_consulted": result.filesystem_consulted,
         "page_census": census,
+        "identity_census": identities,
         "measurements": {
             MEASUREMENT_HISTORICAL: historical.as_dict(),
             MEASUREMENT_OPERATIONAL: operational.as_dict(),
@@ -1006,6 +1147,17 @@ def _print_coverage(coverage: dict) -> None:
         f"    excluded:        {coverage['excluded_pages']:,} pages "
         f"across {coverage['excluded_archives']:,} identities"
     )
+    # Printed so the numerator's derivation is visible: a denominator
+    # that shrank by the right amount says nothing about whether the
+    # covered pages moved with it.
+    print(
+        f"      of which covered:     "
+        f"{coverage['excluded_covered_pages']:,}"
+    )
+    print(
+        f"      of which outstanding: "
+        f"{coverage['excluded_outstanding_pages']:,}"
+    )
     print(f"    basis:           {coverage['basis']}")
 
 
@@ -1038,6 +1190,36 @@ def print_summary(output: dict) -> None:
     print(
         f"  missing dimensions:       "
         f"{census['pages_missing_dimensions']:,}"
+    )
+    print()
+
+    identities = output["identity_census"]
+    print("IDENTITY CENSUS (independent of the classification)")
+    print(
+        f"  archive_files rows:       "
+        f"{identities['expected_identities']:,}"
+    )
+    print(
+        f"  classified rows:          "
+        f"{identities['classified_identities']:,}"
+    )
+    print(f"  missing:                  {identities['missing_count']:,}")
+    print_archive_id_sample(
+        identities["missing_archive_ids"], indent="    ", label="MISSING"
+    )
+    print(f"  extra:                    {identities['extra_count']:,}")
+    print_archive_id_sample(
+        identities["extra_archive_ids"], indent="    ", label="EXTRA"
+    )
+    print(f"  duplicate:                {identities['duplicate_count']:,}")
+    print_archive_id_sample(
+        identities["duplicate_archive_ids"],
+        indent="    ",
+        label="DUPLICATE",
+    )
+    print(
+        f"  incomplete tuples:        "
+        f"{identities['incomplete_tuple_count']:,}"
     )
     print()
 
