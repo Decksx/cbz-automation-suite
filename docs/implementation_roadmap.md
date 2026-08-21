@@ -18,43 +18,129 @@ second blocks further batches until applied. See §"2026-08-17 guarded
 batch and its findings" below.
 
 Structural changes to archive identity, revision ownership, and hash
-foreign keys remain deferred until the Version 1 perceptual-hash
-backfill and its final coverage audit are complete. That deferral is
-unchanged and was reaffirmed in review: full coverage and the final
-audit remain roadmap requirements before revision work, and are not
-descoped by the fact that duplicate detection turned out not to depend
-on them.
+foreign keys were deferred until the Version 1 perceptual-hash backfill
+and its final coverage audit were complete. **Both are now complete** —
+the backfill on 2026-08-19 and the audit on 2026-08-21 — so that
+particular gate is satisfied; see "Audited baseline — 2026-08-21" under
+Step 1.
+
+Satisfying it does not by itself authorise structural work. The golden
+corpus and fault-injection harness, and then the minimum local DAL,
+still come first.
 
 ### Current production metrics
 
-These values are the last fully reconciled production baseline. Update
-this table after each major guarded run and after the final coverage
-audit.
+These values are the last fully reconciled production baseline,
+reconciled against the final coverage audit of 2026-08-21. Update this
+table after each major guarded run.
+
+Rows are grouped by **where the number comes from**, because they are not
+all the same kind of fact and mixing them is how a mid-backfill snapshot
+sat in a "current" table for four days.
+
+#### Database state — reconciled 2026-08-21 against the pre-revision backup
+
+Measured from
+`G:\ComicAutomation\backups\inspection-working.2026-08-21.post-audit-pre-revision.db`
+(sha256 `4c0654b7…86c17a`). That file is immutable, so these figures stay
+checkable after intake resumes.
 
 | Metric | Verified value |
 | --- | ---: |
 | Logical archive rows | 59,688 |
-| Current file locations/archives | 59,377 |
-| Archive SHA-256 rows | 59,541 |
+| Current file locations (`is_current = 1`) | 59,377 |
+| Archive SHA-256 rows (`archive_hashes`) | 59,541 |
 | Archive content signatures | 58,437 |
-| Exact duplicate groups | 886 |
-| Redundant copies in those groups | 1,085 |
-| Page SHA-256 rows | 2,955,304 |
-| Perceptual job rows | 45,700 |
-| Perceptual jobs completed | 57,896 |
-| Perceptual jobs failed | 132 |
-| Active perceptual jobs | 0 |
-| Production schema migrations | 1–12 |
+| Page SHA-256 rows (`page_hashes`, sha256 v1) | 2,955,391 |
+| Archive pages | 2,955,391 |
 | dHash rows, Version 1 | 2,932,841 |
 | pHash rows, Version 1 | 2,932,841 |
 | Pages with exactly one perceptual hash | 0 |
-| Perceptual page coverage | 99.24% (2,932,841 / 2,955,391) |
-| Database-eligible archives | 226 |
-| Enqueueable after selection | 0 |
+| Perceptual job rows (all statuses) | 58,029 |
+| Perceptual jobs completed | 57,896 |
+| Perceptual jobs failed | 132 |
+| Perceptual jobs cancelled | 1 |
+| Active perceptual jobs | 0 |
+| Distinct archives with a perceptual job | 58,029 |
+| Exact duplicate groups (by content digest) | 888 |
+| Redundant copies in those groups | 1,090 |
+| Near-duplicate candidate rows | 3,000 |
+| Archive retirements / supersessions | 1 / 0 |
+| Quarantine rows, `pending_redownload` | 35 |
+| `archive_files.sha256` populated | 0 (deliberately; see Step 2 notes) |
+| Production schema migrations | 1–13 |
+
+The perceptual job rows reconcile exactly: 58,029 = 57,896 completed + 132
+failed + 1 cancelled. The previously recorded 45,700 was a mid-backfill
+snapshot and could not have been current, since 45,700 rows cannot contain
+57,896 completed jobs.
+
+#### Coverage accounting — 2026-08-21 audit, scope `X:\`
+
+Scope digest `e51ea80488d072e1ef6beb143248bda4cc5383c0c2d848756c82ca98b4ffae89`.
+
+| Metric | Verified value |
+| --- | ---: |
+| Historical page coverage | 99.2370% (2,932,841 / 2,955,391) |
+| Operational page coverage | 99.2387% (2,932,841 / 2,955,340) |
+| Outstanding pages | 22,550 |
+| Archive identities reconciled | 59,688 (0 missing, 0 extra, 0 duplicate, 0 incomplete) |
+| Unexplained residue | 0 |
+| Zero-page identities | 1,256 |
+| Selection: eligible / refused / excluded | 0 / 226 / 59,462 |
 | Refused: retired / path missing | 1 / 225 |
-| Archives whose file changed under them | 95 |
-| Near-duplicate candidates | 3,000 |
-| Broken current locations | 1,081 |
+
+#### Filesystem observations — 2026-08-21 audit, scope `X:\`
+
+**Scope-dependent.** These describe what the audit could see under the
+declared root at that moment, not properties of the content. A run under a
+different declared scope answers a different question and its numbers are
+not comparable — which is why the scope digest travels with them.
+
+| Metric | Observed value |
+| --- | ---: |
+| Present, metadata matching | 58,301 |
+| Present, size or mtime drifted | 301 |
+| Missing under the declared root | 775 |
+| No current location | 311 |
+| Beneath an unavailable declared root | 0 (volume mounted at audit time) |
+
+Signature-vs-location metadata mismatch, measured from the backup with no
+filesystem access, is 16 archives / 768 pages. The 301 above is the larger
+filesystem-observed figure and is not the same measurement.
+
+**Those 16 are not one remediation population.** They split, and the split
+matters because the two halves need different handling:
+
+| Group | Archives | Pages | Handling |
+| --- | ---: | ---: | --- |
+| Ordinary drift | 15 | 727 | eligible for a guarded batch re-inspection that rewrites pages, content signature and archive hash together |
+| Archive **37704** | 1 | 41 | **excluded** — needs revision semantics first |
+
+Archive 37704 carries three byte generations. Re-inspecting it in place
+would overwrite one generation with another and destroy the evidence that
+they are distinct, which is the case that motivates immutable revisions in
+the first place. It must **not** be swept into the 15 by a query that
+selects on signature mismatch alone — that query returns all 16, and
+`37704` is the one it must not act on.
+
+Archive 58201 is the related revision-semantics case but does **not**
+appear in this set: its current location metadata matches its signature,
+so a drift query will not surface it at all. Supersession and revision are
+different relationships and 37704/58201 must not be merged on their shared
+historical digest.
+
+Verified against the pre-revision backup: the 16 archives are 10999,
+18348, 27218–27228, 28440, 28441 and 37704; removing 37704 leaves exactly
+15 archives and 727 pages, and 727 + 41 = 768.
+
+#### Backfill batch record — 2026-08-19 (historical, not current)
+
+These describe the completed backfill run and are retained as evidence.
+They are **not** current-state figures.
+
+| Metric | Recorded value |
+| --- | ---: |
 | Last guarded batch | 2,550 processed (remainder) |
 | Backfill totals, 2026-08-19 | 12,329 processed, 12,313 succeeded, 11 terminal |
 | Backfill terminal-failure rate | 0.09% |
@@ -317,11 +403,11 @@ external `relocation-repair-2026-08-18-outcome.md`.
 
 Duplicate *control* turned out not to depend on finishing the backfill.
 Exact duplicates are decidable from `archive_content_signatures` alone,
-and near-duplicate detection produces high-confidence candidates at the
-current 79% coverage. That does not descope Step 1: full coverage and
-the final terminal-failure audit remain prerequisites for the revision
-work in Steps 2–4, and changing that is a review decision rather than
-something a measurement settles.
+and near-duplicate detection produced high-confidence candidates at the
+79% coverage of the time. That did not descope Step 1: full coverage and
+the final terminal-failure audit remained prerequisites for the revision
+work in Steps 2–4. Both were met on 2026-08-19 and 2026-08-21
+respectively, and coverage is now 99.2370% historical.
 
 What it does change is that duplicate control can proceed in parallel
 rather than waiting, and that location repair is now a prerequisite for
@@ -427,16 +513,76 @@ Before the next structural database migration:
 - ~~complete the remaining Version 1 backfill;~~ **done 2026-08-19** — three
   guarded batches, 12,329 processed, coverage 79.16% -> 99.24%, and
   `enqueueable` now 0;
-- audit full-library coverage;
-- classify legitimate terminal failures;
-- capture a final database backup;
-- verify the backup independently;
-- update the production metrics and development log.
+- ~~audit full-library coverage;~~ **done 2026-08-21** — see the audited
+  baseline below;
+- ~~classify legitimate terminal failures;~~ **done 2026-08-21** — 132
+  archives / 9,510 pages, all genuine media defects (40 corrupt archives,
+  92 corrupt page images);
+- ~~capture a final database backup;~~ **done 2026-08-21**;
+- ~~verify the backup independently;~~ **done 2026-08-21**;
+- ~~update the production metrics and development log.~~ **done
+  2026-08-21** — the metrics table below is reconciled against the
+  pre-revision backup, and `docs/development_log_2026-08-21.md`
+  records the cycle.
 
-The backfill itself is finished. **The audit is not**, and it is the remaining
-gate on Step 2. The 22,550 pages still without a Version 1 hash belong to the
-226 refused archives and the 132 terminal failures, and the audit has to say so
-archive by archive rather than by subtraction.
+**Step 1 is complete.** It is no longer a gate on Step 2.
+
+#### Audited baseline — 2026-08-21
+
+Produced by `scripts\comic_perceptual_coverage_audit.py` on a quiesced
+database (GUI and watcher stopped), read-only, under declared scope `X:\`
+with canonical digest
+`e51ea80488d072e1ef6beb143248bda4cc5383c0c2d848756c82ca98b4ffae89`. All
+14 invariants passed; `data_version` 2 -> 2 and the database file was
+unchanged.
+
+| measurement | figure |
+| --- | --- |
+| historical coverage | 2,932,841 / 2,955,391 = **99.2370%** |
+| operational coverage | 2,932,841 / 2,955,340 = **99.2387%** |
+| outstanding pages | **22,550** |
+| archive identities reconciled | **59,688** |
+| unexplained residue | **0** |
+
+Schema is at **migrations 1–13**. The identity census reconciled the
+classified set against `archive_files` exactly: zero missing, zero extra,
+zero duplicate, zero incomplete tuples. dHash and pHash Version 1 counts
+are equal at 2,932,841 with zero half-paired pages, and no completed job
+left partial coverage.
+
+The 22,550 outstanding pages reconcile exactly across 536 archives: 132
+terminal perceptual failures (9,510 pages), 225 path-missing refusals
+(6,879), 162 with no current location (5,342), 16 signature-drift
+(768), and retired archive 45217 (51). A further 1,256 zero-page
+identities hold no pages and so appear in accountability rather than in
+either ratio.
+
+The 16 signature-drift archives are **15 ordinary drift cases (727 pages)
+plus archive 37704 (41 pages)**, which needs revision semantics and must
+be kept out of any guarded re-inspection batch. See "Filesystem
+observations" above for why a mismatch query alone returns all 16.
+
+Operational coverage differs from historical by exactly the 51 pages of
+the single retirement. Note that archive 45217 has **zero covered
+pages**, so it cannot demonstrate that the operational *numerator* is
+subtracted correctly — any test of that behaviour needs a partially
+covered archive instead.
+
+#### Final pre-revision backup — 2026-08-21
+
+The `2026-08-20.pre-migration-013` backup predates migration 013 and is
+therefore **not** the pre-revision baseline. The final one is:
+
+```text
+G:\ComicAutomation\backups\inspection-working.2026-08-21.post-audit-pre-revision.db
+bytes   2,378,436,608
+sha256  4c0654b7b4c88cebc3cbcfda3af72e50ac85dac7179def5d7be679b83486c17a
+```
+
+Verified independently of the backup tool's own report: `quick_check` and
+`integrity_check` both `ok`, all 71 schema objects compared verbatim,
+migrations exactly 1–13, and eleven headline counts equal between source
+and backup. The source was confirmed byte-unchanged by the backup run.
 
 ### Step 1A — Phase 5 performance optimization
 
@@ -807,7 +953,13 @@ For each optimized batch:
 Do not treat a throughput improvement alone as success. Integrity,
 idempotency, Version 1 equality, and reconciliation remain mandatory.
 
-Latest production result:
+Production result of the 2026-08-17 guarded batch. **These are the
+figures for that batch, not current library state** — three further
+batches ran to 2026-08-19 and the final audit landed 2026-08-21. For
+current figures see "Audited baseline — 2026-08-21" under Step 1; in
+particular `eligible archives remaining` below reached 0 on 2026-08-19,
+and the dHash/pHash Version 1 rows below have since risen to 2,932,841
+each:
 
 ```text
 processed:                              5,000
@@ -830,7 +982,7 @@ SHA-256 remained unchanged; the backup retained its pre-batch counts
 and metadata; near-duplicate candidates remained zero; and the
 repository stayed clean.
 
-Latest production phase distribution:
+Phase distribution measured during that same 2026-08-17 batch:
 
 ```text
 image open and decode:       54.827%
