@@ -97,6 +97,7 @@ import hashlib
 import os
 import sqlite3
 import stat as stat_module
+from pathlib import Path
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
@@ -264,6 +265,43 @@ class PartitionError(ClassificationInvariantError):
 # --- declared scope ------------------------------------------------------
 
 
+def normalize_root(root: str) -> str:
+    """Strip ordinary trailing separators without destroying an anchor.
+
+    A plain ``rstrip("\\\\/")`` looks right and is not: it turns ``X:\\`` into
+    ``X:`` and ``/`` into the empty string. Neither survives as a root --
+    ``X:`` is drive-*relative* on Windows, naming whatever directory that
+    drive's process-wide cursor happens to point at, and an empty prefix
+    matches nothing. This matters directly here, because the authoritative
+    scan root recorded in `discovery_checkpoints` is exactly ``X:\\``.
+
+    `pathlib` already draws this distinction correctly -- it strips
+    ``X:\\Comix\\`` to ``X:\\Comix`` while leaving ``X:\\`` and ``\\`` intact --
+    so the anchor logic is borrowed rather than rewritten.
+
+    A bare drive spelling with no separator (``X:``) is resolved to that
+    drive's root. It cannot mean anything else in an argument that names a
+    scope root, and leaving it drive-relative would make containment depend on
+    the process's current directory.
+    """
+    text = str(root)
+
+    if not text:
+        raise ValueError("A declared scope root must not be empty.")
+
+    drive, remainder = os.path.splitdrive(text)
+
+    if drive and not remainder:
+        return drive + os.sep
+
+    return str(Path(text))
+
+
+def _comparison_key(path: str) -> str:
+    """Case-folded, separator-normalised form used for containment only."""
+    return str(path).replace("/", os.sep).casefold()
+
+
 @dataclass(frozen=True)
 class DeclaredScope:
     """The filesystem roots this run was told to consider, and their state.
@@ -288,10 +326,23 @@ class DeclaredScope:
         if roots is None:
             return cls(roots=(), reachable=())
 
-        ordered = tuple(str(root).rstrip("\\/") for root in roots)
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for root in roots:
+            candidate = normalize_root(root)
+            key = _comparison_key(candidate)
+
+            # Deduplicated case-insensitively: the library lives on a
+            # case-insensitive volume, so X:\Comix and x:\comix are one root
+            # and declaring both must not make the scope look different.
+            if key not in seen:
+                seen.add(key)
+                normalized.append(candidate)
+
         return cls(
-            roots=ordered,
-            reachable=tuple(os.path.isdir(root) for root in ordered),
+            roots=tuple(normalized),
+            reachable=tuple(os.path.isdir(root) for root in normalized),
         )
 
     @property
@@ -301,28 +352,40 @@ class DeclaredScope:
 
     @property
     def digest(self) -> str:
-        """Fingerprint of the declared set, for comparing two reports."""
-        joined = "\n".join(
-            f"{root}\t{reachable}"
-            for root, reachable in zip(self.roots, self.reachable)
-        )
+        """Fingerprint of *which roots were declared*, and nothing else.
+
+        Canonicalised, deduplicated and sorted, so declaring the same set in a
+        different order gives the same digest. Reachability is deliberately
+        excluded: mounting a volume changes what this run could observe, not
+        which scope it was asked about, and folding it in meant a report taken
+        before a drive came back was labelled as covering a different scope
+        than one taken after. Reachability is observation data and lives in
+        `as_dict()`.
+        """
+        joined = "\n".join(sorted(_comparison_key(root) for root in self.roots))
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
     def containing_root(self, path: str) -> tuple[str, bool] | None:
         """The declared root holding `path`, and whether it is reachable."""
-        candidate = str(path).replace("/", "\\").casefold()
+        candidate = _comparison_key(path)
         best: tuple[str, bool] | None = None
         best_length = -1
 
         for root, reachable in zip(self.roots, self.reachable):
-            prefix = root.replace("/", "\\").casefold() + "\\"
+            key = _comparison_key(root)
+            # A root that is already an anchor (``X:\``, ``\``, a UNC share)
+            # ends with a separator and must not have another appended, or
+            # nothing beneath it would ever match.
+            prefix = key if key.endswith(os.sep) else key + os.sep
 
             # Longest prefix wins, not the first declared. With X:\ and
             # X:\Horrorsplat both declared, first-match made the answer depend
             # on argument order -- so whether a path was judged against the
             # volume or against the folder was decided by how the caller
             # happened to type the list.
-            if candidate.startswith(prefix) and len(prefix) > best_length:
+            if (
+                candidate == key or candidate.startswith(prefix)
+            ) and len(prefix) > best_length:
                 best, best_length = (root, reachable), len(prefix)
 
         return best
@@ -504,42 +567,59 @@ def _job_histories(
     cancelled job did not complete -- so "when did this job end" is
     COALESCE over both, exactly as that migration's comment says. Ties fall
     back to job id, which is monotonic.
+
+    Two queries, and they must stay two. An earlier version aggregated
+    `MAX(ended_at)` and `MAX(id)` per status and compared the pairs, which
+    reads like a shortcut and is not one: those two maxima can come from
+    different rows, so the comparison is against a job that does not exist.
+    Given completed(id 10, Feb 1), completed(id 30, Jan 1) and
+    failed(id 20, Feb 1), it synthesised completed(Feb 1, id 30) and declared
+    the archive completed -- when the actual latest row is the failure. The
+    ordering has to be applied to real rows.
     """
     counts: dict[int, Counter] = defaultdict(Counter)
-    newest: dict[int, tuple] = {}
 
     for row in connection.execute(
         """
-        SELECT
-            archive_id,
-            status,
-            COUNT(*) AS n,
-            MAX(COALESCE(completed_at, cancelled_at, '')) AS ended_at,
-            MAX(id) AS newest_id
+        SELECT archive_id, status, COUNT(*) AS n
         FROM jobs
         WHERE job_type = ? AND archive_id IS NOT NULL
         GROUP BY archive_id, status
         """,
         (job_type,),
     ):
-        archive_id = int(row["archive_id"])
-        status = str(row["status"])
-        counts[archive_id][status] = int(row["n"])
+        counts[int(row["archive_id"])][str(row["status"])] = int(row["n"])
 
-        if status not in (WORK_COMPLETED, WORK_FAILED, WORK_CANCELLED):
-            continue
+    latest: dict[int, str] = {}
 
-        key = (str(row["ended_at"] or ""), int(row["newest_id"]))
-
-        if archive_id not in newest or key > newest[archive_id][0]:
-            newest[archive_id] = (key, status)
+    for row in connection.execute(
+        """
+        SELECT archive_id, status
+        FROM (
+            SELECT
+                archive_id,
+                status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY archive_id
+                    ORDER BY
+                        COALESCE(completed_at, cancelled_at, '') DESC,
+                        id DESC
+                ) AS rank_in_archive
+            FROM jobs
+            WHERE job_type = ?
+              AND archive_id IS NOT NULL
+              AND status IN ('completed', 'failed', 'cancelled')
+        )
+        WHERE rank_in_archive = 1
+        """,
+        (job_type,),
+    ):
+        latest[int(row["archive_id"])] = str(row["status"])
 
     return {
         archive_id: JobHistory(
             counts=archive_counts,
-            latest_terminal=(
-                newest[archive_id][1] if archive_id in newest else None
-            ),
+            latest_terminal=latest.get(archive_id),
         )
         for archive_id, archive_counts in counts.items()
     }
@@ -699,8 +779,10 @@ def classify(
 
     `scope` names the filesystem roots this run may look at. Omit it to skip
     the filesystem entirely, in which case availability is ``not_observed``
-    and selection reports the database-level answer -- honest, and clearly
-    labelled as such by `ClassificationResult.filesystem_consulted`.
+    and every archive that would otherwise be eligible is refused
+    ``scope_not_observed`` -- because a precondition nobody tested must not be
+    asserted in either direction. `ClassificationResult.filesystem_consulted`
+    labels the run so the distinction is never silent.
 
     Raises `ClassificationInvariantError` when a stored invariant has been
     bypassed: conflicting dispositions, a supersession cycle, or a broken
