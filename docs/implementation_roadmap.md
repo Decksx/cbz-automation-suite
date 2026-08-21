@@ -869,12 +869,46 @@ recovers age-stale jobs automatically, because the queue has no leases or
 heartbeats with which to distinguish a dead worker from legitimate
 long-running work. Recovery is an explicit guarded operator action.
 
-The full-library coverage audit now reports the 17,554 eligible archives
-with no job history as the expected never-enqueued backlog during the
-bounded backfill. Its strict `--expect-backfill-complete` mode verifies
-that both `incomplete` and `stale` populations are zero and exits 2 while
-work remains; it cannot pass merely because all remaining archives have
-job history.
+The full-library coverage audit is built on the shared classification
+contract (`comic_automation/archive/classification.py`) and reports three
+separate measurements rather than one population count:
+
+- **Historical coverage** — the frozen `archive_pages` denominator.
+  Retirements, supersessions, missing files, unavailable roots and
+  signature drift may never move it. Pages that were hashed do not become
+  unhashed because a volume was unmounted.
+- **Operational coverage** — excludes pages only for identities carrying a
+  recorded retirement or supersession. Disposition is the only stored
+  axis, and a decision is the only thing entitled to shrink operational
+  scope; availability observations never move this number.
+- **Accountability** — every archive identity, including the zero-page
+  ones that neither ratio can describe, with independent totals on every
+  classification axis.
+
+`unexplained` is residue only: no predicate produces it, and a non-zero
+count fails the run. The declared roots and the canonical
+`DeclaredScope.digest` are printed with every report, because two runs
+taken under different scopes answer different questions and must not be
+compared on their numbers alone.
+
+The `complete` / `incomplete` / `failed` / `stale` / `ineligible`
+population model is removed, along with the `never_enqueued_backlog`
+field and the `--stale-older-than-seconds` and
+`--expect-backfill-complete` flags. Nothing replaces their behaviour —
+the completion-gate and staleness modes are gone, not renamed.
+
+Separately, `--scope` was **added**. It is a new argument declaring which
+filesystem roots a run may observe, and it carries scope identity through
+the canonical digest; it is not a substitute for either removed flag.
+
+The backlog field was a *positive predicate*, so it reported archives that
+were fully explained by a path refusal while staying silent on the ones
+that had no explanation at all — which is why `unexplained` is residue
+rather than a population.
+
+Historical run logs and dated handoffs describing the previous audit's
+output are left as written; they record what that command actually
+reported at the time.
 
 #### H. Recover in-place source drift
 

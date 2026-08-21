@@ -1,117 +1,86 @@
-"""Read-only, full-library Version 1 perceptual-hash coverage audit.
+"""Read-only perceptual-coverage accounting, built on the shared contract.
 
-`perceptual_failure_audit.py` answers a narrower question: which
-`hash_archive_pages_perceptual` jobs terminally failed, and why. This
-module answers a broader one, appropriate for the end of a backfill
-(see docs/production_handoff_2026-07-30.md, "Remaining project
-sequence" step 3): for *every* archive, whether it ever had a job or
-not, what is its Version 1 dHash/pHash coverage state right now?
+This module used to classify archives itself, into one of five mutually
+exclusive populations, and that single-axis model is what it no longer
+does. `comic_automation/archive/classification.py` now owns eligibility,
+availability, job history, disposition and exclusion, and this module
+consumes those classifications rather than re-deriving them. The audit's
+job is arithmetic and accountability on top of the contract, not a second
+opinion about what an archive is.
 
-Every archive is classified into exactly one of five mutually
-exclusive populations:
+Three measurements, deliberately separate
+-----------------------------------------
 
-- ``complete``: every page has a Version 1 dHash, a Version 1 pHash,
-  and recorded width/height, and the archive is structurally eligible
-  (see below) -- fully covered, nothing left to do.
-- ``failed``: structurally eligible, and has a terminal
-  (``status = 'failed'``) `hash_archive_pages_perceptual` job on
-  record. The failure-category breakdown within this population
-  reuses ``perceptual_failure_audit.py``'s stable categories directly
-  rather than reimplementing that classification.
-- ``stale``: structurally eligible, no terminal failure, and has an
-  active (``claimed``/``running``) job whose age exceeds the given
-  threshold, using the exact same staleness predicate as
-  ``comic_automation/jobs/abandoned_job_audit.py``'s
-  ``collect_stale_jobs`` (itself mirroring
-  ``JobQueue.recover_abandoned()``). A merely ``pending`` job is not
-  "stale" under that predicate -- it is legitimately queued work, not
-  evidence of an abandoned worker.
-- ``incomplete``: structurally eligible, no terminal failure, no stale
-  job, and at least one page still missing a Version 1 dHash, pHash,
-  or decoded width/height. This is the catch-all "still eligible,
-  pending or in-progress work" bucket -- it includes archives with a
-  live (non-stale) active job, archives with partial per-page
-  coverage, and archives with zero coverage and no job history at
-  all. That last case is additionally flagged as
-  ``never_enqueued_backlog`` (see below): it is reported as a count and
-  an archive-id list distinct from the plain ``incomplete`` count, but
-  it remains counted inside ``incomplete`` for the partition invariant
-  (``complete + incomplete + failed + stale + ineligible ==
-  total_archive_count``) rather than being a sixth bucket.
-- ``ineligible``: falls outside
-  ``ArchivePerceptualHashRepository.enqueue_missing()``'s eligibility
-  predicate entirely -- no current (``is_current = 1``) file location,
-  no ``archive_content_signatures`` row, a page_count of zero, or a
-  content signature that no longer matches the current file's
-  size/mtime (stale relative to a file that changed on disk since
-  exact page hashing ran). These archives were never expected to gain
-  Version 1 coverage and are not gaps.
+The old report published one coverage number, which meant every reader
+had to guess which question it answered. It answered all of them badly:
+an archive that went missing from disk made "coverage" rise, because the
+denominator quietly shrank. Pages that were hashed do not become unhashed
+when a drive is unplugged, so a number that moves on that observation is
+not measuring coverage of the library.
 
-Backlog vs. unexplained gap: the same population, two readings
--------------------------------------------------------------
+``historical``
+    Did the Version 1 backfill hash the pages it inventoried? The
+    denominator is every row in ``archive_pages``, frozen. Nothing
+    observed at run time may move it -- not a retirement, not a
+    supersession, not a missing file, not an unavailable root, not
+    signature drift. This is a statement about work that was or was not
+    done, and the past does not change when a volume is unmounted.
 
-``never_enqueued_backlog`` is the sub-population of ``incomplete``
-that is structurally eligible, has zero Version 1 coverage, and has
-*no* ``hash_archive_pages_perceptual`` job of any status on record
-(not pending, not claimed, not running, not failed, not completed).
+``operational``
+    Of the library we still consider ours, how much is covered? Pages are
+    excluded only for identities carrying a *recorded decision* --
+    ``retired`` or ``superseded``. Disposition is the only stored axis,
+    and a decision is the only thing entitled to remove an archive from
+    the operational denominator. Availability is an observation and must
+    never move this number; that is asserted here, not hoped for.
 
-That set is computed identically no matter how the audit is invoked.
-What changes with ``--expect-backfill-complete`` is only the
-*interpretation*, because the same observation means opposite things
-at two points in the project:
+``accountability``
+    Is every identity accounted for at all? Every archive appears here,
+    including those holding zero pages, which therefore cannot
+    participate in either coverage ratio. An identity that cannot be
+    measured must still be *named*, or a report that reconciles perfectly
+    is reconciling over a library it silently shrank.
 
-- **Mid-backfill (the default).** The Version 1 backfill runs in
-  guarded batches (docs/production_handoff_2026-07-30.md, "Remaining
-  project sequence" steps 1-2), and ``enqueue_missing()`` only ever
-  enqueues the next batch, not the whole library. Archives that have
-  not had their batch yet therefore have no job history *by design*.
-  Calling them "unexplained gaps" would label the entire remaining
-  workload -- tens of thousands of archives at the time this audit
-  was written -- a defect, which trains operators to ignore the field
-  that is supposed to catch a real missed enqueue. So they are
-  reported neutrally, as expected work remaining, and never affect
-  the exit code.
-- **Post-backfill (``--expect-backfill-complete``).** Step 3 of that
-  same sequence runs this audit only *after* eligibility has reached
-  zero. At that moment there is no un-enqueued batch left to explain
-  the absence of a job, so an eligible archive with no job history is
-  evidence of a missed enqueue or an orchestration bug. Only then are
-  these reported as blocking unexplained gaps and only then do they
-  drive a distinct non-zero exit code
-  (``EXIT_BLOCKING_UNEXPLAINED_GAPS``).
+``unexplained`` is residue
+--------------------------
 
-The production handoff calls out the underlying distinction: ordinary
-terminal failures are "legitimate archive or image defects... not
-evidence of queue, database, or orchestration failure". An archive
-that was eligible work and never got a job at all is a different kind
-of finding -- but only once every eligible archive was supposed to
-have been enqueued already.
+The contract produces ``selection = unexplained`` only for an archive
+that is in neither the eligible set nor the excluded set. No predicate
+creates it. This module reports it, and fails on it, and never converts
+it into a positive population -- which is exactly what the removed
+``never_enqueued_backlog`` flag did. That flag had a predicate of its own
+("eligible, zero coverage, no job history"), so it confidently reported
+archives that were fully explained by a path refusal while saying nothing
+about the ones that had no explanation at all. It is gone from the model,
+the calculations, the CSV, the console and the tests, and is not replaced
+by another positive predicate.
 
-Both modes always emit the complete, untruncated archive-id list to
-the JSON and CSV outputs. Only the human-facing console summary is
-capped (``MAX_PRINTED_ARCHIVE_IDS``), and it never truncates silently:
-the omitted count is always printed alongside the sample.
+Scope is part of the answer
+---------------------------
 
-Like the audits it builds on, this module never writes: it opens the
-database with SQLite's ``mode=ro`` URI flag plus
-``PRAGMA query_only = ON``, applies no migrations, and fingerprints
-the database file before and after the run to detect any mutation
-(by this process or another) during the audit.
+Two runs over the same database under different declared roots answer
+different questions, and their numbers are not comparable. Under the
+volume root the removed ``Horrorsplat`` folder is a large block of
+missing files; under a declaration that names the library folders
+individually, Horrorsplat is itself an unavailable declared root and
+those archives are unobservable rather than gone. The declared roots and
+`DeclaredScope.digest` are therefore printed prominently and carried in
+every artefact, so two results can never be compared as though they had
+asked the same thing.
 
-The headline guarantee here is stronger than "nothing was written":
-the five populations are claimed to *provably partition* the library,
-so every count in the report has to describe one and the same library.
-Classification issues several separate queries (structural facts, page
-coverage, jobs, terminal failures, stale jobs), so this module reads
-them all inside a single deferred transaction bracketed by
-``PRAGMA data_version`` readings taken outside it -- exactly the
-pattern ``comic_automation/jobs/active_job_duplicate_audit.py`` uses,
-and for exactly the reason documented there: under WAL a commit by
-another connection can touch only the ``-wal`` file, leaving the main
-database's size and mtime *identical*, so the file fingerprint alone
-cannot detect a writer landing between two of the classification
-queries. Such a writer would otherwise produce a report that mixes
-pre- and post-change observations while still looking clean.
+Read-only
+---------
+
+The database is opened with SQLite's ``mode=ro`` URI flag plus
+``PRAGMA query_only = ON``; every read happens inside one deferred
+transaction bracketed by ``PRAGMA data_version`` readings taken outside
+it, and the file is fingerprinted before and after. The data_version
+bracket is the load-bearing guard: under WAL another connection's commit
+can touch only the ``-wal`` file, leaving the main database's size and
+mtime identical, so the fingerprint alone cannot see a writer landing
+between two of the audit's queries. Such a writer would otherwise produce
+a report that mixes pre- and post-change observations while still looking
+clean.
 """
 
 from __future__ import annotations
@@ -122,8 +91,7 @@ import json
 import sqlite3
 import sys
 import time
-from collections import Counter
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -139,11 +107,22 @@ from comic_automation.database.read_guards import (
     read_consistent_snapshot,
     readonly_database_connection,
 )
-from comic_automation.archive.perceptual_failure_audit import (
-    JOB_TYPE,
-    STABLE_CATEGORY_ORDER,
-    category_counts as failure_category_counts,
-    collect_failures,
+from comic_automation.archive import classification as classification_module
+from comic_automation.archive.classification import (
+    AXES,
+    ArchiveClassification,
+    ClassificationInvariantError,
+    ClassificationResult,
+    DeclaredScope,
+    DISPOSITION_RETIRED,
+    DISPOSITION_SUPERSEDED,
+    PERCEPTUAL_JOB_TYPE,
+    SELECTION_UNEXPLAINED,
+    WORK_COMPLETED,
+    axis_totals,
+    outstanding_pages_by_axis,
+    presentation_label,
+    selection_reason_totals,
 )
 from comic_automation.archive.perceptual_hashing import (
     DHASH_ALGORITHM,
@@ -151,108 +130,66 @@ from comic_automation.archive.perceptual_hashing import (
     PHASH_ALGORITHM,
     PHASH_ALGORITHM_VERSION,
 )
-from comic_automation.jobs.abandoned_job_audit import collect_stale_jobs
 
 
-# The active statuses that represent "work is queued or in flight" for
-# a `hash_archive_pages_perceptual` job. Matches the statuses
-# `ArchivePerceptualHashRepository.enqueue_missing()` treats as
-# blocking re-enqueue, minus 'failed' (failed jobs are their own
-# population here, not "active").
-ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
-TERMINAL_FAILURE_STATUS = "failed"
+# Kept as an alias so callers and tests written against the audit's own
+# job-type constant keep working; the contract owns the value now.
+JOB_TYPE = PERCEPTUAL_JOB_TYPE
 
-POPULATION_ORDER = (
-    "complete",
-    "incomplete",
-    "failed",
-    "stale",
-    "ineligible",
-)
+# The dispositions that remove an identity from the operational
+# denominator. Nothing else may. This tuple is the complete list of
+# things entitled to shrink operational scope, and it contains only
+# recorded decisions -- no observation appears in it, and a test proves
+# that adding an observation cannot move the measurement.
+RETIRING_DISPOSITIONS = (DISPOSITION_RETIRED, DISPOSITION_SUPERSEDED)
 
-# The membership rule for the never-enqueued population. Deliberately
-# free of any judgement about whether membership is good or bad: that
-# depends entirely on whether the backfill is still running, which this
-# audit cannot infer from the database and must be told
-# (--expect-backfill-complete).
-NEVER_ENQUEUED_BACKLOG_EXPLANATION = (
-    "An archive lands here only when it is structurally eligible for "
-    "Version 1 perceptual hashing (current file location, a matching "
-    "content signature, at least one page), has zero Version 1 "
-    "dHash/pHash coverage, and has never had a "
-    "hash_archive_pages_perceptual job of any status (pending, "
-    "claimed, running, failed, or completed). While the backfill is "
-    "still running this is simply the remaining work: enqueue_missing() "
-    "enqueues one guarded batch at a time, so archives whose batch has "
-    "not come up yet legitimately have no job history. It becomes a "
-    "blocking unexplained gap only under --expect-backfill-complete."
-)
+MEASUREMENT_HISTORICAL = "historical"
+MEASUREMENT_OPERATIONAL = "operational"
 
-# The same population, read after the backfill was declared finished.
-# Kept as a separate constant (rather than one string with an "if")
-# because these are two distinct operational claims, and only this one
-# asks for investigation.
-BLOCKING_UNEXPLAINED_GAP_EXPLANATION = (
-    "Reported only under --expect-backfill-complete, which asserts that "
-    "Version 1 eligibility has already reached zero. Under that "
-    "assertion there is no un-enqueued batch left to explain an "
-    "eligible archive with zero coverage and no job history of any "
-    "status, so each of these is evidence of a missed enqueue or an "
-    "orchestration bug and must be investigated. Ordinary terminal "
-    "failures are legitimate archive/image defects and are never "
-    "counted here. Outside final-audit mode this list is empty by "
-    "construction and the identical population is reported neutrally "
-    "as never_enqueued_backlog."
-)
+MEASUREMENT_BASIS = {
+    MEASUREMENT_HISTORICAL: (
+        "Denominator is every archive_pages row, frozen. No run-time "
+        "observation and no recorded disposition may change it."
+    ),
+    MEASUREMENT_OPERATIONAL: (
+        "Denominator excludes pages belonging to identities with a "
+        "recorded retirement or supersession, and nothing else. "
+        "Availability observations never move it."
+    ),
+}
 
-# Console-only cap on how many archive ids are printed for any one
-# list. A production run of this audit mid-backfill legitimately found
-# 17,554 never-enqueued archives; printing them all buried the rest of
-# the summary (populations, partition check, integrity, snapshot
-# boundary) under a wall of ids. The full list always remains in the
-# JSON and CSV outputs, and the omitted count is always printed, so
-# nothing is ever hidden -- only relocated to the machine-readable
-# artefacts that are built to hold it.
+# Console-only cap on how many archive ids are printed for any one list.
+# The full list always remains in the JSON and CSV artefacts, and the
+# omitted count is always printed, so nothing is hidden -- only relocated
+# to the machine-readable outputs built to hold it.
 MAX_PRINTED_ARCHIVE_IDS = 20
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
-# Distinct from EXIT_FAILURE so an operator (or a wrapper script) can
-# tell "the audit could not run / crashed" apart from "the audit ran
-# cleanly and proved the backfill is not complete". Mirrors
-# jobs/active_job_duplicate_audit.py's EXIT_BLOCKING_DUPLICATES. Only
-# reachable in final-audit mode: mid-backfill remaining work is expected
-# and must not fail a pipeline.  Keep the original name as an alias for
-# callers written against the first coverage-audit release.
-EXIT_BACKFILL_INCOMPLETE = 2
-EXIT_BLOCKING_UNEXPLAINED_GAPS = EXIT_BACKFILL_INCOMPLETE
+# Distinct from EXIT_FAILURE so an operator can tell "the audit crashed"
+# apart from "the audit ran cleanly and its own arithmetic does not hold".
+# A failed invariant means the report cannot be trusted; unexplained
+# residue is one such failure.
+EXIT_INVARIANT_VIOLATION = 2
 
 
-# `DatabaseChangedError`, `DatabaseMutatedError`,
-# `DatabaseIntegrityError`, `DatabaseFingerprint`,
-# `fingerprint_database` and `readonly_database_connection` are
-# re-exported from `comic_automation.database.read_guards` above; they
-# used to be defined here, one of five near-identical copies across the
-# read-only audits. `DatabaseMutatedError` is still a subclass of
-# `DatabaseChangedError`, so catching the base class still gets both
-# the authoritative data_version guard and the weaker file-fingerprint
-# diagnostic, exactly as before. The names stay importable from this
-# module because the tests import them from here.
+# `DatabaseChangedError`, `DatabaseMutatedError`, `DatabaseIntegrityError`,
+# `DatabaseFingerprint`, `fingerprint_database` and
+# `readonly_database_connection` are re-exported from
+# `comic_automation.database.read_guards` above. The names stay importable
+# from this module because the tests import them from here.
 
 
 class OutputPathCollisionError(ValueError):
     """Raised when a requested output path could clobber input data.
 
-    The audit's own read-only guarantees (mode=ro + query_only) only
-    protect the connection it opens to *read* the database. The
-    separate step that later *writes* the JSON/CSV report opens the
-    output path in write mode with no such protection, so if a caller
-    pointed --json-output or --csv-output at the database file itself
-    (directly, or via a symlink/hard link alias), that write would
-    silently overwrite or corrupt the database this audit just
-    verified was untouched. This is checked and rejected before the
-    database is even opened, so no directory is created and nothing
-    is written once a collision is detected.
+    The audit's read-only guarantees (mode=ro + query_only) protect only
+    the connection it opens to *read*. The separate step that later
+    writes the JSON/CSV report opens the output path in write mode with
+    no such protection, so a caller pointing --json-output at the
+    database file would silently overwrite the database this audit just
+    verified was untouched. Checked before the database is opened, so
+    nothing is created once a collision is detected.
     """
 
 
@@ -304,64 +241,120 @@ def validate_output_paths(
         )
 
 
-def _collect_structural(connection: sqlite3.Connection) -> dict[int, dict]:
-    """Per-archive structural facts needed for the eligibility check.
+# --- the independent page census -----------------------------------------
 
-    Mirrors the joins `ArchivePerceptualHashRepository.enqueue_missing()`
-    uses: the current (`is_current = 1`) file_locations row and the
-    archive_content_signatures row, if either exists.
+
+def identity_census(connection: sqlite3.Connection) -> list[int]:
+    """Every `archive_files` id, read independently of the classifier.
+
+    The page census cannot stand in for this one. An archive holding zero
+    pages contributes nothing to `archive_pages`, so a classifier that
+    dropped such an identity entirely would leave every page number in
+    this report reconciling perfectly -- the library would simply have
+    become smaller without anything saying so. Reading the identity set
+    straight from `archive_files` is the only way the audit can notice.
     """
-    rows = connection.execute(
+    return [
+        int(row["id"])
+        for row in connection.execute(
+            "SELECT id FROM archive_files ORDER BY id"
+        )
+    ]
+
+
+def reconcile_identities(
+    result: ClassificationResult, expected_ids: Sequence[int]
+) -> dict:
+    """Compare the classified identity set against the database's own.
+
+    Four distinct ways this can go wrong, reported separately because
+    they have different causes: an identity the classifier dropped, one
+    it invented, one it emitted twice, and one whose axis tuple is
+    incomplete. Collapsing them into a single boolean would say the
+    report is untrustworthy without saying what to go and look at.
+    """
+    expected = set(expected_ids)
+    classified_ids = [archive.archive_id for archive in result.archives]
+    classified = set(classified_ids)
+
+    seen: set[int] = set()
+    duplicates: set[int] = set()
+
+    for archive_id in classified_ids:
+        if archive_id in seen:
+            duplicates.add(archive_id)
+
+        seen.add(archive_id)
+
+    incomplete = [
+        archive.archive_id
+        for archive in result.archives
+        if not all(
+            (
+                archive.disposition,
+                archive.availability,
+                archive.inventory,
+                archive.perceptual_work,
+                archive.selection,
+            )
+        )
+    ]
+
+    return {
+        "expected_identities": len(expected),
+        "classified_identities": len(classified_ids),
+        "classified_distinct_identities": len(classified),
+        "missing_count": len(expected - classified),
+        "missing_archive_ids": sorted(expected - classified),
+        "extra_count": len(classified - expected),
+        "extra_archive_ids": sorted(classified - expected),
+        "duplicate_count": len(duplicates),
+        "duplicate_archive_ids": sorted(duplicates),
+        "incomplete_tuple_count": len(incomplete),
+        "incomplete_tuple_archive_ids": sorted(incomplete),
+    }
+
+
+def page_census(connection: sqlite3.Connection) -> dict[str, int]:
+    """Whole-table page facts, counted independently of the contract.
+
+    The contract reports one number per archive: how many of its pages
+    are outstanding, where outstanding means missing a Version 1 dHash,
+    a Version 1 pHash, or decoded dimensions. That is the right answer
+    for coverage, but it collapses three different defects into one
+    count, so it cannot answer "are dHash and pHash actually paired?".
+
+    This is deliberately a *second* measurement of the same library,
+    taken by a single grouped scan rather than by summing the contract's
+    per-archive numbers. The reconciliation invariants below compare the
+    two. If this simply re-used the contract's aggregation it could not
+    disagree with it, and a check that cannot fail proves nothing.
+    """
+    row = connection.execute(
         """
         SELECT
-            af.id AS archive_id,
-            fl.id AS location_id,
-            fl.path AS current_path,
-            fl.file_size AS location_file_size,
-            fl.modified_time_ns AS location_modified_time_ns,
-            acs.id AS signature_id,
-            acs.page_count AS signature_page_count,
-            acs.source_file_size AS signature_file_size,
-            acs.source_modified_time_ns AS signature_modified_time_ns
-        FROM archive_files AS af
-        LEFT JOIN file_locations AS fl
-          ON fl.archive_id = af.id
-         AND fl.is_current = 1
-        LEFT JOIN archive_content_signatures AS acs
-          ON acs.archive_id = af.id
-        ORDER BY af.id
-        """
-    ).fetchall()
-
-    # If more than one is_current=1 row somehow existed for an
-    # archive (an application-level invariant violation, not one the
-    # schema enforces), the last row wins; that is a pre-existing data
-    # problem outside this audit's scope, not something to paper over
-    # with an artificial ORDER BY tiebreak.
-    return {int(row["archive_id"]): dict(row) for row in rows}
-
-
-def _collect_page_coverage(
-    connection: sqlite3.Connection,
-) -> dict[int, dict]:
-    """Per-archive page counts: total pages vs. pages still missing a
-    Version 1 dHash, Version 1 pHash, or decoded width/height.
-    """
-    rows = connection.execute(
-        """
-        SELECT
-            ap.archive_id AS archive_id,
-            COUNT(*) AS total_pages,
+            COUNT(*) AS pages,
+            SUM(CASE WHEN dh.id IS NOT NULL THEN 1 ELSE 0 END)
+                AS dhash_pages,
+            SUM(CASE WHEN ph.id IS NOT NULL THEN 1 ELSE 0 END)
+                AS phash_pages,
+            SUM(
+                CASE WHEN (dh.id IS NULL) <> (ph.id IS NULL)
+                THEN 1 ELSE 0 END
+            ) AS half_paired_pages,
+            SUM(
+                CASE WHEN ap.width IS NULL OR ap.height IS NULL
+                THEN 1 ELSE 0 END
+            ) AS pages_missing_dimensions,
             SUM(
                 CASE
-                    WHEN dh.id IS NULL
-                      OR ph.id IS NULL
-                      OR ap.width IS NULL
-                      OR ap.height IS NULL
-                    THEN 1
-                    ELSE 0
+                    WHEN dh.id IS NOT NULL
+                     AND ph.id IS NOT NULL
+                     AND ap.width IS NOT NULL
+                     AND ap.height IS NOT NULL
+                    THEN 1 ELSE 0
                 END
-            ) AS pages_missing
+            ) AS covered_pages
         FROM archive_pages AS ap
         LEFT JOIN page_hashes AS dh
           ON dh.page_id = ap.id
@@ -371,7 +364,6 @@ def _collect_page_coverage(
           ON ph.page_id = ap.id
          AND ph.algorithm = ?
          AND ph.algorithm_version = ?
-        GROUP BY ap.archive_id
         """,
         (
             DHASH_ALGORITHM,
@@ -379,202 +371,519 @@ def _collect_page_coverage(
             PHASH_ALGORITHM,
             PHASH_ALGORITHM_VERSION,
         ),
-    ).fetchall()
+    ).fetchone()
 
-    coverage: dict[int, dict] = {}
-
-    for row in rows:
-        total_pages = int(row["total_pages"])
-        pages_missing = int(row["pages_missing"])
-        coverage[int(row["archive_id"])] = {
-            "total_pages": total_pages,
-            "pages_missing": pages_missing,
-            "pages_covered": total_pages - pages_missing,
-        }
-
-    return coverage
-
-
-def _collect_jobs(connection: sqlite3.Connection) -> dict[int, list[dict]]:
-    """Every hash_archive_pages_perceptual job, grouped by archive_id.
-
-    Jobs with a NULL archive_id are excluded: they cannot be
-    attributed to any archive in this per-archive audit.
-    """
-    rows = connection.execute(
-        """
-        SELECT
-            id,
-            archive_id,
-            status,
-            failure_category,
-            attempts,
-            max_attempts,
-            claimed_at,
-            started_at,
-            completed_at
-        FROM jobs
-        WHERE job_type = ?
-        ORDER BY archive_id, id
-        """,
-        (JOB_TYPE,),
-    ).fetchall()
-
-    jobs_by_archive: dict[int, list[dict]] = {}
-
-    for row in rows:
-        if row["archive_id"] is None:
-            continue
-
-        jobs_by_archive.setdefault(int(row["archive_id"]), []).append(
-            dict(row)
-        )
-
-    return jobs_by_archive
-
-
-def classify_archives(
-    connection: sqlite3.Connection,
-    *,
-    stale_older_than_seconds: int,
-    now: datetime | None = None,
-) -> list[dict]:
-    """Classify every archive_files row into exactly one population.
-
-    See the module docstring for the full definition of each
-    population. Returns one dict per archive, ordered by archive_id.
-    """
-    structural = _collect_structural(connection)
-    coverage = _collect_page_coverage(connection)
-    jobs_by_archive = _collect_jobs(connection)
-    failures_by_archive: dict[int, dict] = {}
-
-    for failure in collect_failures(connection):
-        archive_id = failure["archive_id"]
-        if archive_id is not None and archive_id not in failures_by_archive:
-            # An archive should have at most one terminal failed job
-            # at a time (enqueue_missing() blocks re-enqueue while a
-            # 'failed' job exists for it), so the first row is the
-            # authoritative one; ORDER BY in collect_failures is
-            # deterministic (failure_category, path, job id).
-            failures_by_archive[archive_id] = failure
-
-    stale_job_ids = {
-        job["job_id"]
-        for job in collect_stale_jobs(
-            connection,
-            older_than_seconds=stale_older_than_seconds,
-            now=now,
-        )
-        if job["job_type"] == JOB_TYPE
+    return {
+        "pages": int(row["pages"] or 0),
+        "dhash_pages": int(row["dhash_pages"] or 0),
+        "phash_pages": int(row["phash_pages"] or 0),
+        "half_paired_pages": int(row["half_paired_pages"] or 0),
+        "pages_missing_dimensions": int(row["pages_missing_dimensions"] or 0),
+        "covered_pages": int(row["covered_pages"] or 0),
     }
 
-    results: list[dict] = []
 
-    for archive_id in sorted(structural.keys()):
-        info = structural[archive_id]
-        page_stats = coverage.get(
-            archive_id,
-            {"total_pages": 0, "pages_missing": 0, "pages_covered": 0},
-        )
-        archive_jobs = jobs_by_archive.get(archive_id, [])
-
-        structural_eligible = (
-            info["location_id"] is not None
-            and info["signature_id"] is not None
-            and (info["signature_page_count"] or 0) > 0
-            and info["signature_file_size"] == info["location_file_size"]
-            and info["signature_modified_time_ns"]
-            == info["location_modified_time_ns"]
-        )
-
-        # A page still needs work if it (or its dimensions) is
-        # missing, or if no pages have been inventoried at all yet
-        # (page_count > 0 was promised by the content signature but
-        # archive_pages hasn't caught up -- an edge case, treated as
-        # "still has work to do" rather than vacuously complete).
-        has_missing_hash_work = (
-            page_stats["pages_missing"] > 0 or page_stats["total_pages"] == 0
-        )
-
-        active_jobs = [
-            job for job in archive_jobs if job["status"] in ACTIVE_JOB_STATUSES
-        ]
-        failed_jobs = [
-            job
-            for job in archive_jobs
-            if job["status"] == TERMINAL_FAILURE_STATUS
-        ]
-        has_any_job = len(archive_jobs) > 0
-        is_stale = any(job["id"] in stale_job_ids for job in active_jobs)
-
-        if not structural_eligible:
-            population = "ineligible"
-        elif failed_jobs:
-            population = "failed"
-        elif is_stale:
-            population = "stale"
-        elif not has_missing_hash_work:
-            population = "complete"
-        else:
-            population = "incomplete"
-
-        # Membership only; deliberately mode-independent. Whether this
-        # flag means "expected remaining work" or "blocking unexplained
-        # gap" is decided once, in `run_audit`, from
-        # `expect_backfill_complete` -- classification must not shift
-        # under the operator's claim about backfill state, or the two
-        # modes would no longer be describing the same population.
-        is_never_enqueued_backlog = (
-            population == "incomplete"
-            and not has_any_job
-            and page_stats["pages_covered"] == 0
-        )
-
-        failure = failures_by_archive.get(archive_id)
-
-        results.append(
-            {
-                "archive_id": archive_id,
-                "population": population,
-                "never_enqueued_backlog": is_never_enqueued_backlog,
-                "structural_eligible": structural_eligible,
-                "current_path": info["current_path"],
-                "total_pages": page_stats["total_pages"],
-                "pages_missing": page_stats["pages_missing"],
-                "pages_covered": page_stats["pages_covered"],
-                "has_any_job": has_any_job,
-                "active_job_count": len(active_jobs),
-                "active_job_ids": [job["id"] for job in active_jobs],
-                "is_stale": is_stale,
-                "failed_job_id": (
-                    failure["job_id"] if failure is not None else None
-                ),
-                "failed_stable_category": (
-                    failure["stable_category"] if failure is not None else None
-                ),
-            }
-        )
-
-    return results
+# --- the three measurements ----------------------------------------------
 
 
-def population_counts(archives: list[dict]) -> dict[str, int]:
-    counts = Counter(archive["population"] for archive in archives)
-    return {name: counts.get(name, 0) for name in POPULATION_ORDER}
+@dataclass(frozen=True)
+class Coverage:
+    """One coverage ratio, carrying the basis it was computed on.
 
-
-def failed_category_counts(archives: list[dict]) -> dict[str, int]:
-    """Stable failure-category breakdown, scoped to archives this audit
-    actually classified as 'failed' (i.e. still structurally eligible),
-    reusing perceptual_failure_audit.py's category machinery.
+    A bare percentage is what made the old report unreadable: two numbers
+    that answered different questions looked identical on the page. The
+    basis string travels with the number so a reader always knows which
+    denominator produced it.
     """
-    pseudo_failures = [
-        {"stable_category": archive["failed_stable_category"]}
+
+    name: str
+    covered_pages: int
+    total_pages: int
+    excluded_pages: int
+    excluded_archives: int
+    basis: str
+    # Split out so the derivation is visible rather than inferred. A
+    # denominator that shrank by the right amount says nothing about
+    # whether the numerator moved with it, and the retirement this
+    # library actually holds (archive 45217) has zero covered pages --
+    # so an implementation that shrank the denominator and kept the full
+    # historical numerator would produce the correct total on production
+    # data while being wrong.
+    excluded_covered_pages: int = 0
+    excluded_outstanding_pages: int = 0
+
+    @property
+    def percentage(self) -> float:
+        if self.total_pages == 0:
+            return 0.0
+
+        return 100.0 * self.covered_pages / self.total_pages
+
+    @property
+    def outstanding_pages(self) -> int:
+        return self.total_pages - self.covered_pages
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "covered_pages": self.covered_pages,
+            "total_pages": self.total_pages,
+            "outstanding_pages": self.outstanding_pages,
+            "excluded_pages": self.excluded_pages,
+            "excluded_archives": self.excluded_archives,
+            "excluded_covered_pages": self.excluded_covered_pages,
+            "excluded_outstanding_pages": self.excluded_outstanding_pages,
+            "percentage": round(self.percentage, 6),
+            "percentage_display": f"{self.percentage:.4f}%",
+            "basis": self.basis,
+        }
+
+
+def _covered(archive: ArchiveClassification) -> int:
+    """Pages of one archive with a complete Version 1 record."""
+    return archive.total_pages - archive.outstanding_pages
+
+
+def measure_historical(
+    archives: Sequence[ArchiveClassification],
+) -> Coverage:
+    """Coverage over every inventoried page, with nothing excluded.
+
+    Every archive contributes, whatever its disposition and whatever the
+    filesystem said this run. That is the entire point: this denominator
+    is frozen, so the number describes work done rather than the state of
+    a drive at the moment somebody ran the audit.
+    """
+    return Coverage(
+        name=MEASUREMENT_HISTORICAL,
+        covered_pages=sum(_covered(archive) for archive in archives),
+        total_pages=sum(archive.total_pages for archive in archives),
+        excluded_pages=0,
+        excluded_archives=0,
+        basis=MEASUREMENT_BASIS[MEASUREMENT_HISTORICAL],
+    )
+
+
+def dispositioned_archives(
+    archives: Sequence[ArchiveClassification],
+) -> list[ArchiveClassification]:
+    """Identities carrying a recorded retirement or supersession.
+
+    Read from `disposition`, the stored axis, and never from
+    `presentation_label`. The label collapses six axes by precedence, so
+    counting by it would attribute an archive to whichever axis happened
+    to win -- and a retired archive that is also missing would land under
+    whichever the precedence table listed first.
+    """
+    return [
+        archive
         for archive in archives
-        if archive["population"] == "failed"
+        if archive.disposition in RETIRING_DISPOSITIONS
     ]
-    return failure_category_counts(pseudo_failures)
+
+
+def measure_operational(
+    archives: Sequence[ArchiveClassification],
+) -> Coverage:
+    """Coverage over the library still considered ours.
+
+    Only recorded dispositions shrink the denominator. An archive that is
+    missing, drifted, unreadable, beneath an unavailable root or outside
+    every declared root is still fully counted here, because none of
+    those is a decision -- they are things this run happened to observe,
+    and an observation must not retire anything.
+    """
+    excluded = dispositioned_archives(archives)
+    excluded_ids = {archive.archive_id for archive in excluded}
+    retained = [
+        archive
+        for archive in archives
+        if archive.archive_id not in excluded_ids
+    ]
+
+    return Coverage(
+        name=MEASUREMENT_OPERATIONAL,
+        covered_pages=sum(_covered(archive) for archive in retained),
+        total_pages=sum(archive.total_pages for archive in retained),
+        excluded_pages=sum(archive.total_pages for archive in excluded),
+        excluded_archives=len(excluded),
+        excluded_covered_pages=sum(_covered(archive) for archive in excluded),
+        excluded_outstanding_pages=sum(
+            archive.outstanding_pages for archive in excluded
+        ),
+        basis=MEASUREMENT_BASIS[MEASUREMENT_OPERATIONAL],
+    )
+
+
+def zero_page_archives(
+    archives: Sequence[ArchiveClassification],
+) -> list[ArchiveClassification]:
+    """Identities that hold no pages and so cannot be measured.
+
+    They are not a coverage finding and they are not an error. They are
+    the population that both ratios are structurally unable to describe,
+    and accountability exists to keep them visible anyway.
+    """
+    return [archive for archive in archives if archive.total_pages == 0]
+
+
+def build_accountability(result: ClassificationResult) -> dict:
+    """Every identity, on every axis, with nothing collapsed.
+
+    This is the measurement that must cover the whole library: the two
+    coverage ratios describe pages, and an archive with no pages is
+    invisible to both.
+    """
+    archives = result.archives
+    zero_page = zero_page_archives(archives)
+    unexplained = [
+        archive
+        for archive in archives
+        if archive.selection == SELECTION_UNEXPLAINED
+    ]
+
+    return {
+        "archive_identities": len(archives),
+        "axis_totals": axis_totals(result),
+        "selection_reason_totals": selection_reason_totals(result),
+        "outstanding_pages_by_axis": {
+            axis: outstanding_pages_by_axis(result, axis) for axis in AXES
+        },
+        "zero_page_identity_count": len(zero_page),
+        "zero_page_archive_ids": [
+            archive.archive_id for archive in zero_page
+        ],
+        "zero_page_subreasons": _counted(
+            archive.not_inventoried_subreason for archive in zero_page
+        ),
+        "unexplained_count": len(unexplained),
+        "unexplained_archive_ids": [
+            archive.archive_id for archive in unexplained
+        ],
+        "unexplained_explanation": (
+            "Residue only: an archive that the contract's eligibility "
+            "predicate and its exclusion explanation both failed to "
+            "claim. No predicate produces this value. A non-zero count "
+            "is a defect in the classification code, not a finding "
+            "about the library, and fails the audit."
+        ),
+    }
+
+
+def _counted(values) -> dict[str, int]:
+    """Count non-null values, sorted, without inventing empty buckets."""
+    counts: dict[str, int] = {}
+
+    for value in values:
+        if value is None:
+            continue
+
+        counts[value] = counts.get(value, 0) + 1
+
+    return dict(sorted(counts.items()))
+
+
+# --- invariants ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Invariant:
+    """One checked claim, and what was actually observed.
+
+    Carrying `detail` even when the check passes matters: a reader who
+    does not trust the report should be able to see the numbers the
+    check compared, not just the word PASS.
+    """
+
+    name: str
+    passed: bool
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "passed": self.passed,
+            "detail": self.detail,
+        }
+
+
+def completed_jobs_with_partial_coverage(
+    archives: Sequence[ArchiveClassification],
+) -> list[ArchiveClassification]:
+    """Archives whose latest perceptual job completed, yet lack pages.
+
+    A completed job that left pages outstanding means the worker reported
+    success over work it did not finish, which would make every coverage
+    number here an overstatement of what actually ran.
+    """
+    return [
+        archive
+        for archive in archives
+        if archive.perceptual_work == WORK_COMPLETED
+        and archive.outstanding_pages > 0
+    ]
+
+
+def check_invariants(
+    result: ClassificationResult,
+    census: dict[str, int],
+    historical: Coverage,
+    operational: Coverage,
+    identities: dict,
+) -> list[Invariant]:
+    """Every claim this report makes about its own arithmetic.
+
+    These are checks, not assertions, so the report is still written when
+    one fails -- an operator needs to see the numbers that did not
+    reconcile. The exit code is what turns a failure into a refusal.
+
+    `identities` is required, and must come from `reconcile_identities()`
+    against an *independently read* `archive_files` id set. There is
+    deliberately no default: reconciling the classified rows against
+    their own ids makes the expected and classified sets identical by
+    construction, so both the missing and the extra count are always
+    zero. That mode would leave the "every archive" invariant reporting
+    PASS while blind to the exact failure the census was added to catch,
+    and an optional argument is how such a mode gets used by accident.
+    """
+    archives = result.archives
+    identity_total = len(archives)
+    invariants: list[Invariant] = []
+
+    def record(name: str, passed: bool, detail: str) -> None:
+        invariants.append(Invariant(name=name, passed=passed, detail=detail))
+
+    # 1. One complete tuple per identity, checked against the database's
+    #    own identity set rather than against the returned rows.
+    #    Comparing the rows with themselves is blind to both an omission
+    #    and an invention, because it makes the expected and classified
+    #    sets equal by construction. A zero-page identity the classifier
+    #    dropped contributes nothing to the page census either, so every
+    #    other number in this report would still reconcile while the
+    #    library had quietly shrunk.
+    record(
+        "every_archive_has_exactly_one_complete_tuple",
+        identities["missing_count"] == 0
+        and identities["extra_count"] == 0
+        and identities["duplicate_count"] == 0
+        and identities["incomplete_tuple_count"] == 0,
+        f"expected {identities['expected_identities']} identities, "
+        f"classified {identities['classified_identities']} "
+        f"({identities['classified_distinct_identities']} distinct); "
+        f"missing={identities['missing_count']} "
+        f"extra={identities['extra_count']} "
+        f"duplicate={identities['duplicate_count']} "
+        f"incomplete={identities['incomplete_tuple_count']}; "
+        f"missing_ids={identities['missing_archive_ids'][:10]} "
+        f"extra_ids={identities['extra_archive_ids'][:10]}",
+    )
+
+    # 2. Each axis independently sums to the identity total. Computed
+    #    from the axis itself, never from the presentation label.
+    totals = axis_totals(result)
+    axis_sums = {axis: sum(totals[axis].values()) for axis in AXES}
+    record(
+        "every_axis_sums_to_the_identity_total",
+        all(value == identity_total for value in axis_sums.values()),
+        f"expected {identity_total} per axis; got {axis_sums}",
+    )
+
+    # 3./4. Pairing, from the independent census.
+    record(
+        "dhash_and_phash_counts_are_equal",
+        census["dhash_pages"] == census["phash_pages"],
+        f"dhash={census['dhash_pages']} phash={census['phash_pages']}",
+    )
+    record(
+        "no_half_paired_pages",
+        census["half_paired_pages"] == 0,
+        f"half_paired={census['half_paired_pages']}",
+    )
+
+    # 5. The contract's per-archive page sums agree with the independent
+    #    whole-table scan, in both directions.
+    record(
+        "historical_denominator_matches_the_page_census",
+        historical.total_pages == census["pages"],
+        f"classified={historical.total_pages} census={census['pages']}",
+    )
+    record(
+        "covered_pages_match_the_page_census",
+        historical.covered_pages == census["covered_pages"],
+        f"classified={historical.covered_pages} "
+        f"census={census['covered_pages']}",
+    )
+
+    # 6. Outstanding pages reconcile by archive and by every axis --
+    #    against the *census*, not against another sum over the same
+    #    per-archive numbers. Reconciling the per-archive total with the
+    #    per-axis total would compare a number with itself: grouping a
+    #    set of values by any key and re-summing the groups is an
+    #    identity, so that check could never fail and would prove
+    #    nothing. The census is an independent scan of archive_pages, so
+    #    these comparisons can genuinely disagree.
+    outstanding_by_census = census["pages"] - census["covered_pages"]
+    outstanding_by_archive = sum(
+        archive.outstanding_pages for archive in archives
+    )
+    record(
+        "outstanding_pages_reconcile_by_archive",
+        outstanding_by_archive == outstanding_by_census,
+        f"by_archive={outstanding_by_archive} "
+        f"by_census={outstanding_by_census}",
+    )
+
+    axis_page_sums = {
+        axis: sum(outstanding_pages_by_axis(result, axis).values())
+        for axis in AXES
+    }
+    record(
+        "outstanding_pages_reconcile_by_every_axis",
+        all(
+            value == outstanding_by_census
+            for value in axis_page_sums.values()
+        ),
+        f"expected {outstanding_by_census} per axis; got {axis_page_sums}",
+    )
+
+    # 7. No completed job left partial coverage.
+    partial = completed_jobs_with_partial_coverage(archives)
+    record(
+        "no_completed_job_left_partial_coverage",
+        not partial,
+        f"{len(partial)} archives, ids "
+        f"{[archive.archive_id for archive in partial][:10]}",
+    )
+
+    # 8. Residue is empty.
+    unexplained = [
+        archive
+        for archive in archives
+        if archive.selection == SELECTION_UNEXPLAINED
+    ]
+    record(
+        "no_unexplained_residue",
+        not unexplained,
+        f"{len(unexplained)} archives, ids "
+        f"{[archive.archive_id for archive in unexplained][:10]}",
+    )
+
+    # 9. Operational excluded exactly the dispositioned identities, and
+    #    the two denominators differ by exactly their pages.
+    dispositioned = dispositioned_archives(archives)
+    record(
+        "operational_excludes_only_recorded_dispositions",
+        operational.excluded_archives == len(dispositioned)
+        and operational.excluded_pages
+        == sum(archive.total_pages for archive in dispositioned),
+        f"excluded {operational.excluded_archives} archives / "
+        f"{operational.excluded_pages} pages; dispositioned "
+        f"{len(dispositioned)} archives / "
+        f"{sum(archive.total_pages for archive in dispositioned)} pages",
+    )
+    record(
+        "operational_denominator_is_historical_minus_dispositioned",
+        operational.total_pages
+        == historical.total_pages - operational.excluded_pages,
+        f"operational={operational.total_pages} historical="
+        f"{historical.total_pages} excluded={operational.excluded_pages}",
+    )
+
+    # 10. The numerator has to move with the denominator. Checking only
+    #     the denominator would pass an implementation that removed a
+    #     retired archive's pages from the total while keeping its
+    #     covered pages in the numerator -- and on this library that bug
+    #     is invisible, because the one retirement on record (archive
+    #     45217) has zero covered pages to keep.
+    excluded_covered = sum(
+        _covered(archive) for archive in dispositioned
+    )
+    excluded_outstanding = sum(
+        archive.outstanding_pages for archive in dispositioned
+    )
+    record(
+        "operational_numerator_is_historical_minus_dispositioned",
+        operational.covered_pages
+        == historical.covered_pages - excluded_covered
+        and operational.excluded_covered_pages == excluded_covered,
+        f"operational={operational.covered_pages} historical="
+        f"{historical.covered_pages} excluded_covered={excluded_covered} "
+        f"reported_excluded_covered="
+        f"{operational.excluded_covered_pages}",
+    )
+    record(
+        "operational_outstanding_is_historical_minus_dispositioned",
+        operational.outstanding_pages
+        == historical.outstanding_pages - excluded_outstanding
+        and operational.excluded_outstanding_pages == excluded_outstanding,
+        f"operational={operational.outstanding_pages} historical="
+        f"{historical.outstanding_pages} excluded_outstanding="
+        f"{excluded_outstanding} reported_excluded_outstanding="
+        f"{operational.excluded_outstanding_pages}",
+    )
+
+    return invariants
+
+
+# --- report --------------------------------------------------------------
+
+
+def collect(
+    connection: sqlite3.Connection, *, scope: Sequence[str] | None
+) -> tuple[ClassificationResult, dict[str, int], list[int]]:
+    """Every read this audit performs, inside one snapshot.
+
+    Three reads, deliberately: the classification, an independent page
+    census and an independent identity census. All three must come from
+    the same snapshot or the reconciliations between them would compare
+    different states of the library.
+
+    Kept as a single module-level function, and looked up on the module
+    at call time by `run_audit`, so the WAL regression tests can wrap it
+    and commit from another connection between the reads -- which is
+    precisely the interleaving the data_version bracket exists to catch.
+    """
+    result = classification_module.classify(connection, scope=scope)
+    return result, page_census(connection), identity_census(connection)
+
+
+_CSV_FIELDNAMES = [
+    "archive_id",
+    "disposition",
+    "successor_archive_id",
+    "availability",
+    "availability_detail",
+    "inventory",
+    "not_inventoried_subreason",
+    "perceptual_work",
+    "ever_failed",
+    "ever_cancelled",
+    "selection",
+    "selection_reasons",
+    "quarantine_status",
+    "current_path",
+    "total_pages",
+    "covered_pages",
+    "outstanding_pages",
+    "presentation_label",
+]
+
+
+def archive_rows(result: ClassificationResult) -> list[dict]:
+    """The full classification tuple per archive, for JSON and CSV.
+
+    `presentation_label` is emitted as one extra column beside the tuple,
+    never in place of it. Nothing in this module counts by it.
+    """
+    rows: list[dict] = []
+
+    for archive in result.archives:
+        row = archive.as_dict()
+        row["covered_pages"] = _covered(archive)
+        row["presentation_label"] = presentation_label(archive)
+        rows.append(row)
+
+    return rows
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -588,24 +897,7 @@ def _write_json(path: Path, payload: object) -> Path:
     return resolved
 
 
-_CSV_FIELDNAMES = [
-    "archive_id",
-    "population",
-    "never_enqueued_backlog",
-    "structural_eligible",
-    "current_path",
-    "total_pages",
-    "pages_missing",
-    "pages_covered",
-    "has_any_job",
-    "active_job_count",
-    "is_stale",
-    "failed_job_id",
-    "failed_stable_category",
-]
-
-
-def _write_csv(path: Path, archives: list[dict]) -> Path:
+def _write_csv(path: Path, rows: list[dict]) -> Path:
     resolved = path.resolve(strict=False)
     resolved.parent.mkdir(parents=True, exist_ok=True)
 
@@ -614,7 +906,17 @@ def _write_csv(path: Path, archives: list[dict]) -> Path:
             stream, fieldnames=_CSV_FIELDNAMES, extrasaction="ignore"
         )
         writer.writeheader()
-        writer.writerows(archives)
+
+        for row in rows:
+            flattened = dict(row)
+            # Reasons are a list on the JSON side, where structure is
+            # free; CSV has one cell, so they are joined rather than
+            # dropped. A reader must never have to guess that an archive
+            # had a second reason the column could not hold.
+            flattened["selection_reasons"] = "|".join(
+                row.get("selection_reasons") or ()
+            )
+            writer.writerow(flattened)
 
     return resolved
 
@@ -622,30 +924,22 @@ def _write_csv(path: Path, archives: list[dict]) -> Path:
 def run_audit(
     *,
     database: Path,
-    stale_older_than_seconds: int,
-    now: datetime | None = None,
+    scope: Sequence[str] | None = None,
     json_output: Path | None = None,
     csv_output: Path | None = None,
-    expect_backfill_complete: bool = False,
 ) -> dict:
-    """Produce the read-only, full-library coverage-audit report.
-
-    `expect_backfill_complete` selects the handoff document's strict
-    final-audit mode. It changes no classification and no query. Instead,
-    it verifies the claimed end state: both the `incomplete` and `stale`
-    populations must be zero. The never-enqueued population is identical
-    in both modes, but final mode additionally describes that subset as
-    blocking unexplained gaps.
+    """Produce the read-only accounting report.
 
     Never mutates `database`. `json_output`/`csv_output` are validated
-    against `database` (and against each other) *before* the database
-    is opened or any directory is created.
+    against `database` and each other *before* the database is opened or
+    any directory is created.
 
     Raises `FileNotFoundError` if the database does not exist,
     `OutputPathCollisionError` if an output path could clobber it,
-    `DatabaseIntegrityError` if `PRAGMA quick_check` fails, and
-    `DatabaseChangedError` (or its `DatabaseMutatedError` subclass) if
-    another connection committed during the run or the file's
+    `DatabaseIntegrityError` if `PRAGMA quick_check` fails,
+    `ClassificationInvariantError` if the contract refuses to classify,
+    and `DatabaseChangedError` (or its `DatabaseMutatedError` subclass)
+    if another connection committed during the run or the file's
     size/mtime changed.
     """
     database = Path(database).resolve(strict=False)
@@ -659,49 +953,30 @@ def run_audit(
         csv_output=csv_output,
     )
 
-    effective_now = now or datetime.now(timezone.utc)
-    if effective_now.tzinfo is None:
-        effective_now = effective_now.replace(tzinfo=timezone.utc)
-
     started = time.perf_counter()
     fingerprint_before = fingerprint_database(database)
     files_before = fingerprint_database_files(database)
 
-    def read(connection: sqlite3.Connection) -> list[dict]:
-        # Looked up on the module at call time, so the WAL regression
-        # tests can wrap an internal query to commit from another
-        # connection mid-classification.
-        return classify_archives(
-            connection,
-            stale_older_than_seconds=stale_older_than_seconds,
-            now=effective_now,
-        )
+    def read(
+        connection: sqlite3.Connection,
+    ) -> tuple[ClassificationResult, dict[str, int], list[int]]:
+        # Looked up on the module at call time, so tests can wrap it.
+        return globals()["collect"](connection, scope=scope)
 
-    # One deferred read transaction, bracketed by PRAGMA data_version
-    # readings taken outside it (see
-    # `read_guards.read_consistent_snapshot`, which is where this
-    # sequence now lives): the structural, page-coverage, job, failure
-    # and staleness queries inside classify_archives all read from the
-    # same snapshot, so the population counts cannot disagree with each
-    # other because a writer landed between two of them. Without this,
-    # the partition invariant this audit reports would be an assertion
-    # about no single state of the library.
     snapshot = read_consistent_snapshot(
         database,
         read,
         context="audit",
         integrity_check=quick_check,
     )
-    archives = snapshot.result
+    result, census, expected_ids = snapshot.result
 
     # Re-stat *after* the connection is closed: if opening read-only or
-    # running any SELECT touched the file (it shouldn't -- mode=ro
-    # plus query_only forbid it, but this is the actual guarantee the
-    # audit promises), this run is not trustworthy and must not be
-    # reported as if it were. Checked *after* the data_version gate,
-    # which is the stronger of the two detectors, so a concurrent
-    # commit is reported as exactly that and not as an ambiguous "the
-    # file moved".
+    # running any SELECT touched the file (it should not -- mode=ro plus
+    # query_only forbid it, but this is the actual guarantee the audit
+    # promises), this run is not trustworthy. Checked after the
+    # data_version gate, which is the stronger detector, so a concurrent
+    # commit is reported as exactly that rather than as "the file moved".
     fingerprint_after = fingerprint_database(database)
     files_after = fingerprint_database_files(database)
 
@@ -714,71 +989,36 @@ def run_audit(
 
     elapsed = time.perf_counter() - started
 
-    counts = population_counts(archives)
-    total_archive_count = len(archives)
-    partition_sum = sum(counts.values())
-    never_enqueued = [
-        archive for archive in archives if archive["never_enqueued_backlog"]
-    ]
-    # Full fidelity, always: the console may sample this list, but the
-    # JSON and CSV artefacts are the record of what the audit actually
-    # found and must never be abridged.
-    never_enqueued_archive_ids = [
-        archive["archive_id"] for archive in never_enqueued
-    ]
-    blocking_incomplete_count = (
-        counts["incomplete"] if expect_backfill_complete else 0
+    historical = measure_historical(result.archives)
+    operational = measure_operational(result.archives)
+    accountability = build_accountability(result)
+    identities = reconcile_identities(result, expected_ids)
+    invariants = check_invariants(
+        result, census, historical, operational, identities
     )
-    blocking_stale_count = counts["stale"] if expect_backfill_complete else 0
-    blocking_backfill_work_count = (
-        blocking_incomplete_count + blocking_stale_count
-    )
+    failed = [invariant for invariant in invariants if not invariant.passed]
 
     output = {
         "database": str(database),
         "job_type": JOB_TYPE,
-        "stale_older_than_seconds": stale_older_than_seconds,
-        "total_archive_count": total_archive_count,
-        "population_counts": counts,
-        "population_partition_sum": partition_sum,
-        "population_partition_matches_total": (
-            partition_sum == total_archive_count
-        ),
-        "failed_stable_category_counts": failed_category_counts(archives),
-        "expect_backfill_complete": expect_backfill_complete,
-        # Final mode verifies its own premise.  A nonzero incomplete or
-        # stale population means Version 1 work remains, even when every
-        # such archive has job history and therefore none qualifies as a
-        # never-enqueued unexplained gap.
-        "backfill_complete_gate_passed": (
-            blocking_backfill_work_count == 0
-            if expect_backfill_complete
-            else None
-        ),
-        "blocking_incomplete_count": blocking_incomplete_count,
-        "blocking_stale_count": blocking_stale_count,
-        "blocking_backfill_work_count": blocking_backfill_work_count,
-        "never_enqueued_backlog_count": len(never_enqueued),
-        "never_enqueued_backlog_archive_ids": never_enqueued_archive_ids,
-        "never_enqueued_backlog_explanation": (
-            NEVER_ENQUEUED_BACKLOG_EXPLANATION
-        ),
-        # Same archives, reported under the blocking keys only when the
-        # operator asserted the backfill is finished. Both keys are
-        # always present (empty by default) so downstream parsers can
-        # read one stable schema and simply check the count.
-        "blocking_unexplained_gap_count": (
-            len(never_enqueued) if expect_backfill_complete else 0
-        ),
-        "blocking_unexplained_gap_archive_ids": (
-            list(never_enqueued_archive_ids)
-            if expect_backfill_complete
-            else []
-        ),
-        "blocking_unexplained_gap_explanation": (
-            BLOCKING_UNEXPLAINED_GAP_EXPLANATION
-        ),
-        "archives": archives,
+        "declared_scope": result.scope.as_dict(),
+        "scope_digest": result.scope.digest,
+        "filesystem_consulted": result.filesystem_consulted,
+        "page_census": census,
+        "identity_census": identities,
+        "measurements": {
+            MEASUREMENT_HISTORICAL: historical.as_dict(),
+            MEASUREMENT_OPERATIONAL: operational.as_dict(),
+            "accountability": accountability,
+        },
+        "invariants": [invariant.as_dict() for invariant in invariants],
+        "invariants_passed": not failed,
+        "failed_invariants": [invariant.name for invariant in failed],
+        "archives": archive_rows(result),
+        # Stated affirmatively as well as via `concurrent_commit_detected`:
+        # the read-only claim is the one a reviewer checks first, and it
+        # should not have to be read as a negation.
+        "data_version_unchanged": snapshot.data_version_unchanged,
         **snapshot.report_fields(),
         **fingerprint_report_fields(
             fingerprint_before=fingerprint_before,
@@ -793,25 +1033,25 @@ def run_audit(
         output["json_output"] = str(_write_json(json_output, output))
 
     if csv_output is not None:
-        output["csv_output"] = str(_write_csv(csv_output, archives))
+        output["csv_output"] = str(_write_csv(csv_output, output["archives"]))
 
     return output
+
+
+# --- console -------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Read-only, full-library Version 1 perceptual-hash coverage "
-            "audit. Classifies every archive into exactly one of "
-            "complete / incomplete / failed / stale / ineligible, and "
-            "separately reports eligible archives with zero coverage "
-            "and no job history at all as the never-enqueued backlog "
-            "(expected remaining work while the backfill is running; "
-            "pass --expect-backfill-complete to require incomplete and "
-            "stale populations to be zero and treat any never-enqueued "
-            "subset as blocking unexplained gaps). Never enqueues, retries, "
-            "quarantines, or moves anything; safe to point at a "
-            "protected backup."
+            "Read-only perceptual-coverage accounting over every archive "
+            "identity, built on the shared classification contract. "
+            "Reports historical coverage (frozen page denominator), "
+            "operational coverage (only recorded retirements and "
+            "supersessions excluded) and accountability (every identity, "
+            "including zero-page ones), and fails on any unexplained "
+            "residue. Never enqueues, retries, quarantines or moves "
+            "anything; safe to point at a protected backup."
         )
     )
     parser.add_argument(
@@ -824,40 +1064,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--stale-older-than-seconds",
-        type=int,
-        required=True,
+        "--scope",
+        action="append",
+        metavar="ROOT",
         help=(
-            "Staleness cutoff in seconds for active (claimed/running) "
-            "jobs, using the same predicate as "
-            "JobQueue.recover_abandoned() / abandoned_job_audit.py's "
-            "collect_stale_jobs."
+            "A declared filesystem root this run may observe. Repeat for "
+            "several. Omit entirely to skip the filesystem: availability "
+            "is then reported as not_observed and nothing is stat()ed, "
+            "which is an honest answer rather than a guess. Results taken "
+            "under different scopes are not comparable; the canonical "
+            "digest is printed so they cannot be confused."
         ),
     )
     parser.add_argument(
         "--json-output",
         type=Path,
-        help="Optional path for the JSON coverage report.",
+        help="Optional path for the JSON accounting report.",
     )
     parser.add_argument(
         "--csv-output",
         type=Path,
-        help="Optional path for the per-archive CSV classification.",
-    )
-    parser.add_argument(
-        "--expect-backfill-complete",
-        action="store_true",
-        help=(
-            "Final-audit mode. Verify that Version 1 work is complete by "
-            "requiring both incomplete and stale populations to be zero. "
-            "Any eligible archive that never had a "
-            "hash_archive_pages_perceptual job is additionally reported "
-            "as a blocking unexplained gap (missed enqueue / orchestration "
-            "bug). Changes no classification; exits 2 whenever incomplete "
-            "or stale work remains. Use this for step 3 of "
-            "the handoff document's remaining project sequence; leave "
-            "it off while the backfill is still running."
-        ),
+        help="Optional path for the per-archive classification CSV.",
     )
     return parser
 
@@ -869,151 +1096,227 @@ def print_archive_id_sample(
     label: str = "ARCHIVE IDS",
     limit: int = MAX_PRINTED_ARCHIVE_IDS,
 ) -> None:
-    """Print at most `limit` ids, plus an explicit omitted count.
-
-    Truncation is never silent: when the list is longer than `limit`
-    the header states how many of how many are shown and a following
-    line names the exact number omitted and where the full list lives.
-    An operator who sees only part of a list must be able to tell that
-    from the console alone -- otherwise a capped summary is worse than
-    no summary, because it looks complete.
-    """
-    total = len(archive_ids)
-
-    if total == 0:
+    """Print a capped sample, always stating what was omitted."""
+    if not archive_ids:
         return
 
     shown = list(archive_ids[:limit])
-    omitted = total - len(shown)
+    omitted = len(archive_ids) - len(shown)
+    print(f"{indent}{label}: {', '.join(str(value) for value in shown)}")
 
     if omitted:
-        print(f"{indent}{label} (first {len(shown):,} of {total:,}): {shown}")
         print(
-            f"{indent}... and {omitted:,} more "
-            "(see JSON/CSV for the full list)"
+            f"{indent}  ... and {omitted} more "
+            "(full list in the JSON and CSV outputs)"
+        )
+
+
+def print_scope(output: dict) -> None:
+    """The declared roots and digest, printed before any number.
+
+    First, deliberately. Every figure below is conditional on this scope,
+    and a reader who skips it can compare two incomparable reports.
+    """
+    scope = output["declared_scope"]
+    print("DECLARED SCOPE")
+
+    if not scope["roots"]:
+        print(
+            "  (none declared -- the filesystem was not consulted; "
+            "availability is not_observed for every archive)"
         )
     else:
-        print(f"{indent}{label} ({total:,}): {shown}")
+        for entry in scope["roots"]:
+            state = "reachable" if entry["reachable"] else "UNREACHABLE"
+            print(f"  {entry['root']}  [{state}]")
+
+    print(f"  canonical scope digest: {scope['digest']}")
+    print(f"  filesystem consulted:   {output['filesystem_consulted']}")
+    print()
 
 
-def _print_never_enqueued_section(output: dict) -> None:
-    """The one part of the summary whose wording depends on the mode.
-
-    Identical population, two framings -- see the module docstring.
-    """
-    archive_ids = output["never_enqueued_backlog_archive_ids"]
-
-    if output.get("expect_backfill_complete"):
-        count = output["blocking_unexplained_gap_count"]
-        print(
-            "BLOCKING UNEXPLAINED GAPS (eligible, zero coverage, no job "
-            f"ever): {count:,}"
-        )
-
-        if count:
-            print(
-                "  Final-audit mode asserted the backfill is complete, so "
-                "these indicate a missed enqueue or an orchestration bug "
-                "and must be investigated before the backfill is signed "
-                "off."
-            )
-            print_archive_id_sample(
-                output["blocking_unexplained_gap_archive_ids"]
-            )
-
-        return
-
-    count = output["never_enqueued_backlog_count"]
+def _print_coverage(coverage: dict) -> None:
+    print(f"  {coverage['name'].upper()}")
     print(
-        "Never-enqueued backlog (eligible, zero coverage, not yet "
-        f"enqueued): {count:,}"
+        f"    covered / total: {coverage['covered_pages']:,} / "
+        f"{coverage['total_pages']:,} = {coverage['percentage_display']}"
     )
-
-    if count:
-        # Deliberately free of the word "gap": mid-backfill this is the
-        # work queue, and an operator scanning the summary should not
-        # read the remaining workload as a defect. The pointer to
-        # --expect-backfill-complete is how they get the strict reading
-        # once it is actually the right one.
-        print(
-            "  Expected remaining work while the Version 1 backfill is in "
-            "progress -- not an anomaly. Once eligibility reaches zero, "
-            "re-run with --expect-backfill-complete for the strict "
-            "post-backfill check."
-        )
-        print_archive_id_sample(archive_ids, label="Sample archive IDs")
+    print(f"    outstanding:     {coverage['outstanding_pages']:,}")
+    print(
+        f"    excluded:        {coverage['excluded_pages']:,} pages "
+        f"across {coverage['excluded_archives']:,} identities"
+    )
+    # Printed so the numerator's derivation is visible: a denominator
+    # that shrank by the right amount says nothing about whether the
+    # covered pages moved with it.
+    print(
+        f"      of which covered:     "
+        f"{coverage['excluded_covered_pages']:,}"
+    )
+    print(
+        f"      of which outstanding: "
+        f"{coverage['excluded_outstanding_pages']:,}"
+    )
+    print(f"    basis:           {coverage['basis']}")
 
 
 def print_summary(output: dict) -> None:
-    print("Perceptual-hashing Version 1 coverage audit completed.")
-    print(f"Database:              {output['database']}")
-    print(f"Total archives:        {output['total_archive_count']}")
-    print("Populations:")
+    """The whole report, scope first and invariants last."""
+    print()
+    print("=" * 72)
+    print("PERCEPTUAL COVERAGE ACCOUNTING")
+    print("=" * 72)
+    print(f"database: {output['database']}")
+    print()
 
-    for population, count in output["population_counts"].items():
-        print(f"  {population}: {count}")
+    print_scope(output)
 
+    measurements = output["measurements"]
+    accountability = measurements["accountability"]
+
+    print("COVERAGE")
+    _print_coverage(measurements[MEASUREMENT_HISTORICAL])
+    print()
+    _print_coverage(measurements[MEASUREMENT_OPERATIONAL])
+    print()
+
+    census = output["page_census"]
+    print("PAGE CENSUS (independent of the classification)")
+    print(f"  pages:                    {census['pages']:,}")
+    print(f"  dHash v1:                 {census['dhash_pages']:,}")
+    print(f"  pHash v1:                 {census['phash_pages']:,}")
+    print(f"  half-paired pages:        {census['half_paired_pages']:,}")
     print(
-        "Partition check:       "
-        f"{output['population_partition_sum']} == "
-        f"{output['total_archive_count']} -> "
-        f"{output['population_partition_matches_total']}"
+        f"  missing dimensions:       "
+        f"{census['pages_missing_dimensions']:,}"
     )
-    print("Failed-job categories (within 'failed'):")
+    print()
 
-    for category, count in output["failed_stable_category_counts"].items():
-        print(f"  {category}: {count}")
-
-    _print_never_enqueued_section(output)
-
-    if output.get("expect_backfill_complete"):
-        print(
-            "Final backfill gate:    "
-            f"{output['backfill_complete_gate_passed']} "
-            f"(incomplete={output['blocking_incomplete_count']:,}, "
-            f"stale={output['blocking_stale_count']:,})"
-        )
-
-    print(f"Integrity check:       {output['quick_check']}")
+    identities = output["identity_census"]
+    print("IDENTITY CENSUS (independent of the classification)")
     print(
-        "Snapshot data_version: "
-        f"{output['data_version_before']} -> "
-        f"{output['data_version_after']} (authoritative guard)"
+        f"  archive_files rows:       "
+        f"{identities['expected_identities']:,}"
     )
     print(
-        "DB file unchanged:     "
-        f"{output['database_file_unchanged']} (diagnostic only; a WAL "
-        "commit can leave the main file identical)"
+        f"  classified rows:          "
+        f"{identities['classified_identities']:,}"
+    )
+    print(f"  missing:                  {identities['missing_count']:,}")
+    print_archive_id_sample(
+        identities["missing_archive_ids"], indent="    ", label="MISSING"
+    )
+    print(f"  extra:                    {identities['extra_count']:,}")
+    print_archive_id_sample(
+        identities["extra_archive_ids"], indent="    ", label="EXTRA"
+    )
+    print(f"  duplicate:                {identities['duplicate_count']:,}")
+    print_archive_id_sample(
+        identities["duplicate_archive_ids"],
+        indent="    ",
+        label="DUPLICATE",
+    )
+    print(
+        f"  incomplete tuples:        "
+        f"{identities['incomplete_tuple_count']:,}"
+    )
+    print()
+
+    print("ACCOUNTABILITY")
+    print(
+        f"  archive identities:       "
+        f"{accountability['archive_identities']:,}"
+    )
+    print(
+        f"  zero-page identities:     "
+        f"{accountability['zero_page_identity_count']:,}"
     )
 
-    if output.get("json_output"):
-        print(f"JSON output:           {output['json_output']}")
-    if output.get("csv_output"):
-        print(f"CSV output:            {output['csv_output']}")
+    for subreason, count in accountability["zero_page_subreasons"].items():
+        print(f"    {subreason}: {count:,}")
+
+    print(f"  unexplained residue:      {accountability['unexplained_count']:,}")
+    print_archive_id_sample(
+        accountability["unexplained_archive_ids"],
+        indent="    ",
+        label="UNEXPLAINED",
+    )
+    print()
+
+    for axis in AXES:
+        print(f"  {axis}")
+        pages = accountability["outstanding_pages_by_axis"][axis]
+
+        for value, count in accountability["axis_totals"][axis].items():
+            print(
+                f"    {value:<28} {count:>8,} identities  "
+                f"{pages.get(value, 0):>9,} outstanding pages"
+            )
+
+        print()
+
+    print("INVARIANTS")
+
+    for invariant in output["invariants"]:
+        state = "PASS" if invariant["passed"] else "FAIL"
+        print(f"  [{state}] {invariant['name']}")
+
+        if not invariant["passed"]:
+            print(f"         {invariant['detail']}")
+
+    print()
+    print("READ-ONLY EVIDENCE")
+    print(
+        f"  data_version before/after: "
+        f"{output['data_version_before']} / {output['data_version_after']}"
+    )
+    print(f"  data_version unchanged:    {output['data_version_unchanged']}")
+    print(
+        f"  concurrent commit:         "
+        f"{output['concurrent_commit_detected']}"
+    )
+    print(f"  quick_check:               {output['quick_check']}")
+    # Labelled as the weaker signal it is: under WAL a commit can leave
+    # the main file's size and mtime identical, so this confirms nothing
+    # about concurrency on its own.
+    print(
+        f"  file unchanged (diagnostic only): "
+        f"{output['database_file_unchanged']}"
+    )
+    print(f"  elapsed: {output['elapsed_seconds']}s")
+    print("=" * 72)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     try:
         output = run_audit(
             database=args.database,
-            stale_older_than_seconds=args.stale_older_than_seconds,
+            scope=args.scope,
             json_output=args.json_output,
             csv_output=args.csv_output,
-            expect_backfill_complete=args.expect_backfill_complete,
         )
-    except Exception as exc:
-        print(f"Perceptual coverage audit failed: {exc}", file=sys.stderr)
+    except (
+        FileNotFoundError,
+        OutputPathCollisionError,
+        DatabaseIntegrityError,
+        DatabaseChangedError,
+        ClassificationInvariantError,
+    ) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
         return EXIT_FAILURE
 
     print_summary(output)
 
-    # Only final-audit mode can fail the run. It verifies its own premise:
-    # all incomplete and stale work must be gone. The never-enqueued gap
-    # population is a diagnostic subset of incomplete, not the whole gate.
-    if output["blocking_backfill_work_count"] > 0:
-        return EXIT_BACKFILL_INCOMPLETE
+    if not output["invariants_passed"]:
+        print(
+            "FAILED INVARIANTS: "
+            + ", ".join(output["failed_invariants"]),
+            file=sys.stderr,
+        )
+        return EXIT_INVARIANT_VIOLATION
 
     return EXIT_OK
 

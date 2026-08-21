@@ -1,31 +1,54 @@
+"""Perceptual-coverage accounting, on top of the shared contract.
+
+Three kinds of test here, and the distinction matters.
+
+*Arithmetic* tests seed a small library whose numbers can be worked out by
+hand, then assert the three measurements report exactly those numbers.
+
+*Neutrality proofs* are the reason this audit was rebuilt. Each one takes a
+measurement, changes one thing about the library, and asserts the measurement
+did or did not move. Historical coverage must survive a retirement; operational
+coverage must survive a file being deleted from disk. These are the properties
+the old single-population report silently violated, so they are asserted
+directly rather than inferred from a total.
+
+*Bypass proofs* seed a state the audit claims cannot exist -- a half-paired
+page, a completed job over unhashed pages, unexplained residue -- and assert
+the audit fails rather than reports. A guard exercised only through the path
+that respects it has not been demonstrated.
+"""
+
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from comic_automation.archive import perceptual_coverage_audit as audit
 from comic_automation.archive.perceptual_coverage_audit import (
     DatabaseChangedError,
     DatabaseIntegrityError,
     DatabaseMutatedError,
-    EXIT_BACKFILL_INCOMPLETE,
-    EXIT_BLOCKING_UNEXPLAINED_GAPS,
+    EXIT_INVARIANT_VIOLATION,
     EXIT_OK,
     MAX_PRINTED_ARCHIVE_IDS,
     OutputPathCollisionError,
-    POPULATION_ORDER,
-    classify_archives,
-    failed_category_counts,
+    build_accountability,
+    check_invariants,
     fingerprint_database,
     main,
-    population_counts,
+    measure_historical,
+    measure_operational,
+    page_census,
     readonly_database_connection,
     run_audit,
     validate_output_paths,
 )
+from comic_automation.archive import classification as C
+from comic_automation.archive import disposition
 from comic_automation.archive.perceptual_hashing import (
     DHASH_ALGORITHM,
     DHASH_ALGORITHM_VERSION,
@@ -47,560 +70,1331 @@ MIGRATIONS = (
 )
 
 JOB_TYPE = "hash_archive_pages_perceptual"
-FIXED_NOW = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+INSPECT_JOB_TYPE = "inspect_archive"
 
 
 # --- fixture-building helpers -------------------------------------------
 
 
-def seed_archive(
-    connection: sqlite3.Connection,
-    *,
-    path: str | None,
-    file_size: int = 2048,
-    modified_time_ns: int = 1_000_000_000,
-) -> int:
-    """Insert an archive_files row and, optionally, its current
-    file_locations row. path=None simulates an archive with no current
-    location (orphaned / moved / deleted).
-    """
-    archive = connection.execute(
-        "INSERT INTO archive_files (file_size) VALUES (?)",
-        (file_size,),
+def add_archive(conn: sqlite3.Connection, archive_id: int) -> int:
+    conn.execute(
+        "INSERT INTO archive_files (id, file_size) VALUES (?, ?)",
+        (archive_id, 4096),
     )
-    archive_id = int(archive.lastrowid)
-
-    if path is not None:
-        connection.execute(
-            """
-            INSERT INTO file_locations (
-                archive_id, path, file_size, modified_time_ns, is_current
-            )
-            VALUES (?, ?, ?, ?, 1)
-            """,
-            (archive_id, path, file_size, modified_time_ns),
-        )
-
     return archive_id
 
 
-def seed_content_signature(
-    connection: sqlite3.Connection,
-    *,
+def add_location(
+    conn: sqlite3.Connection,
     archive_id: int,
-    page_count: int,
-    source_file_size: int = 2048,
-    source_modified_time_ns: int = 1_000_000_000,
+    path: Path | str,
+    *,
+    is_current: bool = True,
+    file_size: int = 4096,
+    mtime: int = 111,
 ) -> None:
-    connection.execute(
+    conn.execute(
+        """
+        INSERT INTO file_locations
+            (archive_id, path, is_current, file_size, modified_time_ns)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (archive_id, str(path), 1 if is_current else 0, file_size, mtime),
+    )
+
+
+def add_signature(
+    conn: sqlite3.Connection,
+    archive_id: int,
+    *,
+    page_count: int = 2,
+    file_size: int = 4096,
+    mtime: int = 111,
+) -> None:
+    conn.execute(
         """
         INSERT INTO archive_content_signatures (
-            archive_id, algorithm, algorithm_version, digest,
-            page_count, image_bytes, source_file_size,
-            source_modified_time_ns
+            archive_id, algorithm, algorithm_version, digest, page_count,
+            image_bytes, source_file_size, source_modified_time_ns
         )
-        VALUES (?, 'sha256', '1', 'deadbeef', ?, 1024, ?, ?)
+        VALUES (?, 'ordered-page', '1', ?, ?, 1, ?, ?)
         """,
-        (
-            archive_id,
-            page_count,
-            source_file_size,
-            source_modified_time_ns,
-        ),
+        (archive_id, f"digest-{archive_id}", page_count, file_size, mtime),
     )
 
 
-def seed_page(
-    connection: sqlite3.Connection,
-    *,
+def add_pages(
+    conn: sqlite3.Connection,
     archive_id: int,
-    page_index: int,
-    dhash: bool,
-    phash: bool,
-    dimensions: bool,
-) -> int:
-    page = connection.execute(
-        """
-        INSERT INTO archive_pages (
-            archive_id, page_index, entry_name, entry_size,
-            compressed_size, crc32, width, height, image_format
-        )
-        VALUES (?, ?, ?, 1024, 512, 0, ?, ?, ?)
-        """,
-        (
-            archive_id,
-            page_index,
-            f"page-{page_index:03d}.jpg",
-            800 if dimensions else None,
-            1200 if dimensions else None,
-            "JPEG" if dimensions else None,
-        ),
-    )
-    page_id = int(page.lastrowid)
-
-    if dhash:
-        connection.execute(
-            """
-            INSERT INTO page_hashes (
-                page_id, algorithm, algorithm_version, digest, bytes_read
-            )
-            VALUES (?, ?, ?, 'aaaa', 1024)
-            """,
-            (page_id, DHASH_ALGORITHM, DHASH_ALGORITHM_VERSION),
-        )
-
-    if phash:
-        connection.execute(
-            """
-            INSERT INTO page_hashes (
-                page_id, algorithm, algorithm_version, digest, bytes_read
-            )
-            VALUES (?, ?, ?, 'bbbb', 1024)
-            """,
-            (page_id, PHASH_ALGORITHM, PHASH_ALGORITHM_VERSION),
-        )
-
-    return page_id
-
-
-def seed_job(
-    connection: sqlite3.Connection,
+    count: int,
     *,
-    archive_id: int,
-    status: str,
-    failure_category: str | None = None,
-    error_message: str | None = None,
-    attempts: int = 1,
-    max_attempts: int = 3,
-    claimed_at: str | None = None,
-    started_at: str | None = None,
-    completed_at: str | None = None,
-) -> int:
-    job = connection.execute(
-        """
-        INSERT INTO jobs (
-            job_type, status, archive_id, attempts, max_attempts,
-            failure_category, error_message, claimed_at, started_at,
-            completed_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            JOB_TYPE,
-            status,
-            archive_id,
-            attempts,
-            max_attempts,
-            failure_category,
-            error_message,
-            claimed_at,
-            started_at,
-            completed_at,
-        ),
-    )
-    return int(job.lastrowid)
+    hashed: int = 0,
+    dhash_only: int = 0,
+) -> list[int]:
+    """Add `count` pages, the first `hashed` fully covered.
 
-
-def build_populated_database(database: Path) -> dict[str, int]:
-    """One archive per population, plus one never-enqueued archive.
-
-    Returns a name -> archive_id map so tests can assert on specific
-    archives by role rather than by position.
+    `dhash_only` seeds pages carrying a dHash and no pHash -- a state the
+    hashing worker cannot produce, used by the pairing bypass proof.
     """
-    ids: dict[str, int] = {}
+    page_ids: list[int] = []
 
-    with database_connection(database) as connection:
+    for index in range(count):
+        covered = index < hashed
+        cursor = conn.execute(
+            """
+            INSERT INTO archive_pages (
+                archive_id, page_index, entry_name, entry_size,
+                compressed_size, crc32, width, height
+            )
+            VALUES (?, ?, ?, 10, 10, 0, ?, ?)
+            """,
+            (
+                archive_id,
+                index,
+                f"{index}.jpg",
+                100 if covered else None,
+                100 if covered else None,
+            ),
+        )
+        page_id = int(cursor.lastrowid)
+        page_ids.append(page_id)
+
+        if covered:
+            for algorithm, version in (
+                (DHASH_ALGORITHM, DHASH_ALGORITHM_VERSION),
+                (PHASH_ALGORITHM, PHASH_ALGORITHM_VERSION),
+            ):
+                add_page_hash(conn, page_id, algorithm, version)
+
+    for page_id in page_ids[hashed : hashed + dhash_only]:
+        conn.execute(
+            "UPDATE archive_pages SET width = 100, height = 100 "
+            "WHERE id = ?",
+            (page_id,),
+        )
+        add_page_hash(
+            conn, page_id, DHASH_ALGORITHM, DHASH_ALGORITHM_VERSION
+        )
+
+    return page_ids
+
+
+def add_page_hash(
+    conn: sqlite3.Connection, page_id: int, algorithm: str, version: str
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO page_hashes
+            (page_id, algorithm, algorithm_version, digest, bytes_read)
+        VALUES (?, ?, ?, ?, 1)
+        """,
+        (page_id, algorithm, version, f"h{page_id}{algorithm}"),
+    )
+
+
+def add_job(
+    conn: sqlite3.Connection,
+    archive_id: int,
+    job_type: str,
+    status: str,
+) -> int:
+    column = {
+        "completed": "completed_at",
+        "failed": "completed_at",
+        "cancelled": "cancelled_at",
+    }.get(status)
+
+    if column is not None:
+        cursor = conn.execute(
+            f"INSERT INTO jobs (job_type, archive_id, status, {column}) "
+            "VALUES (?, ?, ?, '2026-08-01T00:00:00Z')",
+            (job_type, archive_id, status),
+        )
+    else:
+        cursor = conn.execute(
+            "INSERT INTO jobs (job_type, archive_id, status) "
+            "VALUES (?, ?, ?)",
+            (job_type, archive_id, status),
+        )
+
+    return int(cursor.lastrowid)
+
+
+def write_archive_file(path: Path, size: int = 4096) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x00" * size)
+
+
+def build_library(database: Path, root: Path) -> dict[str, int]:
+    """A small library whose every figure can be checked by hand.
+
+    ==  =====  =======  ==================================================
+    id  pages  covered  shape
+    ==  =====  =======  ==================================================
+     1      3        3  present and matching, fully covered
+     2      4        2  present and matching, half covered
+     3      0        0  zero pages -- in accountability, in neither ratio
+     4      5        0  present, will be retired by the neutrality proofs
+     5      2        2  file absent from disk: covered, and still ours
+    ==  =====  =======  ==================================================
+
+    Totals: 5 identities, 14 pages, 7 covered, 7 outstanding.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    connection = connect_database(database)
+
+    try:
         apply_migrations(connection, MIGRATIONS)
 
-        # complete: fully covered, eligible, no job needed anymore.
-        complete_id = seed_archive(connection, path=r"X:\Comics\A\complete.cbz")
-        seed_content_signature(connection, archive_id=complete_id, page_count=2)
-        seed_page(
-            connection,
-            archive_id=complete_id,
-            page_index=0,
-            dhash=True,
-            phash=True,
-            dimensions=True,
-        )
-        seed_page(
-            connection,
-            archive_id=complete_id,
-            page_index=1,
-            dhash=True,
-            phash=True,
-            dimensions=True,
-        )
-        ids["complete"] = complete_id
+        for archive_id, pages, hashed, on_disk in (
+            (1, 3, 3, True),
+            (2, 4, 2, True),
+            (3, 0, 0, True),
+            (4, 5, 0, True),
+            (5, 2, 2, False),
+        ):
+            add_archive(connection, archive_id)
+            path = root / f"{archive_id}.cbz"
+            add_location(connection, archive_id, path)
+            add_signature(connection, archive_id, page_count=max(pages, 1))
+            add_pages(connection, archive_id, pages, hashed=hashed)
 
-        # incomplete: eligible, partial coverage, an active *pending*
-        # (not stale) job in flight.
-        incomplete_id = seed_archive(
-            connection, path=r"X:\Comics\B\incomplete.cbz"
-        )
-        seed_content_signature(
-            connection, archive_id=incomplete_id, page_count=2
-        )
-        seed_page(
-            connection,
-            archive_id=incomplete_id,
-            page_index=0,
-            dhash=True,
-            phash=True,
-            dimensions=True,
-        )
-        seed_page(
-            connection,
-            archive_id=incomplete_id,
-            page_index=1,
-            dhash=False,
-            phash=False,
-            dimensions=False,
-        )
-        seed_job(connection, archive_id=incomplete_id, status="pending")
-        ids["incomplete"] = incomplete_id
+            if on_disk:
+                write_archive_file(path)
 
-        # never enqueued: eligible, zero coverage, *no* job ever. Read
-        # as remaining backlog by default and as a blocking unexplained
-        # gap only under --expect-backfill-complete.
-        gap_id = seed_archive(connection, path=r"X:\Comics\C\gap.cbz")
-        seed_content_signature(connection, archive_id=gap_id, page_count=1)
-        seed_page(
-            connection,
-            archive_id=gap_id,
-            page_index=0,
-            dhash=False,
-            phash=False,
-            dimensions=False,
-        )
-        ids["never_enqueued_backlog"] = gap_id
+        connection.commit()
+    finally:
+        connection.close()
 
-        # failed (corrupt_archives): eligible, terminal failure.
-        failed_archive_id = seed_archive(
-            connection, path=r"X:\Comics\D\failed-archive.cbz"
-        )
-        seed_content_signature(
-            connection, archive_id=failed_archive_id, page_count=1
-        )
-        seed_job(
-            connection,
-            archive_id=failed_archive_id,
-            status="failed",
-            failure_category="archive_corrupt",
-            error_message="Invalid or corrupt CBZ archive",
-            attempts=3,
-            completed_at="2026-07-29T12:00:00",
-        )
-        ids["failed_corrupt_archive"] = failed_archive_id
-
-        # failed (corrupt_images): eligible, terminal failure, a
-        # different stable category than the one above.
-        failed_image_id = seed_archive(
-            connection, path=r"X:\Comics\E\failed-image.cbz"
-        )
-        seed_content_signature(
-            connection, archive_id=failed_image_id, page_count=1
-        )
-        seed_job(
-            connection,
-            archive_id=failed_image_id,
-            status="failed",
-            failure_category="page_image_corrupt",
-            error_message="Invalid or unsupported image page",
-            attempts=3,
-            completed_at="2026-07-29T12:00:00",
-        )
-        ids["failed_corrupt_image"] = failed_image_id
-
-        # stale: eligible, an old claimed job (older than the threshold).
-        stale_id = seed_archive(connection, path=r"X:\Comics\F\stale.cbz")
-        seed_content_signature(connection, archive_id=stale_id, page_count=1)
-        old_claimed_at = (
-            FIXED_NOW - timedelta(hours=6)
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        seed_job(
-            connection,
-            archive_id=stale_id,
-            status="claimed",
-            claimed_at=old_claimed_at,
-        )
-        ids["stale"] = stale_id
-
-        # ineligible: no current file location at all (orphaned).
-        ineligible_no_location_id = seed_archive(connection, path=None)
-        seed_content_signature(
-            connection, archive_id=ineligible_no_location_id, page_count=1
-        )
-        ids["ineligible_no_location"] = ineligible_no_location_id
-
-        # ineligible: has a current location, but the content signature
-        # is stale relative to it (file changed on disk since exact
-        # page hashing ran).
-        ineligible_stale_signature_id = seed_archive(
-            connection,
-            path=r"X:\Comics\G\stale-signature.cbz",
-            file_size=4096,
-            modified_time_ns=2_000_000_000,
-        )
-        seed_content_signature(
-            connection,
-            archive_id=ineligible_stale_signature_id,
-            page_count=1,
-            source_file_size=1234,
-            source_modified_time_ns=999,
-        )
-        ids["ineligible_stale_signature"] = ineligible_stale_signature_id
-
-        # ineligible: has a current location, but no content signature
-        # at all yet (exact page hashing never ran).
-        ineligible_no_signature_id = seed_archive(
-            connection, path=r"X:\Comics\H\no-signature.cbz"
-        )
-        ids["ineligible_no_signature"] = ineligible_no_signature_id
-
-    return ids
+    return {
+        "identities": 5,
+        "pages": 14,
+        "covered": 7,
+        "outstanding": 7,
+    }
 
 
-# --- classification, per population -------------------------------------
-
-
-def test_complete_archive_is_classified_complete(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
+def classify_library(database: Path, root: Path | None):
+    scope = [str(root)] if root is not None else None
 
     with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
-
-    by_id = {a["archive_id"]: a for a in archives}
-    assert by_id[ids["complete"]]["population"] == "complete"
-    assert by_id[ids["complete"]]["pages_missing"] == 0
-    assert by_id[ids["complete"]]["never_enqueued_backlog"] is False
+        return C.classify(connection, scope=scope)
 
 
-def test_incomplete_archive_is_classified_incomplete(tmp_path: Path) -> None:
+@pytest.fixture()
+def library(tmp_path: Path):
+    """A seeded database plus its declared root."""
     database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
-
-    by_id = {a["archive_id"]: a for a in archives}
-    entry = by_id[ids["incomplete"]]
-    assert entry["population"] == "incomplete"
-    assert entry["pages_missing"] == 1
-    assert entry["has_any_job"] is True
-    assert entry["never_enqueued_backlog"] is False
+    root = tmp_path / "lib"
+    facts = build_library(database, root)
+    return database, root, facts
 
 
-def test_never_enqueued_archive_is_incomplete_and_flagged(
-    tmp_path: Path,
+# --- the three measurements ---------------------------------------------
+
+
+def test_every_archive_appears_exactly_once(library) -> None:
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+
+    ids = [row["archive_id"] for row in output["archives"]]
+
+    assert len(ids) == facts["identities"]
+    assert len(set(ids)) == facts["identities"]
+
+
+def test_historical_denominator_is_every_inventoried_page(library) -> None:
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+    historical = output["measurements"]["historical"]
+
+    assert historical["total_pages"] == facts["pages"]
+    assert historical["covered_pages"] == facts["covered"]
+    assert historical["outstanding_pages"] == facts["outstanding"]
+    assert historical["excluded_pages"] == 0
+    assert historical["excluded_archives"] == 0
+
+
+def test_operational_equals_historical_without_any_disposition(
+    library,
 ) -> None:
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
+    """With nothing retired, the two measurements must agree exactly.
 
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
+    They answer different questions, but on a library where nobody has
+    decided anything the answers coincide -- and any divergence here
+    would mean an observation had leaked into the operational
+    denominator.
+    """
+    database, root, _ = library
+    output = run_audit(database=database, scope=[str(root)])
+    measurements = output["measurements"]
 
-    by_id = {a["archive_id"]: a for a in archives}
-    entry = by_id[ids["never_enqueued_backlog"]]
-    assert entry["population"] == "incomplete"
-    assert entry["never_enqueued_backlog"] is True
-    assert entry["has_any_job"] is False
-    assert entry["pages_covered"] == 0
-
-
-def test_failed_archives_classified_failed_with_stable_categories(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
-
-    by_id = {a["archive_id"]: a for a in archives}
-
-    corrupt_archive_entry = by_id[ids["failed_corrupt_archive"]]
-    assert corrupt_archive_entry["population"] == "failed"
-    assert corrupt_archive_entry["failed_stable_category"] == "corrupt_archives"
-
-    corrupt_image_entry = by_id[ids["failed_corrupt_image"]]
-    assert corrupt_image_entry["population"] == "failed"
-    assert corrupt_image_entry["failed_stable_category"] == "corrupt_images"
-
-    counts = failed_category_counts(archives)
-    assert counts["corrupt_archives"] == 1
-    assert counts["corrupt_images"] == 1
-    assert counts["missing_files"] == 0
-
-
-def test_stale_archive_is_classified_stale(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
-
-    by_id = {a["archive_id"]: a for a in archives}
-    entry = by_id[ids["stale"]]
-    assert entry["population"] == "stale"
-    assert entry["is_stale"] is True
-
-
-def test_stale_archive_not_stale_under_a_longer_threshold(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection,
-            stale_older_than_seconds=999_999,
-            now=FIXED_NOW,
-        )
-
-    by_id = {a["archive_id"]: a for a in archives}
-    entry = by_id[ids["stale"]]
-    # Still has an active job and missing hash work, but the job is no
-    # longer "stale" under a threshold larger than its age.
-    assert entry["population"] == "incomplete"
-    assert entry["is_stale"] is False
-
-
-def test_ineligible_archives_classified_ineligible(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
-
-    by_id = {a["archive_id"]: a for a in archives}
-
-    for key in (
-        "ineligible_no_location",
-        "ineligible_stale_signature",
-        "ineligible_no_signature",
-    ):
-        assert by_id[ids[key]]["population"] == "ineligible", key
-        assert by_id[ids[key]]["structural_eligible"] is False, key
-
-
-# --- partition invariant --------------------------------------------------
-
-
-def test_populations_partition_all_archives(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        archives = classify_archives(
-            connection, stale_older_than_seconds=3600, now=FIXED_NOW
-        )
-
-    counts = population_counts(archives)
-    assert set(counts.keys()) == set(POPULATION_ORDER)
-    assert sum(counts.values()) == len(archives)
-
-    # Every population actually has at least one member in this fixture.
-    for population in POPULATION_ORDER:
-        assert counts[population] >= 1, population
-
-
-def test_run_audit_reports_matching_partition(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    output = run_audit(
-        database=database,
-        stale_older_than_seconds=3600,
-        now=FIXED_NOW,
-    )
-
-    assert output["population_partition_matches_total"] is True
     assert (
-        output["population_partition_sum"] == output["total_archive_count"]
+        measurements["operational"]["total_pages"]
+        == measurements["historical"]["total_pages"]
     )
-    assert output["never_enqueued_backlog_count"] == 1
+    assert (
+        measurements["operational"]["covered_pages"]
+        == measurements["historical"]["covered_pages"]
+    )
+    assert measurements["operational"]["excluded_archives"] == 0
 
 
-# --- output generation -----------------------------------------------------
+def test_zero_page_identities_remain_in_accountability(library) -> None:
+    """Archive 3 has no pages, so neither ratio can describe it.
+
+    Accountability exists precisely so that an identity invisible to
+    every page-denominator measurement is still named.
+    """
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+    accountability = output["measurements"]["accountability"]
+
+    assert accountability["archive_identities"] == facts["identities"]
+    assert accountability["zero_page_identity_count"] == 1
+    assert accountability["zero_page_archive_ids"] == [3]
+    assert sum(accountability["zero_page_subreasons"].values()) == 1
 
 
-def test_run_audit_generates_json_and_csv(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
+def test_every_axis_sums_to_the_identity_total(library) -> None:
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+    totals = output["measurements"]["accountability"]["axis_totals"]
 
-    json_output = tmp_path / "reports" / "coverage.json"
-    csv_output = tmp_path / "reports" / "coverage.csv"
+    for axis in C.AXES:
+        assert sum(totals[axis].values()) == facts["identities"], axis
+
+
+def test_outstanding_pages_reconcile_by_archive_and_by_axis(
+    library,
+) -> None:
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+    accountability = output["measurements"]["accountability"]
+
+    by_archive = sum(row["outstanding_pages"] for row in output["archives"])
+    assert by_archive == facts["outstanding"]
+
+    for axis in C.AXES:
+        pages = accountability["outstanding_pages_by_axis"][axis]
+        assert sum(pages.values()) == facts["outstanding"], axis
+
+
+# --- neutrality proofs ---------------------------------------------------
+
+
+def test_historical_coverage_is_unchanged_by_a_seeded_retirement(
+    library,
+) -> None:
+    """The load-bearing property of the historical measurement.
+
+    Retiring archive 4 removes five pages from operational scope. It must
+    not remove them from history: the backfill either hashed those pages
+    or it did not, and a decision taken today cannot change what happened.
+    """
+    database, root, _ = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    connection = connect_database(database)
+    try:
+        disposition.retire(
+            connection, 4, reason="out of scope", evidence="operator"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    after = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    assert after["historical"] == before["historical"]
+
+
+def test_historical_coverage_is_unchanged_by_a_seeded_supersession(
+    library,
+) -> None:
+    database, root, _ = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    connection = connect_database(database)
+    try:
+        disposition.supersede(
+            connection, 4, 1, reason="replaced", evidence="sha256"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    after = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    assert after["historical"] == before["historical"]
+
+
+def test_operational_coverage_moves_only_by_the_dispositioned_pages(
+    library,
+) -> None:
+    """Retiring archive 4 must move operational by exactly its 5 pages."""
+    database, root, facts = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    connection = connect_database(database)
+    try:
+        disposition.retire(
+            connection, 4, reason="out of scope", evidence="operator"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    after = run_audit(database=database, scope=[str(root)])["measurements"]
+    operational = after["operational"]
+
+    assert operational["excluded_archives"] == 1
+    assert operational["excluded_pages"] == 5
+    assert operational["total_pages"] == facts["pages"] - 5
+    # Archive 4 had no covered pages, so the numerator cannot move.
+    assert (
+        operational["covered_pages"]
+        == before["operational"]["covered_pages"]
+    )
+
+
+def _disposition_movement(database: Path, root: Path, apply) -> tuple:
+    """Measurements either side of a disposition, and the deltas."""
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    connection = connect_database(database)
+    try:
+        apply(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    after = run_audit(database=database, scope=[str(root)])["measurements"]
+    return before, after
+
+
+@pytest.mark.parametrize(
+    "name, apply",
+    [
+        (
+            "retirement",
+            lambda conn: disposition.retire(
+                conn, 2, reason="out of scope", evidence="operator"
+            ),
+        ),
+        (
+            "supersession",
+            lambda conn: disposition.supersede(
+                conn, 2, 1, reason="replaced", evidence="sha256"
+            ),
+        ),
+    ],
+)
+def test_a_disposition_moves_numerator_denominator_and_outstanding(
+    library, name, apply
+) -> None:
+    """Archive 2 is *partially* covered: 4 pages, 2 of them hashed.
+
+    That is the whole point of using it. The retirement this library
+    actually holds in production (archive 45217) has zero covered pages,
+    so an implementation that shrank the denominator while keeping the
+    full historical numerator would produce the right answer there and
+    be wrong everywhere else. A partially covered archive forces all
+    three numbers to move by known, different amounts.
+    """
+    database, root, facts = library
+    before, after = _disposition_movement(database, root, apply)
+
+    operational = after["operational"]
+
+    # Historical is untouched by either kind of decision.
+    assert after["historical"] == before["historical"]
+
+    assert operational["excluded_archives"] == 1
+    assert operational["excluded_pages"] == 4
+    assert operational["excluded_covered_pages"] == 2
+    assert operational["excluded_outstanding_pages"] == 2
+
+    assert operational["total_pages"] == facts["pages"] - 4
+    assert operational["covered_pages"] == facts["covered"] - 2
+    assert operational["outstanding_pages"] == facts["outstanding"] - 2
+
+    # And the numerator really did move -- not merely the denominator.
+    assert (
+        operational["covered_pages"]
+        < before["operational"]["covered_pages"]
+    )
+
+
+def test_operational_coverage_is_unmoved_by_a_file_going_missing(
+    library,
+) -> None:
+    """The 2026-07-28 lesson, as arithmetic.
+
+    Deleting archive 1's file makes it `missing` on the availability
+    axis. Availability is an observation, and an observation must not
+    retire anything, so neither coverage measurement may move.
+    """
+    database, root, _ = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    (root / "1.cbz").unlink()
+
+    after = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    assert after["historical"] == before["historical"]
+    assert after["operational"] == before["operational"]
+
+    # ...and the observation really did register.
+    output = run_audit(database=database, scope=[str(root)])
+    availability = output["measurements"]["accountability"]["axis_totals"][
+        "availability"
+    ]
+    assert availability[C.AVAILABILITY_MISSING] >= 1
+
+
+def test_operational_coverage_is_unmoved_by_an_unavailable_declared_root(
+    library,
+) -> None:
+    """A declared root that is not mounted, not an unrelated sibling.
+
+    The distinction is the entire point of the availability axis and it
+    is easy to fake by accident: declaring some *other* absent directory
+    while the archives live elsewhere puts them outside every declared
+    root, which is `undeclared_scope` -- a different value, reached by a
+    different code path, proving nothing about unavailability.
+
+    Here the archives stay beneath the declared root and the root itself
+    is removed, so the run genuinely cannot look. The emitted value is
+    asserted explicitly before any coverage claim, so this test cannot
+    silently drift back into testing the wrong thing.
+    """
+    database, root, facts = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    shutil.rmtree(root)
+    assert not root.exists()
+
+    output = run_audit(database=database, scope=[str(root)])
+    availability = output["measurements"]["accountability"]["axis_totals"][
+        "availability"
+    ]
+
+    # Every identity is beneath the declared root, so every one of them
+    # must be unobservable -- and none may be called missing.
+    assert (
+        availability[C.AVAILABILITY_UNAVAILABLE_SCOPE]
+        == facts["identities"]
+    )
+    assert availability[C.AVAILABILITY_MISSING] == 0
+    assert availability[C.AVAILABILITY_UNDECLARED_SCOPE] == 0
+
+    after = output["measurements"]
+    assert after["historical"] == before["historical"]
+    assert after["operational"] == before["operational"]
+
+
+def test_a_path_outside_every_declared_root_is_undeclared_not_missing(
+    library, tmp_path: Path
+) -> None:
+    """The case the old unavailable-root test was accidentally exercising.
+
+    Kept deliberately, and named for what it actually proves: declaring
+    an unrelated root leaves the archives outside every declared root,
+    which is `undeclared_scope`. It must also move neither measurement.
+    """
+    database, root, facts = library
+    before = run_audit(database=database, scope=[str(root)])["measurements"]
+
+    unrelated = tmp_path / "somewhere-else"
+    unrelated.mkdir()
+
+    output = run_audit(database=database, scope=[str(unrelated)])
+    availability = output["measurements"]["accountability"]["axis_totals"][
+        "availability"
+    ]
+
+    assert (
+        availability[C.AVAILABILITY_UNDECLARED_SCOPE] == facts["identities"]
+    )
+    assert availability[C.AVAILABILITY_MISSING] == 0
+
+    after = output["measurements"]
+    assert after["historical"] == before["historical"]
+    assert after["operational"] == before["operational"]
+
+
+@pytest.mark.parametrize("availability", C.AVAILABILITIES)
+def test_no_availability_value_moves_either_coverage(availability) -> None:
+    """Every value on the axis, pinned at the measurement level.
+
+    The database-level tests above cover the values a seeded library can
+    actually reach. This covers all ten -- including `unreadable`,
+    `non_regular` and `multiple_current_locations`, which need a
+    filesystem or a schema violation to reproduce -- so a future value
+    cannot quietly start moving a coverage number.
+    """
+    baseline = _one_archive_result(
+        availability=C.AVAILABILITY_PRESENT_MATCHING
+    )
+    observed = _one_archive_result(availability=availability)
+
+    assert measure_historical(observed.archives) == measure_historical(
+        baseline.archives
+    )
+    assert measure_operational(observed.archives) == measure_operational(
+        baseline.archives
+    )
+
+
+def test_a_run_with_no_scope_still_reports_the_same_coverage(
+    library,
+) -> None:
+    """Not looking at the filesystem is an honest answer, not a smaller one."""
+    database, root, _ = library
+    scoped = run_audit(database=database, scope=[str(root)])
+    unscoped = run_audit(database=database)
+
+    assert (
+        unscoped["measurements"]["historical"]
+        == scoped["measurements"]["historical"]
+    )
+    assert (
+        unscoped["measurements"]["operational"]
+        == scoped["measurements"]["operational"]
+    )
+    assert unscoped["filesystem_consulted"] is False
+
+
+# --- scope identity ------------------------------------------------------
+
+
+def test_scope_digest_is_reported_and_order_independent(
+    library, tmp_path: Path
+) -> None:
+    database, root, _ = library
+    other = tmp_path / "second"
+    other.mkdir()
+
+    one = run_audit(database=database, scope=[str(root), str(other)])
+    two = run_audit(database=database, scope=[str(other), str(root)])
+
+    assert one["scope_digest"] == two["scope_digest"]
+    assert one["declared_scope"]["digest"] == one["scope_digest"]
+
+    narrower = run_audit(database=database, scope=[str(root)])
+    assert narrower["scope_digest"] != one["scope_digest"]
+
+
+def test_console_prints_the_scope_before_any_number(
+    library, capsys
+) -> None:
+    database, root, _ = library
+    output = run_audit(database=database, scope=[str(root)])
+    audit.print_summary(output)
+
+    printed = capsys.readouterr().out
+
+    assert "DECLARED SCOPE" in printed
+    assert output["scope_digest"] in printed
+    # Matched as whole section headings: "COVERAGE" on its own also
+    # occurs inside the banner, which would make this pass for the
+    # wrong reason.
+    assert printed.index("\nDECLARED SCOPE\n") < printed.index(
+        "\nCOVERAGE\n"
+    )
+
+
+# --- bypass proofs -------------------------------------------------------
+
+
+def test_a_half_paired_page_fails_the_audit(tmp_path: Path) -> None:
+    """A dHash with no matching pHash is a state no worker can produce.
+
+    The hashing job writes both or neither, so a page carrying one is
+    evidence the pairing broke somewhere. The audit must refuse rather
+    than publish a coverage number over it.
+    """
+    database = tmp_path / "half.db"
+    root = tmp_path / "lib"
+    root.mkdir()
+    connection = connect_database(database)
+
+    try:
+        apply_migrations(connection, MIGRATIONS)
+        add_archive(connection, 1)
+        add_location(connection, 1, root / "1.cbz")
+        add_signature(connection, 1, page_count=2)
+        add_pages(connection, 1, 2, hashed=0, dhash_only=1)
+        connection.commit()
+    finally:
+        connection.close()
+
+    write_archive_file(root / "1.cbz")
+
+    output = run_audit(database=database, scope=[str(root)])
+
+    assert output["page_census"]["half_paired_pages"] == 1
+    assert output["page_census"]["dhash_pages"] == 1
+    assert output["page_census"]["phash_pages"] == 0
+    assert output["invariants_passed"] is False
+    assert "no_half_paired_pages" in output["failed_invariants"]
+    assert (
+        "dhash_and_phash_counts_are_equal" in output["failed_invariants"]
+    )
+
+
+def test_a_completed_job_over_unhashed_pages_fails_the_audit(
+    tmp_path: Path,
+) -> None:
+    """A worker reporting success over work it did not do.
+
+    If this were tolerated every coverage number in the report would
+    overstate what actually ran, so it fails the audit rather than
+    appearing as a footnote.
+    """
+    database = tmp_path / "partial.db"
+    root = tmp_path / "lib"
+    root.mkdir()
+    connection = connect_database(database)
+
+    try:
+        apply_migrations(connection, MIGRATIONS)
+        add_archive(connection, 1)
+        add_location(connection, 1, root / "1.cbz")
+        add_signature(connection, 1, page_count=4)
+        add_pages(connection, 1, 4, hashed=1)
+        add_job(connection, 1, JOB_TYPE, "completed")
+        connection.commit()
+    finally:
+        connection.close()
+
+    write_archive_file(root / "1.cbz")
+
+    output = run_audit(database=database, scope=[str(root)])
+
+    assert output["invariants_passed"] is False
+    assert (
+        "no_completed_job_left_partial_coverage"
+        in output["failed_invariants"]
+    )
+
+
+def test_unexplained_residue_fails_the_audit() -> None:
+    """Residue is a defect in the classifier, and is treated as one.
+
+    `unexplained` has no predicate, so it cannot be seeded through the
+    database -- the contract only emits it when its own eligible and
+    excluded sets fail to partition the library. The invariant is
+    therefore proven against a classification carrying that residue
+    directly, which is the only way this state can be constructed.
+    """
+    residue = C.ArchiveClassification(
+        archive_id=99,
+        disposition=C.DISPOSITION_ACTIVE,
+        availability=C.AVAILABILITY_PRESENT_MATCHING,
+        inventory=C.INVENTORY_COVERED,
+        perceptual_work=C.WORK_COMPLETED,
+        selection=C.SELECTION_UNEXPLAINED,
+        total_pages=2,
+        outstanding_pages=0,
+    )
+    result = C.ClassificationResult(
+        archives=(residue,),
+        scope=C.DeclaredScope.declare(None),
+        filesystem_consulted=False,
+    )
+    census = {
+        "pages": 2,
+        "dhash_pages": 2,
+        "phash_pages": 2,
+        "half_paired_pages": 0,
+        "pages_missing_dimensions": 0,
+        "covered_pages": 2,
+    }
+
+    historical = measure_historical(result.archives)
+    operational = measure_operational(result.archives)
+    invariants = check_invariants(
+        result,
+        census,
+        historical,
+        operational,
+        audit.reconcile_identities(result, [99]),
+    )
+    failed = [
+        invariant.name for invariant in invariants if not invariant.passed
+    ]
+
+    assert "no_unexplained_residue" in failed
+
+    accountability = build_accountability(result)
+    assert accountability["unexplained_count"] == 1
+    assert accountability["unexplained_archive_ids"] == [99]
+
+
+def _one_archive_result(**overrides):
+    """A single-archive classification, for invariant-level proofs.
+
+    Some states the invariants guard against cannot be reached through
+    the database, because the contract will not emit them. Constructing
+    the classification directly is the only way to demonstrate that the
+    check would catch one.
+    """
+    return C.ClassificationResult(
+        archives=(C.ArchiveClassification(**_baseline_fields(**overrides)),),
+        scope=C.DeclaredScope.declare(None),
+        filesystem_consulted=False,
+    )
+
+
+def _baseline_fields(**overrides) -> dict:
+    """A legitimate single-archive tuple, before any deliberate defect."""
+    fields = {
+        "archive_id": 1,
+        "disposition": C.DISPOSITION_ACTIVE,
+        "availability": C.AVAILABILITY_PRESENT_MATCHING,
+        # A terminal failure, not a completed job: this archive has an
+        # outstanding page, and a *completed* job over an outstanding
+        # page is itself an invariant violation. The baseline has to be
+        # a state the audit considers legitimate, or every proof built
+        # on it would fail for the wrong reason.
+        "inventory": C.INVENTORY_INCOMPLETE,
+        "perceptual_work": C.WORK_FAILED,
+        "selection": C.SELECTION_EXCLUDED,
+        "total_pages": 4,
+        "outstanding_pages": 1,
+    }
+    fields.update(overrides)
+    return fields
+
+
+def _census(**overrides) -> dict[str, int]:
+    census = {
+        "pages": 4,
+        "dhash_pages": 3,
+        "phash_pages": 3,
+        "half_paired_pages": 0,
+        "pages_missing_dimensions": 0,
+        "covered_pages": 3,
+    }
+    census.update(overrides)
+    return census
+
+
+def _sole_identity(result):
+    """Reconcile against the id set the notional database holds.
+
+    Written as a literal `[1]` rather than read back off `result`, so a
+    test that drops or invents an archive still has an independent
+    expectation to disagree with.
+    """
+    return audit.reconcile_identities(result, [1])
+
+
+def _failed_invariants(result, census, identities) -> list[str]:
+    """Run the invariants over a constructed state.
+
+    `identities` is required here for the same reason it is required on
+    `check_invariants` itself: a helper that defaulted it would let a
+    test reconcile the classification against its own ids and quietly
+    assert nothing about the census.
+    """
+    historical = measure_historical(result.archives)
+    operational = measure_operational(result.archives)
+
+    return [
+        invariant.name
+        for invariant in check_invariants(
+            result, census, historical, operational, identities
+        )
+        if not invariant.passed
+    ]
+
+
+def test_the_baseline_invariant_fixture_passes_cleanly() -> None:
+    """The control for the constructed-state proofs below.
+
+    Without this, a test asserting some invariant fails could be passing
+    because the fixture was broken in some entirely different way.
+    """
+    result = _one_archive_result()
+
+    assert _failed_invariants(result, _census(), _sole_identity(result)) == []
+
+
+def test_a_dropped_zero_page_identity_is_caught_by_the_census(
+    library,
+) -> None:
+    """The omission the page census structurally cannot see.
+
+    Archive 3 holds no pages, so removing it from the classification
+    leaves every page number in the report reconciling perfectly -- the
+    denominator, the numerator, the outstanding count and the whole
+    census all still agree. Only comparing against `archive_files`
+    notices that the library got smaller.
+    """
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        census = page_census(connection)
+        expected_ids = audit.identity_census(connection)
+
+    assert 3 in expected_ids
+
+    pruned = C.ClassificationResult(
+        archives=tuple(
+            archive for archive in result.archives if archive.archive_id != 3
+        ),
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+
+    # The page-based reconciliations still pass: this is exactly why the
+    # identity census had to be a separate measurement.
+    page_invariants = _failed_invariants(
+        pruned,
+        census,
+        audit.reconcile_identities(
+            pruned, [a.archive_id for a in pruned.archives]
+        ),
+    )
+    assert "historical_denominator_matches_the_page_census" not in (
+        page_invariants
+    )
+    assert "outstanding_pages_reconcile_by_archive" not in page_invariants
+
+    # Against the real identity set, the omission is caught.
+    identities = audit.reconcile_identities(pruned, expected_ids)
+    assert identities["missing_count"] == 1
+    assert identities["missing_archive_ids"] == [3]
+
+    assert (
+        "every_archive_has_exactly_one_complete_tuple"
+        in _failed_invariants(pruned, census, identities)
+    )
+
+
+def test_an_invented_identity_is_caught_by_the_census(library) -> None:
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        expected_ids = audit.identity_census(connection)
+
+    invented = C.ClassificationResult(
+        archives=result.archives
+        + (C.ArchiveClassification(**_baseline_fields(archive_id=9999)),),
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+    identities = audit.reconcile_identities(invented, expected_ids)
+
+    assert identities["extra_count"] == 1
+    assert identities["extra_archive_ids"] == [9999]
+
+
+def test_a_duplicated_classification_row_is_caught(library) -> None:
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        expected_ids = audit.identity_census(connection)
+
+    doubled = C.ClassificationResult(
+        archives=result.archives + (result.archives[0],),
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+    identities = audit.reconcile_identities(doubled, expected_ids)
+
+    assert identities["duplicate_count"] == 1
+    assert identities["duplicate_archive_ids"] == [
+        result.archives[0].archive_id
+    ]
+
+
+def test_an_incomplete_tuple_is_caught(library) -> None:
+    database, root, _ = library
+    result = classify_library(database, root)
+
+    with readonly_database_connection(database) as connection:
+        expected_ids = audit.identity_census(connection)
+
+    blanked = C.ClassificationResult(
+        archives=(
+            C.ArchiveClassification(
+                **_baseline_fields(archive_id=1, availability="")
+            ),
+        )
+        + result.archives[1:],
+        scope=result.scope,
+        filesystem_consulted=result.filesystem_consulted,
+    )
+    identities = audit.reconcile_identities(blanked, expected_ids)
+
+    assert identities["incomplete_tuple_count"] == 1
+    assert identities["incomplete_tuple_archive_ids"] == [1]
+
+
+def test_run_audit_catches_an_identity_the_classifier_dropped(
+    library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end proof that run_audit uses the *independent* census.
+
+    The direct reconcile_identities tests above would still pass if
+    run_audit reconciled the classified rows against themselves, because
+    they never go through run_audit. This drops a zero-page identity
+    inside the snapshot and asserts the assembled report notices -- which
+    it can only do by having read archive_files separately.
+    """
+    database, root, facts = library
+    real_collect = audit.collect
+
+    def collect_dropping_archive_three(connection, *, scope):
+        result, census, expected_ids = real_collect(
+            connection, scope=scope
+        )
+        pruned = C.ClassificationResult(
+            archives=tuple(
+                archive
+                for archive in result.archives
+                if archive.archive_id != 3
+            ),
+            scope=result.scope,
+            filesystem_consulted=result.filesystem_consulted,
+        )
+        return pruned, census, expected_ids
+
+    monkeypatch.setattr(audit, "collect", collect_dropping_archive_three)
+
+    output = run_audit(database=database, scope=[str(root)])
+
+    assert output["invariants_passed"] is False
+    assert (
+        "every_archive_has_exactly_one_complete_tuple"
+        in output["failed_invariants"]
+    )
+    assert output["identity_census"]["missing_archive_ids"] == [3]
+    assert output["identity_census"]["expected_identities"] == (
+        facts["identities"]
+    )
+
+    # The page-based reconciliations are untouched, which is exactly why
+    # the identity census had to exist: archive 3 has no pages.
+    for name in (
+        "historical_denominator_matches_the_page_census",
+        "covered_pages_match_the_page_census",
+        "outstanding_pages_reconcile_by_archive",
+    ):
+        assert name not in output["failed_invariants"]
+
+
+def test_an_operational_numerator_that_was_not_subtracted_is_caught(
+    library,
+) -> None:
+    """The invariant, not the measurement, is what this proves.
+
+    `measure_operational` is asserted directly elsewhere. This builds a
+    Coverage whose denominator was correctly shrunk while the numerator
+    kept every historical covered page -- the precise bug that archive
+    45217 cannot reveal on production data -- and asserts the runtime
+    check refuses it.
+    """
+    result = _one_archive_result(
+        disposition=C.DISPOSITION_RETIRED,
+        total_pages=4,
+        outstanding_pages=1,
+    )
+    historical = measure_historical(result.archives)
+    assert (historical.total_pages, historical.covered_pages) == (4, 3)
+
+    unsubtracted = audit.Coverage(
+        name="operational",
+        covered_pages=historical.covered_pages,
+        total_pages=0,
+        excluded_pages=4,
+        excluded_archives=1,
+        excluded_covered_pages=3,
+        excluded_outstanding_pages=1,
+        basis="deliberately wrong numerator",
+    )
+    identities = audit.reconcile_identities(result, [1])
+    failed = [
+        invariant.name
+        for invariant in check_invariants(
+            result,
+            _census(pages=4, dhash_pages=3, phash_pages=3, covered_pages=3),
+            historical,
+            unsubtracted,
+            identities,
+        )
+        if not invariant.passed
+    ]
+
+    assert (
+        "operational_numerator_is_historical_minus_dispositioned" in failed
+    )
+    assert (
+        "operational_outstanding_is_historical_minus_dispositioned"
+        in failed
+    )
+
+
+def test_the_identity_census_is_reported_in_the_output(library) -> None:
+    database, root, facts = library
+    output = run_audit(database=database, scope=[str(root)])
+    identities = output["identity_census"]
+
+    assert identities["expected_identities"] == facts["identities"]
+    assert identities["classified_identities"] == facts["identities"]
+    assert identities["missing_count"] == 0
+    assert identities["extra_count"] == 0
+    assert identities["duplicate_count"] == 0
+    assert identities["incomplete_tuple_count"] == 0
+
+
+def test_an_axis_value_outside_the_vocabulary_fails_to_sum() -> None:
+    """Axis totals are built from a fixed vocabulary of known values.
+
+    An archive carrying a value nobody has a definition for is dropped
+    from that axis's counts, so the axis stops summing to the identity
+    total. That is the failure mode the sum check exists to catch.
+    """
+    result = _one_archive_result(availability="invented_state")
+
+    assert (
+        "every_axis_sums_to_the_identity_total"
+        in _failed_invariants(result, _census(), _sole_identity(result))
+    )
+
+
+def test_page_totals_that_disagree_with_the_census_are_caught() -> None:
+    """The reconciliation is a real comparison, not a restatement.
+
+    The classification says four pages with one outstanding; the census
+    is told the library holds ten. Two independent measurements of the
+    same library disagreeing is exactly what must not pass silently.
+    """
+    result = _one_archive_result()
+    failed = _failed_invariants(
+        result,
+        _census(pages=10, covered_pages=3),
+        _sole_identity(result),
+    )
+
+    assert "historical_denominator_matches_the_page_census" in failed
+    assert "outstanding_pages_reconcile_by_archive" in failed
+    assert "outstanding_pages_reconcile_by_every_axis" in failed
+
+
+def test_a_covered_count_that_disagrees_with_the_census_is_caught() -> None:
+    result = _one_archive_result()
+    failed = _failed_invariants(
+        result, _census(covered_pages=1), _sole_identity(result)
+    )
+
+    assert "covered_pages_match_the_page_census" in failed
+
+
+def test_unexplained_is_never_produced_by_a_predicate(library) -> None:
+    """On a valid library the residue bucket is empty.
+
+    Paired with the test above: one proves the audit fails on residue,
+    this proves the residue is not manufactured by ordinary data.
+    """
+    database, root, _ = library
+    output = run_audit(database=database, scope=[str(root)])
+
+    assert output["measurements"]["accountability"]["unexplained_count"] == 0
+    assert output["invariants_passed"] is True
+
+
+def test_the_removed_backlog_flag_appears_nowhere_in_the_report(
+    library, tmp_path: Path, capsys
+) -> None:
+    """`never_enqueued_backlog` is gone, not renamed.
+
+    Asserted across every surface it used to occupy -- the JSON payload,
+    the CSV header and the console -- because a positive predicate that
+    survives in any one of them is still a positive predicate.
+    """
+    database, root, _ = library
+    json_output = tmp_path / "report.json"
+    csv_output = tmp_path / "report.csv"
 
     output = run_audit(
         database=database,
-        stale_older_than_seconds=3600,
-        now=FIXED_NOW,
+        scope=[str(root)],
         json_output=json_output,
         csv_output=csv_output,
     )
+    audit.print_summary(output)
+    printed = capsys.readouterr().out
 
-    assert json_output.is_file()
-    payload = json.loads(json_output.read_text(encoding="utf-8"))
-    assert payload["total_archive_count"] == output["total_archive_count"]
-
-    assert csv_output.is_file()
-    csv_text = csv_output.read_text(encoding="utf-8-sig")
-    header = csv_text.splitlines()[0]
-    assert header.startswith("archive_id,population,never_enqueued_backlog")
-    # Header + one row per archive.
-    assert len(csv_text.splitlines()) == 1 + output["total_archive_count"]
-
-
-def test_cli_main_writes_reports(tmp_path: Path, capsys) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    json_output = tmp_path / "coverage.json"
-    csv_output = tmp_path / "coverage.csv"
-
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--json-output",
-            str(json_output),
-            "--csv-output",
-            str(csv_output),
-        ]
+    assert "never_enqueued_backlog" not in json.dumps(output)
+    assert "never_enqueued_backlog" not in json_output.read_text(
+        encoding="utf-8"
     )
-    captured = capsys.readouterr()
+    assert "never_enqueued_backlog" not in csv_output.read_text(
+        encoding="utf-8-sig"
+    )
+    assert "never_enqueued_backlog" not in printed
 
-    assert result == 0
-    assert "Populations:" in captured.out
-    assert json_output.is_file()
-    assert csv_output.is_file()
+    # And not merely renamed: no key anywhere in the payload, and no
+    # CSV column, may carry the concept under a different spelling.
+    # (The console is excluded from this sweep because the temporary
+    # database path pytest generates contains this test's own name.)
+    assert not [
+        key for key in _all_keys(output) if "backlog" in key.lower()
+    ]
+    assert "backlog" not in csv_output.read_text(
+        encoding="utf-8-sig"
+    ).splitlines()[0].lower()
 
 
-# --- output path collisions -------------------------------------------------
+def _all_keys(payload) -> list[str]:
+    """Every mapping key in a nested JSON-shaped structure."""
+    if isinstance(payload, dict):
+        keys: list[str] = []
+
+        for key, value in payload.items():
+            keys.append(key)
+            keys.extend(_all_keys(value))
+
+        return keys
+
+    if isinstance(payload, list):
+        return [key for item in payload for key in _all_keys(item)]
+
+    return []
+
+
+# --- read-only guarantees ------------------------------------------------
+
+
+def test_read_only_connection_rejects_writes(library) -> None:
+    database, _, _ = library
+
+    with readonly_database_connection(database) as connection:
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute(
+                "UPDATE archive_files SET file_size = 1 WHERE id = 1"
+            )
+
+
+def test_run_audit_leaves_the_database_byte_identical(library) -> None:
+    database, root, _ = library
+
+    before = fingerprint_database(database)
+    before_bytes = database.read_bytes()
+
+    run_audit(database=database, scope=[str(root)])
+
+    assert fingerprint_database(database) == before
+    assert database.read_bytes() == before_bytes
+
+
+def test_run_audit_reports_the_snapshot_boundary(library) -> None:
+    database, root, _ = library
+    output = run_audit(database=database, scope=[str(root)])
+
+    assert output["quick_check"] == "ok"
+    assert output["data_version_before"] == output["data_version_after"]
+    assert output["data_version_unchanged"] is True
+    assert output["concurrent_commit_detected"] is False
+    assert output["database_file_unchanged"] is True
+
+
+def test_a_commit_mid_read_invalidates_the_report(
+    library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The data_version bracket, proven by bypassing it.
+
+    A writer committing between the classification and the page census
+    would otherwise produce a report whose two halves describe different
+    states of the library while still looking clean -- under WAL the
+    commit can land entirely in the -wal file, leaving the main
+    database's size and mtime untouched.
+    """
+    database, root, _ = library
+    real_collect = audit.collect
+    fingerprints: dict[str, object] = {}
+
+    def collect_then_external_commit(connection, *, scope):
+        result = real_collect(connection, scope=scope)
+
+        fingerprints["before"] = fingerprint_database(database)
+
+        with database_connection(database) as other:
+            add_job(other, 1, JOB_TYPE, "pending")
+
+        fingerprints["after"] = fingerprint_database(database)
+
+        return result
+
+    monkeypatch.setattr(audit, "collect", collect_then_external_commit)
+
+    with pytest.raises(DatabaseChangedError) as raised:
+        run_audit(database=database, scope=[str(root)])
+
+    # Specifically the data_version guard, not the fingerprint fallback:
+    # DatabaseMutatedError is a subclass, so the exact type is what says
+    # which detector fired.
+    assert type(raised.value) is DatabaseChangedError
+    assert "data_version" in str(raised.value)
+
+    # And this is why the bracket is required: at the moment of the
+    # commit the main file's size and mtime were unchanged, so the
+    # fingerprint comparison could not have raised.
+    assert fingerprints["before"] == fingerprints["after"]
+
+
+def test_run_audit_raises_if_the_database_file_is_mutated(
+    library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, root, _ = library
+    original = audit.fingerprint_database
+    calls = {"count": 0}
+
+    def mutating_fingerprint(path):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            database.write_bytes(database.read_bytes() + b"\x00")
+        return original(path)
+
+    monkeypatch.setattr(audit, "fingerprint_database", mutating_fingerprint)
+
+    with pytest.raises(DatabaseMutatedError):
+        run_audit(database=database, scope=[str(root)])
+
+
+def test_quick_check_failure_raises_integrity_error(
+    library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, root, _ = library
+
+    monkeypatch.setattr(
+        audit, "quick_check", lambda connection: "malformed page 7"
+    )
+
+    with pytest.raises(DatabaseIntegrityError):
+        run_audit(database=database, scope=[str(root)])
+
+
+def test_missing_database_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        run_audit(database=tmp_path / "absent.db")
+
+
+# --- output paths --------------------------------------------------------
 
 
 def test_validate_output_paths_rejects_json_matching_database(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "audit.db"
-    build_populated_database(database)
 
     with pytest.raises(OutputPathCollisionError):
         validate_output_paths(
@@ -612,7 +1406,6 @@ def test_validate_output_paths_rejects_csv_matching_database(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "audit.db"
-    build_populated_database(database)
 
     with pytest.raises(OutputPathCollisionError):
         validate_output_paths(
@@ -620,677 +1413,176 @@ def test_validate_output_paths_rejects_csv_matching_database(
         )
 
 
-def test_run_audit_rejects_output_path_colliding_with_database(
+def test_validate_output_paths_rejects_json_matching_csv(
     tmp_path: Path,
 ) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
+    shared = tmp_path / "report.out"
 
-    before_bytes = database.read_bytes()
+    with pytest.raises(OutputPathCollisionError):
+        validate_output_paths(
+            tmp_path / "audit.db", json_output=shared, csv_output=shared
+        )
+
+
+def test_run_audit_rejects_an_output_colliding_with_the_database(
+    library,
+) -> None:
+    database, root, _ = library
 
     with pytest.raises(OutputPathCollisionError):
         run_audit(
-            database=database,
-            stale_older_than_seconds=3600,
-            now=FIXED_NOW,
-            json_output=database,
+            database=database, scope=[str(root)], json_output=database
         )
 
-    # Nothing was written: the database is untouched.
-    assert database.read_bytes() == before_bytes
+
+# --- artefacts and CLI ---------------------------------------------------
 
 
-# --- read-only preservation -------------------------------------------------
-
-
-def test_read_only_connection_rejects_writes(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    with readonly_database_connection(database) as connection:
-        with pytest.raises(sqlite3.OperationalError):
-            connection.execute(
-                "UPDATE jobs SET status = 'pending' WHERE id = 1"
-            )
-
-
-def test_run_audit_leaves_database_byte_identical(tmp_path: Path) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    before = fingerprint_database(database)
-    before_bytes = database.read_bytes()
-
-    run_audit(database=database, stale_older_than_seconds=3600, now=FIXED_NOW)
-
-    after = fingerprint_database(database)
-    after_bytes = database.read_bytes()
-
-    assert before == after
-    assert before_bytes == after_bytes
-
-
-def test_run_audit_raises_if_database_mutated_mid_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_json_and_csv_carry_the_full_classification_tuple(
+    library, tmp_path: Path
 ) -> None:
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
+    database, root, facts = library
+    json_output = tmp_path / "report.json"
+    csv_output = tmp_path / "report.csv"
 
-    import comic_automation.archive.perceptual_coverage_audit as audit_module
-
-    original_fingerprint = audit_module.fingerprint_database
-    calls = {"count": 0}
-
-    def mutating_fingerprint(path):
-        calls["count"] += 1
-        if calls["count"] == 2:
-            database.write_bytes(database.read_bytes() + b"\x00")
-        return original_fingerprint(path)
-
-    monkeypatch.setattr(
-        audit_module, "fingerprint_database", mutating_fingerprint
-    )
-
-    with pytest.raises(DatabaseMutatedError):
-        run_audit(
-            database=database,
-            stale_older_than_seconds=3600,
-            now=FIXED_NOW,
-        )
-
-
-# --- consistent-snapshot boundary -------------------------------------------
-
-
-def test_run_audit_reports_snapshot_boundary(tmp_path: Path) -> None:
-    """The report surfaces the integrity check and both data_versions."""
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    output = run_audit(
+    run_audit(
         database=database,
-        stale_older_than_seconds=3600,
-        now=FIXED_NOW,
+        scope=[str(root)],
+        json_output=json_output,
+        csv_output=csv_output,
     )
 
-    assert output["quick_check"] == "ok"
-    assert output["data_version_before"] == output["data_version_after"]
-    assert output["database_unchanged"] is True
+    payload = json.loads(json_output.read_text(encoding="utf-8"))
+    assert payload["measurements"]["historical"]["total_pages"] == (
+        facts["pages"]
+    )
+    assert payload["scope_digest"]
+
+    lines = csv_output.read_text(encoding="utf-8-sig").splitlines()
+    header = lines[0].split(",")
+
+    for column in (
+        "disposition",
+        "availability",
+        "inventory",
+        "perceptual_work",
+        "selection",
+        "total_pages",
+        "covered_pages",
+        "outstanding_pages",
+    ):
+        assert column in header
+
+    assert len(lines) == facts["identities"] + 1
 
 
-def test_external_commit_mid_classification_invalidates_the_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_cli_main_succeeds_on_a_clean_library(
+    library, tmp_path: Path, capsys
 ) -> None:
-    """A commit landing between two classification queries is rejected.
+    database, root, _ = library
+    json_output = tmp_path / "report.json"
 
-    `classify_archives` issues several separate queries, and the report
-    claims its five populations partition the library. If a writer
-    commits between two of those queries the report silently mixes pre-
-    and post-change observations, so the run must fail instead.
-
-    The commit is injected inside `_collect_page_coverage`, i.e. after
-    the structural query has already run and before the job queries do
-    -- squarely in the middle of the classification, which is exactly
-    where the old fingerprint-only guard was blind.
-    """
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    import comic_automation.archive.perceptual_coverage_audit as audit_module
-
-    real_collect_page_coverage = audit_module._collect_page_coverage
-    fingerprint_at_commit: dict[str, object] = {}
-
-    def collect_then_external_commit(connection):
-        result = real_collect_page_coverage(connection)
-
-        before = fingerprint_database(database)
-
-        # A *different* connection commits while the audit is mid-read.
-        # database_connection() opens in WAL mode, so this commit can
-        # land entirely in the -wal file.
-        with database_connection(database) as other:
-            seed_job(
-                other,
-                archive_id=ids["never_enqueued_backlog"],
-                status="pending",
-            )
-
-        fingerprint_at_commit["before"] = before
-        fingerprint_at_commit["after"] = fingerprint_database(database)
-
-        return result
-
-    monkeypatch.setattr(
-        audit_module,
-        "_collect_page_coverage",
-        collect_then_external_commit,
+    exit_code = main(
+        [
+            "--database",
+            str(database),
+            "--scope",
+            str(root),
+            "--json-output",
+            str(json_output),
+        ]
     )
 
-    with pytest.raises(DatabaseChangedError) as raised:
-        run_audit(
-            database=database,
-            stale_older_than_seconds=3600,
-            now=FIXED_NOW,
-        )
+    printed = capsys.readouterr().out
 
-    # Specifically the data_version guard, not the fingerprint fallback:
-    # DatabaseMutatedError is a *subclass* of DatabaseChangedError, so
-    # the exact type is what distinguishes which detector fired.
-    assert type(raised.value) is DatabaseChangedError
-    assert "data_version" in str(raised.value)
-
-    # The commit really did happen...
-    with database_connection(database) as connection:
-        assert (
-            connection.execute(
-                "SELECT COUNT(*) FROM jobs WHERE archive_id = ?",
-                (ids["never_enqueued_backlog"],),
-            ).fetchone()[0]
-            == 1
-        )
-
-    # ...and this is *why* data_version is required: at the moment of
-    # the commit the main database file's size and mtime were entirely
-    # unchanged, so the fingerprint comparison could not have raised.
-    assert fingerprint_at_commit["before"] == fingerprint_at_commit["after"]
+    assert exit_code == EXIT_OK
+    assert json_output.is_file()
+    assert "HISTORICAL" in printed
+    assert "OPERATIONAL" in printed
+    assert "ACCOUNTABILITY" in printed
 
 
-def test_wal_commit_can_leave_the_file_fingerprint_unchanged(
-    tmp_path: Path,
+def test_cli_main_exits_nonzero_on_a_failed_invariant(
+    tmp_path: Path, capsys
 ) -> None:
-    """Documents the hazard the data_version guard exists to cover.
+    database = tmp_path / "half.db"
+    root = tmp_path / "lib"
+    root.mkdir()
+    connection = connect_database(database)
 
-    In WAL mode a committed write is appended to the ``-wal`` sidecar
-    file; the main database file is only rewritten later, at
-    checkpoint. So size + mtime of the database itself can be
-    byte-for-byte identical across another connection's commit, and any
-    audit relying on that fingerprint alone would report a mixed
-    snapshot as clean.
-    """
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-
-    before = fingerprint_database(database)
-
-    # The writer is deliberately left open across the second stat:
-    # closing it would checkpoint the WAL back into the main file and
-    # change the fingerprint after the fact. The hazard is about what
-    # is observable *at the moment of the commit*, which is when a
-    # concurrent audit would be reading.
-    writer = connect_database(database)
     try:
-        assert (
-            writer.execute("PRAGMA journal_mode").fetchone()[0].lower()
-            == "wal"
-        )
-        writer.execute("BEGIN IMMEDIATE")
-        seed_job(writer, archive_id=ids["complete"], status="pending")
-        writer.execute("COMMIT")
-
-        after = fingerprint_database(database)
-        # The commit went to the sidecar, not to the database file.
-        # (Closing the writer checkpoints and removes this file, which
-        # is why it is asserted here rather than after the finally.)
-        assert (database.parent / "audit.db-wal").is_file()
+        apply_migrations(connection, MIGRATIONS)
+        add_archive(connection, 1)
+        add_location(connection, 1, root / "1.cbz")
+        add_signature(connection, 1, page_count=2)
+        add_pages(connection, 1, 2, hashed=0, dhash_only=1)
+        connection.commit()
     finally:
-        writer.close()
+        connection.close()
 
-    assert before == after
+    write_archive_file(root / "1.cbz")
 
+    exit_code = main(
+        ["--database", str(database), "--scope", str(root)]
+    )
 
-def test_quick_check_failure_raises_integrity_error(tmp_path: Path) -> None:
-    """A structurally damaged database must abort the audit."""
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    # Clobber the final page. The schema (page 1 and friends) stays
-    # readable, so the database still opens and the audit gets far
-    # enough to run quick_check -- which is the point: the integrity
-    # guard, not sqlite3's own open-time errors, is what must fire.
-    page_size = 4096
-    data = bytearray(database.read_bytes())
-    assert len(data) > page_size * 2
-    data[-page_size:] = bytes([0x5A]) * page_size
-    database.write_bytes(bytes(data))
-
-    with pytest.raises(DatabaseIntegrityError) as raised:
-        run_audit(
-            database=database,
-            stale_older_than_seconds=3600,
-            now=FIXED_NOW,
-        )
-
-    assert "quick_check" in str(raised.value)
+    assert exit_code == EXIT_INVARIANT_VIOLATION
+    assert "no_half_paired_pages" in capsys.readouterr().err
 
 
-def test_missing_database_raises(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        run_audit(
-            database=tmp_path / "does-not-exist.db",
-            stale_older_than_seconds=3600,
-        )
-
-
-# --- backlog vs. blocking unexplained gap -----------------------------------
-#
-# The population is computed identically in both modes; only the
-# interpretation, the console framing and the exit code differ. Each
-# mode is therefore asserted separately and explicitly, against the
-# same fixtures.
-
-
-def build_never_enqueued_database(database: Path, *, count: int) -> list[int]:
-    """`count` eligible archives with zero coverage and no job at all.
-
-    This is the shape a mid-backfill production database has for every
-    archive whose guarded batch has not come up yet -- the case that
-    used to be reported as an unexplained gap.
-    """
-    archive_ids: list[int] = []
-
-    with database_connection(database) as connection:
-        apply_migrations(connection, MIGRATIONS)
-
-        for index in range(count):
-            archive_id = seed_archive(
-                connection, path=rf"X:\Comics\Backlog\{index:04d}.cbz"
-            )
-            seed_content_signature(
-                connection, archive_id=archive_id, page_count=1
-            )
-            seed_page(
-                connection,
-                archive_id=archive_id,
-                page_index=0,
-                dhash=False,
-                phash=False,
-                dimensions=False,
-            )
-            archive_ids.append(archive_id)
-
-    return archive_ids
-
-
-def build_fully_backfilled_database(database: Path) -> dict[str, int]:
-    """A library where the backfill genuinely finished.
-
-    Every structurally eligible archive is fully covered, and the only
-    other archive is ineligible (no content signature), which was never
-    expected to gain coverage. Nothing is left never-enqueued, so a
-    final audit must pass cleanly.
-    """
-    ids: dict[str, int] = {}
-
-    with database_connection(database) as connection:
-        apply_migrations(connection, MIGRATIONS)
-
-        complete_id = seed_archive(connection, path=r"X:\Comics\A\done.cbz")
-        seed_content_signature(connection, archive_id=complete_id, page_count=1)
-        seed_page(
-            connection,
-            archive_id=complete_id,
-            page_index=0,
-            dhash=True,
-            phash=True,
-            dimensions=True,
-        )
-        seed_job(
-            connection,
-            archive_id=complete_id,
-            status="completed",
-            completed_at="2026-07-30T09:00:00",
-        )
-        ids["complete"] = complete_id
-
-        ineligible_id = seed_archive(
-            connection, path=r"X:\Comics\B\no-signature.cbz"
-        )
-        ids["ineligible_no_signature"] = ineligible_id
-
-    return ids
-
-
-def printed_id_sample(stdout: str) -> list[int]:
-    """The archive-id list literal the console summary printed, if any."""
-    for line in stdout.splitlines():
-        start = line.find("[")
-        if start != -1 and line.rstrip().endswith("]"):
-            return json.loads(line[start:].strip())
-
-    return []
-
-
-def test_intermediate_mode_reports_backlog_neutrally_and_exits_zero(
+def test_cli_main_reports_a_missing_database_without_traceback(
     tmp_path: Path, capsys
 ) -> None:
-    """Default mode: never-enqueued archives are expected work.
+    exit_code = main(["--database", str(tmp_path / "absent.db")])
 
-    Mid-backfill this population is the remaining queue, so it must not
-    be called an unexplained gap and must not fail the run.
-    """
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-    json_output = tmp_path / "coverage.json"
-
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--json-output",
-            str(json_output),
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert result == EXIT_OK
-    assert "Never-enqueued backlog" in captured.out
-    assert "unexplained gap" not in captured.out.lower()
-
-    payload = json.loads(json_output.read_text(encoding="utf-8"))
-    assert payload["expect_backfill_complete"] is False
-    assert payload["never_enqueued_backlog_count"] == 1
-    assert payload["blocking_unexplained_gap_count"] == 0
-    assert payload["blocking_unexplained_gap_archive_ids"] == []
-
-
-def test_final_audit_mode_reports_blocking_gaps_and_exits_nonzero(
-    tmp_path: Path, capsys
-) -> None:
-    """Same database, final-audit mode: now it is a blocking finding.
-
-    Once eligibility is asserted to be zero there is no un-enqueued
-    batch left to explain a missing job, so the identical archive is
-    reported loudly and the exit code says so.
-    """
-    database = tmp_path / "audit.db"
-    ids = build_populated_database(database)
-    json_output = tmp_path / "coverage.json"
-
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--json-output",
-            str(json_output),
-            "--expect-backfill-complete",
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert result == EXIT_BLOCKING_UNEXPLAINED_GAPS
-    assert EXIT_BLOCKING_UNEXPLAINED_GAPS != EXIT_OK
-    assert "BLOCKING UNEXPLAINED GAPS" in captured.out
-
-    payload = json.loads(json_output.read_text(encoding="utf-8"))
-    assert payload["expect_backfill_complete"] is True
-    assert payload["backfill_complete_gate_passed"] is False
-    assert payload["blocking_incomplete_count"] == 2
-    assert payload["blocking_stale_count"] == 1
-    assert payload["blocking_backfill_work_count"] == 3
-    assert payload["blocking_unexplained_gap_count"] == 1
-    assert payload["blocking_unexplained_gap_archive_ids"] == [
-        ids["never_enqueued_backlog"]
-    ]
-    # The neutral keys keep reporting the same population, unchanged.
-    assert payload["never_enqueued_backlog_count"] == 1
-    assert payload["never_enqueued_backlog_archive_ids"] == [
-        ids["never_enqueued_backlog"]
-    ]
-
-
-def test_both_modes_classify_the_identical_population(tmp_path: Path) -> None:
-    """The flag changes interpretation only -- never classification."""
-    database = tmp_path / "audit.db"
-    build_populated_database(database)
-
-    intermediate = run_audit(
-        database=database, stale_older_than_seconds=3600, now=FIXED_NOW
-    )
-    final = run_audit(
-        database=database,
-        stale_older_than_seconds=3600,
-        now=FIXED_NOW,
-        expect_backfill_complete=True,
-    )
-
-    assert intermediate["archives"] == final["archives"]
-    assert intermediate["population_counts"] == final["population_counts"]
-    assert (
-        intermediate["never_enqueued_backlog_archive_ids"]
-        == final["never_enqueued_backlog_archive_ids"]
-    )
-    assert intermediate["blocking_unexplained_gap_count"] == 0
-    assert final["blocking_unexplained_gap_count"] == (
-        final["never_enqueued_backlog_count"]
-    )
-
-
-def test_final_audit_on_fully_backfilled_database_passes_cleanly(
-    tmp_path: Path, capsys
-) -> None:
-    database = tmp_path / "audit.db"
-    build_fully_backfilled_database(database)
-
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--expect-backfill-complete",
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert result == EXIT_OK
-    assert "BLOCKING UNEXPLAINED GAPS (eligible, zero coverage, no job " in (
-        captured.out
-    )
-    assert "must be investigated" not in captured.out
-    assert "ARCHIVE IDS" not in captured.out
-    assert "Final backfill gate:    True (incomplete=0, stale=0)" in captured.out
-
-
-def test_final_audit_blocks_incomplete_work_even_with_job_history(
-    tmp_path: Path,
-) -> None:
-    """Final mode verifies completion, not merely absence of missed enqueue."""
-    database = tmp_path / "audit.db"
-    (archive_id,) = build_never_enqueued_database(database, count=1)
-
-    with database_connection(database) as connection:
-        seed_job(
-            connection,
-            archive_id=archive_id,
-            status="completed",
-            completed_at="2026-07-30T09:00:00",
-        )
-
-    json_output = tmp_path / "coverage.json"
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--json-output",
-            str(json_output),
-            "--expect-backfill-complete",
-        ]
-    )
-
-    payload = json.loads(json_output.read_text(encoding="utf-8"))
-    assert result == EXIT_BACKFILL_INCOMPLETE
-    assert payload["never_enqueued_backlog_count"] == 0
-    assert payload["blocking_unexplained_gap_count"] == 0
-    assert payload["blocking_incomplete_count"] == 1
-    assert payload["blocking_stale_count"] == 0
-    assert payload["blocking_backfill_work_count"] == 1
-    assert payload["backfill_complete_gate_passed"] is False
-
-
-def test_final_audit_blocks_stale_work_without_unexplained_gap(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "audit.db"
-    (archive_id,) = build_never_enqueued_database(database, count=1)
-
-    with database_connection(database) as connection:
-        seed_job(
-            connection,
-            archive_id=archive_id,
-            status="claimed",
-            claimed_at="2000-01-01 00:00:00",
-        )
-
-    json_output = tmp_path / "coverage.json"
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--json-output",
-            str(json_output),
-            "--expect-backfill-complete",
-        ]
-    )
-
-    payload = json.loads(json_output.read_text(encoding="utf-8"))
-    assert result == EXIT_BACKFILL_INCOMPLETE
-    assert payload["never_enqueued_backlog_count"] == 0
-    assert payload["blocking_unexplained_gap_count"] == 0
-    assert payload["blocking_incomplete_count"] == 0
-    assert payload["blocking_stale_count"] == 1
-    assert payload["blocking_backfill_work_count"] == 1
-    assert payload["backfill_complete_gate_passed"] is False
-
-
-# --- bounded console output, full machine-readable output -------------------
+    assert exit_code == 1
+    assert "ERROR" in capsys.readouterr().err
 
 
 def test_console_caps_printed_ids_and_states_the_omitted_count(
-    tmp_path: Path, capsys
+    capsys,
 ) -> None:
-    """A production run found 17,554 of these; the console must not
-    print them all, and must say how many it left out.
+    audit.print_archive_id_sample(
+        list(range(MAX_PRINTED_ARCHIVE_IDS + 5)),
+        label="UNEXPLAINED",
+    )
+
+    printed = capsys.readouterr().out
+
+    assert "and 5 more" in printed
+    assert "full list in the JSON and CSV outputs" in printed
+
+
+def test_short_id_lists_print_without_an_omitted_count(capsys) -> None:
+    audit.print_archive_id_sample([1, 2, 3], label="UNEXPLAINED")
+
+    printed = capsys.readouterr().out
+
+    assert "1, 2, 3" in printed
+    assert "more" not in printed
+
+
+# --- the page census is a second opinion ---------------------------------
+
+
+def test_the_census_is_computed_independently_of_the_contract(
+    library,
+) -> None:
+    """The reconciliation would be vacuous if both sides shared a source.
+
+    The census scans archive_pages directly; the coverage figures come
+    from summing the contract's per-archive numbers. The invariants
+    compare them, so this asserts they really are two measurements.
     """
-    total = MAX_PRINTED_ARCHIVE_IDS + 5
-    database = tmp_path / "audit.db"
-    archive_ids = build_never_enqueued_database(database, count=total)
+    database, root, facts = library
 
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-        ]
-    )
-    captured = capsys.readouterr()
+    with readonly_database_connection(database) as connection:
+        census = page_census(connection)
 
-    assert result == EXIT_OK
+    result = classify_library(database, root)
+    historical = measure_historical(result.archives)
 
-    printed = printed_id_sample(captured.out)
-    assert len(printed) == MAX_PRINTED_ARCHIVE_IDS
-    assert printed == archive_ids[:MAX_PRINTED_ARCHIVE_IDS]
-
-    # Truncation is never silent: the omitted count is always shown.
-    assert f"... and {total - MAX_PRINTED_ARCHIVE_IDS:,} more" in captured.out
-    assert "see JSON/CSV for the full list" in captured.out
-    assert f"of {total:,}" in captured.out
-
-
-def test_final_audit_console_is_capped_too(tmp_path: Path, capsys) -> None:
-    total = MAX_PRINTED_ARCHIVE_IDS + 7
-    database = tmp_path / "audit.db"
-    build_never_enqueued_database(database, count=total)
-
-    result = main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--expect-backfill-complete",
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert result == EXIT_BLOCKING_UNEXPLAINED_GAPS
-    assert len(printed_id_sample(captured.out)) == MAX_PRINTED_ARCHIVE_IDS
-    assert f"... and {total - MAX_PRINTED_ARCHIVE_IDS:,} more" in captured.out
-
-
-def test_short_id_list_is_printed_without_an_omitted_count(
-    tmp_path: Path, capsys
-) -> None:
-    total = MAX_PRINTED_ARCHIVE_IDS - 5
-    database = tmp_path / "audit.db"
-    archive_ids = build_never_enqueued_database(database, count=total)
-
-    main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-        ]
-    )
-    captured = capsys.readouterr()
-
-    assert printed_id_sample(captured.out) == archive_ids
-    assert "more (see JSON/CSV" not in captured.out
-
-
-def test_json_and_csv_keep_the_full_id_list_when_console_truncates(
-    tmp_path: Path, capsys
-) -> None:
-    """Only the console is capped: the artefacts stay complete."""
-    total = MAX_PRINTED_ARCHIVE_IDS + 13
-    database = tmp_path / "audit.db"
-    archive_ids = build_never_enqueued_database(database, count=total)
-
-    json_output = tmp_path / "coverage.json"
-    csv_output = tmp_path / "coverage.csv"
-
-    main(
-        [
-            "--database",
-            str(database),
-            "--stale-older-than-seconds",
-            "3600",
-            "--json-output",
-            str(json_output),
-            "--csv-output",
-            str(csv_output),
-        ]
-    )
-    captured = capsys.readouterr()
-
-    # The console really did truncate...
-    assert len(printed_id_sample(captured.out)) == MAX_PRINTED_ARCHIVE_IDS
-
-    # ...while the JSON kept every id, in full.
-    payload = json.loads(json_output.read_text(encoding="utf-8"))
-    assert payload["never_enqueued_backlog_count"] == total
-    assert len(payload["never_enqueued_backlog_archive_ids"]) == total
-    assert payload["never_enqueued_backlog_archive_ids"] == archive_ids
-
-    # ...and so did the CSV, one flagged row per archive.
-    csv_lines = csv_output.read_text(encoding="utf-8-sig").splitlines()
-    header = csv_lines[0].split(",")
-    flag_column = header.index("never_enqueued_backlog")
-    flagged = [
-        int(line.split(",")[0])
-        for line in csv_lines[1:]
-        if line.split(",")[flag_column] == "True"
-    ]
-    assert flagged == archive_ids
+    assert census["pages"] == facts["pages"]
+    assert census["covered_pages"] == facts["covered"]
+    assert historical.total_pages == census["pages"]
+    assert historical.covered_pages == census["covered_pages"]
