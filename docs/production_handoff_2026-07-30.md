@@ -486,12 +486,37 @@ The full-library Version 1 coverage audit is:
 ```powershell
 python scripts\comic_perceptual_coverage_audit.py `
   --database G:\ComicAutomation\TestDatabase\inspection-working.db `
-  --stale-older-than-seconds 3600 `
+  --scope X:\ `
   --json-output <new-json-path> `
   --csv-output <new-csv-path>
 ```
 
-It classifies every archive into exactly one of `complete`,
+`--scope` declares which filesystem roots the run may observe, and the
+report prints the canonical scope digest. Two runs taken under different
+scopes answer different questions and must never be compared on their
+numbers alone. Omitting `--scope` skips the filesystem entirely and
+reports every availability as `not_observed`, which is an honest answer
+rather than a guess.
+
+The audit reports three separate measurements -- historical coverage
+(frozen `archive_pages` denominator), operational coverage (pages
+excluded only for recorded retirements and supersessions) and
+accountability (every identity, including zero-page ones) -- and exits
+`2` on any failed invariant, including unexplained residue.
+
+> **Superseded.** Everything from here to the end of this subsection
+> describes the audit's original single-population model, which was
+> replaced by the shared classification contract
+> (`comic_automation/archive/classification.py`). The `complete` /
+> `incomplete` / `failed` / `stale` / `ineligible` populations, the
+> `--stale-older-than-seconds` and `--expect-backfill-complete` flags,
+> and the `never_enqueued_backlog` field no longer exist. The text is
+> kept because it records why that model was wrong: `never_enqueued_backlog`
+> was a *positive predicate*, so it confidently reported archives that
+> were fully explained while staying silent on the ones that had no
+> explanation at all. Its replacement, `unexplained`, is residue only.
+
+It classified every archive into exactly one of `complete`,
 `incomplete`, `failed`, `stale`, `ineligible`, and separately reports
 the eligible archives that have zero Version 1 coverage and no
 `hash_archive_pages_perceptual` job of any status. That sub-population
