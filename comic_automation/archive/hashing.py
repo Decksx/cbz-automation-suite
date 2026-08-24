@@ -440,6 +440,15 @@ class CalculateArchiveHashHandler:
                     location_id=location_id,
                     path=path,
                 )
+                # Checked before the writes as well as after them. For
+                # correctness the pre-commit check below subsumes this one --
+                # removing this line alone fails no test, measured -- because
+                # anything it would catch is still caught before COMMIT and
+                # rolled back. It is kept as fail-fast: without it a
+                # replacement noticed before any work began would still write
+                # four rows, enqueue a reinspection, and undo all of it.
+                # Recorded here because an overlap nobody wrote down is how
+                # one of the two gets deleted later as dead weight.
                 self._assert_file_matches(path, result)
 
                 self.hashes.save(
