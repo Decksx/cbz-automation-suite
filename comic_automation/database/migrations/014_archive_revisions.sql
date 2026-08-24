@@ -50,9 +50,12 @@
 -- to be remembered. `identity_state` is 'established' (digest known) or
 -- 'provisional' (digest not known), the CHECK below ties it to the presence of
 -- the digest in both directions, and a partial unique index allows at most one
--- provisional revision per archive. A provisional revision is replaced by an
--- established one once the bytes are hashed; it is the only kind of revision
--- this schema lets you delete, for exactly that reason.
+-- provisional revision per archive. When the bytes are finally hashed, an
+-- established revision is *appended* after the provisional one and the current
+-- pointer moves to it. The provisional row is kept as noncurrent history,
+-- because "the identity existed and its bytes were unknown, from this date
+-- until that one" is a fact worth being able to answer later -- and because
+-- deleting it would cascade away every observation recorded against it.
 --
 -- 59,541 established + 147 provisional = 59,688, so every archive gets a
 -- current revision and the gap stays queryable instead of becoming folklore.
@@ -100,6 +103,23 @@
 -- `archive_files.current_revision_id` is the sole authoritative pointer. There
 -- is deliberately no `is_current` column on archive_revisions: two sources of
 -- truth for the same fact is how they drift apart.
+--
+-- Every archive has one, and that is enforced for the whole life of the
+-- schema rather than only at backfill time. The column is nullable and always
+-- will be -- an archive's first revision cannot exist before the archive row
+-- it references, so there is no way to satisfy a NOT NULL column on INSERT.
+-- The invariant is closed at both ends instead:
+--
+--   * an AFTER INSERT trigger gives every new archive an initial provisional
+--     revision and points it there, so the NULL window closes inside the same
+--     statement and applies to raw SQL exactly as it does to the DAL;
+--   * a BEFORE UPDATE trigger refuses to clear a live archive's pointer back
+--     to NULL.
+--
+-- Without both, an archive could be inserted and committed with no current
+-- revision at all -- which the backfill alone cannot prevent, because it runs
+-- once and every archive discovered afterwards arrives through an INSERT it
+-- never sees.
 --
 -- It is added with ALTER TABLE, which in SQLite cannot express a composite
 -- foreign key -- so the requirement that a pointer names a revision *of its
@@ -179,9 +199,16 @@ CREATE TABLE IF NOT EXISTS archive_revisions (
 
     FOREIGN KEY (archive_id) REFERENCES archive_files(id)
         ON DELETE CASCADE,
+    -- CASCADE, not RESTRICT. The delete guard below already refuses to
+    -- remove any revision while its archive exists, so this action only ever
+    -- runs during an archive's own cascade -- and RESTRICT there made an
+    -- archive with more than one generation undeletable, because deleting
+    -- the root would violate the reference held by its successor. Measured
+    -- 2026-08-24: RESTRICT fails the cascade, CASCADE completes it, and the
+    -- mid-chain guard still bites in both cases.
     FOREIGN KEY (previous_revision_id, archive_id)
         REFERENCES archive_revisions(id, archive_id)
-        ON DELETE RESTRICT
+        ON DELETE CASCADE
 );
 
 -- Duplicate lookup across archives. Not unique: byte-identical archives stay
@@ -209,10 +236,11 @@ BEGIN
     );
 END;
 
--- An established revision is a record that specific bytes existed, so it
--- cannot be cherry-picked out of a live archive's history. Only the
--- provisional placeholder can go that way, and it goes precisely when the
--- real digest arrives to replace it.
+-- A revision records what was known about an archive's bytes at a point in
+-- time, so none of them can be cherry-picked out of a live archive's history
+-- -- provisional rows included. Establishing recovered bytes appends and
+-- promotes rather than replacing, so there is no legitimate reason left to
+-- delete any revision while its archive exists.
 --
 -- The archive_files test is what keeps this from making every archive
 -- undeletable. Deleting an archive cascades its revisions away, and an
@@ -226,15 +254,14 @@ END;
 -- (visible count 0), while a direct DELETE against archive_revisions still
 -- sees it (count 1). Both readings are pinned by tests, so a change in that
 -- ordering fails loudly instead of silently disarming the guard.
-CREATE TRIGGER IF NOT EXISTS trg_archive_revisions_established_not_deletable
+CREATE TRIGGER IF NOT EXISTS trg_archive_revisions_not_deletable
 BEFORE DELETE ON archive_revisions
 FOR EACH ROW
-WHEN OLD.identity_state = 'established'
- AND EXISTS (SELECT 1 FROM archive_files WHERE id = OLD.archive_id)
+WHEN EXISTS (SELECT 1 FROM archive_files WHERE id = OLD.archive_id)
 BEGIN
     SELECT RAISE(
         ABORT,
-        'an established revision cannot be deleted; its bytes are evidence'
+        'a revision cannot be deleted while its archive exists; it is evidence'
     );
 END;
 
@@ -298,6 +325,50 @@ BEGIN
         ABORT,
         'current_revision_id must name a revision of this archive'
     );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_current_revision_not_cleared
+BEFORE UPDATE OF current_revision_id ON archive_files
+FOR EACH ROW
+WHEN NEW.current_revision_id IS NULL
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'an archive must always have a current revision; it cannot be cleared'
+    );
+END;
+
+-- Closes the NULL window for every archive created after this migration.
+-- Fires for raw SQL exactly as for the DAL, which is the point: an invariant
+-- that only the application upholds is a convention, not an invariant.
+--
+-- The new revision is provisional because that is the truth at this instant:
+-- the identity row has just been created and nothing has hashed its bytes.
+-- Hashing later appends an established revision and moves the pointer,
+-- leaving this row as the record of the period when the bytes were unknown.
+--
+-- The pointer is read back by ordinal rather than from last_insert_rowid(),
+-- so it cannot be confused by any other insert a trigger might perform.
+CREATE TRIGGER IF NOT EXISTS trg_archive_files_initial_revision
+AFTER INSERT ON archive_files
+FOR EACH ROW
+WHEN NEW.current_revision_id IS NULL
+BEGIN
+    INSERT INTO archive_revisions (
+        archive_id, revision_ordinal, identity_state, archive_sha256,
+        previous_revision_id, evidence, source
+    )
+    VALUES (
+        NEW.id, 1, 'provisional', NULL, NULL,
+        'archive identity created; bytes not yet hashed', 'runtime'
+    );
+
+    UPDATE archive_files
+    SET current_revision_id = (
+        SELECT id FROM archive_revisions
+        WHERE archive_id = NEW.id AND revision_ordinal = 1
+    )
+    WHERE id = NEW.id;
 END;
 
 -- ------------------------------------------------------------ observations
