@@ -550,6 +550,378 @@ class ContentSignatureRepository(_Repository):
         )
 
 
+@dataclass(frozen=True)
+class RevisionRecord:
+    """One immutable byte state of one logical archive.
+
+    `archive_sha256` is None exactly when `identity_state` is 'provisional',
+    which means the archive's bytes have never been hashed -- 147 archives
+    were in that state when migration 014 was written, and some of them have
+    no reachable file, so it is a state to be carried rather than a gap to be
+    filled in later.
+    """
+
+    revision_id: int
+    archive_id: int
+    revision_ordinal: int
+    identity_state: str
+    archive_sha256: str | None
+    content_signature: str | None
+    file_size: int | None
+    page_count: int | None
+    previous_revision_id: int | None
+    evidence: str
+    source: str
+
+    @property
+    def is_established(self) -> bool:
+        return self.identity_state == "established"
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "RevisionRecord":
+        return cls(
+            revision_id=int(row["id"]),
+            archive_id=int(row["archive_id"]),
+            revision_ordinal=int(row["revision_ordinal"]),
+            identity_state=row["identity_state"],
+            archive_sha256=row["archive_sha256"],
+            content_signature=row["content_signature"],
+            file_size=(
+                int(row["file_size"]) if row["file_size"] is not None else None
+            ),
+            page_count=(
+                int(row["page_count"])
+                if row["page_count"] is not None
+                else None
+            ),
+            previous_revision_id=(
+                int(row["previous_revision_id"])
+                if row["previous_revision_id"] is not None
+                else None
+            ),
+            evidence=row["evidence"],
+            source=row["source"],
+        )
+
+
+_REVISION_COLUMNS = """
+    id, archive_id, revision_ordinal, identity_state, archive_sha256,
+    content_signature, file_size, page_count, previous_revision_id,
+    evidence, source
+"""
+
+
+class RevisionRepository(_Repository):
+    """Read and append archive revisions, and move the current pointer.
+
+    Two rules shape every method here, and both come from the schema rather
+    than from this class: a revision is never updated, and the pointer at
+    `archive_files.current_revision_id` is the only statement of which
+    revision is current. Nothing in this class writes an `is_current` flag,
+    because there is no such column to write.
+    """
+
+    # --- reads ------------------------------------------------------------
+
+    def get(self, revision_id: int) -> RevisionRecord | None:
+        row = self.connection.execute(
+            f"SELECT {_REVISION_COLUMNS} FROM archive_revisions WHERE id = ?",
+            (revision_id,),
+        ).fetchone()
+        return RevisionRecord.from_row(row) if row is not None else None
+
+    def current_for(self, archive_id: int) -> RevisionRecord | None:
+        """The archive's current revision, resolved through the pointer.
+
+        Deliberately joined from `archive_files.current_revision_id` rather
+        than by taking the highest ordinal. The two agree today, but "current"
+        is an operator-controlled decision -- rolling back to an earlier
+        generation is a legitimate act -- and reading it as "the newest" would
+        silently disagree the moment anyone does that.
+        """
+        row = self.connection.execute(
+            f"""
+            SELECT {_REVISION_COLUMNS}
+            FROM archive_revisions
+            WHERE id = (
+                SELECT current_revision_id FROM archive_files WHERE id = ?
+            )
+            """,
+            (archive_id,),
+        ).fetchone()
+        return RevisionRecord.from_row(row) if row is not None else None
+
+    def lineage_for(self, archive_id: int) -> list[RevisionRecord]:
+        """Every revision of one archive, oldest first.
+
+        This is the three-generation view: for archive 37704 it returns three
+        rows, and the fact that they are three rows rather than one overwritten
+        row is the whole point of the table.
+        """
+        return [
+            RevisionRecord.from_row(row)
+            for row in self.connection.execute(
+                f"""
+                SELECT {_REVISION_COLUMNS}
+                FROM archive_revisions
+                WHERE archive_id = ?
+                ORDER BY revision_ordinal
+                """,
+                (archive_id,),
+            )
+        ]
+
+    def revision_with_digest(
+        self, archive_id: int, archive_sha256: str
+    ) -> RevisionRecord | None:
+        """The revision of *archive_id* holding these exact bytes, if any."""
+        row = self.connection.execute(
+            f"""
+            SELECT {_REVISION_COLUMNS}
+            FROM archive_revisions
+            WHERE archive_id = ? AND archive_sha256 = ?
+            """,
+            (archive_id, archive_sha256),
+        ).fetchone()
+        return RevisionRecord.from_row(row) if row is not None else None
+
+    def archives_sharing_digest(self, archive_sha256: str) -> list[int]:
+        """Every archive holding these bytes in some revision.
+
+        A list, and the digest is not globally unique: 888 exact-duplicate
+        groups were measured in production. Returning one id would be the
+        first step towards merging two archives that are deliberately
+        distinct.
+        """
+        return [
+            int(row["archive_id"])
+            for row in self.connection.execute(
+                """
+                SELECT DISTINCT archive_id FROM archive_revisions
+                WHERE archive_sha256 = ?
+                ORDER BY archive_id
+                """,
+                (archive_sha256,),
+            )
+        ]
+
+    # --- writes -----------------------------------------------------------
+
+    def record_or_reuse(
+        self,
+        *,
+        archive_id: int,
+        archive_sha256: str,
+        evidence: str,
+        content_signature: str | None = None,
+        file_size: int | None = None,
+        page_count: int | None = None,
+    ) -> tuple[int, bool]:
+        """Append a revision for these bytes, or return the existing one.
+
+        Returns ``(revision_id, created)``.
+
+        Re-seeing bytes an archive already has is not a new revision -- the
+        roadmap is explicit that a revision is a content state, not a sighting.
+        Appending one anyway would violate UNIQUE(archive_id, archive_sha256)
+        and, worse, would make a file that keeps being rediscovered look like
+        it kept changing. The caller records an observation instead.
+        """
+        self._require_transaction()
+
+        existing = self.revision_with_digest(archive_id, archive_sha256)
+
+        if existing is not None:
+            return existing.revision_id, False
+
+        # A provisional revision is a placeholder for exactly these unknown
+        # bytes, so learning the digest resolves it rather than adding a
+        # generation beside it.
+        provisional = self.connection.execute(
+            "SELECT id FROM archive_revisions "
+            "WHERE archive_id = ? AND identity_state = 'provisional'",
+            (archive_id,),
+        ).fetchone()
+
+        if provisional is not None:
+            return (
+                self._establish(
+                    archive_id=archive_id,
+                    provisional_id=int(provisional["id"]),
+                    archive_sha256=archive_sha256,
+                    evidence=evidence,
+                    content_signature=content_signature,
+                    file_size=file_size,
+                    page_count=page_count,
+                ),
+                True,
+            )
+
+        return (
+            self._append(
+                archive_id=archive_id,
+                archive_sha256=archive_sha256,
+                evidence=evidence,
+                content_signature=content_signature,
+                file_size=file_size,
+                page_count=page_count,
+            ),
+            True,
+        )
+
+    def _append(
+        self,
+        *,
+        archive_id: int,
+        archive_sha256: str | None,
+        evidence: str,
+        content_signature: str | None,
+        file_size: int | None,
+        page_count: int | None,
+        identity_state: str = "established",
+    ) -> int:
+        """Add the next generation, linked to the one before it."""
+        tip = self.connection.execute(
+            "SELECT id, revision_ordinal FROM archive_revisions "
+            "WHERE archive_id = ? ORDER BY revision_ordinal DESC LIMIT 1",
+            (archive_id,),
+        ).fetchone()
+
+        ordinal = 1 if tip is None else int(tip["revision_ordinal"]) + 1
+        previous = None if tip is None else int(tip["id"])
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO archive_revisions (
+                archive_id, revision_ordinal, identity_state, archive_sha256,
+                content_signature, file_size, page_count,
+                previous_revision_id, evidence, source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'runtime')
+            """,
+            (
+                archive_id,
+                ordinal,
+                identity_state,
+                archive_sha256,
+                content_signature,
+                file_size,
+                page_count,
+                previous,
+                evidence,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def _establish(
+        self,
+        *,
+        archive_id: int,
+        provisional_id: int,
+        archive_sha256: str,
+        evidence: str,
+        content_signature: str | None,
+        file_size: int | None,
+        page_count: int | None,
+    ) -> int:
+        """Replace a provisional revision with the bytes it stood in for.
+
+        Delete-then-insert rather than an update, because revisions are
+        immutable and the schema enforces it. The provisional row is the one
+        kind this schema permits deleting, precisely so this path exists.
+
+        The insert reuses the placeholder's ordinal and predecessor, so
+        establishing an identity does not invent a generation: the archive had
+        one unknown byte state and now has one known one.
+        """
+        placeholder = self.connection.execute(
+            "SELECT revision_ordinal, previous_revision_id "
+            "FROM archive_revisions WHERE id = ?",
+            (provisional_id,),
+        ).fetchone()
+
+        # Clear the pointer first: the column's foreign key is deferred, but
+        # leaving it aimed at a row being deleted makes the intermediate state
+        # depend on that deferral. Doing it explicitly keeps the sequence
+        # readable and correct either way.
+        self.connection.execute(
+            "UPDATE archive_files SET current_revision_id = NULL "
+            "WHERE id = ? AND current_revision_id = ?",
+            (archive_id, provisional_id),
+        )
+        self.connection.execute(
+            "DELETE FROM archive_revisions WHERE id = ?", (provisional_id,)
+        )
+
+        cursor = self.connection.execute(
+            """
+            INSERT INTO archive_revisions (
+                archive_id, revision_ordinal, identity_state, archive_sha256,
+                content_signature, file_size, page_count,
+                previous_revision_id, evidence, source
+            )
+            VALUES (?, ?, 'established', ?, ?, ?, ?, ?, ?, 'runtime')
+            """,
+            (
+                archive_id,
+                int(placeholder["revision_ordinal"]),
+                archive_sha256,
+                content_signature,
+                file_size,
+                page_count,
+                placeholder["previous_revision_id"],
+                evidence,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def set_current(self, archive_id: int, revision_id: int) -> None:
+        """Point an archive at one of its own revisions.
+
+        The ownership trigger rejects a foreign revision, so this does not
+        re-check it: duplicating the rule here would let the two drift, and
+        the database is the one that cannot be bypassed.
+        """
+        self._require_transaction()
+        self.connection.execute(
+            "UPDATE archive_files SET current_revision_id = ? WHERE id = ?",
+            (revision_id, archive_id),
+        )
+
+    def observe(
+        self,
+        *,
+        revision_id: int,
+        location_id: int | None = None,
+        run_id: int | None = None,
+        file_size: int | None = None,
+        modified_time_ns: int | None = None,
+    ) -> int:
+        """Record a sighting of known bytes. Appends; rewrites nothing."""
+        self._require_transaction()
+        cursor = self.connection.execute(
+            """
+            INSERT INTO archive_revision_observations (
+                revision_id, location_id, run_id, file_size, modified_time_ns
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (revision_id, location_id, run_id, file_size, modified_time_ns),
+        )
+        return int(cursor.lastrowid)
+
+    def observations_for(self, revision_id: int) -> list[int]:
+        """Observation ids for one revision, oldest first."""
+        return [
+            int(row["id"])
+            for row in self.connection.execute(
+                "SELECT id FROM archive_revision_observations "
+                "WHERE revision_id = ? ORDER BY id",
+                (revision_id,),
+            )
+        ]
+
+
 # --- the connection-factory guard ----------------------------------------
 #
 # Recorded here rather than in the test so the list and the reasons live
