@@ -202,7 +202,11 @@ def test_upgrade_from_12_backfills_the_existing_retirement(
         (1, "2026-08-19 04:55:30", "deduplicated", "signature held by 45213"),
     )
 
-    assert apply_migrations(conn, MIGRATIONS) == [13]
+    # 14 comes along because MIGRATIONS is the real directory and this
+    # database starts at 12. Asserted in full rather than loosened to a
+    # membership check, so a migration appearing or vanishing is still caught
+    # here rather than silently tolerated.
+    assert apply_migrations(conn, MIGRATIONS) == [13, 14]
 
     events = disposition.disposition_history(conn)
 

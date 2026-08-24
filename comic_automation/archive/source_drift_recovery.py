@@ -38,6 +38,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+from comic_automation.database.dal import transaction
 from comic_automation.archive.hashing import (
     ArchiveHashRepository,
     calculate_archive_hash,
@@ -518,8 +519,13 @@ def apply_source_drift_recovery(
     location_id = int(baseline["location_id"])
 
     with database_connection(database) as connection:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        # The DAL owns this boundary now. `ArchiveHashRepository.save()`
+        # writes the archive's revision as well as its hash, and
+        # `require_transaction()` demands a transaction this module started --
+        # a raw BEGIN IMMEDIATE is refused precisely because nothing would own
+        # its commit and rollback. The semantics are unchanged: BEGIN
+        # IMMEDIATE up front, commit at the end, rollback on any exception.
+        with transaction(connection):
             current = _job_and_location(connection, job_id)
             conflicts = _active_conflicts(
                 connection,
@@ -656,12 +662,6 @@ def apply_source_drift_recovery(
                 expected_file_size=expected_file_size,
                 expected_modified_time_ns=expected_modified_time_ns,
             )
-
-            connection.execute("COMMIT")
-        except Exception:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
 
         post_job = _job_and_location(connection, job_id)
         post_pages = _stored_inventory(connection, archive_id)

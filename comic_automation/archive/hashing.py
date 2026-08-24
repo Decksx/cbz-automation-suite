@@ -8,12 +8,46 @@ from pathlib import Path
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
+from comic_automation.database.dal import (
+    RevisionRepository,
+    require_transaction,
+    transaction,
+)
+from comic_automation.archive.repository import (
+    ArchiveLocationNotFoundError,
+)
 from comic_automation.jobs import (
     CategorizedJobError,
     EnqueueOutcome,
     Job,
     JobQueue,
 )
+
+
+class SourceChangedError(OSError):
+    """The archive or its recorded location moved after it was hashed.
+
+    An OSError subclass so it classifies as `filesystem_io` alongside every
+    other transient source problem, and is retried rather than treated as a
+    permanent failure: the next attempt re-hashes whatever is there now.
+    """
+
+
+def _as_categorized(error: OSError) -> CategorizedJobError:
+    """Map a filesystem error onto the queue's stable categories.
+
+    Collected in one place so the checks added around the write transaction
+    classify identically to the hashing read that precedes them -- two
+    spellings of the same failure would be triaged as two different problems.
+    """
+    if isinstance(error, FileNotFoundError):
+        category = "filesystem_not_found"
+    elif isinstance(error, PermissionError):
+        category = "filesystem_permission"
+    else:
+        category = "filesystem_io"
+
+    return CategorizedJobError(str(error), category=category)
 
 
 HASH_ALGORITHM = "sha256"
@@ -81,6 +115,16 @@ class ArchiveHashRepository:
         result: ArchiveHash,
         enqueue_reinspection: bool = True,
     ) -> None:
+        # This writes four things that have to agree: the archive_hashes row,
+        # the location's observed size/mtime, the denormalized file_size on
+        # archive_files, and the archive's revision. Before revisions existed
+        # these were three independent autocommits and a crash between them
+        # left the database disagreeing with itself; now that the current
+        # revision is derived from the same digest, a partial write would mean
+        # `archive_hashes.digest` and `current_revision_id` naming different
+        # bytes -- two answers to "what is this archive now?".
+        require_transaction(self.connection)
+
         # Compare against the file_size/modified_time_ns already
         # recorded for this location to detect whether the underlying
         # file changed since the last time it was seen (as opposed to
@@ -165,6 +209,49 @@ class ArchiveHashRepository:
             WHERE id = ?
             """,
             (result.file_size, archive_id),
+        )
+
+        # The revision is the authoritative statement of byte identity, and
+        # archive_hashes is the mutable record of the most recent hash. They
+        # are written together so they cannot disagree.
+        #
+        # Three cases, all handled by record_or_reuse:
+        #
+        #   first hash       -- the archive's current revision is still the
+        #                       provisional one it was created with, so this
+        #                       appends the established generation and the
+        #                       pointer moves;
+        #   unchanged rehash -- the digest is already a revision of this
+        #                       archive, so it is reused and only an
+        #                       observation is added. A file rediscovered
+        #                       unchanged must not look like a file that
+        #                       changed;
+        #   changed rehash   -- new bytes, so a new generation is appended
+        #                       *beside* the old one rather than overwriting
+        #                       it, which is what archive_hashes alone did.
+        revisions = RevisionRepository(self.connection)
+        revision_id, _ = revisions.record_or_reuse(
+            archive_id=archive_id,
+            archive_sha256=result.digest,
+            evidence=(
+                f"{result.algorithm} v{result.algorithm_version} over "
+                f"{result.bytes_read} bytes, location {location_id}"
+            ),
+            file_size=result.file_size,
+        )
+
+        # Promoted unconditionally, unlike an ordinary append. This digest was
+        # just measured from the file on disk, so it *is* the archive's
+        # current byte state -- there is no operator judgement to preserve
+        # here, and leaving the pointer elsewhere would recreate exactly the
+        # disagreement this method exists to prevent.
+        revisions.set_current(archive_id, revision_id)
+
+        revisions.observe(
+            revision_id=revision_id,
+            location_id=location_id,
+            file_size=result.file_size,
+            modified_time_ns=result.modified_time_ns,
         )
 
         if metadata_changed and enqueue_reinspection:
@@ -315,6 +402,7 @@ class CalculateArchiveHashHandler:
         *,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
+        self.connection = connection
         self.locations = ArchiveInspectionRepository(connection)
         self.hashes = ArchiveHashRepository(connection)
         self.chunk_size = chunk_size
@@ -326,29 +414,104 @@ class CalculateArchiveHashHandler:
         location = self.locations.current_location(job.archive_id)
         path = Path(str(location["path"]))
 
+        location_id = int(location["id"])
+
         try:
             result = calculate_archive_hash(
                 path,
                 chunk_size=self.chunk_size,
             )
-        except FileNotFoundError as exc:
-            raise CategorizedJobError(
-                str(exc),
-                category="filesystem_not_found",
-            ) from exc
-        except PermissionError as exc:
-            raise CategorizedJobError(
-                str(exc),
-                category="filesystem_permission",
-            ) from exc
         except OSError as exc:
-            raise CategorizedJobError(
-                str(exc),
-                category="filesystem_io",
+            raise _as_categorized(exc) from exc
+
+        # `calculate_archive_hash` proves the file held still only while it
+        # was being read. Everything below re-establishes that the bytes it
+        # measured are still the archive's current bytes at the moment they
+        # are recorded -- otherwise the hash row and the revision would agree
+        # with each other while both described a file that no longer exists
+        # in that form, which is a more convincing kind of wrong than a plain
+        # disagreement.
+        #
+        # The handler runs outside any transaction, so it owns this one.
+        try:
+            with transaction(self.connection):
+                self._assert_still_current(
+                    archive_id=job.archive_id,
+                    location_id=location_id,
+                    path=path,
+                )
+                # Checked before the writes as well as after them. For
+                # correctness the pre-commit check below subsumes this one --
+                # removing this line alone fails no test, measured -- because
+                # anything it would catch is still caught before COMMIT and
+                # rolled back. It is kept as fail-fast: without it a
+                # replacement noticed before any work began would still write
+                # four rows, enqueue a reinspection, and undo all of it.
+                # Recorded here because an overlap nobody wrote down is how
+                # one of the two gets deleted later as dead weight.
+                self._assert_file_matches(path, result)
+
+                self.hashes.save(
+                    archive_id=job.archive_id,
+                    location_id=location_id,
+                    result=result,
+                )
+
+                # Re-stat after every write but before COMMIT. The archive is
+                # outside SQLite's transaction boundary, so a replacement
+                # during the write window is invisible to the database; the
+                # same pattern guards the reviewed source-drift recovery.
+                self._assert_file_matches(path, result)
+        except OSError as exc:
+            raise _as_categorized(exc) from exc
+
+    def _assert_still_current(
+        self,
+        *,
+        archive_id: int,
+        location_id: int,
+        path: Path,
+    ) -> None:
+        """Refuse if the archive was relocated while it was being hashed.
+
+        The location row is read before hashing and the promotion happens
+        after, so a relocation in between would attach a digest measured at
+        the old path to whatever the archive points at now.
+        """
+        try:
+            current = self.locations.current_location(archive_id)
+        except ArchiveLocationNotFoundError as exc:
+            raise SourceChangedError(
+                f"Archive {archive_id} lost its current location while it "
+                "was being hashed."
             ) from exc
 
-        self.hashes.save(
-            archive_id=job.archive_id,
-            location_id=int(location["id"]),
-            result=result,
-        )
+        if int(current["id"]) != location_id or (
+            str(current["path"]) != str(path)
+        ):
+            raise SourceChangedError(
+                f"Archive {archive_id} was relocated while it was being "
+                f"hashed: location {location_id} ({path}) is no longer "
+                f"current."
+            )
+
+    @staticmethod
+    def _assert_file_matches(path: Path, result: ArchiveHash) -> None:
+        """Refuse if the file no longer matches what was hashed.
+
+        Size and mtime only -- the same evidence `calculate_archive_hash`
+        compares either side of its own read. It cannot see a same-length
+        replacement inside one filesystem timestamp tick; re-hashing to close
+        that would double every archive's read cost, and the window here is
+        the write transaction rather than the whole file read.
+        """
+        stat = path.stat()
+
+        if (
+            stat.st_size != result.file_size
+            or stat.st_mtime_ns != result.modified_time_ns
+        ):
+            raise SourceChangedError(
+                f"{path} changed after it was hashed and before the result "
+                "was recorded; the rewrite was abandoned."
+            )

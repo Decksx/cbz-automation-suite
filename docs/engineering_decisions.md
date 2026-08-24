@@ -303,3 +303,75 @@ Filesystem, volume, and access-path behavior is measured on the actual
 target before it is written down or designed against. First-principles
 reasoning about these is evidence of a hypothesis worth testing, not a
 finding.
+
+## Unknown byte identity is a state, not a null
+
+Revision identity is `archive_revisions.archive_sha256`, and it is
+nullable. Reconciled 2026-08-21 against the protected pre-revision backup,
+147 of 59,688 archives have no archive-level SHA-256, and 311 archives have
+no current file location at all -- so some of those bytes are unreachable
+and can never acquire a digest.
+
+A `NOT NULL` column left two options and both were wrong. Aborting the
+migration would block Step 2 permanently on archives whose files no longer
+exist. Backfilling only the hashed ones would leave 147 archives with no
+revision and a NULL `current_revision_id`, breaking the roadmap's criterion
+that every archive has exactly one deterministic current revision -- and
+leaving a silent NULL that every later query has to remember.
+
+So `identity_state` is `'established'` or `'provisional'`, tied to the
+presence of the digest by a CHECK in both directions, and capped at one
+provisional row per archive by a partial unique index. 59,541 established
++ 147 provisional accounts for every archive. The gap stays queryable
+instead of becoming folklore, which is the same reason retirement evidence
+is NOT NULL: a missing fact that looks like an ordinary empty value stops
+being findable.
+
+When the bytes are finally hashed, the established revision is **appended
+after** the provisional one and the current pointer moves to it. The
+provisional row is kept as noncurrent history and the schema refuses to
+delete it while its archive exists. Replacing it in place was the first
+design and it was wrong twice over: it destroyed the record that the
+identity existed with unknown bytes between two dates, and it cascaded
+away every observation recorded against it during that period.
+
+## Every archive has a current revision, enforced by the schema
+
+`archive_files.current_revision_id` is nullable and always will be: an
+archive's first revision cannot exist before the archive row it
+references, so no `NOT NULL` column can be satisfied on INSERT. Enforcing
+the invariant only in the migration's backfill would cover the archives
+that existed the day 014 ran and nothing discovered afterwards, because
+every later archive arrives through an INSERT the backfill never sees.
+
+It is closed at both ends instead. An `AFTER INSERT` trigger gives every
+new archive an initial provisional revision and points it there, so the
+NULL window shuts inside the same statement and applies to raw SQL exactly
+as it does to the DAL. A `BEFORE UPDATE` trigger refuses to clear a live
+archive's pointer back to NULL. Without both, a transaction could commit
+an archive with no current revision at all, and nothing would ever revisit
+it.
+
+The initial revision is provisional because that is the truth at that
+instant: the identity row has just been created and nothing has hashed its
+bytes.
+
+## Revisions and supersession are different relationships
+
+Supersession (migration 013) relates two archive *identities*: the work
+continues under a different `archive_id`. A revision (migration 014)
+relates two byte *states of one identity*. Archive 37704 needs both --
+three byte generations recorded across two identities -- and it shares a
+historical digest with archive 58201, which is a supersession case.
+
+Merging them on that shared digest is the specific failure the model
+prevents, and it is prevented structurally rather than by convention:
+revision lineage carries `archive_id` into its foreign key so a chain
+cannot cross identities, and `archive_supersessions` holds no digest
+column at all so it cannot express a byte generation. Neither table can
+be used to say the other's thing.
+
+`archive_sha256` is indexed but deliberately not globally unique: 888
+exact-duplicate groups were measured on 2026-08-21, and byte-identical
+archives must stay separately addressable. Canonical-copy selection is a
+later guarded resolution action, not a schema constraint.

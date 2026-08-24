@@ -33,6 +33,8 @@ from comic_automation.database.connection import connect_database
 from comic_automation.database.migrations import (
     applied_versions,
     apply_migrations,
+    discover_migrations,
+    migration_version,
 )
 from scripts import cbz_library_maintenance
 from scripts.cbz_library_maintenance import write_comicinfo
@@ -616,9 +618,22 @@ def test_a_commit_failure_inside_a_migration_restores_the_tables(
     """
     tables = ("archive_files", "file_locations", "jobs")
     directory = tmp_path / "migrations"
+    # One past the real migration set, derived rather than written down.
+    # This migration is applied on top of MIGRATIONS, so a hard-coded
+    # version silently becomes "already applied" the moment a real
+    # migration claims that number -- which is exactly what happened when
+    # 014 landed: the injected file was skipped, nothing raised, and the
+    # test reported that no InjectedFailure occurred.
+    injected_version = (
+        max(
+            migration_version(path)
+            for path in discover_migrations(MIGRATIONS)
+        )
+        + 1
+    )
     _write_migration(
         directory,
-        14,
+        injected_version,
         "CREATE TABLE injected_rollback (id INTEGER PRIMARY KEY);\n"
         "INSERT INTO archive_files (file_size) VALUES (4096);\n",
     )

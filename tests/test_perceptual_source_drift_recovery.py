@@ -12,6 +12,7 @@ from comic_automation.archive.hashing import (
     ArchiveHashRepository,
     calculate_archive_hash,
 )
+from comic_automation.database.dal import transaction
 from comic_automation.archive.inspection import inspect_archive
 from comic_automation.archive.page_hashing import (
     ArchivePageHashRepository,
@@ -109,11 +110,14 @@ def seed_stale_perceptual_job(
         )
         location_id = int(location_cursor.lastrowid)
 
-        ArchiveHashRepository(connection).save(
-            archive_id=archive_id,
-            location_id=location_id,
-            result=calculate_archive_hash(archive),
-        )
+        # save() writes the archive's revision as well as its hash, so it
+        # requires the DAL's transaction boundary.
+        with transaction(connection):
+            ArchiveHashRepository(connection).save(
+                archive_id=archive_id,
+                location_id=location_id,
+                result=calculate_archive_hash(archive),
+            )
         inspection = inspect_archive(archive)
         ArchiveInspectionRepository(connection).save(
             archive_id=archive_id,

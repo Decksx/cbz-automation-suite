@@ -119,7 +119,7 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
 # This is the one place that knows what the sequence should be. A new
 # migration updates HIGHEST_MIGRATION here and nothing else.
 
-HIGHEST_MIGRATION = 13
+HIGHEST_MIGRATION = 14
 
 
 def test_migration_versions_are_unique_and_contiguous() -> None:
