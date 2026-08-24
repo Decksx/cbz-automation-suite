@@ -308,6 +308,111 @@ def test_a_partial_multi_step_change_leaves_nothing_behind(
     assert signatures.for_archive(archive_id) is None
 
 
+def _arm_deferred_constraint(conn: sqlite3.Connection) -> None:
+    """Scaffold a constraint that fails at COMMIT rather than at INSERT.
+
+    Every FOREIGN KEY in the production schema is immediate, so it raises
+    at statement time and never reaches the commit boundary. A DEFERRABLE
+    INITIALLY DEFERRED key is checked only when COMMIT runs, which is the
+    one point `transaction()` cannot delegate to the caller. Created in the
+    temporary database only -- this is test scaffolding, not schema.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE commit_time_parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE commit_time_child(
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER REFERENCES commit_time_parent(id)
+                DEFERRABLE INITIALLY DEFERRED
+        );
+        """
+    )
+
+
+def _fail_at_commit(conn: sqlite3.Connection) -> None:
+    """Run one transaction whose COMMIT is the statement that fails."""
+    with pytest.raises(sqlite3.IntegrityError):
+        with dal.transaction(conn):
+            conn.execute("INSERT INTO commit_time_child VALUES (1, 999)")
+
+
+def test_a_failing_commit_rolls_back_and_leaves_nothing_durable(
+    connection, database_path: Path
+) -> None:
+    """COMMIT is itself a statement that can fail.
+
+    Measured before this was guarded: the block exited with the
+    transaction still open, the failed row still visible on the
+    connection, and that row became durable the moment anything else on
+    the connection committed. The last assertion is that strongest form --
+    an unrelated later commit must not carry the failed work with it.
+    """
+    _arm_deferred_constraint(connection)
+    _fail_at_commit(connection)
+
+    assert connection.in_transaction is False
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM commit_time_child"
+        ).fetchone()[0]
+        == 0
+    )
+
+    connection.execute("INSERT INTO commit_time_parent VALUES (999)")
+    connection.commit()
+
+    with dal.connection_scope(database_path, readonly=True) as reader:
+        assert (
+            reader.execute(
+                "SELECT COUNT(*) FROM commit_time_child"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_a_failing_commit_releases_the_write_lock(
+    connection, database_path: Path
+) -> None:
+    """A transaction stranded by a failed COMMIT holds the write lock.
+
+    Measured before this was guarded: a second writer got "database is
+    locked" and stayed locked out until the first connection was closed.
+    """
+    _arm_deferred_constraint(connection)
+    _fail_at_commit(connection)
+
+    second = dal.open_connection(database_path)
+
+    try:
+        # Far below the policy's 30s default, so a still-held lock fails
+        # this test in half a second instead of stalling the suite.
+        second.execute("PRAGMA busy_timeout = 500")
+        second.execute("BEGIN IMMEDIATE")
+        second.execute("ROLLBACK")
+    finally:
+        second.close()
+
+
+def test_a_failing_commit_leaves_the_connection_usable(connection) -> None:
+    """The stranded transaction also poisoned the connection.
+
+    `require_transaction()` saw `in_transaction` and let repository writes
+    join a transaction nobody owned, while `transaction()` refused every
+    later block as a nested one. Both follow from the rollback, so both
+    are asserted here rather than assumed.
+    """
+    _arm_deferred_constraint(connection)
+    _fail_at_commit(connection)
+
+    with pytest.raises(dal.TransactionRequiredError):
+        dal.ArchiveRepository(connection).create(file_size=1)
+
+    with dal.transaction(connection):
+        archive_id = dal.ArchiveRepository(connection).create(file_size=7)
+
+    assert dal.ArchiveRepository(connection).get(archive_id).file_size == 7
+
+
 def test_nesting_a_transaction_is_refused(connection) -> None:
     """SQLite has no nested transactions, so joining silently would lie.
 
