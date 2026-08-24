@@ -726,6 +726,18 @@ class RevisionRepository(_Repository):
         Appending one anyway would violate UNIQUE(archive_id, archive_sha256)
         and, worse, would make a file that keeps being rediscovered look like
         it kept changing. The caller records an observation instead.
+
+        When the archive's current revision is still provisional, this also
+        moves the pointer, inside the caller's transaction. Appending without
+        promoting would leave the archive reporting an unestablished identity
+        for bytes that have just been hashed, and splitting the promotion into
+        a second call the caller has to remember is how that state becomes
+        permanent.
+
+        The provisional row itself is kept. It records the period when the
+        identity existed and its bytes were unknown, every observation made
+        during that period hangs off it, and the schema refuses to delete it
+        while the archive exists.
         """
         self._require_transaction()
 
@@ -734,40 +746,24 @@ class RevisionRepository(_Repository):
         if existing is not None:
             return existing.revision_id, False
 
-        # A provisional revision is a placeholder for exactly these unknown
-        # bytes, so learning the digest resolves it rather than adding a
-        # generation beside it.
-        provisional = self.connection.execute(
-            "SELECT id FROM archive_revisions "
-            "WHERE archive_id = ? AND identity_state = 'provisional'",
-            (archive_id,),
-        ).fetchone()
-
-        if provisional is not None:
-            return (
-                self._establish(
-                    archive_id=archive_id,
-                    provisional_id=int(provisional["id"]),
-                    archive_sha256=archive_sha256,
-                    evidence=evidence,
-                    content_signature=content_signature,
-                    file_size=file_size,
-                    page_count=page_count,
-                ),
-                True,
-            )
-
-        return (
-            self._append(
-                archive_id=archive_id,
-                archive_sha256=archive_sha256,
-                evidence=evidence,
-                content_signature=content_signature,
-                file_size=file_size,
-                page_count=page_count,
-            ),
-            True,
+        revision_id = self._append(
+            archive_id=archive_id,
+            archive_sha256=archive_sha256,
+            evidence=evidence,
+            content_signature=content_signature,
+            file_size=file_size,
+            page_count=page_count,
         )
+
+        # Read the pointer before promoting, so an archive deliberately rolled
+        # back to an earlier established generation stays where the operator
+        # put it. Only an unestablished identity is promoted automatically.
+        current = self.current_for(archive_id)
+
+        if current is not None and not current.is_established:
+            self.set_current(archive_id, revision_id)
+
+        return revision_id, True
 
     def _append(
         self,
@@ -808,68 +804,6 @@ class RevisionRepository(_Repository):
                 file_size,
                 page_count,
                 previous,
-                evidence,
-            ),
-        )
-        return int(cursor.lastrowid)
-
-    def _establish(
-        self,
-        *,
-        archive_id: int,
-        provisional_id: int,
-        archive_sha256: str,
-        evidence: str,
-        content_signature: str | None,
-        file_size: int | None,
-        page_count: int | None,
-    ) -> int:
-        """Replace a provisional revision with the bytes it stood in for.
-
-        Delete-then-insert rather than an update, because revisions are
-        immutable and the schema enforces it. The provisional row is the one
-        kind this schema permits deleting, precisely so this path exists.
-
-        The insert reuses the placeholder's ordinal and predecessor, so
-        establishing an identity does not invent a generation: the archive had
-        one unknown byte state and now has one known one.
-        """
-        placeholder = self.connection.execute(
-            "SELECT revision_ordinal, previous_revision_id "
-            "FROM archive_revisions WHERE id = ?",
-            (provisional_id,),
-        ).fetchone()
-
-        # Clear the pointer first: the column's foreign key is deferred, but
-        # leaving it aimed at a row being deleted makes the intermediate state
-        # depend on that deferral. Doing it explicitly keeps the sequence
-        # readable and correct either way.
-        self.connection.execute(
-            "UPDATE archive_files SET current_revision_id = NULL "
-            "WHERE id = ? AND current_revision_id = ?",
-            (archive_id, provisional_id),
-        )
-        self.connection.execute(
-            "DELETE FROM archive_revisions WHERE id = ?", (provisional_id,)
-        )
-
-        cursor = self.connection.execute(
-            """
-            INSERT INTO archive_revisions (
-                archive_id, revision_ordinal, identity_state, archive_sha256,
-                content_signature, file_size, page_count,
-                previous_revision_id, evidence, source
-            )
-            VALUES (?, ?, 'established', ?, ?, ?, ?, ?, ?, 'runtime')
-            """,
-            (
-                archive_id,
-                int(placeholder["revision_ordinal"]),
-                archive_sha256,
-                content_signature,
-                file_size,
-                page_count,
-                placeholder["previous_revision_id"],
                 evidence,
             ),
         )
