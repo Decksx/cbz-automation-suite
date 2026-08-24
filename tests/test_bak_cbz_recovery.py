@@ -286,3 +286,163 @@ def test_cleanup_leaves_unrelated_files_alone(tmp_path: Path) -> None:
 
     assert keeper.exists()
     assert notes.exists()
+
+
+# --- the retry actually retries ------------------------------------------
+
+
+def _fail_only_the_first_swap(monkeypatch, tmp_path: Path) -> dict[str, int]:
+    """Fail the rebuild swap once, then let everything through.
+
+    The parameterised recovery test above fails *every* swap, which proves
+    the original is restored each time but would pass just as well if the
+    function gave up after attempt one. A transient fault is the case that
+    separates "restores and retries" from "restores and stops", so it gets
+    its own injection.
+
+    Counts swap attempts so the test can assert the retry happened rather
+    than inferring it from the end state.
+    """
+    real_rename = Path.rename
+    doomed = tmp_path.resolve()
+    state = {"swap_attempts": 0}
+
+    def fake_rename(self: Path, target):
+        if self.resolve() == doomed:
+            state["swap_attempts"] += 1
+
+            if state["swap_attempts"] == 1:
+                raise OSError(13, "simulated transient lock on the first swap")
+
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fake_rename)
+    return state
+
+
+@pytest.mark.parametrize(
+    "module", [cbz_watcher, cbz_sanitizer], ids=["watcher", "sanitizer"]
+)
+def test_a_transient_swap_failure_recovers_and_then_succeeds(
+    archive: Path, monkeypatch, module
+) -> None:
+    """The whole point of restoring: the next attempt can actually work.
+
+    Before the fix the retry re-opened `cbz_path`, which the failed swap
+    had left missing, so every remaining attempt failed on an absent file
+    and the rewrite was lost. With the original put back, attempt two
+    reads a real archive and completes.
+    """
+    tmp_path = archive.with_suffix(".tmp.cbz")
+    monkeypatch.setattr(module.time, "sleep", lambda *_: None)
+    state = _fail_only_the_first_swap(monkeypatch, tmp_path)
+
+    module._write_cbz_with_comicinfo(
+        archive, NEW_XML, replace_entry="ComicInfo.xml"
+    )
+
+    # Two swap attempts: the injected failure, then the one that worked.
+    # Without this the test would pass if the fault never fired at all.
+    assert state["swap_attempts"] == 2
+
+    assert archive.exists()
+    with zipfile.ZipFile(archive) as zf:
+        assert zf.read("ComicInfo.xml").decode("utf-8") == NEW_XML
+        assert zf.read("001.jpg") == ORIGINAL_PAGE
+
+    assert not archive.with_suffix(".bak.cbz").exists()
+    assert not tmp_path.exists()
+
+
+# --- the unrecoverable state, per implementation -------------------------
+
+
+@pytest.mark.parametrize(
+    "module", [cbz_watcher, cbz_sanitizer], ids=["watcher", "sanitizer"]
+)
+def test_when_swap_and_restore_both_fail_nothing_is_deleted(
+    archive: Path, monkeypatch, caplog, module
+) -> None:
+    """The one state this code cannot repair, asserted at each writer.
+
+    Both renames fail, so the archive genuinely is not at its recorded
+    path. What must not happen is either surviving copy being deleted --
+    including by the four further retries that follow, each of which fails
+    on the now-absent original and runs the handler again.
+
+    Both copies must also still be readable archives: a rebuild that
+    survived as a truncated file would be worthless.
+    """
+    tmp_path = archive.with_suffix(".tmp.cbz")
+    bak_path = archive.with_suffix(".bak.cbz")
+    monkeypatch.setattr(module.time, "sleep", lambda *_: None)
+    _fail_renames_from(monkeypatch, tmp_path, bak_path)
+
+    with caplog.at_level("CRITICAL"):
+        module._write_cbz_with_comicinfo(
+            archive, NEW_XML, replace_entry="ComicInfo.xml"
+        )
+
+    assert not archive.exists(), "the recorded path is genuinely empty here"
+
+    # The original, still readable, still the original bytes.
+    assert bak_path.exists()
+    assert zipfile.is_zipfile(bak_path)
+    assert _page_of(bak_path) == ORIGINAL_PAGE
+
+    # The rebuild, still readable, carrying the update that was in flight.
+    assert tmp_path.exists()
+    assert zipfile.is_zipfile(tmp_path)
+    with zipfile.ZipFile(tmp_path) as zf:
+        assert zf.read("ComicInfo.xml").decode("utf-8") == NEW_XML
+        assert zf.read("001.jpg") == ORIGINAL_PAGE
+
+    # The CRITICAL record has to name both locations, or the operator it
+    # exists for cannot find the bytes it is telling them about.
+    assert "could not be restored" in caplog.text
+    assert str(bak_path) in caplog.text
+    assert str(tmp_path) in caplog.text
+
+
+@pytest.mark.parametrize(
+    "module", [cbz_watcher, cbz_sanitizer], ids=["watcher", "sanitizer"]
+)
+def test_the_startup_cleanup_preserves_that_exact_joint_state(
+    archive: Path, monkeypatch, caplog, module
+) -> None:
+    """The two halves of the defect, composed.
+
+    The state left by an unrecoverable rewrite -- original missing, both a
+    `.bak.cbz` and a `.tmp.cbz` present -- is precisely what the watcher's
+    startup cleanup used to walk into and delete. Built here by running the
+    real failure rather than by planting files, so the two halves are shown
+    to compose rather than merely being tested apart.
+    """
+    watch_root = archive.parent
+    tmp_path = archive.with_suffix(".tmp.cbz")
+    bak_path = archive.with_suffix(".bak.cbz")
+
+    monkeypatch.setattr(module.time, "sleep", lambda *_: None)
+
+    with monkeypatch.context() as patch:
+        _fail_renames_from(patch, tmp_path, bak_path)
+        module._write_cbz_with_comicinfo(
+            archive, NEW_XML, replace_entry="ComicInfo.xml"
+        )
+
+    # Precondition: the joint state really was produced.
+    assert not archive.exists()
+    assert bak_path.exists() and tmp_path.exists()
+
+    with caplog.at_level("CRITICAL"):
+        cbz_watcher._clean_up_stale_rewrite_files(watch_root)
+
+    assert bak_path.exists(), "the original must survive the cleanup"
+    assert tmp_path.exists(), "the rebuild must survive the cleanup"
+    assert _page_of(bak_path) == ORIGINAL_PAGE
+    assert zipfile.is_zipfile(tmp_path)
+
+    # Both are reported, not silently kept.
+    assert caplog.text.count("KEPT") == 2
+    assert str(bak_path) in caplog.text
+    assert str(tmp_path) in caplog.text
