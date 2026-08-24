@@ -441,20 +441,30 @@ class ArchiveRepository(_Repository):
             )
         ]
 
-    def create(self, *, file_size: int, sha256: str | None = None) -> int:
+    def create(self, *, file_size: int) -> int:
+        """Create an archive identity.
+
+        There is deliberately no way to set `archive_files.sha256` here, and
+        no `set_sha256()`. That column is the legacy digest -- populated for
+        0 of 59,688 archives -- and since migration 014 the authoritative
+        statement of byte identity is the archive's current revision. A
+        writer that could change one without the other would give the
+        database two answers to "what bytes is this?", which is the whole
+        failure the revision model exists to remove.
+
+        Byte identity is established by hashing, through
+        `ArchiveHashRepository.save()`, which appends or reuses the revision
+        and moves the pointer in one transaction.
+
+        The archive is given a provisional current revision by an AFTER
+        INSERT trigger, so it is never momentarily without one.
+        """
         self._require_transaction()
         cursor = self.connection.execute(
-            "INSERT INTO archive_files (file_size, sha256) VALUES (?, ?)",
-            (file_size, sha256),
+            "INSERT INTO archive_files (file_size) VALUES (?)",
+            (file_size,),
         )
         return int(cursor.lastrowid)
-
-    def set_sha256(self, archive_id: int, sha256: str | None) -> None:
-        self._require_transaction()
-        self.connection.execute(
-            "UPDATE archive_files SET sha256 = ? WHERE id = ?",
-            (sha256, archive_id),
-        )
 
 
 class ContentSignatureRepository(_Repository):
