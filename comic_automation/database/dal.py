@@ -249,16 +249,23 @@ def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 
     try:
         yield connection
+        connection.execute("COMMIT")
     except BaseException:
         # BaseException, not Exception: a KeyboardInterrupt in the middle
         # of a multi-step write must not leave the transaction open for
         # whatever runs next on this connection.
+        #
+        # COMMIT is inside this block because COMMIT is itself a statement
+        # that fails: a deferred FOREIGN KEY is checked here and nowhere
+        # earlier, and a busy database can refuse here too. SQLite leaves
+        # the transaction *open* when COMMIT fails, so committing outside
+        # this block left the caller holding the write lock, with the
+        # failed change still visible on the connection and durable the
+        # moment anything else on it committed.
         if connection.in_transaction:
             connection.execute("ROLLBACK")
 
         raise
-
-    connection.execute("COMMIT")
 
 
 def require_transaction(connection: sqlite3.Connection) -> None:
