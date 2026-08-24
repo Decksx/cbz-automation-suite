@@ -428,6 +428,27 @@ def _read_central_directory_fingerprint(path: Path) -> tuple:
         return _central_directory_fingerprint(zf)
 
 
+def _discard_rebuild_if_original_intact(cbz_path: Path, tmp_path: Path) -> None:
+    """Delete the rebuilt copy only while the original is still in place.
+
+    The rebuild at *tmp_path* is disposable exactly as long as *cbz_path*
+    holds a real archive. If the swap failed partway and cbz_path is
+    missing, the rebuild may be the last intact copy in existence, and
+    deleting it is what turns a recoverable failure into data loss.
+    """
+    if not tmp_path.exists():
+        return
+
+    if cbz_path.exists():
+        tmp_path.unlink()
+        return
+
+    log.critical(
+        f"    {cbz_path.name}: missing from its recorded path after a "
+        f"failed rewrite; keeping {tmp_path} rather than deleting it."
+    )
+
+
 def _write_cbz_with_comicinfo(
     cbz_path: Path,
     new_xml: str,
@@ -515,8 +536,29 @@ def _write_cbz_with_comicinfo(
                     "ComicInfo.xml was being rewritten."
                 )
             bak_path = cbz_path.with_suffix(".bak.cbz")
+            bak_path.unlink(missing_ok=True)
             cbz_path.rename(bak_path)
-            tmp_path.rename(cbz_path)
+
+            # Nothing exists at cbz_path between these two renames. If the
+            # second fails, the retry below re-opens a file that is no
+            # longer there and burns every remaining attempt, the handler
+            # deletes the rebuilt copy, and the surviving original is a
+            # .bak.cbz that the watcher's startup cleanup deletes. Restore
+            # first, so the retry runs against a file that exists.
+            try:
+                tmp_path.rename(cbz_path)
+            except OSError:
+                try:
+                    bak_path.rename(cbz_path)
+                except OSError:
+                    log.critical(
+                        f"    {cbz_path.name}: rewrite failed AND the "
+                        f"original could not be restored. Original bytes "
+                        f"are at {bak_path}, rebuilt copy at {tmp_path}. "
+                        f"Neither will be deleted. Recover by hand."
+                    )
+                raise
+
             bak_path.unlink(missing_ok=True)
             log.info(f"    comicinfo.xml {action} successfully.")
             return
@@ -525,13 +567,11 @@ def _write_cbz_with_comicinfo(
                 f"    File locked (attempt {attempt + 1}/{FILE_LOCK_RETRY_ATTEMPTS}), "
                 f"retrying in {FILE_LOCK_RETRY_DELAY_SECONDS}s... ({e})"
             )
-            if tmp_path.exists():
-                tmp_path.unlink()
+            _discard_rebuild_if_original_intact(cbz_path, tmp_path)
             time.sleep(FILE_LOCK_RETRY_DELAY_SECONDS)
         except Exception as e:
             log.error(f"    Failed to write comicinfo.xml: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
+            _discard_rebuild_if_original_intact(cbz_path, tmp_path)
             return
     log.error(f"    Gave up writing comicinfo.xml after {FILE_LOCK_RETRY_ATTEMPTS} attempts: {cbz_path.name}")
 

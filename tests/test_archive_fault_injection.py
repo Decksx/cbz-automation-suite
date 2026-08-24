@@ -433,19 +433,24 @@ def test_a_failure_before_the_first_rename_leaves_the_original_intact(
 def test_a_failure_between_the_two_renames_leaves_the_data_in_the_backup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dangerous window, characterised rather than asserted as correct.
+    """[RESOLVED 2026-08-24] The dangerous window, now with a restore attempt.
 
-    `write_comicinfo` renames the original to `.bak.cbz`, then the temp file
-    to the original name. A crash between the two leaves **no file at the
-    archive's own path** while the original bytes survive under `.bak.cbz`.
-    The recovery handler unlinks the temp file but does not move the backup
-    back.
+    Originally pinned as characterisation, not correctness: `write_comicinfo`
+    renamed the original to `.bak.cbz`, then the temp file to the original
+    name, and a failure between the two left **no file at the archive's own
+    path** while the original bytes survived under `.bak.cbz`. The handler
+    unlinked the temp file and did not move the backup back, so the archive
+    stayed absent from its recorded location until somebody restored it by
+    hand. That was recorded here as belonging in a separate PR.
 
-    Nothing is lost, and this is not a data-destruction bug -- but the
-    archive is absent from its recorded location until somebody restores it
-    by hand, and the caller is told only that the rewrite failed. Pinned so
-    the behaviour is known before revision work depends on it. Restoring the
-    backup would be a production change and belongs in a separate PR.
+    That PR landed. The second rename is now followed by a restore, so this
+    injection no longer describes the common case -- with `after=1` *every*
+    subsequent rename fails, including the restore, which is the one case
+    the function still cannot repair in-process. What it must do there is
+    keep both copies rather than delete either, and that is what is asserted
+    now. The ordinary case, where only the swap fails and the restore
+    succeeds, is covered by
+    `tests/test_bak_cbz_recovery.py::test_maintenance_restores_the_original_when_the_swap_fails`.
     """
     path = gc.build_case("ordinary", tmp_path)
     original_bytes = path.read_bytes()
@@ -454,12 +459,19 @@ def test_a_failure_between_the_two_renames_leaves_the_data_in_the_backup(
         result = write_comicinfo(path, gc.COMIC_INFO, NEW_XML, dry_run=False)
 
     assert result is False
-    assert state["calls"] == 2
+    # Three now, not two: the swap, the failed rebuild rename, and the
+    # restore attempt that the injection also fails.
+    assert state["calls"] == 3
 
     backup = path.with_suffix(".bak.cbz")
     assert backup.exists()
     assert backup.read_bytes() == original_bytes
     assert not path.exists()
+
+    # The change that matters: the rebuild is no longer deleted while the
+    # archive is missing from its recorded path, so no byte of this archive
+    # exists in only one place.
+    assert path.with_suffix(".tmp.cbz").exists()
 
 
 def test_an_interrupted_rewrite_never_leaves_a_truncated_archive(
