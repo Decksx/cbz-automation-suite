@@ -362,13 +362,20 @@ def test_a_partial_multi_step_change_leaves_nothing_behind(
     Four writes where the fourth fails. Under per-statement commits three
     would be durable with nothing to undo; under one transaction none are.
     """
-    archives = dal.ArchiveRepository(connection)
     signatures = dal.ContentSignatureRepository(connection)
     archive_id = _seed_archive(connection)
+    second_id = _seed_archive(connection, file_size=8192)
 
     with pytest.raises(sqlite3.IntegrityError):
         with dal.transaction(connection):
-            archives.set_sha256(archive_id, "a" * 64)
+            signatures.save(
+                archive_id=second_id,
+                digest="c" * 64,
+                page_count=1,
+                image_bytes=1,
+                source_file_size=1,
+                source_modified_time_ns=1,
+            )
             signatures.save(
                 archive_id=archive_id,
                 digest="d" * 64,
@@ -387,7 +394,7 @@ def test_a_partial_multi_step_change_leaves_nothing_behind(
                 source_modified_time_ns=1,
             )
 
-    assert archives.get(archive_id).sha256 is None
+    assert signatures.for_archive(second_id) is None
     assert signatures.for_archive(archive_id) is None
 
 
@@ -547,7 +554,7 @@ def test_every_repository_write_requires_a_transaction(
 
     writes = [
         lambda: archives.create(file_size=1),
-        lambda: archives.set_sha256(archive_id, "a" * 64),
+        lambda: archives.create(file_size=1),
         lambda: signatures.save(
             archive_id=archive_id,
             digest="d" * 64,
@@ -646,7 +653,7 @@ def test_an_inherited_transaction_does_not_satisfy_it_either(
 
     try:
         with pytest.raises(dal.TransactionRequiredError):
-            archives.set_sha256(1, "a" * 64)
+            archives.create(file_size=1)
     finally:
         connection.execute("ROLLBACK")
 
@@ -710,12 +717,11 @@ def test_archive_round_trips(connection) -> None:
 
     assert record.archive_id == archive_id
     assert record.file_size == 1234
+    # The legacy digest column stays empty: since migration 014 byte identity
+    # lives in the archive's current revision, and the DAL deliberately offers
+    # no way to write this column without one.
     assert record.sha256 is None
-
-    with dal.transaction(connection):
-        archives.set_sha256(archive_id, "b" * 64)
-
-    assert archives.get(archive_id).sha256 == "b" * 64
+    assert not hasattr(archives, "set_sha256")
 
 
 def test_a_missing_archive_reads_as_none(connection) -> None:

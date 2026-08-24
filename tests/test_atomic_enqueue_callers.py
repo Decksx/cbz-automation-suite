@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
+from comic_automation.database.dal import transaction
 from comic_automation.archive.hashing import (
     ArchiveHashRepository,
     calculate_archive_hash,
@@ -436,11 +437,14 @@ def test_save_enqueues_reinspection_only_when_absent(
         result = calculate_archive_hash(archive)
 
         repository = ArchiveHashRepository(connection)
-        repository.save(
-            archive_id=archive_id,
-            location_id=location_id,
-            result=result,
-        )
+        # save() now writes the archive's revision too, so it needs the DAL
+        # transaction boundary that owns the commit.
+        with transaction(connection):
+            repository.save(
+                archive_id=archive_id,
+                location_id=location_id,
+                result=result,
+            )
         first_total = job_count(
             connection,
             job_type="inspect_archive",
@@ -450,11 +454,12 @@ def test_save_enqueues_reinspection_only_when_absent(
         # Saving again with drifted metadata must not stack a second
         # active reinspection job.
         archive.write_bytes(archive.read_bytes() + b"\x00")
-        repository.save(
-            archive_id=archive_id,
-            location_id=location_id,
-            result=calculate_archive_hash(archive),
-        )
+        with transaction(connection):
+            repository.save(
+                archive_id=archive_id,
+                location_id=location_id,
+                result=calculate_archive_hash(archive),
+            )
         second_total = job_count(
             connection,
             job_type="inspect_archive",
