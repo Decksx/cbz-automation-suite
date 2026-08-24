@@ -574,23 +574,47 @@ def test_an_archive_may_hold_only_one_provisional_revision(
     unknown bytes.
     """
     archive_id = _new_archive(connection)
+    revisions = dal.RevisionRepository(connection)
 
+    # An established generation 1 first, so the second provisional row below
+    # is legal in every other respect. Inserting it at ordinal 2 with a NULL
+    # predecessor would be refused by the ordinal CHECK instead, and the test
+    # would pass while the index did nothing -- which is what it did before
+    # a bypass run removed the index and nothing failed.
     with dal.transaction(connection):
+        first_id, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_A, evidence="gen 1"
+        )
         connection.execute(
             "INSERT INTO archive_revisions (archive_id, revision_ordinal, "
-            "identity_state, archive_sha256, evidence) "
-            "VALUES (?, 1, 'provisional', NULL, 'first placeholder')",
-            (archive_id,),
+            "identity_state, archive_sha256, previous_revision_id, evidence) "
+            "VALUES (?, 2, 'provisional', NULL, ?, 'first placeholder')",
+            (archive_id, first_id),
         )
+        second_id = connection.execute(
+            "SELECT id FROM archive_revisions WHERE archive_id = ? "
+            "AND revision_ordinal = 2",
+            (archive_id,),
+        ).fetchone()["id"]
 
-    with pytest.raises(sqlite3.IntegrityError):
+    # Ordinal 3, a valid predecessor, valid state/digest pairing: the partial
+    # unique index is the only thing left that can refuse it.
+    # The partial index reports as a UNIQUE failure on archive_id, which is
+    # the column it indexes -- matched explicitly so this cannot start passing
+    # on some other constraint's error.
+    with pytest.raises(
+        sqlite3.IntegrityError, match=r"archive_revisions\.archive_id"
+    ):
         with dal.transaction(connection):
             connection.execute(
                 "INSERT INTO archive_revisions (archive_id, "
-                "revision_ordinal, identity_state, archive_sha256, evidence) "
-                "VALUES (?, 2, 'provisional', NULL, 'second placeholder')",
-                (archive_id,),
+                "revision_ordinal, identity_state, archive_sha256, "
+                "previous_revision_id, evidence) "
+                "VALUES (?, 3, 'provisional', NULL, ?, 'second placeholder')",
+                (archive_id, second_id),
             )
+
+    assert len(revisions.lineage_for(archive_id)) == 2
 
 
 def test_one_archive_cannot_hold_the_same_byte_state_twice(
