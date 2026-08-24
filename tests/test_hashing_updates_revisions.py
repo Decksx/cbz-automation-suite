@@ -21,13 +21,17 @@ from pathlib import Path
 
 import pytest
 
+from comic_automation.archive import hashing as hashing_module
 from comic_automation.archive.hashing import (
     ArchiveHashRepository,
+    CalculateArchiveHashHandler,
     calculate_archive_hash,
 )
+from comic_automation.jobs import CategorizedJobError
 from comic_automation.database import dal
 from comic_automation.database.connection import connect_database
 from comic_automation.database.migrations import apply_migrations
+from tests import golden_corpus as gc
 
 MIGRATIONS = (
     Path(__file__).resolve().parents[1]
@@ -38,12 +42,21 @@ MIGRATIONS = (
 
 
 def _make_cbz(path: Path, payload: bytes) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """A byte-reproducible archive: identical payload, identical digest.
 
-    with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("001.jpg", payload)
+    Built through the golden-corpus helper rather than a bare
+    `writestr`, which stamps each member with the current time at
+    2-second DOS granularity. Writing the same payload twice then yields
+    two different archive digests whenever the writes straddle an
+    interval boundary -- measured: two identical-payload archives three
+    seconds apart hashed differently.
 
-    return path
+    That matters most for the A -> B -> A test below, whose whole premise
+    is that restoring the earlier bytes reproduces the earlier digest. It
+    would have passed only when the test happened to finish inside one
+    interval, which is the same timestamp trap found during PR #79.
+    """
+    return gc.build_cbz(path, [("001.jpg", payload)])
 
 
 @pytest.fixture()
@@ -223,6 +236,7 @@ def test_reverting_to_earlier_bytes_reuses_that_generation(
     `UNIQUE (archive_id, archive_sha256)` would refuse anyway.
     """
     archive = _make_cbz(tmp_path / "library" / "issue.cbz", b"state A")
+    original_digest = calculate_archive_hash(archive).digest
     archive_id, location_id = _seed(connection, archive)
     revisions = dal.RevisionRepository(connection)
 
@@ -234,6 +248,14 @@ def test_reverting_to_earlier_bytes_reuses_that_generation(
     state_b = revisions.current_for(archive_id)
 
     _make_cbz(archive, b"state A")
+
+    # The premise, asserted rather than assumed: restoring the payload has
+    # actually restored the digest. Without a byte-reproducible writer this
+    # is false whenever the writes straddle a DOS timestamp interval, and
+    # the reuse assertion below would fail for a reason that has nothing to
+    # do with revisions.
+    assert calculate_archive_hash(archive).digest == original_digest
+
     _hash(connection, archive_id, location_id, archive)
 
     current = revisions.current_for(archive_id)
@@ -315,3 +337,204 @@ def test_saving_outside_a_transaction_is_refused(
         .identity_state
         == "provisional"
     )
+
+
+# --- the window between hashing and promotion ----------------------------
+#
+# `calculate_archive_hash()` proves the file held still only while it was
+# being read. The handler then opens a transaction and promotes, and between
+# those two moments the file -- or the database's idea of where the file is
+# -- can change. Without the checks below the hash row and the revision
+# would agree with each other while both described bytes that were no longer
+# current, which is harder to notice than a plain disagreement.
+
+
+def _snapshot(conn: sqlite3.Connection, archive_id: int) -> dict:
+    """Everything the handler could damage, in one comparable value."""
+    revisions = dal.RevisionRepository(conn)
+    lineage = revisions.lineage_for(archive_id)
+    hash_row = conn.execute(
+        "SELECT digest, file_size, modified_time_ns FROM archive_hashes "
+        "WHERE archive_id = ?",
+        (archive_id,),
+    ).fetchone()
+    locations = conn.execute(
+        "SELECT id, path, file_size, modified_time_ns, is_current "
+        "FROM file_locations WHERE archive_id = ? ORDER BY id",
+        (archive_id,),
+    ).fetchall()
+
+    return {
+        "hash": tuple(hash_row) if hash_row is not None else None,
+        "current": revisions.current_for(archive_id),
+        "lineage": lineage,
+        "observations": [
+            tuple(revisions.observations_for(record.revision_id))
+            for record in lineage
+        ],
+        "locations": [tuple(row) for row in locations],
+    }
+
+
+def _run_handler(conn: sqlite3.Connection, archive_id: int):
+    from comic_automation.jobs import JobQueue
+
+    handler = CalculateArchiveHashHandler(conn)
+    job = JobQueue(conn).enqueue(
+        "calculate_archive_hash", archive_id=archive_id
+    )
+
+    return handler(job)
+
+
+def test_a_replacement_before_the_transaction_is_refused(
+    connection, tmp_path: Path, monkeypatch
+) -> None:
+    """The file is swapped after hashing, before the write transaction opens.
+
+    Injected by replacing the archive the instant `calculate_archive_hash`
+    returns, which is exactly the window the handler cannot see from inside
+    its own transaction.
+    """
+    archive = _make_cbz(tmp_path / "library" / "issue.cbz", b"original bytes")
+    archive_id, location_id = _seed(connection, archive)
+    _hash(connection, archive_id, location_id, archive)
+
+    before = _snapshot(connection, archive_id)
+
+    real_hash = hashing_module.calculate_archive_hash
+
+    def hash_then_replace(path, **kwargs):
+        result = real_hash(path, **kwargs)
+        # The swap the handler must notice.
+        _make_cbz(Path(path), b"replaced after hashing, before the write")
+        return result
+
+    monkeypatch.setattr(
+        hashing_module, "calculate_archive_hash", hash_then_replace
+    )
+
+    with pytest.raises(CategorizedJobError) as caught:
+        _run_handler(connection, archive_id)
+
+    assert caught.value.category == "filesystem_io"
+    assert _snapshot(connection, archive_id) == before
+
+
+def test_a_replacement_during_the_write_is_refused(
+    connection, tmp_path: Path, monkeypatch
+) -> None:
+    """The file is swapped after save() has written, before COMMIT.
+
+    This is the case the pre-write check alone cannot catch: everything
+    looked correct when the writes began. Only the re-stat immediately
+    before commit sees it, and the whole transaction has to roll back --
+    including the revision and its observation.
+    """
+    archive = _make_cbz(tmp_path / "library" / "issue.cbz", b"original bytes")
+    archive_id, location_id = _seed(connection, archive)
+    _hash(connection, archive_id, location_id, archive)
+
+    before = _snapshot(connection, archive_id)
+
+    real_save = ArchiveHashRepository.save
+
+    def save_then_replace(self, **kwargs):
+        real_save(self, **kwargs)
+        # Every write has landed; COMMIT has not.
+        _make_cbz(archive, b"replaced mid-transaction, before commit")
+
+    monkeypatch.setattr(ArchiveHashRepository, "save", save_then_replace)
+
+    with pytest.raises(CategorizedJobError) as caught:
+        _run_handler(connection, archive_id)
+
+    assert caught.value.category == "filesystem_io"
+    # The rollback took the hash row, the pointer, the lineage, the
+    # observations and the location metadata with it.
+    assert _snapshot(connection, archive_id) == before
+
+
+def test_a_relocation_after_hashing_is_refused(
+    connection, tmp_path: Path, monkeypatch
+) -> None:
+    """The archive's current location is reassigned while it is hashed.
+
+    The handler reads the location before hashing and promotes after, so a
+    relocation in between would attach a digest measured at the old path to
+    whatever the archive points at now.
+    """
+    archive = _make_cbz(tmp_path / "library" / "issue.cbz", b"original bytes")
+    archive_id, location_id = _seed(connection, archive)
+    _hash(connection, archive_id, location_id, archive)
+
+    moved = tmp_path / "library" / "moved.cbz"
+    _make_cbz(moved, b"original bytes")
+
+    before = _snapshot(connection, archive_id)
+
+    real_hash = hashing_module.calculate_archive_hash
+
+    def hash_then_relocate(path, **kwargs):
+        result = real_hash(path, **kwargs)
+        stat = moved.stat()
+        # A new current location, exactly as a relocation repair would make.
+        connection.execute(
+            "UPDATE file_locations SET is_current = 0 WHERE archive_id = ?",
+            (archive_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO file_locations (
+                archive_id, path, file_size, modified_time_ns, is_current
+            )
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            (
+                archive_id,
+                str(moved.resolve()),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            ),
+        )
+        return result
+
+    monkeypatch.setattr(
+        hashing_module, "calculate_archive_hash", hash_then_relocate
+    )
+
+    with pytest.raises(CategorizedJobError) as caught:
+        _run_handler(connection, archive_id)
+
+    assert caught.value.category == "filesystem_io"
+
+    after = _snapshot(connection, archive_id)
+
+    # The relocation itself is not this handler's to undo -- it was committed
+    # outside the transaction -- but nothing derived from the stale hash was
+    # written: the digest, pointer, lineage and observations are untouched.
+    assert after["hash"] == before["hash"]
+    assert after["current"] == before["current"]
+    assert after["lineage"] == before["lineage"]
+    assert after["observations"] == before["observations"]
+
+
+def test_the_handler_still_succeeds_when_nothing_moves(
+    connection, tmp_path: Path
+) -> None:
+    """The guards did not break the path they guard.
+
+    Three refusals above are worth nothing without this: a handler that
+    always raised would pass every one of them.
+    """
+    archive = _make_cbz(tmp_path / "library" / "issue.cbz", b"original bytes")
+    archive_id, location_id = _seed(connection, archive)
+    revisions = dal.RevisionRepository(connection)
+
+    _run_handler(connection, archive_id)
+
+    current = revisions.current_for(archive_id)
+
+    assert current.identity_state == "established"
+    assert current.archive_sha256 == _stored_digest(connection, archive_id)
+    assert revisions.observations_for(current.revision_id) != []
