@@ -199,16 +199,30 @@ CREATE TABLE IF NOT EXISTS archive_revisions (
 
     FOREIGN KEY (archive_id) REFERENCES archive_files(id)
         ON DELETE CASCADE,
-    -- CASCADE, not RESTRICT. The delete guard below already refuses to
-    -- remove any revision while its archive exists, so this action only ever
-    -- runs during an archive's own cascade -- and RESTRICT there made an
-    -- archive with more than one generation undeletable, because deleting
-    -- the root would violate the reference held by its successor. Measured
-    -- 2026-08-24: RESTRICT fails the cascade, CASCADE completes it, and the
-    -- mid-chain guard still bites in both cases.
+    -- NO ACTION (the default), made DEFERRABLE INITIALLY DEFERRED. All
+    -- three candidates were measured on 2026-08-24 against a three-generation
+    -- archive:
+    --
+    --   RESTRICT   whole-archive delete FAILS -- the cascade removes the root
+    --              while its successor still references it, so an archive
+    --              with more than one generation could never be deleted;
+    --   CASCADE    whole-archive delete succeeds, but deleting the *oldest*
+    --              revision silently removes every successor -- lineage
+    --              [20, 21, 22] became [] -- which would take the current
+    --              revision with it;
+    --   deferred   whole-archive delete succeeds, and deleting a referenced
+    --   NO ACTION  revision is refused with the lineage intact.
+    --
+    -- The delete guard below refuses removing any revision while its archive
+    -- exists, so CASCADE's hazard is latent today. It is still the wrong
+    -- choice: Step 3 introduces reviewed pruning and will relax that guard,
+    -- and a foreign key that quietly erases descendants is exactly the broad
+    -- cascading deletion of revision evidence the roadmap forbids. Deferring
+    -- the check is what lets a whole-archive delete succeed without granting
+    -- an old revision the power to erase the ones after it.
     FOREIGN KEY (previous_revision_id, archive_id)
         REFERENCES archive_revisions(id, archive_id)
-        ON DELETE CASCADE
+        DEFERRABLE INITIALLY DEFERRED
 );
 
 -- Duplicate lookup across archives. Not unique: byte-identical archives stay
