@@ -303,3 +303,46 @@ Filesystem, volume, and access-path behavior is measured on the actual
 target before it is written down or designed against. First-principles
 reasoning about these is evidence of a hypothesis worth testing, not a
 finding.
+
+## Unknown byte identity is a state, not a null
+
+Revision identity is `archive_revisions.archive_sha256`, and it is
+nullable. Reconciled 2026-08-21 against the protected pre-revision backup,
+147 of 59,688 archives have no archive-level SHA-256, and 311 archives have
+no current file location at all -- so some of those bytes are unreachable
+and can never acquire a digest.
+
+A `NOT NULL` column left two options and both were wrong. Aborting the
+migration would block Step 2 permanently on archives whose files no longer
+exist. Backfilling only the hashed ones would leave 147 archives with no
+revision and a NULL `current_revision_id`, breaking the roadmap's criterion
+that every archive has exactly one deterministic current revision -- and
+leaving a silent NULL that every later query has to remember.
+
+So `identity_state` is `'established'` or `'provisional'`, tied to the
+presence of the digest by a CHECK in both directions, capped at one
+provisional row per archive by a partial unique index, and replaced in
+place when a digest finally arrives. 59,541 established + 147 provisional
+accounts for every archive. The gap stays queryable instead of becoming
+folklore, which is the same reason retirement evidence is NOT NULL: a
+missing fact that looks like an ordinary empty value stops being findable.
+
+## Revisions and supersession are different relationships
+
+Supersession (migration 013) relates two archive *identities*: the work
+continues under a different `archive_id`. A revision (migration 014)
+relates two byte *states of one identity*. Archive 37704 needs both --
+three byte generations recorded across two identities -- and it shares a
+historical digest with archive 58201, which is a supersession case.
+
+Merging them on that shared digest is the specific failure the model
+prevents, and it is prevented structurally rather than by convention:
+revision lineage carries `archive_id` into its foreign key so a chain
+cannot cross identities, and `archive_supersessions` holds no digest
+column at all so it cannot express a byte generation. Neither table can
+be used to say the other's thing.
+
+`archive_sha256` is indexed but deliberately not globally unique: 888
+exact-duplicate groups were measured on 2026-08-21, and byte-identical
+archives must stay separately addressable. Canonical-copy selection is a
+later guarded resolution action, not a schema constraint.
