@@ -131,9 +131,11 @@ WRITABLE_POLICY = ConnectionPolicy(
     ),
 )
 
-# `query_only` is the difference that matters. Without it a "read-only"
-# connection is read-only by convention only; with it, a write is rejected
-# at the statement level even if the URI flag were ever dropped.
+# Both layers are set, and they fail in opposite directions. `query_only`
+# rejects writes at the statement level but is a pragma, so any code on the
+# connection can turn it back off -- measured, and a write then succeeds.
+# `mode=ro` refuses at the VFS layer and survives that. Neither alone is
+# sufficient, which is why dropping either one is covered by its own test.
 READ_ONLY_POLICY = ConnectionPolicy(
     name="read_only",
     readonly=True,

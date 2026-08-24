@@ -120,17 +120,62 @@ def test_a_read_only_connection_reports_itself_as_read_only(
 def test_a_read_only_connection_rejects_writes(
     database_path: Path,
 ) -> None:
-    """`query_only` is what makes this a guarantee rather than a habit.
+    """The ordinary case: a write on a read-only connection is refused.
 
-    The `mode=ro` URI flag alone would also reject the write, but only at
-    the VFS layer; `query_only` rejects it at the statement level, which is
-    the layer that survives someone later changing how the file is opened.
+    Both layers reject it, so this test alone cannot say which one did.
+    `test_query_only_cannot_be_turned_off_on_a_read_only_connection`
+    separates them, and the measurement there runs the other way from the
+    intuitive reading: `query_only` is a pragma and can simply be turned
+    back off, while `mode=ro` is the layer that survives that.
     """
     with dal.connection_scope(database_path, readonly=True) as conn:
         with pytest.raises(sqlite3.OperationalError):
             conn.execute(
                 "INSERT INTO archive_files (file_size) VALUES (1)"
             )
+
+
+def test_query_only_cannot_be_turned_off_on_a_read_only_connection(
+    database_path: Path,
+) -> None:
+    """Why `mode=ro` and `query_only` are both set rather than either.
+
+    `query_only` is a pragma, and a pragma can be turned back off -- by a
+    later refactor, or by any code that runs on the connection. Measured:
+    without the `mode=ro` URI flag, setting `query_only = OFF` makes the
+    connection writable again and the INSERT succeeds. With it, the write
+    is still refused at the VFS layer.
+
+    Removing the flag therefore fails no test that only tries to write, so
+    this asserts the specific thing the flag adds.
+    """
+    with dal.connection_scope(database_path, readonly=True) as conn:
+        conn.execute("PRAGMA query_only = OFF")
+
+        assert dal.is_readonly(conn) is False  # the pragma really is off
+
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute(
+                "INSERT INTO archive_files (file_size) VALUES (1)"
+            )
+
+
+def test_a_missing_read_only_database_names_itself_in_the_error(
+    tmp_path: Path,
+) -> None:
+    """The explicit check exists for the message, and is tested for it.
+
+    `Path.resolve(strict=True)` would also raise `FileNotFoundError`, but
+    with the OS's text -- "[WinError 2] The system cannot find the file
+    specified" -- which does not say *which* database an operator pointed a
+    tool at. Dropping the explicit check therefore breaks no exception type
+    and no control flow, only the diagnostic, so the message is what this
+    asserts.
+    """
+    missing = tmp_path / "absent.db"
+
+    with pytest.raises(FileNotFoundError, match="Database does not exist"):
+        dal.open_connection(missing, readonly=True)
 
 
 def test_a_read_only_connection_can_still_read(
