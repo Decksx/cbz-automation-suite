@@ -13,12 +13,41 @@ from comic_automation.database.dal import (
     require_transaction,
     transaction,
 )
+from comic_automation.archive.repository import (
+    ArchiveLocationNotFoundError,
+)
 from comic_automation.jobs import (
     CategorizedJobError,
     EnqueueOutcome,
     Job,
     JobQueue,
 )
+
+
+class SourceChangedError(OSError):
+    """The archive or its recorded location moved after it was hashed.
+
+    An OSError subclass so it classifies as `filesystem_io` alongside every
+    other transient source problem, and is retried rather than treated as a
+    permanent failure: the next attempt re-hashes whatever is there now.
+    """
+
+
+def _as_categorized(error: OSError) -> CategorizedJobError:
+    """Map a filesystem error onto the queue's stable categories.
+
+    Collected in one place so the checks added around the write transaction
+    classify identically to the hashing read that precedes them -- two
+    spellings of the same failure would be triaged as two different problems.
+    """
+    if isinstance(error, FileNotFoundError):
+        category = "filesystem_not_found"
+    elif isinstance(error, PermissionError):
+        category = "filesystem_permission"
+    else:
+        category = "filesystem_io"
+
+    return CategorizedJobError(str(error), category=category)
 
 
 HASH_ALGORITHM = "sha256"
@@ -385,33 +414,95 @@ class CalculateArchiveHashHandler:
         location = self.locations.current_location(job.archive_id)
         path = Path(str(location["path"]))
 
+        location_id = int(location["id"])
+
         try:
             result = calculate_archive_hash(
                 path,
                 chunk_size=self.chunk_size,
             )
-        except FileNotFoundError as exc:
-            raise CategorizedJobError(
-                str(exc),
-                category="filesystem_not_found",
-            ) from exc
-        except PermissionError as exc:
-            raise CategorizedJobError(
-                str(exc),
-                category="filesystem_permission",
-            ) from exc
         except OSError as exc:
-            raise CategorizedJobError(
-                str(exc),
-                category="filesystem_io",
+            raise _as_categorized(exc) from exc
+
+        # `calculate_archive_hash` proves the file held still only while it
+        # was being read. Everything below re-establishes that the bytes it
+        # measured are still the archive's current bytes at the moment they
+        # are recorded -- otherwise the hash row and the revision would agree
+        # with each other while both described a file that no longer exists
+        # in that form, which is a more convincing kind of wrong than a plain
+        # disagreement.
+        #
+        # The handler runs outside any transaction, so it owns this one.
+        try:
+            with transaction(self.connection):
+                self._assert_still_current(
+                    archive_id=job.archive_id,
+                    location_id=location_id,
+                    path=path,
+                )
+                self._assert_file_matches(path, result)
+
+                self.hashes.save(
+                    archive_id=job.archive_id,
+                    location_id=location_id,
+                    result=result,
+                )
+
+                # Re-stat after every write but before COMMIT. The archive is
+                # outside SQLite's transaction boundary, so a replacement
+                # during the write window is invisible to the database; the
+                # same pattern guards the reviewed source-drift recovery.
+                self._assert_file_matches(path, result)
+        except OSError as exc:
+            raise _as_categorized(exc) from exc
+
+    def _assert_still_current(
+        self,
+        *,
+        archive_id: int,
+        location_id: int,
+        path: Path,
+    ) -> None:
+        """Refuse if the archive was relocated while it was being hashed.
+
+        The location row is read before hashing and the promotion happens
+        after, so a relocation in between would attach a digest measured at
+        the old path to whatever the archive points at now.
+        """
+        try:
+            current = self.locations.current_location(archive_id)
+        except ArchiveLocationNotFoundError as exc:
+            raise SourceChangedError(
+                f"Archive {archive_id} lost its current location while it "
+                "was being hashed."
             ) from exc
 
-        # The handler runs outside any transaction, so it owns this one.
-        # save() now writes the archive's revision as well as its hash, and
-        # those must land together or not at all.
-        with transaction(self.connection):
-            self.hashes.save(
-                archive_id=job.archive_id,
-                location_id=int(location["id"]),
-                result=result,
+        if int(current["id"]) != location_id or (
+            str(current["path"]) != str(path)
+        ):
+            raise SourceChangedError(
+                f"Archive {archive_id} was relocated while it was being "
+                f"hashed: location {location_id} ({path}) is no longer "
+                f"current."
+            )
+
+    @staticmethod
+    def _assert_file_matches(path: Path, result: ArchiveHash) -> None:
+        """Refuse if the file no longer matches what was hashed.
+
+        Size and mtime only -- the same evidence `calculate_archive_hash`
+        compares either side of its own read. It cannot see a same-length
+        replacement inside one filesystem timestamp tick; re-hashing to close
+        that would double every archive's read cost, and the window here is
+        the write transaction rather than the whole file read.
+        """
+        stat = path.stat()
+
+        if (
+            stat.st_size != result.file_size
+            or stat.st_mtime_ns != result.modified_time_ns
+        ):
+            raise SourceChangedError(
+                f"{path} changed after it was hashed and before the result "
+                "was recorded; the rewrite was abandoned."
             )
