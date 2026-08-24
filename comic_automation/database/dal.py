@@ -56,11 +56,12 @@ already exist.
 
 from __future__ import annotations
 
+import ast
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping
 
 
 class DalError(RuntimeError):
@@ -164,7 +165,23 @@ def open_connection(
     `isolation_level=None` on both modes: the codebase issues its own
     ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK``, and the driver's
     implicit transaction handling fights them.
+
+    Passing a `policy` whose mode disagrees with `readonly` is refused
+    rather than resolved. Both resolutions are wrong in one direction --
+    letting the policy win turns an explicit read-only request into a
+    writable connection, and letting the flag win discards the policy the
+    caller deliberately supplied. A safety request must never quietly
+    become its opposite, so the disagreement is the caller's to settle.
     """
+    if policy is not None and policy.readonly != readonly:
+        raise DalError(
+            f"Conflicting connection request: readonly={readonly} but "
+            f"policy {policy.name!r} is readonly={policy.readonly}. "
+            "Refused rather than resolved: silently preferring either one "
+            "can hand back a writable connection to a caller that asked "
+            "for a read-only one."
+        )
+
     resolved_policy = policy or (
         READ_ONLY_POLICY if readonly else WRITABLE_POLICY
     )
@@ -209,6 +226,22 @@ def connection_scope(
         connection.close()
 
 
+# Connections currently inside a `transaction()` block.
+#
+# `require_transaction()` cannot rely on `connection.in_transaction` alone.
+# That is true for *any* open transaction -- a raw ``BEGIN`` issued by a
+# caller, or one inherited from unrelated code -- so a repository write
+# would pass having never entered this module's boundary, and would be
+# relying on a commit and rollback that nothing here owns.
+#
+# A plain set rather than a `WeakSet` because `sqlite3.Connection` supports
+# neither weak references nor attribute assignment. It cannot leak:
+# membership begins at ``BEGIN IMMEDIATE`` and is removed in a ``finally``,
+# so it lasts exactly as long as the ``with`` block. Set mutation is atomic
+# under the GIL, and a connection is single-threaded by default anyway.
+_OWNED_TRANSACTIONS: set[sqlite3.Connection] = set()
+
+
 def is_readonly(connection: sqlite3.Connection) -> bool:
     """True when this connection rejects writes at the statement level."""
     return bool(
@@ -246,6 +279,9 @@ def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         )
 
     connection.execute("BEGIN IMMEDIATE")
+    # Recorded only after BEGIN succeeds, so a connection that failed to
+    # start a transaction is never treated as owning one.
+    _OWNED_TRANSACTIONS.add(connection)
 
     try:
         yield connection
@@ -266,21 +302,45 @@ def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             connection.execute("ROLLBACK")
 
         raise
+    finally:
+        # Ownership ends with the block on every path -- commit, rollback,
+        # or a failure of the COMMIT itself.
+        _OWNED_TRANSACTIONS.discard(connection)
 
 
 def require_transaction(connection: sqlite3.Connection) -> None:
-    """Refuse a write that no transaction owns.
+    """Refuse a write that this module's boundary does not own.
 
-    Called by every repository write. Without it, `isolation_level=None`
-    means each statement commits on its own, so a four-step change that
-    fails on the fourth leaves three steps durable and nothing to undo.
+    Called by every repository write, and it makes two distinct refusals
+    because there are two distinct ways to be outside the boundary.
+
+    No transaction at all: `isolation_level=None` means each statement
+    commits on its own, so a four-step change that fails on the fourth
+    leaves three steps durable and nothing to undo.
+
+    A transaction this module did not open -- a raw ``BEGIN``, or one
+    inherited from unrelated code: `in_transaction` is true, so checking
+    only that would let the write through. Nothing here owns that
+    transaction's commit or rollback, so the guarantee the repository is
+    relying on is simply absent. "One transaction owner" has to mean this
+    owner, or it means nothing.
     """
-    if not connection.in_transaction:
+    if connection in _OWNED_TRANSACTIONS:
+        return
+
+    if connection.in_transaction:
         raise TransactionRequiredError(
-            "This write must run inside `transaction()`. Writing outside "
-            "one commits each statement on its own, which makes a partial "
-            "multi-step change durable with nothing left to roll back."
+            "A transaction is open on this connection, but `transaction()` "
+            "did not start it -- a raw BEGIN, or one inherited from other "
+            "code. Repository writes require this module's boundary, which "
+            "is what owns the commit and the rollback."
         )
+
+    raise TransactionRequiredError(
+        "This write must run inside `transaction()`. Writing outside "
+        "one commits each statement on its own, which makes a partial "
+        "multi-step change durable with nothing left to roll back."
+    )
 
 
 # --- repositories --------------------------------------------------------
@@ -490,78 +550,204 @@ class ContentSignatureRepository(_Repository):
         )
 
 
-# --- the connection-factory allowlist ------------------------------------
+# --- the connection-factory guard ----------------------------------------
 #
 # Recorded here rather than in the test so the list and the reasons live
 # beside the policy they are exceptions to.
+#
+# Each entry pins an exact *call count*, not just a filename. A filename
+# allowlist would let any number of further `sqlite3.connect` calls be
+# added inside an already-sanctioned file -- which is most of the files
+# that touch the database -- so the guard would pass while the bypass it
+# exists to catch walked in through the front door.
 
-SANCTIONED_CONNECT_SITES: dict[str, str] = {
-    "comic_automation/database/dal.py": (
-        "This module. The policy has to call sqlite3.connect somewhere."
+
+@dataclass(frozen=True)
+class SanctionedSite:
+    """One allowlisted file, with the number of calls it is allowed."""
+
+    calls: int
+    reason: str
+
+
+SANCTIONED_CONNECT_SITES: dict[str, SanctionedSite] = {
+    "comic_automation/database/dal.py": SanctionedSite(
+        calls=2,
+        reason=(
+            "This module. The policy has to call sqlite3.connect somewhere, "
+            "once for the read-only URI form and once for the writable one."
+        ),
     ),
-    "comic_automation/database/connection.py": (
-        "The pre-existing writable factory, retained so no call site "
-        "changes behaviour in this PR."
+    "comic_automation/database/connection.py": SanctionedSite(
+        calls=1,
+        reason=(
+            "The pre-existing writable factory, retained so no call site "
+            "changes behaviour in this PR."
+        ),
     ),
-    "comic_automation/database/read_guards.py": (
-        "The pre-existing read-only factory used by every audit."
+    "comic_automation/database/read_guards.py": SanctionedSite(
+        calls=1,
+        reason="The pre-existing read-only factory used by every audit.",
     ),
-    "comic_automation/database/backup_cli.py": (
-        "Opens the backup *destination*, which is a new file being "
-        "created rather than the operational database."
+    "comic_automation/database/backup_cli.py": SanctionedSite(
+        calls=1,
+        reason=(
+            "Opens the backup *destination*, which is a new file being "
+            "created rather than the operational database."
+        ),
     ),
-    "comic_automation/archive/duplicate_resolution_cli.py": (
-        "Opens the backup destination it is about to create, not the "
-        "operational database, so the read/write policy does not apply."
+    "comic_automation/archive/duplicate_resolution_cli.py": SanctionedSite(
+        calls=1,
+        reason=(
+            "Opens the backup destination it is about to create, not the "
+            "operational database, so the read/write policy does not apply."
+        ),
     ),
-    "comic_automation/archive/perceptual_reuse_analysis.py": (
-        "A fourth read-only implementation with its own 60s timeout. "
-        "Known drift; consolidating it changes behaviour and is out of "
-        "scope for this PR."
+    "comic_automation/archive/perceptual_reuse_analysis.py": SanctionedSite(
+        calls=1,
+        reason=(
+            "A fourth read-only implementation with its own 60s timeout. "
+            "Known drift; consolidating it changes behaviour and is out of "
+            "scope for this PR."
+        ),
     ),
-    "scripts/db.py": (
-        "A legacy helper whose read-only mode sets no query_only and "
-        "whose connections keep the driver's default isolation_level. "
-        "Known drift; migrating its callers is a separate change."
+    "scripts/db.py": SanctionedSite(
+        calls=2,
+        reason=(
+            "A legacy helper whose read-only mode sets no query_only and "
+            "whose connections keep the driver's default isolation_level. "
+            "Known drift; migrating its callers is a separate change."
+        ),
     ),
 }
 
 
-def find_connect_sites(root: Path) -> dict[str, int]:
-    """Every production file calling `sqlite3.connect`, with a count.
+class UnparseableModuleError(DalError):
+    """A production module could not be parsed, so it could not be scanned.
 
-    Deliberately textual and deliberately narrow: it exists to notice a
-    *new* bypass appearing, not to police how the sanctioned ones work.
+    Raised rather than skipped. A file the guard cannot read is a file the
+    guard cannot clear, and passing silently over it is exactly the blind
+    spot the guard exists to remove.
+    """
+
+
+def _connect_call_lines(source: str) -> list[int]:
+    """Line numbers of every `sqlite3.connect` call in *source*.
+
+    Parsed rather than grepped. The textual version matched the literal
+    string ``sqlite3.connect(``, which missed three real shapes:
+
+    - ``import sqlite3 as sq`` then ``sq.connect(...)``;
+    - ``from sqlite3 import connect`` then ``connect(...)``, with or
+      without an ``as`` alias;
+    - a call split across lines, or spaced as ``sqlite3 . connect (``.
+
+    The AST sees the call, not its spelling, so all three are counted.
+
+    ``sqlite3`` is treated as a module alias whether or not an ``import``
+    was found, because ``sqlite3.connect(...)`` is a bypass however that
+    name came to be bound.
+
+    Known limit: a fully dynamic call -- ``getattr(sqlite3, "conn" + "ect")``
+    or an ``importlib`` lookup -- is not detected. Defeating this guard on
+    purpose is possible; it is aimed at the bypass added without noticing,
+    which is the one that actually happens.
+    """
+    tree = ast.parse(source)
+
+    module_aliases = {"sqlite3"}
+    function_aliases: set[str] = set()
+
+    # Collected in a full pass first: an import inside a function body still
+    # binds the name for calls written above it in the file.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "sqlite3":
+                    module_aliases.add(alias.asname or "sqlite3")
+        elif isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+            for alias in node.names:
+                if alias.name == "connect":
+                    function_aliases.add(alias.asname or "connect")
+
+    lines: list[int] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func = node.func
+
+        if isinstance(func, ast.Attribute) and func.attr == "connect":
+            if (
+                isinstance(func.value, ast.Name)
+                and func.value.id in module_aliases
+            ):
+                lines.append(node.lineno)
+        elif isinstance(func, ast.Name) and func.id in function_aliases:
+            lines.append(node.lineno)
+
+    return sorted(lines)
+
+
+def find_connect_sites(root: Path) -> dict[str, int]:
+    """Every production file calling `sqlite3.connect`, with a call count.
+
+    `tests/` is excluded: test files legitimately open their own temporary
+    databases, and holding them to the production policy would only teach
+    people to add allowlist entries.
     """
     found: dict[str, int] = {}
 
     for path in sorted(root.rglob("*.py")):
         relative = path.relative_to(root).as_posix()
 
-        if relative.startswith("tests/"):
+        if relative.startswith("tests/") or relative.startswith(".venv/"):
             continue
 
-        text = path.read_text(encoding="utf-8", errors="replace")
-        count = sum(
-            1
-            for line in text.splitlines()
-            if "sqlite3.connect(" in line
-            and not line.lstrip().startswith("#")
-        )
+        source = path.read_text(encoding="utf-8", errors="replace")
 
-        if count:
-            found[relative] = count
+        try:
+            lines = _connect_call_lines(source)
+        except SyntaxError as error:
+            raise UnparseableModuleError(f"{relative}: {error}") from error
+
+        if lines:
+            found[relative] = len(lines)
 
     return found
 
 
 def unsanctioned_connect_sites(
-    root: Path, sanctioned: Sequence[str] | None = None
+    root: Path,
+    sanctioned: Mapping[str, SanctionedSite | int] | None = None,
 ) -> list[str]:
-    """Files calling `sqlite3.connect` that are not on the allowlist."""
-    allowed = set(
-        sanctioned
-        if sanctioned is not None
-        else SANCTIONED_CONNECT_SITES
-    )
-    return sorted(set(find_connect_sites(root)) - allowed)
+    """Every bypass the allowlist does not account for, described.
+
+    Two kinds, because a filename-level allowlist only catches the first:
+    a file that opens its own connection and is not listed at all, and a
+    listed file that has *grown* a call beyond the count recorded for it.
+
+    A file with fewer calls than recorded is not reported here; the
+    allowlist going stale is its own test.
+    """
+    entries = SANCTIONED_CONNECT_SITES if sanctioned is None else sanctioned
+    allowed = {
+        name: entry.calls if isinstance(entry, SanctionedSite) else int(entry)
+        for name, entry in entries.items()
+    }
+
+    violations: list[str] = []
+
+    for name, count in sorted(find_connect_sites(root).items()):
+        if name not in allowed:
+            violations.append(
+                f"{name}: {count} sqlite3.connect call(s), not on the allowlist"
+            )
+        elif count > allowed[name]:
+            violations.append(
+                f"{name}: {count} sqlite3.connect call(s), allowlist records "
+                f"{allowed[name]}"
+            )
+
+    return violations
