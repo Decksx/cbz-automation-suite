@@ -76,9 +76,17 @@
 --
 --   * lineage is `(previous_revision_id, archive_id) REFERENCES
 --     archive_revisions(id, archive_id)`. Carrying archive_id into the foreign
---     key is what structurally prevents a revision chain from wandering into
---     another archive -- the 37704/58201 failure, expressed as a constraint
---     rather than as a rule someone has to remember.
+--     key structurally prevents a revision chain from wandering into another
+--     archive -- the 37704/58201 failure, expressed as a constraint rather
+--     than as a rule someone has to remember.
+--
+--     This overlaps with trg_archive_revisions_lineage_is_sequential below,
+--     which also compares archive_id. Removing either one alone leaves
+--     cross-archive lineage refused by the other, so neither fails a test on
+--     its own; removing both opens it. That is deliberate defence in depth
+--     and not an accident, but it is written down because a bypass run
+--     showed each looking individually redundant, and an undocumented
+--     overlap is how one of them gets deleted as dead weight later.
 --
 --   * `evidence` is NOT NULL and CHECKed non-blank, matching migrations 012
 --     and 013. A revision asserts that specific bytes existed; that claim
@@ -103,10 +111,14 @@
 -- CASCADE across every child table. That is a data-destroying rebuild to buy a
 -- constraint two triggers already provide.
 --
--- The foreign key is DEFERRABLE INITIALLY DEFERRED so that deleting an archive
--- still works: the cascade removes its revisions while the archive row still
--- points at one, and only the state at COMMIT has to be consistent. Verified
--- rather than assumed -- an immediate constraint makes archives undeletable.
+-- The foreign key is deliberately NOT deferrable. A deferred constraint was
+-- written first, on the reasoning that deleting an archive leaves the row
+-- pointing at a revision the cascade is removing. Measured 2026-08-24: the
+-- deletion succeeds either way, because SQLite settles the parent delete and
+-- its cascade together. The deferral bought nothing and cost something --
+-- violations would surface at COMMIT instead of at the offending statement --
+-- so it is gone. Recorded here because the original comment claimed the
+-- opposite and a bypass run is what caught it.
 --
 -- ---------------------------------------------------------------- backfill
 --
@@ -248,8 +260,7 @@ END;
 
 -- ------------------------------------------------------- current pointer
 ALTER TABLE archive_files ADD COLUMN current_revision_id INTEGER
-    REFERENCES archive_revisions(id)
-    DEFERRABLE INITIALLY DEFERRED;
+    REFERENCES archive_revisions(id);
 
 CREATE INDEX IF NOT EXISTS idx_archive_files_current_revision
     ON archive_files(current_revision_id);
