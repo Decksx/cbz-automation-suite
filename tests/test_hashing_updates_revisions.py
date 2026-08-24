@@ -59,6 +59,35 @@ def _make_cbz(path: Path, payload: bytes) -> Path:
     return gc.build_cbz(path, [("001.jpg", payload)])
 
 
+def test_the_fixture_writer_is_byte_reproducible(tmp_path: Path) -> None:
+    """The A -> B -> A proof rests on this, so it is asserted directly.
+
+    Comparing two writes for equal digests is not enough: a bare `writestr`
+    produces equal digests too, whenever both writes land inside the same
+    2-second DOS timestamp interval, which in a fast test is almost always.
+    Restoring the unpinned writer therefore failed nothing downstream --
+    measured -- and the flakiness would only appear later, on a slower
+    machine or at an unlucky moment.
+
+    So the stored metadata is inspected instead. A writer that stamps the
+    current time cannot produce FIXED_DATE_TIME, whatever the clock is doing
+    when the test runs.
+    """
+    first = _make_cbz(tmp_path / "one.cbz", b"same payload")
+    second = _make_cbz(tmp_path / "two.cbz", b"same payload")
+
+    with zipfile.ZipFile(first) as archive:
+        info = archive.getinfo("001.jpg")
+
+    assert info.date_time == gc.FIXED_DATE_TIME
+    assert info.create_system == 0
+    assert first.read_bytes() == second.read_bytes()
+    assert (
+        calculate_archive_hash(first).digest
+        == calculate_archive_hash(second).digest
+    )
+
+
 @pytest.fixture()
 def database(tmp_path: Path) -> Path:
     path = tmp_path / "hashing.db"
