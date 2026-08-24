@@ -1851,12 +1851,50 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
 
         bak_path.unlink(missing_ok=True)  # remove any stale backup before renaming
         cbz_path.rename(bak_path)
-        tmp_path.rename(cbz_path)
+
+        # Between these two renames there is no file at cbz_path at all. If
+        # the second one fails the original is sitting at bak_path under a
+        # name nothing else knows about: the database, the library scan and
+        # every other tool look for the archive at cbz_path, and the
+        # watcher's startup cleanup deletes *.bak.cbz outright -- so bytes
+        # left parked there are one restart away from being gone for good.
+        # Put the original back before letting the failure propagate.
+        try:
+            tmp_path.rename(cbz_path)
+        except Exception:
+            try:
+                bak_path.rename(cbz_path)
+            except Exception:
+                # Both renames failed, so the archive is not at its recorded
+                # path and this function cannot put it there. Say exactly
+                # where the two copies are and stop: the handler below must
+                # not delete the rebuilt one, because with the original
+                # stranded it may be the only intact archive left.
+                log.critical(
+                    "  %s: rewrite failed AND the original could not be "
+                    "restored. Original bytes are at %s, rebuilt copy at "
+                    "%s. Neither will be deleted. Recover by hand before "
+                    "running any tool that cleans up .bak.cbz files.",
+                    cbz_path.name, bak_path, tmp_path,
+                )
+            raise
+
         bak_path.unlink(missing_ok=True)
         return True
     except Exception as exc:
         log.error("  Failed to write ComicInfo for %s: %s", cbz_path.name, exc)
-        tmp_path.unlink(missing_ok=True)
+        # Only discard the rebuilt copy once the original is genuinely back
+        # at its recorded path. If cbz_path is missing, tmp_path may be the
+        # last intact archive and deleting it turns a failed rewrite into
+        # data loss -- which is the whole failure this guard exists for.
+        if cbz_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        else:
+            log.critical(
+                "  %s: not present at its recorded path after a failed "
+                "rewrite; keeping %s rather than deleting it.",
+                cbz_path.name, tmp_path,
+            )
         return False
 
 
