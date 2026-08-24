@@ -320,12 +320,41 @@ that every archive has exactly one deterministic current revision -- and
 leaving a silent NULL that every later query has to remember.
 
 So `identity_state` is `'established'` or `'provisional'`, tied to the
-presence of the digest by a CHECK in both directions, capped at one
-provisional row per archive by a partial unique index, and replaced in
-place when a digest finally arrives. 59,541 established + 147 provisional
-accounts for every archive. The gap stays queryable instead of becoming
-folklore, which is the same reason retirement evidence is NOT NULL: a
-missing fact that looks like an ordinary empty value stops being findable.
+presence of the digest by a CHECK in both directions, and capped at one
+provisional row per archive by a partial unique index. 59,541 established
++ 147 provisional accounts for every archive. The gap stays queryable
+instead of becoming folklore, which is the same reason retirement evidence
+is NOT NULL: a missing fact that looks like an ordinary empty value stops
+being findable.
+
+When the bytes are finally hashed, the established revision is **appended
+after** the provisional one and the current pointer moves to it. The
+provisional row is kept as noncurrent history and the schema refuses to
+delete it while its archive exists. Replacing it in place was the first
+design and it was wrong twice over: it destroyed the record that the
+identity existed with unknown bytes between two dates, and it cascaded
+away every observation recorded against it during that period.
+
+## Every archive has a current revision, enforced by the schema
+
+`archive_files.current_revision_id` is nullable and always will be: an
+archive's first revision cannot exist before the archive row it
+references, so no `NOT NULL` column can be satisfied on INSERT. Enforcing
+the invariant only in the migration's backfill would cover the archives
+that existed the day 014 ran and nothing discovered afterwards, because
+every later archive arrives through an INSERT the backfill never sees.
+
+It is closed at both ends instead. An `AFTER INSERT` trigger gives every
+new archive an initial provisional revision and points it there, so the
+NULL window shuts inside the same statement and applies to raw SQL exactly
+as it does to the DAL. A `BEFORE UPDATE` trigger refuses to clear a live
+archive's pointer back to NULL. Without both, a transaction could commit
+an archive with no current revision at all, and nothing would ever revisit
+it.
+
+The initial revision is provisional because that is the truth at that
+instant: the identity row has just been created and nothing has hashed its
+bytes.
 
 ## Revisions and supersession are different relationships
 
