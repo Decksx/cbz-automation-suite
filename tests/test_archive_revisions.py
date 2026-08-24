@@ -1016,6 +1016,79 @@ def test_the_migration_leaves_no_archive_without_a_current_revision(
         connection.close()
 
 
+def test_the_lineage_key_protects_successors_without_the_delete_guard(
+    connection,
+) -> None:
+    """Defence in depth for Step 3's reviewed pruning.
+
+    The delete guard refuses removing any revision while its archive exists,
+    so today nothing reaches the lineage foreign key. Step 3 introduces
+    reviewed pruning and will relax that guard, and at that moment the key
+    becomes the only thing between "prune an old revision" and "erase every
+    generation after it".
+
+    So the guard is dropped here -- in this temporary database only -- and
+    the key is asserted alone.
+
+    The current pointer is deliberately parked on the provisional origin,
+    outside the chain being pruned. An earlier version of this test left it
+    on the newest generation, and it passed under `ON DELETE CASCADE` for
+    the wrong reason: the cascade reached the current revision and
+    `archive_files.current_revision_id` aborted the statement, so the
+    refusal came from a different constraint entirely. With the pointer out
+    of the way, only the lineage key can refuse this.
+    """
+    archive_id = _new_archive(connection)
+    revisions = dal.RevisionRepository(connection)
+    origin = _provisional_origin(revisions, archive_id)
+
+    with dal.transaction(connection):
+        gen1, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_A, evidence="gen 1"
+        )
+        gen2, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_B, evidence="gen 2"
+        )
+        gen3, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_C, evidence="gen 3"
+        )
+        revisions.set_current(archive_id, origin.revision_id)
+
+    before = revisions.lineage_for(archive_id)
+    assert len(before) == 4  # provisional origin plus three generations
+
+    connection.execute("DROP TRIGGER trg_archive_revisions_not_deletable")
+
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            with dal.transaction(connection):
+                connection.execute(
+                    "DELETE FROM archive_revisions WHERE id = ?", (gen1,)
+                )
+
+        # What survived is the assertion that matters. A cascading key would
+        # have taken gen2 and gen3 with gen1 and reported success.
+        assert revisions.lineage_for(archive_id) == before
+        assert revisions.get(gen2) is not None
+        assert revisions.get(gen3) is not None
+    finally:
+        # Leave the fixture's database as the migration built it.
+        connection.executescript(
+            """
+            CREATE TRIGGER trg_archive_revisions_not_deletable
+            BEFORE DELETE ON archive_revisions
+            FOR EACH ROW
+            WHEN EXISTS (SELECT 1 FROM archive_files WHERE id = OLD.archive_id)
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'a revision cannot be deleted while its archive exists; it is evidence'
+                );
+            END;
+            """
+        )
+
+
 # --- archive 37704: three generations, and 58201 kept apart --------------
 
 
