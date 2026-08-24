@@ -223,6 +223,89 @@ def test_the_two_policies_differ_only_where_intended() -> None:
     assert dal.WRITABLE_POLICY.readonly is False
 
 
+def test_a_readonly_request_with_a_writable_policy_is_refused(
+    database_path: Path,
+) -> None:
+    """A safety request must never silently become its opposite.
+
+    `readonly=True` with `WRITABLE_POLICY` used to hand back a fully
+    writable connection, because the supplied policy won and the flag was
+    dropped. The caller asked for a connection that cannot write and got
+    one that can, with nothing raised and nothing logged.
+    """
+    with pytest.raises(dal.DalError) as caught:
+        dal.open_connection(
+            database_path, readonly=True, policy=dal.WRITABLE_POLICY
+        )
+
+    message = str(caught.value)
+    assert "readonly=True" in message
+    assert "writable" in message
+
+
+def test_a_writable_request_with_a_readonly_policy_is_refused(
+    database_path: Path,
+) -> None:
+    """The mirror image, refused for the same reason.
+
+    Resolving it the other way is no better: the caller supplied a policy
+    deliberately and would have had it silently discarded.
+    """
+    with pytest.raises(dal.DalError) as caught:
+        dal.open_connection(
+            database_path, readonly=False, policy=dal.READ_ONLY_POLICY
+        )
+
+    assert "read_only" in str(caught.value)
+
+
+def test_a_policy_agreeing_with_the_flag_is_accepted(
+    database_path: Path,
+) -> None:
+    """The refusal is about disagreement, not about passing a policy.
+
+    Without this, a blanket refusal of the `policy` argument would pass
+    both tests above while making the parameter useless.
+    """
+    with dal.connection_scope(database_path) as _:
+        pass
+
+    explicit_write = dal.open_connection(
+        database_path, readonly=False, policy=dal.WRITABLE_POLICY
+    )
+    try:
+        assert dal.is_readonly(explicit_write) is False
+    finally:
+        explicit_write.close()
+
+    explicit_read = dal.open_connection(
+        database_path, readonly=True, policy=dal.READ_ONLY_POLICY
+    )
+    try:
+        assert dal.is_readonly(explicit_read) is True
+    finally:
+        explicit_read.close()
+
+
+def test_a_custom_policy_is_still_honoured(database_path: Path) -> None:
+    """A caller-supplied policy that agrees with the flag still applies.
+
+    Proves the conflict check did not turn into "ignore the policy".
+    """
+    custom = dal.ConnectionPolicy(
+        name="custom_writable",
+        readonly=False,
+        timeout_seconds=5.0,
+        pragmas=(("busy_timeout", "7000"),),
+    )
+
+    conn = dal.open_connection(database_path, policy=custom)
+
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 7000
+    finally:
+        conn.close()
+
 # --- transaction ownership -----------------------------------------------
 
 
@@ -519,6 +602,103 @@ def test_a_repository_write_does_not_commit_by_itself(
     assert connection.in_transaction is False
 
 
+def test_a_raw_begin_does_not_satisfy_the_transaction_requirement(
+    connection,
+) -> None:
+    """`in_transaction` is not ownership.
+
+    A caller that issues its own ``BEGIN`` has an open transaction, so a
+    guard checking only `connection.in_transaction` let repository writes
+    straight through -- while nothing in this module owned the commit or
+    the rollback the repository was relying on. The write is refused, and
+    the caller's transaction is left exactly as it was found.
+    """
+    archives = dal.ArchiveRepository(connection)
+    connection.execute("BEGIN IMMEDIATE")
+
+    try:
+        assert connection.in_transaction is True
+
+        with pytest.raises(dal.TransactionRequiredError) as caught:
+            archives.create(file_size=1)
+
+        # The message has to distinguish this from "no transaction at all",
+        # or the reader fixes the wrong problem.
+        assert "did not start it" in str(caught.value)
+        assert connection.in_transaction is True
+    finally:
+        connection.execute("ROLLBACK")
+
+    assert archives.count() == 0
+
+
+def test_an_inherited_transaction_does_not_satisfy_it_either(
+    connection,
+) -> None:
+    """The same hole, arrived at without anyone writing ``BEGIN``.
+
+    An implicit transaction opened by unrelated code on the same
+    connection is indistinguishable from a raw one as far as
+    `in_transaction` is concerned.
+    """
+    archives = dal.ArchiveRepository(connection)
+    connection.execute("BEGIN")
+
+    try:
+        with pytest.raises(dal.TransactionRequiredError):
+            archives.set_sha256(1, "a" * 64)
+    finally:
+        connection.execute("ROLLBACK")
+
+
+def test_ownership_is_released_when_the_block_ends(connection) -> None:
+    """Ownership is scoped to the block, on every exit path.
+
+    Asserted through the public refusal rather than by reading the private
+    set, so the test still means something if the bookkeeping changes.
+    """
+    archives = dal.ArchiveRepository(connection)
+
+    with dal.transaction(connection):
+        archives.create(file_size=1)
+
+    # Committed and released.
+    with pytest.raises(dal.TransactionRequiredError):
+        archives.create(file_size=2)
+
+    # Released after a rollback too.
+    with pytest.raises(ValueError):
+        with dal.transaction(connection):
+            archives.create(file_size=3)
+            raise ValueError("boom")
+
+    with pytest.raises(dal.TransactionRequiredError):
+        archives.create(file_size=4)
+
+    assert archives.count() == 1
+
+
+def test_ownership_is_released_when_the_commit_fails(connection) -> None:
+    """The stranded-transaction path must not strand ownership either."""
+    _arm_deferred_constraint(connection)
+    _fail_at_commit(connection)
+
+    with pytest.raises(dal.TransactionRequiredError):
+        dal.ArchiveRepository(connection).create(file_size=1)
+
+
+def test_ownership_does_not_leak_between_connections(
+    database_path: Path,
+) -> None:
+    """One connection's transaction does not license another's writes."""
+    with dal.connection_scope(database_path) as first:
+        with dal.connection_scope(database_path) as second:
+            with dal.transaction(first):
+                dal.ArchiveRepository(first).create(file_size=1)
+
+                with pytest.raises(dal.TransactionRequiredError):
+                    dal.ArchiveRepository(second).create(file_size=2)
+
 # --- repositories over existing entities ---------------------------------
 
 
@@ -632,10 +812,26 @@ def test_the_allowlist_has_no_stale_entries() -> None:
     assert listed - actual == set(), "allowlist names files that no longer connect"
 
 
+def test_the_allowlist_counts_match_the_tree() -> None:
+    """The recorded count is the live one, not a number that drifted.
+
+    An entry recording more calls than the file actually makes would leave
+    room for a bypass to be added later without the guard noticing, which
+    is the whole failure this count exists to close.
+    """
+    actual = dal.find_connect_sites(REPO_ROOT)
+
+    for path, entry in dal.SANCTIONED_CONNECT_SITES.items():
+        assert actual[path] == entry.calls, (
+            f"{path}: allowlist records {entry.calls}, tree has {actual[path]}"
+        )
+
+
 def test_every_allowlist_entry_records_a_reason() -> None:
-    for path, reason in dal.SANCTIONED_CONNECT_SITES.items():
-        assert reason.strip(), path
-        assert len(reason) > 40, f"{path}: reason is too thin to be useful"
+    for path, entry in dal.SANCTIONED_CONNECT_SITES.items():
+        assert entry.reason.strip(), path
+        assert len(entry.reason) > 40, f"{path}: reason is too thin to be useful"
+        assert entry.calls >= 1, f"{path}: an entry allowing no calls is dead"
 
 
 def test_the_guard_detects_a_newly_added_bypass(tmp_path: Path) -> None:
@@ -664,22 +860,138 @@ def test_the_guard_detects_a_newly_added_bypass(tmp_path: Path) -> None:
     assert not any(name.startswith("tests/") for name in found)
 
     unsanctioned = dal.unsanctioned_connect_sites(
-        tmp_path, sanctioned=["pkg/sanctioned.py"]
+        tmp_path, sanctioned={"pkg/sanctioned.py": 1}
     )
-    assert unsanctioned == ["pkg/rogue.py"]
+    assert len(unsanctioned) == 1
+    assert unsanctioned[0].startswith("pkg/rogue.py")
+
+
+def test_a_second_call_inside_a_sanctioned_file_is_caught(
+    tmp_path: Path,
+) -> None:
+    """The hole a filename-level allowlist leaves open.
+
+    Subtracting whole filenames cleared every call in an allowlisted file,
+    so a new `sqlite3.connect` added to one of the seven files that are
+    already listed -- which is where database code actually gets written --
+    passed the guard silently. The count is what closes it.
+    """
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "sanctioned.py").write_text(
+        "import sqlite3\n"
+        "first = sqlite3.connect('a.db')\n"
+        "second = sqlite3.connect('b.db')\n",
+        encoding="utf-8",
+    )
+
+    assert dal.find_connect_sites(tmp_path) == {"pkg/sanctioned.py": 2}
+
+    # One call is sanctioned; the second is not.
+    violations = dal.unsanctioned_connect_sites(
+        tmp_path, sanctioned={"pkg/sanctioned.py": 1}
+    )
+    assert len(violations) == 1
+    assert "allowlist records 1" in violations[0]
+
+    # Recording both makes it clean again -- the guard tracks the count,
+    # it does not simply forbid a second call.
+    assert (
+        dal.unsanctioned_connect_sites(
+            tmp_path, sanctioned={"pkg/sanctioned.py": 2}
+        )
+        == []
+    )
+
+
+def test_aliased_and_split_calls_are_counted(tmp_path: Path) -> None:
+    """Four spellings the textual scan missed entirely.
+
+    `"sqlite3.connect(" in line` matched one shape. An aliased module, a
+    directly imported `connect`, an aliased `connect`, and a call split
+    across lines are all the same bypass and none of them contain that
+    substring.
+    """
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "aliased_module.py").write_text(
+        "import sqlite3 as sq\nconn = sq.connect('a.db')\n", encoding="utf-8"
+    )
+    (tmp_path / "pkg" / "imported_func.py").write_text(
+        "from sqlite3 import connect\nconn = connect('b.db')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg" / "aliased_func.py").write_text(
+        "from sqlite3 import connect as c\nconn = c('c.db')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg" / "split_call.py").write_text(
+        "import sqlite3\nconn = sqlite3 . connect (\n    'd.db',\n)\n",
+        encoding="utf-8",
+    )
+
+    found = dal.find_connect_sites(tmp_path)
+
+    assert found == {
+        "pkg/aliased_func.py": 1,
+        "pkg/aliased_module.py": 1,
+        "pkg/imported_func.py": 1,
+        "pkg/split_call.py": 1,
+    }, found
+
+    # None of them are on an allowlist, so all four are violations.
+    assert len(dal.unsanctioned_connect_sites(tmp_path, sanctioned={})) == 4
+
+
+def test_an_unrelated_connect_is_not_counted(tmp_path: Path) -> None:
+    """`connect` is a common method name; only sqlite3's is a bypass.
+
+    Without this the guard would fire on any `something.connect(...)` --
+    a socket, an SSH client, a signal -- and a guard that cries wolf gets
+    an allowlist entry added to shut it up.
+    """
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "unrelated.py").write_text(
+        "import socket\n"
+        "import sqlite3\n"
+        "s = socket.socket()\n"
+        "s.connect(('localhost', 1))\n",
+        encoding="utf-8",
+    )
+
+    assert dal.find_connect_sites(tmp_path) == {}
 
 
 def test_commented_out_calls_are_not_counted(tmp_path: Path) -> None:
-    """A mention in a comment is not a bypass.
+    """A mention in a comment or a string is not a bypass.
 
     `read_guards.py` discusses `sqlite3.connect` in prose; counting that
-    would make the guard fire on documentation.
+    would make the guard fire on documentation. The parser drops comments
+    outright, and a docstring is a string rather than a call.
     """
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "documented.py").write_text(
+        '"""A plain sqlite3.connect( would create the file."""\n'
         "# a plain sqlite3.connect( would create the file\n"
         "VALUE = 1\n",
         encoding="utf-8",
     )
 
     assert dal.find_connect_sites(tmp_path) == {}
+
+
+def test_a_module_that_cannot_be_parsed_is_reported_not_skipped(
+    tmp_path: Path,
+) -> None:
+    """A file the scanner cannot read is a file it cannot clear.
+
+    Swallowing the SyntaxError would silently drop the module from the
+    scan, which is indistinguishable from the module being clean.
+    """
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "broken.py").write_text(
+        "def oops(:\n    pass\n", encoding="utf-8"
+    )
+
+    with pytest.raises(dal.UnparseableModuleError) as caught:
+        dal.find_connect_sites(tmp_path)
+
+    assert "pkg/broken.py" in str(caught.value)
