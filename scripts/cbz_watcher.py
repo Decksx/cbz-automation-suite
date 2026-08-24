@@ -190,6 +190,95 @@ class ProgressReporter:
 # ─────────────────────────────────────────────
 # COMICINFO.XML HANDLING
 # ─────────────────────────────────────────────
+def _discard_rebuild_if_original_intact(cbz_path: Path, tmp_path: Path) -> None:
+    """Delete the rebuilt copy only while the original is still in place.
+
+    The rebuild at *tmp_path* is disposable exactly as long as *cbz_path*
+    holds a real archive. If the swap failed partway and cbz_path is
+    missing, the rebuild may be the last intact copy in existence, and
+    deleting it is what turns a recoverable failure into data loss.
+    """
+    if not tmp_path.exists():
+        return
+
+    if cbz_path.exists():
+        tmp_path.unlink()
+        return
+
+    log.critical(
+        f"    {cbz_path.name}: missing from its recorded path after a "
+        f"failed rewrite; keeping {tmp_path} rather than deleting it."
+    )
+
+
+def _shadowed_archive_path(leftover: Path) -> Path | None:
+    """The archive a ``.tmp.cbz`` / ``.bak.cbz`` leftover belongs to.
+
+    Both names are produced by `Path.with_suffix` on the original, so the
+    original's name is recovered by putting ``.cbz`` back. Returns None for
+    anything that is not one of those two shapes, so an unrelated file is
+    never treated as a leftover.
+    """
+    for marker in (".tmp.cbz", ".bak.cbz"):
+        if leftover.name.endswith(marker):
+            return leftover.with_name(leftover.name[: -len(marker)] + ".cbz")
+
+    return None
+
+
+def _clean_up_stale_rewrite_files(watch_path: Path) -> None:
+    """Delete rewrite leftovers, but never the last copy of an archive.
+
+    A ``.tmp.cbz`` or ``.bak.cbz`` is genuinely disposable only when the
+    archive it shadows is present at its own name. When that archive is
+    missing, the leftover is not stale at all -- it is the surviving copy
+    of an interrupted rewrite, and this cleanup running on the next start
+    was the step that turned a recoverable interruption into permanent
+    loss.
+
+    Kept files are reported at CRITICAL and left exactly where they are,
+    because quarantining them here would move bytes out from under the
+    operator recovering them by hand.
+    """
+    leftovers = sorted(
+        list(watch_path.rglob("*.tmp.cbz")) + list(watch_path.rglob("*.bak.cbz"))
+    )
+
+    if not leftovers:
+        return
+
+    deleted = 0
+    kept: list[Path] = []
+
+    for leftover in leftovers:
+        original = _shadowed_archive_path(leftover)
+
+        # Checked before deleting, so a leftover that is the only copy is
+        # reported even when deletion would have succeeded.
+        if original is not None and not original.exists():
+            kept.append(leftover)
+            continue
+
+        try:
+            leftover.unlink()
+            deleted += 1
+            log.info(f"    Deleted stale file: {leftover.name}")
+        except OSError as e:
+            log.warning(f"    Could not delete stale file {leftover.name}: {e}")
+
+    log.info(
+        f"  Cleaned up {deleted} stale temp file(s) from previous run; "
+        f"kept {len(kept)}."
+    )
+
+    for leftover in kept:
+        log.critical(
+            f"    KEPT {leftover}: the archive it belongs to is missing "
+            f"from its recorded path, so this is the surviving copy of an "
+            f"interrupted rewrite. Recover it by hand."
+        )
+
+
 def _write_cbz_with_comicinfo(
     cbz_path: Path,
     new_xml: str,
@@ -231,21 +320,41 @@ def _write_cbz_with_comicinfo(
             time.sleep(0.5)
 
             bak_path = cbz_path.with_suffix(".bak.cbz")
+            bak_path.unlink(missing_ok=True)
             cbz_path.rename(bak_path)
-            tmp_path.rename(cbz_path)
+
+            # Nothing exists at cbz_path between these two renames, and the
+            # failure compounds badly here: the retry below re-opens
+            # cbz_path, which is now missing, so every remaining attempt
+            # fails on a file that is not there, the handler deletes the
+            # rebuilt copy, and the only surviving original is a .bak.cbz
+            # that this watcher's own startup cleanup deletes. Restore
+            # first, so the retry runs against a file that exists.
+            try:
+                tmp_path.rename(cbz_path)
+            except OSError:
+                try:
+                    bak_path.rename(cbz_path)
+                except OSError:
+                    log.critical(
+                        f"    {cbz_path.name}: rewrite failed AND the "
+                        f"original could not be restored. Original bytes "
+                        f"are at {bak_path}, rebuilt copy at {tmp_path}. "
+                        f"Neither will be deleted. Recover by hand."
+                    )
+                raise
+
             bak_path.unlink(missing_ok=True)
             log.info(f"    comicinfo.xml {action} successfully.")
             return
 
         except OSError as e:
             log.warning(f"    File locked (attempt {attempt + 1}/5), retrying in 5s... ({e})")
-            if tmp_path.exists():
-                tmp_path.unlink()
+            _discard_rebuild_if_original_intact(cbz_path, tmp_path)
             time.sleep(5)
         except Exception as e:
             log.error(f"    Failed to write comicinfo.xml: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
+            _discard_rebuild_if_original_intact(cbz_path, tmp_path)
             return
 
     log.error(f"    Gave up writing comicinfo.xml after 5 attempts: {cbz_path.name}")
@@ -1885,15 +1994,7 @@ def main():
 
     tracker = DirectorySettleTracker()
 
-    stale = list(watch_path.rglob("*.tmp.cbz")) + list(watch_path.rglob("*.bak.cbz"))
-    if stale:
-        log.info(f"  Cleaning up {len(stale)} stale temp file(s) from previous run...")
-        for f in stale:
-            try:
-                f.unlink()
-                log.info(f"    Deleted stale file: {f.name}")
-            except OSError as e:
-                log.warning(f"    Could not delete stale file {f.name}: {e}")
+    _clean_up_stale_rewrite_files(watch_path)
 
     _discover_startup_directories(watch_path, tracker)
 
