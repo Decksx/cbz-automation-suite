@@ -8,6 +8,11 @@ from pathlib import Path
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
+from comic_automation.database.dal import (
+    RevisionRepository,
+    require_transaction,
+    transaction,
+)
 from comic_automation.jobs import (
     CategorizedJobError,
     EnqueueOutcome,
@@ -81,6 +86,16 @@ class ArchiveHashRepository:
         result: ArchiveHash,
         enqueue_reinspection: bool = True,
     ) -> None:
+        # This writes four things that have to agree: the archive_hashes row,
+        # the location's observed size/mtime, the denormalized file_size on
+        # archive_files, and the archive's revision. Before revisions existed
+        # these were three independent autocommits and a crash between them
+        # left the database disagreeing with itself; now that the current
+        # revision is derived from the same digest, a partial write would mean
+        # `archive_hashes.digest` and `current_revision_id` naming different
+        # bytes -- two answers to "what is this archive now?".
+        require_transaction(self.connection)
+
         # Compare against the file_size/modified_time_ns already
         # recorded for this location to detect whether the underlying
         # file changed since the last time it was seen (as opposed to
@@ -165,6 +180,49 @@ class ArchiveHashRepository:
             WHERE id = ?
             """,
             (result.file_size, archive_id),
+        )
+
+        # The revision is the authoritative statement of byte identity, and
+        # archive_hashes is the mutable record of the most recent hash. They
+        # are written together so they cannot disagree.
+        #
+        # Three cases, all handled by record_or_reuse:
+        #
+        #   first hash       -- the archive's current revision is still the
+        #                       provisional one it was created with, so this
+        #                       appends the established generation and the
+        #                       pointer moves;
+        #   unchanged rehash -- the digest is already a revision of this
+        #                       archive, so it is reused and only an
+        #                       observation is added. A file rediscovered
+        #                       unchanged must not look like a file that
+        #                       changed;
+        #   changed rehash   -- new bytes, so a new generation is appended
+        #                       *beside* the old one rather than overwriting
+        #                       it, which is what archive_hashes alone did.
+        revisions = RevisionRepository(self.connection)
+        revision_id, _ = revisions.record_or_reuse(
+            archive_id=archive_id,
+            archive_sha256=result.digest,
+            evidence=(
+                f"{result.algorithm} v{result.algorithm_version} over "
+                f"{result.bytes_read} bytes, location {location_id}"
+            ),
+            file_size=result.file_size,
+        )
+
+        # Promoted unconditionally, unlike an ordinary append. This digest was
+        # just measured from the file on disk, so it *is* the archive's
+        # current byte state -- there is no operator judgement to preserve
+        # here, and leaving the pointer elsewhere would recreate exactly the
+        # disagreement this method exists to prevent.
+        revisions.set_current(archive_id, revision_id)
+
+        revisions.observe(
+            revision_id=revision_id,
+            location_id=location_id,
+            file_size=result.file_size,
+            modified_time_ns=result.modified_time_ns,
         )
 
         if metadata_changed and enqueue_reinspection:
@@ -315,6 +373,7 @@ class CalculateArchiveHashHandler:
         *,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
+        self.connection = connection
         self.locations = ArchiveInspectionRepository(connection)
         self.hashes = ArchiveHashRepository(connection)
         self.chunk_size = chunk_size
@@ -347,8 +406,12 @@ class CalculateArchiveHashHandler:
                 category="filesystem_io",
             ) from exc
 
-        self.hashes.save(
-            archive_id=job.archive_id,
-            location_id=int(location["id"]),
-            result=result,
-        )
+        # The handler runs outside any transaction, so it owns this one.
+        # save() now writes the archive's revision as well as its hash, and
+        # those must land together or not at all.
+        with transaction(self.connection):
+            self.hashes.save(
+                archive_id=job.archive_id,
+                location_id=int(location["id"]),
+                result=result,
+            )
