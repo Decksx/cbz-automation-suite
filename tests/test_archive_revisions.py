@@ -160,8 +160,36 @@ def connection(database_path: Path):
 
 
 def _new_archive(conn: sqlite3.Connection, file_size: int = 4096) -> int:
+    """A new archive, which the schema immediately gives a provisional origin.
+
+    Every archive created after migration 014 starts with one provisional
+    revision at ordinal 1, because that is the truth at that instant: the
+    identity row exists and nothing has hashed its bytes. Established
+    generations are therefore appended from ordinal 2 onward, and tests that
+    care about byte generations filter for them rather than counting rows.
+    """
     with dal.transaction(conn):
         return dal.ArchiveRepository(conn).create(file_size=file_size)
+
+
+def _established(
+    revisions: "dal.RevisionRepository", archive_id: int
+) -> list:
+    """Only the generations whose bytes are known."""
+    return [
+        record
+        for record in revisions.lineage_for(archive_id)
+        if record.is_established
+    ]
+
+
+def _provisional_origin(
+    revisions: "dal.RevisionRepository", archive_id: int
+):
+    """The ordinal-1 placeholder every archive is created with."""
+    origin = revisions.lineage_for(archive_id)[0]
+    assert origin.revision_ordinal == 1 and not origin.is_established
+    return origin
 
 
 # --- the forward migration -----------------------------------------------
@@ -334,8 +362,14 @@ def test_the_upgrade_is_idempotent(legacy_database: Path) -> None:
         # Matched on content, not on a `startswith`: iter_sql_statements keeps
         # each statement's leading comment block, so these do not start with
         # the keyword.
+        # Narrowed to the backfill specifically: the auto-provision trigger
+        # also contains "INSERT INTO archive_revisions", and matching both
+        # would have this replay a trigger body as a bare statement.
         backfill = [
-            s for s in statements if "INSERT INTO archive_revisions" in s
+            s
+            for s in statements
+            if "INSERT INTO archive_revisions" in s
+            and "FROM archive_files AS a" in s
         ]
         assert len(backfill) == 1, "expected exactly one backfill INSERT"
 
@@ -520,29 +554,28 @@ def test_an_established_revision_cannot_be_deleted(connection) -> None:
     assert revisions.get(revision_id) is not None
 
 
-def test_a_provisional_revision_can_be_deleted(connection) -> None:
-    """The one deletable kind, and the reason the exception exists.
+def test_a_provisional_revision_cannot_be_deleted_either(
+    connection,
+) -> None:
+    """A provisional row records a real historical state, so it is evidence.
 
-    A provisional row is a placeholder for bytes nobody has hashed. Replacing
-    it when the digest finally arrives is the only supported way to change a
-    revision, and it works by deleting the placeholder.
+    It says the identity existed and its bytes were unknown between two
+    dates, and every observation made during that period hangs off it.
+    Deleting it when a digest finally arrives would erase that uncertainty
+    and cascade the observations away with it.
     """
     archive_id = _new_archive(connection)
+    revisions = dal.RevisionRepository(connection)
+    origin = _provisional_origin(revisions, archive_id)
 
-    with dal.transaction(connection):
-        connection.execute(
-            "INSERT INTO archive_revisions (archive_id, revision_ordinal, "
-            "identity_state, archive_sha256, evidence) "
-            "VALUES (?, 1, 'provisional', NULL, 'never hashed')",
-            (archive_id,),
-        )
+    with pytest.raises(sqlite3.IntegrityError, match="evidence"):
+        with dal.transaction(connection):
+            connection.execute(
+                "DELETE FROM archive_revisions WHERE id = ?",
+                (origin.revision_id,),
+            )
 
-    with dal.transaction(connection):
-        connection.execute(
-            "DELETE FROM archive_revisions WHERE archive_id = ?", (archive_id,)
-        )
-
-    assert dal.RevisionRepository(connection).lineage_for(archive_id) == []
+    assert revisions.get(origin.revision_id) is not None
 
 
 def test_identity_state_and_the_digest_cannot_disagree(connection) -> None:
@@ -575,33 +608,18 @@ def test_an_archive_may_hold_only_one_provisional_revision(
     """
     archive_id = _new_archive(connection)
     revisions = dal.RevisionRepository(connection)
+    origin = _provisional_origin(revisions, archive_id)
 
-    # An established generation 1 first, so the second provisional row below
-    # is legal in every other respect. Inserting it at ordinal 2 with a NULL
-    # predecessor would be refused by the ordinal CHECK instead, and the test
-    # would pass while the index did nothing -- which is what it did before
-    # a bypass run removed the index and nothing failed.
-    with dal.transaction(connection):
-        first_id, _ = revisions.record_or_reuse(
-            archive_id=archive_id, archive_sha256=SHA_A, evidence="gen 1"
-        )
-        connection.execute(
-            "INSERT INTO archive_revisions (archive_id, revision_ordinal, "
-            "identity_state, archive_sha256, previous_revision_id, evidence) "
-            "VALUES (?, 2, 'provisional', NULL, ?, 'first placeholder')",
-            (archive_id, first_id),
-        )
-        second_id = connection.execute(
-            "SELECT id FROM archive_revisions WHERE archive_id = ? "
-            "AND revision_ordinal = 2",
-            (archive_id,),
-        ).fetchone()["id"]
-
-    # Ordinal 3, a valid predecessor, valid state/digest pairing: the partial
-    # unique index is the only thing left that can refuse it.
-    # The partial index reports as a UNIQUE failure on archive_id, which is
-    # the column it indexes -- matched explicitly so this cannot start passing
-    # on some other constraint's error.
+    # A second placeholder at a valid ordinal behind a valid predecessor, with
+    # a valid state/digest pairing: the partial unique index is the only
+    # constraint left that can refuse it. Inserting it at ordinal 2 with a
+    # NULL predecessor would be caught by the ordinal CHECK instead, and the
+    # test would pass while the index did nothing -- which is exactly what it
+    # did until a bypass run removed the index and nothing failed.
+    #
+    # The index reports as a UNIQUE failure on archive_id, the column it
+    # indexes, matched explicitly so this cannot start passing on some other
+    # constraint's error.
     with pytest.raises(
         sqlite3.IntegrityError, match=r"archive_revisions\.archive_id"
     ):
@@ -610,23 +628,22 @@ def test_an_archive_may_hold_only_one_provisional_revision(
                 "INSERT INTO archive_revisions (archive_id, "
                 "revision_ordinal, identity_state, archive_sha256, "
                 "previous_revision_id, evidence) "
-                "VALUES (?, 3, 'provisional', NULL, ?, 'second placeholder')",
-                (archive_id, second_id),
+                "VALUES (?, 2, 'provisional', NULL, ?, 'second placeholder')",
+                (archive_id, origin.revision_id),
             )
 
-    assert len(revisions.lineage_for(archive_id)) == 2
+    assert len(revisions.lineage_for(archive_id)) == 1
 
 
 def test_one_archive_cannot_hold_the_same_byte_state_twice(
     connection,
 ) -> None:
     archive_id = _new_archive(connection)
+    revisions = dal.RevisionRepository(connection)
 
     with dal.transaction(connection):
-        connection.execute(
-            "INSERT INTO archive_revisions (archive_id, revision_ordinal, "
-            "archive_sha256, evidence) VALUES (?, 1, ?, 'first')",
-            (archive_id, SHA_A),
+        first_id, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_A, evidence="first"
         )
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -634,10 +651,8 @@ def test_one_archive_cannot_hold_the_same_byte_state_twice(
             connection.execute(
                 "INSERT INTO archive_revisions (archive_id, "
                 "revision_ordinal, archive_sha256, previous_revision_id, "
-                "evidence) VALUES (?, 2, ?, "
-                "(SELECT id FROM archive_revisions WHERE archive_id = ?), "
-                "'duplicate bytes')",
-                (archive_id, SHA_A, archive_id),
+                "evidence) VALUES (?, 3, ?, ?, 'duplicate bytes')",
+                (archive_id, SHA_A, first_id),
             )
 
 
@@ -686,8 +701,8 @@ def test_lineage_must_be_a_sequential_chain(connection) -> None:
             connection.execute(
                 "INSERT INTO archive_revisions (archive_id, "
                 "revision_ordinal, archive_sha256, previous_revision_id, "
-                "evidence) VALUES (?, 3, ?, ?, 'skips ordinal 2')",
-                (archive_id, SHA_B, first_id),
+                "evidence) VALUES (?, 4, ?, ?, 'skips an ordinal')",
+                (archive_id, SHA_C, first_id),
             )
 
 
@@ -702,14 +717,14 @@ def test_the_first_revision_has_no_predecessor_and_later_ones_do(
             archive_id=archive_id, archive_sha256=SHA_A, evidence="gen 1"
         )
 
-    # An ordinal-2 row with no predecessor.
+    # A later row with no predecessor.
     with pytest.raises(sqlite3.IntegrityError):
         with dal.transaction(connection):
             connection.execute(
                 "INSERT INTO archive_revisions (archive_id, "
                 "revision_ordinal, archive_sha256, evidence) "
-                "VALUES (?, 2, ?, 'rootless')",
-                (archive_id, SHA_B),
+                "VALUES (?, 3, ?, 'rootless')",
+                (archive_id, SHA_C),
             )
 
     # A second root.
@@ -719,10 +734,12 @@ def test_the_first_revision_has_no_predecessor_and_later_ones_do(
                 "INSERT INTO archive_revisions (archive_id, "
                 "revision_ordinal, archive_sha256, evidence) "
                 "VALUES (?, 1, ?, 'second root')",
-                (archive_id, SHA_B),
+                (archive_id, SHA_C),
             )
 
-    assert revisions.get(first_id).previous_revision_id is None
+    # The archive's only root is the provisional origin it was created with.
+    assert _provisional_origin(revisions, archive_id).previous_revision_id is None
+    assert revisions.get(first_id).previous_revision_id is not None
 
 
 def test_a_revision_requires_non_blank_evidence(connection) -> None:
@@ -811,7 +828,9 @@ def test_an_established_revision_cannot_be_cherry_picked_from_a_live_archive(
                 "DELETE FROM archive_revisions WHERE id = ?", (gen2,)
             )
 
-    assert len(revisions.lineage_for(archive_id)) == 2
+    # Provisional origin plus the two established generations.
+    assert len(revisions.lineage_for(archive_id)) == 3
+    assert len(_established(revisions, archive_id)) == 2
 
 
 def test_an_archive_can_still_be_deleted(connection) -> None:
@@ -840,6 +859,161 @@ def test_an_archive_can_still_be_deleted(connection) -> None:
 
     assert revisions.lineage_for(archive_id) == []
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+# --- every archive has a current revision, for the life of the schema ----
+#
+# The backfill only covers archives that existed when 014 ran. Everything
+# discovered afterwards arrives through an INSERT the backfill never sees, so
+# the invariant has to be enforced by the schema or it is not enforced at all.
+
+
+def test_a_repository_created_archive_has_a_current_revision(
+    connection,
+) -> None:
+    """`ArchiveRepository.create()` inserts no revision of its own.
+
+    Before the trigger existed, this transaction committed an archive with
+    `current_revision_id` NULL, and nothing ever revisited it.
+    """
+    with dal.transaction(connection):
+        archive_id = dal.ArchiveRepository(connection).create(file_size=4096)
+
+        # Already true inside the transaction, not repaired at commit.
+        assert (
+            connection.execute(
+                "SELECT current_revision_id FROM archive_files WHERE id = ?",
+                (archive_id,),
+            ).fetchone()[0]
+            is not None
+        )
+
+    current = dal.RevisionRepository(connection).current_for(archive_id)
+
+    assert current is not None
+    assert current.archive_id == archive_id
+    assert current.revision_ordinal == 1
+    assert current.identity_state == "provisional"
+
+
+def test_a_raw_sql_created_archive_has_a_current_revision(
+    connection,
+) -> None:
+    """The invariant is not a DAL convention.
+
+    An INSERT issued from a CLI, a migration, or an operator's sqlite3
+    prompt gets the same treatment, which is the difference between an
+    invariant and a house rule.
+    """
+    with dal.transaction(connection):
+        connection.execute(
+            "INSERT INTO archive_files (id, file_size) VALUES (4242, 99)"
+        )
+
+    row = connection.execute(
+        "SELECT current_revision_id FROM archive_files WHERE id = 4242"
+    ).fetchone()
+
+    assert row[0] is not None
+
+    current = dal.RevisionRepository(connection).current_for(4242)
+    assert current.archive_id == 4242
+    assert current.identity_state == "provisional"
+
+    # And no archive anywhere is left without one.
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM archive_files WHERE current_revision_id IS NULL"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_the_current_pointer_cannot_be_cleared(connection) -> None:
+    """The other end of the invariant.
+
+    Auto-provisioning closes the window at INSERT; without this, any later
+    UPDATE could reopen it and leave a live archive pointing at nothing.
+    """
+    archive_id = _new_archive(connection)
+
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be cleared"):
+        with dal.transaction(connection):
+            connection.execute(
+                "UPDATE archive_files SET current_revision_id = NULL "
+                "WHERE id = ?",
+                (archive_id,),
+            )
+
+    assert (
+        dal.RevisionRepository(connection).current_for(archive_id) is not None
+    )
+
+
+def test_clearing_every_pointer_at_once_is_refused(connection) -> None:
+    """The shape a careless repair actually takes.
+
+    A blanket UPDATE with no WHERE clause is how this would really happen,
+    and it must fail on the first row rather than partway through.
+    """
+    first = _new_archive(connection)
+    second = _new_archive(connection)
+
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be cleared"):
+        with dal.transaction(connection):
+            connection.execute(
+                "UPDATE archive_files SET current_revision_id = NULL"
+            )
+
+    revisions = dal.RevisionRepository(connection)
+    assert revisions.current_for(first) is not None
+    assert revisions.current_for(second) is not None
+
+
+def test_the_migration_leaves_no_archive_without_a_current_revision(
+    legacy_database: Path,
+) -> None:
+    """Backfilled archives and newly inserted ones both satisfy it.
+
+    The upgrade covers the five that existed; the trigger covers the sixth,
+    inserted afterwards. Asserted together because the invariant is only
+    useful if it holds across that boundary.
+    """
+    connection = connect_database(legacy_database)
+
+    try:
+        apply_migrations(connection, MIGRATIONS)
+        connection.commit()
+
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "INSERT INTO archive_files (id, file_size) VALUES (99, 1)"
+        )
+        connection.execute("COMMIT")
+
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM archive_files "
+                "WHERE current_revision_id IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+
+        # The five backfilled archives keep established identities; only the
+        # one created afterwards is provisional.
+        states = dict(
+            connection.execute(
+                """
+                SELECT r.identity_state, COUNT(*)
+                FROM archive_files AS a
+                JOIN archive_revisions AS r ON r.id = a.current_revision_id
+                GROUP BY r.identity_state
+                """
+            ).fetchall()
+        )
+        assert states == {"established": 3, "provisional": 3}
+    finally:
+        connection.close()
 
 
 # --- archive 37704: three generations, and 58201 kept apart --------------
@@ -876,17 +1050,25 @@ def test_archive_37704_carries_three_distinct_generations(
         assert created is True
         recorded.append(revision_id)
 
-    lineage = revisions.lineage_for(archive_37704)
+    origin = _provisional_origin(revisions, archive_37704)
+    established = _established(revisions, archive_37704)
 
-    assert [r.revision_ordinal for r in lineage] == [1, 2, 3]
-    assert [r.archive_sha256 for r in lineage] == [SHA_A, SHA_B, SHA_C]
-    assert [r.previous_revision_id for r in lineage] == [
-        None,
+    # Three byte generations, appended after the provisional origin the
+    # archive was created with -- so ordinals 2, 3, 4.
+    assert [r.revision_ordinal for r in established] == [2, 3, 4]
+    assert [r.archive_sha256 for r in established] == [SHA_A, SHA_B, SHA_C]
+    assert [r.previous_revision_id for r in established] == [
+        origin.revision_id,
         recorded[0],
         recorded[1],
     ]
-    assert [r.evidence for r in lineage] == [e for _, e in generations]
-    assert revisions.current_for(archive_37704).revision_ordinal == 3
+    assert [r.evidence for r in established] == [e for _, e in generations]
+    assert revisions.current_for(archive_37704).revision_id == recorded[2]
+
+    # The earlier generations survived the arrival of the third, which is
+    # precisely what re-inspecting in place would have destroyed.
+    assert revisions.get(recorded[0]).archive_sha256 == SHA_A
+    assert revisions.get(recorded[1]).archive_sha256 == SHA_B
 
 
 def test_37704_and_58201_are_not_merged_by_their_shared_digest(
@@ -935,8 +1117,8 @@ def test_37704_and_58201_are_not_merged_by_their_shared_digest(
     )
 
     # The shared digest did not pull 58201 into 37704's lineage.
-    assert len(revisions.lineage_for(archive_37704)) == 2
-    assert len(revisions.lineage_for(archive_58201)) == 1
+    assert len(_established(revisions, archive_37704)) == 2
+    assert len(_established(revisions, archive_58201)) == 1
     assert revisions.current_for(archive_58201).revision_id == other
     assert revisions.current_for(archive_37704).revision_id == gen2
 
@@ -1023,36 +1205,30 @@ def test_re_seeing_known_bytes_reuses_the_revision(connection) -> None:
 
     assert again_id == first_id
     assert created_again is False
-    assert len(revisions.lineage_for(archive_id)) == 1
+    assert len(_established(revisions, archive_id)) == 1
     assert len(revisions.observations_for(first_id)) == 1
     # The original evidence is untouched -- re-seeing did not rewrite it.
     assert revisions.get(first_id).evidence == "first sight"
 
 
-def test_hashing_a_provisional_archive_establishes_its_identity(
+def test_hashing_a_provisional_archive_appends_and_promotes(
     connection,
 ) -> None:
-    """The placeholder is resolved, not added beside.
+    """The placeholder is kept, not replaced.
 
-    The archive had one unknown byte state and now has one known one, so the
-    ordinal must not advance -- otherwise every un-hashed archive would appear
-    to have two generations the moment it was hashed.
+    Deleting it would erase the record that this identity existed with
+    unknown bytes for a period, and would cascade away every observation
+    made during that period. So the established revision is appended after
+    it and the pointer moves, both inside the caller's transaction -- the
+    promotion is not a second call anyone has to remember.
     """
     archive_id = _new_archive(connection)
     revisions = dal.RevisionRepository(connection)
+    origin = _provisional_origin(revisions, archive_id)
 
+    # An observation recorded while the bytes were still unknown.
     with dal.transaction(connection):
-        connection.execute(
-            "INSERT INTO archive_revisions (archive_id, revision_ordinal, "
-            "identity_state, archive_sha256, evidence) "
-            "VALUES (?, 1, 'provisional', NULL, 'no reachable file')",
-            (archive_id,),
-        )
-        placeholder = connection.execute(
-            "SELECT id FROM archive_revisions WHERE archive_id = ?",
-            (archive_id,),
-        ).fetchone()["id"]
-        revisions.set_current(archive_id, placeholder)
+        revisions.observe(revision_id=origin.revision_id, file_size=4096)
 
     with dal.transaction(connection):
         established_id, created = revisions.record_or_reuse(
@@ -1060,16 +1236,81 @@ def test_hashing_a_provisional_archive_establishes_its_identity(
             archive_sha256=SHA_A,
             evidence="file recovered and hashed",
         )
-        revisions.set_current(archive_id, established_id)
 
     lineage = revisions.lineage_for(archive_id)
 
     assert created is True
-    assert len(lineage) == 1, "establishing identity must not add a generation"
-    assert lineage[0].revision_ordinal == 1
-    assert lineage[0].identity_state == "established"
-    assert lineage[0].archive_sha256 == SHA_A
+    assert len(lineage) == 2, "the provisional origin must be retained"
+
+    assert lineage[0].revision_id == origin.revision_id
+    assert lineage[0].identity_state == "provisional"
+    assert lineage[0].archive_sha256 is None
+    assert lineage[0].evidence == origin.evidence
+
+    assert lineage[1].revision_id == established_id
+    assert lineage[1].revision_ordinal == 2
+    assert lineage[1].identity_state == "established"
+    assert lineage[1].archive_sha256 == SHA_A
+    assert lineage[1].previous_revision_id == origin.revision_id
+
+    # Promoted without a separate set_current() call.
     assert revisions.current_for(archive_id).revision_id == established_id
+
+    # The observation made while the identity was unknown is still there.
+    assert revisions.observations_for(origin.revision_id) != []
+
+
+def test_establishing_identity_is_atomic(connection) -> None:
+    """Append and promote land together or not at all.
+
+    If the promotion were a separate step the caller had to remember, a
+    failure between the two would leave an archive holding established bytes
+    while still reporting a provisional identity -- permanently, since
+    nothing would ever revisit it.
+    """
+    archive_id = _new_archive(connection)
+    revisions = dal.RevisionRepository(connection)
+    origin = _provisional_origin(revisions, archive_id)
+
+    with pytest.raises(RuntimeError):
+        with dal.transaction(connection):
+            revisions.record_or_reuse(
+                archive_id=archive_id,
+                archive_sha256=SHA_A,
+                evidence="hashed",
+            )
+            raise RuntimeError("failure after the append and the promotion")
+
+    assert revisions.lineage_for(archive_id) == [origin]
+    assert revisions.current_for(archive_id).revision_id == origin.revision_id
+
+
+def test_a_later_generation_does_not_move_the_pointer_by_itself(
+    connection,
+) -> None:
+    """Only an unestablished identity is promoted automatically.
+
+    Once an archive's identity is established, which generation is current is
+    an operator decision -- rolling back to an earlier one is legitimate --
+    so appending must not silently override it.
+    """
+    archive_id = _new_archive(connection)
+    revisions = dal.RevisionRepository(connection)
+
+    with dal.transaction(connection):
+        first_id, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_A, evidence="gen 1"
+        )
+
+    assert revisions.current_for(archive_id).revision_id == first_id
+
+    with dal.transaction(connection):
+        second_id, _ = revisions.record_or_reuse(
+            archive_id=archive_id, archive_sha256=SHA_B, evidence="gen 2"
+        )
+
+    assert revisions.current_for(archive_id).revision_id == first_id
+    assert revisions.get(second_id) is not None
 
 
 def test_current_is_read_from_the_pointer_not_the_highest_ordinal(
@@ -1101,9 +1342,9 @@ def test_current_is_read_from_the_pointer_not_the_highest_ordinal(
     current = revisions.current_for(archive_id)
 
     assert current.revision_id == gen1
-    assert current.revision_ordinal == 1
+    assert current.revision_ordinal == 2
     # Generation 2 still exists; rolling back is not deleting.
-    assert len(revisions.lineage_for(archive_id)) == 2
+    assert len(_established(revisions, archive_id)) == 2
 
 
 def test_every_revision_write_requires_the_dal_transaction(
@@ -1134,11 +1375,10 @@ def test_every_revision_write_requires_the_dal_transaction(
         with pytest.raises(dal.TransactionRequiredError):
             write()
 
-    # Reads are deliberately not gated. `current_for` is not asserted here:
-    # nothing in this test ever set the pointer, so None is the correct
-    # answer and asserting otherwise would be testing the fixture.
+    # Reads are deliberately not gated.
     assert revisions.get(revision_id) is not None
-    assert len(revisions.lineage_for(archive_id)) == 1
+    assert revisions.current_for(archive_id) is not None
+    assert len(_established(revisions, archive_id)) == 1
 
 
 def test_a_failed_revision_transaction_leaves_no_generation_behind(
@@ -1162,5 +1402,5 @@ def test_a_failed_revision_transaction_leaves_no_generation_behind(
             revisions.set_current(archive_id, gen2)
             raise RuntimeError("something failed after the write")
 
-    assert len(revisions.lineage_for(archive_id)) == 1
+    assert len(_established(revisions, archive_id)) == 1
     assert revisions.current_for(archive_id).revision_id == gen1
