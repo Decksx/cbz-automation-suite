@@ -362,8 +362,10 @@ candidate — the distances, ratios and cut-offs — are recorded nowhere;
 
 It therefore needs, in one slice: `revision_a_id`, `revision_b_id`,
 `match_algorithm` + `match_algorithm_version` split out of `match_method`,
-`parameters_json`, and supersession columns — with uniqueness moving to
-`(revision_a_id, revision_b_id, match_algorithm, match_algorithm_version)`.
+`parameters_json` + `parameters_digest` + `parameters_basis`, and supersession
+columns — with uniqueness moving to `(revision_a_id, revision_b_id,
+match_algorithm, match_algorithm_version, parameters_digest)`, split into the
+four branches of §9.6 because the digest is NULL for every historical row.
 This is a bigger change than the other five tables combined and is given its
 own slice.
 
@@ -416,18 +418,37 @@ roadmap's "algorithm versions cannot be silently mixed" criterion is aimed at,
 and the two inspections would be indistinguishable in the table.
 
 So an `inspector_version` column is introduced in slice 5, alongside the
-uniqueness move, and joins the active unique key:
+uniqueness move.
+
+**Historical rows must not be given the current version.** An earlier draft
+proposed backfilling all 59,541 rows with whatever the present inspector
+reports, "recorded as the value it is rather than as a claim". That distinction
+does not survive contact with the column: a version written into
+`inspector_version` *is* the assertion that this row came from that code, and a
+sentence elsewhere saying otherwise does not unwrite it. The 59,541 rows were
+produced over months by code that has changed since; nobody knows which
+versions, and inventing one uniform answer is exactly the kind of plausible
+reconstruction that cannot afterwards be told from a fact.
+
+It mirrors the near-duplicate parameters solution (§9.6):
 
 ```text
-archive_inspections
-    bound       (source_revision_id, inspector_version)   WHERE bound AND active
-    unresolved  (archive_id, inspector_version)           WHERE unresolved AND active
+inspector_version       TEXT
+inspector_version_basis TEXT NOT NULL
+    CHECK (inspector_version_basis IN ('known', 'unknown_legacy'))
+CHECK (
+    (inspector_version_basis = 'known'          AND inspector_version IS NOT NULL)
+ OR (inspector_version_basis = 'unknown_legacy' AND inspector_version IS NULL)
+)
 ```
 
-Historical rows are backfilled with the version the current inspector reports,
-recorded as the value it is rather than as a claim that the 59,541 rows were
-all produced by that exact code. That distinction is the same one §4.1 draws
-about seeds, and it belongs in the slice-4 plan.
+All 59,541 historical rows are `unknown_legacy` with a NULL version. Every row
+a producer writes after slice 5 requires `known` and a non-NULL version. Both
+the status and the version are decision-bearing, so both go into the slice-3
+plan digest and the slice-4 binding digest.
+
+Because the version may be NULL, the active uniqueness needs the same
+known/unknown split the near-duplicate table uses (§9.3).
 
 `algorithm` stays "n/a" for this table: there is one inspection procedure, not
 a family of interchangeable ones, so a version without an algorithm name is the
@@ -731,9 +752,11 @@ Every table therefore needs **two** partial unique indexes — one for bound
 active rows, one for unresolved active rows keyed conservatively by archive:
 
 ```text
-archive_inspections
-    bound       (source_revision_id)              WHERE bound AND active
-    unresolved  (archive_id)                      WHERE unresolved AND active
+archive_inspections    -- four branches: inspector_version may be NULL (§6.5)
+    bound,      version known    (source_revision_id, inspector_version)
+    bound,      version unknown  (source_revision_id)
+    unresolved, version known    (archive_id, inspector_version)
+    unresolved, version unknown  (archive_id)
 
 archive_hashes
     bound       (source_revision_id, algorithm, algorithm_version)
@@ -880,6 +903,61 @@ same constraint that excludes cycles.
 What a CHECK cannot express, because it reads another row, is that the
 successor describes the *same* revision and the *same* evidence identity.
 
+##### The evidence-identity tuple is defined once, per table
+
+An earlier draft spelled the identity out inline in each trigger and got a
+different subset every time — one omitted parameters, another omitted
+`inspector_version`, and none of them handled the near-duplicate table's
+pairwise columns. A successor could satisfy both triggers and then have an
+omitted component changed, which is the same hole the immutability trigger was
+supposed to close.
+
+So the tuple is named per table and every mechanism below is generated from
+that one definition:
+
+```text
+archive_hashes              (archive_id, source_revision_id,
+                             algorithm, algorithm_version)
+
+archive_content_signatures  (archive_id, source_revision_id,
+                             algorithm, algorithm_version)
+
+archive_inspections         (archive_id, source_revision_id,
+                             inspector_version)
+
+near_duplicate_candidates   (archive_a_id, archive_b_id,
+                             revision_a_id, revision_b_id,
+                             match_algorithm, match_algorithm_version,
+                             parameters_digest)
+
+archive_pages / page inventory
+                            deferred to slice 2 (§9.5); whatever that design
+                            settles on becomes this table's tuple
+```
+
+Note `near_duplicate_candidates` has no single `archive_id` or
+`source_revision_id`: its identity is pairwise, which is precisely why a
+generic four-column template could not express it.
+
+**The same tuple is used in all four places**, and they must not drift apart:
+
+```text
+1. the active partial unique index          (§9.3, §9.6)
+2. the idempotent-result lookup             (§9.4, "same identity")
+3. trg_<table>_supersede_checks_existing_successor
+4. trg_<table>_insert_checks_waiting_predecessors
+   plus the identity-immutability trigger, which lists exactly these columns
+```
+
+**Every comparison must be NULL-safe.** `source_revision_id`,
+`inspector_version`, `parameters_digest` and the near-duplicate revision
+columns are all nullable, and `a <> b` is NULL — neither true nor false — when
+either side is NULL, so a mismatch involving a NULL would pass a trigger
+silently. SQLite's `IS NOT` is the NULL-safe form and is what these triggers
+use throughout.
+
+##### The two complementary triggers
+
 A single `BEFORE UPDATE` trigger asserting `NOT EXISTS (matching successor)`
 **cannot work**, and an earlier draft proposed exactly that. Step 2 of the write
 order updates the predecessor *before* the successor exists, so such a trigger
@@ -887,46 +965,75 @@ sees no successor and aborts every valid replacement. The deferred foreign key
 exists precisely to permit that window; a trigger that refuses it cancels the
 mechanism it was paired with.
 
-Two complementary triggers instead, each covering what the other cannot:
+Two triggers instead, each covering what the other cannot. Shown for
+`archive_inspections`; the others differ only in which columns the tuple names.
 
-```text
-trg_<table>_supersede_checks_existing_successor
-    BEFORE UPDATE OF superseded_by_id
-    WHEN NEW.superseded_by_id IS NOT NULL
-     AND EXISTS (SELECT 1 FROM <table> WHERE id = NEW.superseded_by_id)
-     AND NOT EXISTS (successor with the same archive_id,
-                     the same source_revision_id,
-                     and the same algorithm/version/parameters)
-    -> RAISE(ABORT, 'successor does not describe the same evidence identity')
-
-    -- Note the EXISTS guard. A successor that is not there yet is the
-    -- deliberately deferred case and is allowed through; a successor that IS
-    -- there and does not match is refused immediately.
-
-trg_<table>_insert_checks_waiting_predecessors
-    AFTER INSERT ON <table>
-    WHEN EXISTS (SELECT 1 FROM <table> AS p
-                 WHERE p.superseded_by_id = NEW.id
-                   AND (p.archive_id         <> NEW.archive_id
-                     OR p.source_revision_id IS NOT NEW.source_revision_id
-                     OR p.algorithm          <> NEW.algorithm
-                     OR p.algorithm_version  <> NEW.algorithm_version))
-    -> RAISE(ABORT, 'a predecessor already points here with another identity')
-
-    -- This is the half that closes the window the first trigger leaves open:
-    -- every predecessor already pointing at the row being inserted must match
-    -- it. Together with the deferred FK, which guarantees the successor exists
-    -- by COMMIT, the pair is complete: the FK proves it exists, this proves it
-    -- matches.
+```sql
+CREATE TRIGGER trg_archive_inspections_supersede_checks_existing_successor
+BEFORE UPDATE OF superseded_by_id ON archive_inspections
+FOR EACH ROW
+WHEN NEW.superseded_by_id IS NOT NULL
+ AND EXISTS (SELECT 1 FROM archive_inspections
+              WHERE id = NEW.superseded_by_id)
+ AND NOT EXISTS (
+        SELECT 1 FROM archive_inspections AS succ
+         WHERE succ.id                 =      NEW.superseded_by_id
+           AND succ.archive_id         IS     NEW.archive_id
+           AND succ.source_revision_id IS     NEW.source_revision_id
+           AND succ.inspector_version  IS     NEW.inspector_version)
+BEGIN
+    SELECT RAISE(ABORT,
+        'successor does not describe the same evidence identity');
+END;
 ```
 
-One further constraint is required for the pair to hold: **the identity columns
-must be immutable after insert**. Without that, a row could satisfy both
-triggers and then have its `source_revision_id`, algorithm or version updated
-afterwards, leaving a predecessor pointing at a successor that no longer
-matches. A `BEFORE UPDATE OF source_revision_id, algorithm, algorithm_version`
-trigger raising unconditionally is the same device migration 014 uses for
-`trg_archive_revisions_immutable`.
+The `EXISTS` guard is what makes the deferral usable: a successor that is not
+there yet is the deliberately deferred case and passes; a successor that *is*
+there and does not match is refused at the offending statement.
+
+```sql
+CREATE TRIGGER trg_archive_inspections_insert_checks_waiting_predecessors
+AFTER INSERT ON archive_inspections
+FOR EACH ROW
+WHEN EXISTS (
+        SELECT 1 FROM archive_inspections AS pred
+         WHERE pred.superseded_by_id = NEW.id
+           AND (pred.archive_id         IS NOT NEW.archive_id
+             OR pred.source_revision_id IS NOT NEW.source_revision_id
+             OR pred.inspector_version  IS NOT NEW.inspector_version))
+BEGIN
+    SELECT RAISE(ABORT,
+        'a predecessor already points here with another identity');
+END;
+```
+
+This is the half that closes the window the first trigger leaves open: every
+predecessor already pointing at the row being inserted must match it. Together
+with the deferred FK, which guarantees the successor exists by COMMIT, the pair
+is complete — the FK proves it exists, this proves it matches.
+
+##### Identity columns are immutable after insert
+
+Without this, a row could satisfy both triggers and then have a tuple component
+updated afterwards, leaving a predecessor pointing at a successor that no
+longer matches. The trigger lists **exactly** the tuple's columns, which is the
+reason for naming the tuple once rather than re-deriving it:
+
+```sql
+CREATE TRIGGER trg_archive_inspections_identity_immutable
+BEFORE UPDATE OF archive_id, source_revision_id, inspector_version
+    ON archive_inspections
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT,
+        'evidence identity is immutable; record a new row instead');
+END;
+```
+
+Same device as `trg_archive_revisions_immutable` in migration 014, narrowed to
+the identity columns so that `superseded_at`, `superseded_by_id` and
+`superseded_reason` remain writable — they are the only columns supersession
+needs to change.
 
 The "same revision, same identity" rule is what makes the model coherent: a
 superseding row is a *replacement measurement of the same bytes by the same
@@ -1141,9 +1248,9 @@ and must stay that way.
 | --- | --- | --- |
 | **1** | *this document* | lead accepts the matrix, the census, the requirement coverage, the producer paths and the invariants |
 | **2** | **page-inventory design** (§9.5). Design only, no schema, no planner. Decides whether page ownership lives on 2,955,391 `archive_pages` rows or on ~58,432 inventory parents, and where page idempotency and supersession live | lead accepts the parent's shape, the **authoritative backfill unit**, and the migration path. **This gates the planner as well as the schema** — see §11.3 |
-| **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table |
+| **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table; every inspection is planned as `inspector_version_basis = 'unknown_legacy'` with a NULL version, and every near-duplicate row as `parameters_basis = 'unknown_legacy'`, both contributing to the plan digest |
 | **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, backfilling exactly what slice 3 planned. **Uniqueness unchanged.** Producers write a basis on the path they already take, plus an interim guard that **refuses** to overwrite a row bound to a different revision | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; recovery is restore-from-backup |
-| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, supersession per §9.4 including the deferred self-FK, the preallocated-id write order and both triggers, `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, `inspector_version` introduced (§6.5). Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; the insert-side trigger catches an identity mismatch the update-side one deliberately let through |
+| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, supersession per §9.4 including the deferred self-FK, the preallocated-id write order and both triggers, `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, `inspector_version` + `inspector_version_basis` introduced (§6.5), all four mechanisms generated from the per-table evidence-identity tuple (§9.4.2). Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; the insert-side trigger catches an identity mismatch the update-side one deliberately let through; no historical inspection is given a version it cannot be shown to have; bypass proof that changing any single tuple column is refused by the immutability trigger |
 | **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest` + `parameters_basis`, **begin writing `processing_runs`** and carry `processing_run_id`, four partial indexes per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run |
 | **7** | planner: split `quarantine_or_resolution`, introduce `RULE_MAX_GRANULARITY`, resolve granularity per evidence row | see §11.2 |
 
