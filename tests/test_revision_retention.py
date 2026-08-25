@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -2076,6 +2077,75 @@ def test_the_cli_refuses_an_output_path_that_is_a_database_sidecar(
 
         assert code == cli.EXIT_FAILED
         assert "sidecar" in capsys.readouterr().err
+
+
+def test_the_resolved_sidecar_is_protected_when_the_database_is_a_symlink(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """A symlinked database path puts its WAL beside the *resolved* target.
+
+    `read_guards` opens the database through `path.resolve(strict=True)`, so
+    SQLite works against the link's target and writes `target.db-wal`, not
+    `alias.db-wal`. A guard that builds sidecar names by concatenating onto
+    the typed path protects the wrong file, and nothing else catches the
+    difference: the resolved WAL is not the database, `samefile` cannot
+    compare a file that does not exist yet, and the writers' header check
+    does not recognise a WAL either -- it does not begin with the SQLite
+    magic.
+
+    The resolved sidecar is deliberately *absent* here. That is the state the
+    defect lived in: an idle database has no WAL on disk, so this is the
+    ordinary case rather than a contrived one.
+    """
+    _new_archive(connection)
+    connection.close()
+
+    alias = tmp_path / "alias.db"
+
+    try:
+        os.symlink(database_path, alias)
+    except (OSError, NotImplementedError) as error:  # pragma: no cover
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    resolved_wal = Path(os.path.realpath(alias) + "-wal")
+    typed_wal = Path(str(alias) + "-wal")
+
+    assert resolved_wal != typed_wal
+    assert not resolved_wal.exists(), "the case only matters before it exists"
+
+    code = cli.main(
+        ["--database", str(alias), "--json-out", str(resolved_wal)]
+    )
+
+    assert code == cli.EXIT_FAILED
+    assert "sidecar" in capsys.readouterr().err
+    assert not resolved_wal.exists()
+
+
+def test_sidecar_protection_is_not_duplicated_for_an_ordinary_path(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """When nothing is a link, both derivations name the same four paths.
+
+    Deduplicating by resolved identity keeps the refusal message about one
+    collision rather than repeating it, and keeps the typed name -- the one
+    the operator actually wrote -- as the one reported.
+    """
+    _new_archive(connection)
+    connection.close()
+
+    code = cli.main(
+        [
+            "--database",
+            str(database_path),
+            "--json-out",
+            str(database_path) + "-wal",
+        ]
+    )
+    error = capsys.readouterr().err
+
+    assert code == cli.EXIT_FAILED
+    assert error.count("is a database sidecar") == 1
 
 
 def test_the_cli_refuses_to_overwrite_the_pin_manifest(
