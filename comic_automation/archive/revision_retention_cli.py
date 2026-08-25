@@ -179,13 +179,51 @@ def _refuse_colliding_outputs(
     The WAL and SHM sidecars are included. They are not the database file, but
     truncating either one destroys uncommitted state or forces recovery, and
     an operator who typed one of those paths did not mean to.
+
+    Sidecars are derived from **both** the typed path and its fully resolved
+    target, and that is not belt-and-braces. `read_guards` opens the database
+    through `path.resolve(strict=True)`, so when the typed path is a symlink
+    or sits under a junction, SQLite works against the resolved file and puts
+    its WAL and SHM beside *that* -- while a sidecar name built by
+    concatenating onto the typed path names a different, quite possibly
+    nonexistent, file. Protecting only the typed form leaves the real WAL
+    unguarded: it matches neither the typed sidecar nor the database itself,
+    `samefile` cannot help while it does not yet exist, and the writers'
+    SQLite-header check does not recognise a WAL or SHM file either, since
+    neither begins with the database magic. Every layer misses it, so the
+    resolved names are enumerated here.
+
+    The resulting list is deduplicated by resolved identity -- for the
+    ordinary case where nothing is a link, both derivations give the same four
+    paths, and reporting a collision twice helps nobody.
     """
-    sidecars = [database + suffix for suffix in ("-wal", "-shm")]
     protected: list[tuple[str, str]] = [(database, "the database being read")]
-    protected.extend((path, "a database sidecar") for path in sidecars)
+
+    # os.path.realpath rather than Path.resolve: it does not raise on a
+    # missing path, and the database's existence is SQLite's to complain
+    # about, with a better message than this function could give.
+    for base in (database, os.path.realpath(database)):
+        protected.extend(
+            (base + suffix, "a database sidecar")
+            for suffix in ("-wal", "-shm")
+        )
 
     if pins is not None:
         protected.append((pins, "the pin manifest"))
+
+    seen: set[str] = set()
+    deduplicated: list[tuple[str, str]] = []
+
+    for path, description in protected:
+        key = _identity(path)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduplicated.append((path, description))
+
+    protected = deduplicated
 
     for flag, output in (("--json-out", json_out), ("--csv-out", csv_out)):
         if output is None:
