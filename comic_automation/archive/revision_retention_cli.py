@@ -17,21 +17,30 @@ Exit codes
 ----------
 
     0   a plan was produced and reconciled
-    1   the plan could not be produced (unreadable database, bad manifest,
-        a concurrent commit during the read)
-    3   the plan was produced but contains unexplained residue
+    1   the plan could not be produced or written (colliding output paths, an
+        unreadable database, a bad manifest, a concurrent commit during the
+        read, a failed write)
+    3   the plan was produced but did not pass the reconciliation gate
 
-Residue is a failure by default. `unexplained` is the bucket for evidence the
-planner could not interpret, so a plan carrying any is one whose reconciliation
-is incomplete -- and the production gate for this slice is that there is none.
-`--allow-unexplained` downgrades it to a warning for use against development
-databases, and says so in the summary rather than falling silent.
+The gate is three conditions, not one: zero classified residue, zero rows
+carrying evidence the planner could not interpret, and zero archives holding
+no revision row. Residue alone is insufficient, because a current revision
+keeps its `protected` classification even when its archive's evidence is
+unreadable -- and production holds one revision per archive, every one of them
+current, so an unreadable archive there would produce no residue at all.
+`--allow-unexplained` downgrades all three to a warning for development
+databases, and says which fired rather than falling silent.
+
+Output paths are refused before anything is opened when they collide with the
+database, its WAL/SHM sidecars, the pin manifest, or each other. The read-only
+guarantee covers the connection; it does not cover a report writer handed the
+database as its destination.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -40,6 +49,7 @@ from comic_automation.archive.revision_retention import (
     EXECUTION_STATUS,
     PLANNER_VERSION,
     RULE_GRANULARITY,
+    OutputPathError,
     RetentionPolicy,
     load_pin_manifest,
     plan_from_database,
@@ -114,6 +124,94 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _identity(path: str) -> str:
+    """A comparable identity for a path that may not exist yet.
+
+    `realpath` resolves symlinks, junctions and `..` segments; `normcase`
+    folds case and separators, which matters because this repository's
+    library volumes are case-insensitive and `X:/a` and `x:\\a` are one file.
+    Neither requires the path to exist, so an output file can be checked
+    before it is created.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _same_file(left: str, right: str) -> bool:
+    """True when two paths reach the same file.
+
+    Two tests, because neither alone is sufficient. The textual comparison
+    catches paths that do not exist yet, which is the ordinary case for an
+    output file. `os.path.samefile` catches what text cannot: hard links and
+    distinct paths onto the same volume that resolve differently but share an
+    inode or file index. It needs both files to exist, so it only supplements.
+    """
+    if _identity(left) == _identity(right):
+        return True
+
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        # One of them does not exist, or is not stat-able. The textual test
+        # above has already had its say; an unreadable path is not evidence
+        # of sameness.
+        return False
+
+
+def _refuse_colliding_outputs(
+    *,
+    database: str,
+    pins: str | None,
+    json_out: str | None,
+    csv_out: str | None,
+) -> None:
+    """Refuse output paths that would destroy an input, or each other.
+
+    Checked before the database is opened, so a refusal costs nothing and
+    nothing has been written or read.
+
+    This exists because the planner's read-only guarantee stops at the
+    connection. `mode=ro` and `PRAGMA query_only` make it impossible for the
+    *reader* to modify the database, and none of that survives contact with
+    `--json-out <database>`: the guarded read closes, and the report writer
+    truncates the file through an ordinary `write_text`. The read-only claim
+    would still have been true, and the database would still be gone.
+
+    The WAL and SHM sidecars are included. They are not the database file, but
+    truncating either one destroys uncommitted state or forces recovery, and
+    an operator who typed one of those paths did not mean to.
+    """
+    sidecars = [database + suffix for suffix in ("-wal", "-shm")]
+    protected: list[tuple[str, str]] = [(database, "the database being read")]
+    protected.extend((path, "a database sidecar") for path in sidecars)
+
+    if pins is not None:
+        protected.append((pins, "the pin manifest"))
+
+    for flag, output in (("--json-out", json_out), ("--csv-out", csv_out)):
+        if output is None:
+            continue
+
+        for target, description in protected:
+            if _same_file(output, target):
+                raise OutputPathError(
+                    f"{flag}={output!r} is {description} "
+                    f"({os.path.realpath(target)}). Refusing to write a "
+                    "report over an input: the database is read through a "
+                    "read-only connection, but that guarantee does not "
+                    "extend to output paths, and this write would truncate "
+                    "the file the plan describes."
+                )
+
+    if json_out is not None and csv_out is not None:
+        if _same_file(json_out, csv_out):
+            raise OutputPathError(
+                f"--json-out and --csv-out are the same file ({json_out!r}). "
+                "Refusing rather than writing both: the second write would "
+                "silently replace the first, leaving one format and no sign "
+                "that the other was ever requested."
+            )
+
+
 def _print_rules() -> None:
     print("Protection rules and evidence granularity")
     print("-" * 60)
@@ -155,6 +253,16 @@ def print_summary(payload: dict[str, Any]) -> None:
     print(f"    unexplained:       {totals['unexplained']}")
     print("-" * 60)
     print(
+        "Rows carrying uninterpretable evidence: "
+        f"{totals['rows_with_unknown_evidence']} "
+        f"across {totals['archives_with_unknown_evidence']} archive(s)"
+    )
+    print(
+        "Archives with no revision row:          "
+        f"{totals['archives_without_revisions']}"
+    )
+    print("-" * 60)
+    print(
         "Candidates executable under schema 014: "
         f"{totals['candidates_feasible_under_schema_014']}"
     )
@@ -187,10 +295,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.show_rules:
         _print_rules()
 
+    # Output paths are settled before anything is opened or read. A refusal
+    # here costs nothing; discovering the collision after a seven-second read
+    # would mean discovering it with the write already underway.
+    try:
+        _refuse_colliding_outputs(
+            database=args.database,
+            pins=args.pins,
+            json_out=args.json_out,
+            csv_out=args.csv_out,
+        )
+    except OutputPathError as error:
+        print(f"Refusing to run: {error}", file=sys.stderr)
+        return EXIT_FAILED
+
     try:
         policy = RetentionPolicy(keep_previous_generations=args.keep_previous)
+        # None means no manifest was named; an empty list means one was named
+        # and held no pins. The distinction reaches the snapshot digest.
         pin_entries = (
-            load_pin_manifest(args.pins) if args.pins is not None else []
+            None if args.pins is None else load_pin_manifest(args.pins)
         )
         snapshot = plan_from_database(
             args.database,
@@ -213,28 +337,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         **snapshot.report_fields(),
     }
 
-    if args.json_out:
-        payload["json_output"] = str(write_json(plan, args.json_out))
-    if args.csv_out:
-        payload["csv_output"] = str(write_csv(plan, args.csv_out))
+    # Written after the summary is assembled but reported before the gate, so
+    # a write failure is never mistaken for a policy outcome.
+    try:
+        if args.json_out:
+            payload["json_output"] = str(write_json(plan, args.json_out))
+        if args.csv_out:
+            payload["csv_output"] = str(write_csv(plan, args.csv_out))
+    except (OutputPathError, OSError) as error:
+        print_summary(payload)
+        print(f"\nFAILED to write the report: {error}", file=sys.stderr)
+        return EXIT_FAILED
 
     print_summary(payload)
 
-    if plan.totals["unexplained"]:
-        message = (
-            f"{plan.totals['unexplained']} revision(s) could not be "
-            "classified from the available evidence."
-        )
+    failures = plan.gate_failures
+
+    if failures:
+        message = "; ".join(failures)
 
         if args.allow_unexplained:
-            print(f"\nWARNING: {message} Reported as residue, never as "
-                  "prunable. --allow-unexplained suppressed the failure.")
+            print(
+                f"\nWARNING: {message}. Nothing here is reported as prunable "
+                "-- residue and unreadable evidence never become candidates "
+                "-- but the plan is not fully reconciled. "
+                "--allow-unexplained suppressed the failure."
+            )
             return EXIT_OK
 
         print(
-            f"\nFAILED: {message} The production gate for this planner is "
-            "unexplained = 0; residue is never a prune candidate, but a "
-            "plan carrying any is not fully reconciled.",
+            f"\nFAILED: {message}. The production gate for this planner is "
+            "zero residue, zero rows carrying evidence the planner could not "
+            "interpret, and zero archives without a revision row. A current "
+            "revision stays protected even when its archive's evidence is "
+            "unreadable, so residue alone would not have caught this.",
             file=sys.stderr,
         )
         return EXIT_UNEXPLAINED
