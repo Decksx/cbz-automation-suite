@@ -2122,30 +2122,62 @@ def test_the_resolved_sidecar_is_protected_when_the_database_is_a_symlink(
     assert not resolved_wal.exists()
 
 
-def test_sidecar_protection_is_not_duplicated_for_an_ordinary_path(
-    connection, database_path: Path, tmp_path: Path, capsys
+def test_the_protected_input_set_is_deduplicated_by_identity(
+    connection, database_path: Path, tmp_path: Path
 ) -> None:
-    """When nothing is a link, both derivations name the same four paths.
+    """Asserted on the set, because the refusal loop cannot show it.
 
-    Deduplicating by resolved identity keeps the refusal message about one
-    collision rather than repeating it, and keeps the typed name -- the one
-    the operator actually wrote -- as the one reported.
+    `_refuse_colliding_outputs` raises on its first match, so a duplicated
+    entry changes nothing an operator would ever see -- a test driving the CLI
+    passes whether or not the list is deduplicated. The set is therefore
+    returned rather than consumed in place, and checked here directly.
+
+    Three entries for an ordinary path: the database and two sidecars, with
+    the resolved derivation collapsing onto the typed one. Five when the path
+    is a link, because then the two derivations genuinely differ.
     """
     _new_archive(connection)
     connection.close()
 
-    code = cli.main(
-        [
-            "--database",
-            str(database_path),
-            "--json-out",
-            str(database_path) + "-wal",
-        ]
-    )
-    error = capsys.readouterr().err
+    ordinary = cli.protected_inputs(str(database_path))
+    assert len(ordinary) == 3
+    assert len({cli._identity(path) for path, _ in ordinary}) == 3
 
-    assert code == cli.EXIT_FAILED
-    assert error.count("is a database sidecar") == 1
+    # The typed name leads, so a collision is reported as the operator wrote it.
+    assert ordinary[0] == (str(database_path), "the database being read")
+
+    alias = tmp_path / "alias.db"
+
+    try:
+        os.symlink(database_path, alias)
+    except (OSError, NotImplementedError) as error:  # pragma: no cover
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    linked = cli.protected_inputs(str(alias))
+    assert len(linked) == 5
+    assert len({cli._identity(path) for path, _ in linked}) == 5
+
+    resolved_wal = os.path.realpath(alias) + "-wal"
+    assert any(
+        cli._identity(path) == cli._identity(resolved_wal)
+        for path, _ in linked
+    )
+
+
+def test_the_pin_manifest_joins_the_protected_set(
+    connection, database_path: Path, tmp_path: Path
+) -> None:
+    _new_archive(connection)
+    connection.close()
+
+    manifest = tmp_path / "pins.json"
+    manifest.write_text("[]", encoding="utf-8")
+
+    without = cli.protected_inputs(str(database_path))
+    with_pins = cli.protected_inputs(str(database_path), str(manifest))
+
+    assert len(with_pins) == len(without) + 1
+    assert with_pins[-1] == (str(manifest), "the pin manifest")
 
 
 def test_the_cli_refuses_to_overwrite_the_pin_manifest(

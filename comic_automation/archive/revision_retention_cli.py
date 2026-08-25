@@ -157,24 +157,16 @@ def _same_file(left: str, right: str) -> bool:
         return False
 
 
-def _refuse_colliding_outputs(
-    *,
-    database: str,
-    pins: str | None,
-    json_out: str | None,
-    csv_out: str | None,
-) -> None:
-    """Refuse output paths that would destroy an input, or each other.
+def protected_inputs(
+    database: str, pins: str | None = None
+) -> list[tuple[str, str]]:
+    """Every path an output must not collide with, and what each one is.
 
-    Checked before the database is opened, so a refusal costs nothing and
-    nothing has been written or read.
-
-    This exists because the planner's read-only guarantee stops at the
-    connection. `mode=ro` and `PRAGMA query_only` make it impossible for the
-    *reader* to modify the database, and none of that survives contact with
-    `--json-out <database>`: the guarded read closes, and the report writer
-    truncates the file through an ordinary `write_text`. The read-only claim
-    would still have been true, and the database would still be gone.
+    Deduplicated by resolved identity, and returned rather than consumed in
+    place so the set itself is inspectable. `_refuse_colliding_outputs` raises
+    on its first match, which means a duplicated entry has no observable
+    effect there -- the deduplication is only checkable by looking at the list,
+    so the list is something you can look at.
 
     The WAL and SHM sidecars are included. They are not the database file, but
     truncating either one destroys uncommitted state or forces recovery, and
@@ -193,9 +185,8 @@ def _refuse_colliding_outputs(
     neither begins with the database magic. Every layer misses it, so the
     resolved names are enumerated here.
 
-    The resulting list is deduplicated by resolved identity -- for the
-    ordinary case where nothing is a link, both derivations give the same four
-    paths, and reporting a collision twice helps nobody.
+    For an ordinary path the two derivations name the same files and collapse
+    to three entries; only a link makes them five.
     """
     protected: list[tuple[str, str]] = [(database, "the database being read")]
 
@@ -220,10 +211,36 @@ def _refuse_colliding_outputs(
         if key in seen:
             continue
 
+        # First occurrence wins, which is why the typed database leads the
+        # list: a collision is reported under the name the operator wrote.
         seen.add(key)
         deduplicated.append((path, description))
 
-    protected = deduplicated
+    return deduplicated
+
+
+def _refuse_colliding_outputs(
+    *,
+    database: str,
+    pins: str | None,
+    json_out: str | None,
+    csv_out: str | None,
+) -> None:
+    """Refuse output paths that would destroy an input, or each other.
+
+    Checked before the database is opened, so a refusal costs nothing and
+    nothing has been written or read.
+
+    This exists because the planner's read-only guarantee stops at the
+    connection. `mode=ro` and `PRAGMA query_only` make it impossible for the
+    *reader* to modify the database, and none of that survives contact with
+    `--json-out <database>`: the guarded read closes, and the report writer
+    truncates the file through an ordinary `write_text`. The read-only claim
+    would still have been true, and the database would still be gone.
+
+    What counts as an input is `protected_inputs`.
+    """
+    protected = protected_inputs(database, pins)
 
     for flag, output in (("--json-out", json_out), ("--csv-out", csv_out)):
         if output is None:
