@@ -1752,19 +1752,23 @@ def test_the_retention_window_cannot_cross_archive_identity(
     own window does not, which is the only position where a crossed walk is
     visible in the output.
 
-    A also holds generations above the ordinal it strays into, so a
-    `newer_than_current` decision made against a foreign ordinal would show up
-    here too.
+    A also holds a generation at a *higher* ordinal than the one it strays
+    into. That is what exercises the second ownership check: `newer_than_current`
+    compares ordinals, and an ordinal borrowed from a foreign revision would
+    have A's own generations judged against B's numbering.
     """
     archive_a = _new_archive(connection)
     archive_b = _new_archive(connection)
 
-    # B: provisional origin + three generations, pointer at the tip.
+    # B: provisional origin + three generations (ordinals 1-4), pointer at
+    # the tip.
     oldest_b = _generation(connection, archive_b, SHA_A)
     middle_b = _generation(connection, archive_b, SHA_B)
     tip_b = _generation(connection, archive_b, SHA_C)
 
-    # A: provisional origin + two generations of its own.
+    # A: provisional origin + three generations of its own, so A reaches
+    # ordinal 4 while straying into B's ordinal 3.
+    _generation(connection, archive_a, SHA_A)
     _generation(connection, archive_a, SHA_B)
     _generation(connection, archive_a, SHA_C)
 
