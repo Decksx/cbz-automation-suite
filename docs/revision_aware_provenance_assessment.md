@@ -288,7 +288,7 @@ breaking the producers or shipping code that does nothing.
 | `archive_content_signatures` | `archive/page_hashing.py`, `database/dal.py` | digest over page content | **yes** | `source_revision_id` |
 | `archive_pages` | `archive/page_hashing.py` | entries of the archive as read | **yes** | `source_revision_id` |
 | `near_duplicate_candidates` | `archive/near_duplicate.py` | comparison of two page sets | **yes, pairwise** | `revision_a_id` + `revision_b_id` |
-| `archive_quarantine` | `archive/quarantine.py` | a specific failed read | **yes** | `source_revision_id` (NULL for all 35 today — §7.3) |
+| `archive_quarantine` | `archive/quarantine.py` | a specific failed read | **no, by decision** | none — §5.1 |
 | `page_hashes` | `archive/page_hashing.py`, `archive/perceptual_hashing.py` | hash of one page's bytes | **inherited** | none — reaches the revision through `archive_pages.page_id` |
 | `jobs` | `jobs/queue.py` | scheduled work against an identity | **no** | none — §8.6 |
 | `file_locations` | `library/repository.py`, `library/relocation_repair.py` | where an identity lives | **no** | none; the revision-at-a-location fact is `archive_revision_observations` |
@@ -299,14 +299,26 @@ breaking the producers or shipping code that does nothing.
 | `processing_items` | run infrastructure | run bookkeeping | **no** | none |
 | `archive_revision_observations` | `database/dal.py` | a sighting of a revision | already revision-keyed | — |
 
-**Six tables gain an ownership key** — `archive_inspections`,
-`archive_hashes`, `archive_content_signatures`, `archive_pages`,
-`archive_quarantine`, and `near_duplicate_candidates` (two keys). All six are
-in slice 3; an earlier draft named six but omitted `archive_hashes` from the
-slice, which is corrected here. Its possible retirement (§9.7) is a separate
-question, and §8.2 gives it a new load-bearing role in the meantime.
+**Five tables gain an ownership key** — `archive_inspections`,
+`archive_hashes`, `archive_content_signatures`, `archive_pages`, and
+`near_duplicate_candidates` (two keys). `archive_hashes` is included in the
+schema slice, not merely named; §9.7 records the decision to retain it
+throughout Step 4.
 
-Eight tables are identity-scoped and correctly key on `archive_id` today.
+### 5.1 Quarantine stays identity-scoped
+
+An earlier draft made `archive_quarantine` a sixth receiving table with a
+column that would have been NULL for every row that exists and every row any
+current producer could write. A quarantine records that bytes **could not be
+read**; no digest is obtained, so nothing can bind it, and a guaranteed-NULL
+ownership column adds no provenance while implying one is available.
+
+It therefore keeps `archive_id` alone. What would reverse this: a producer that
+hashes the quarantined file itself and mints a revision for the corrupt byte
+state. No such producer exists or is planned, and inventing the column ahead of
+it would be building for an anticipated need the roadmap explicitly defers.
+
+Nine tables are identity-scoped and correctly key on `archive_id` today.
 `page_hashes` inherits through its parent and must **not** gain its own column:
 8,821,073 rows with a redundant key that could disagree with `archive_pages` is
 a contradiction waiting to be written.
@@ -358,7 +370,7 @@ own slice.
 ### 6.3 Run provenance: historical backfill deferred, future rows are not
 
 `processing_runs` and `processing_stages` both hold **0 rows**. That is a
-sufficient reason why the **3,135,945 historical rows** cannot be given a
+sufficient reason why the **3,135,910 historical rows** cannot be given a
 `processing_run_id`: there is no run to point at, and inventing one would
 manufacture provenance rather than record it.
 
@@ -396,9 +408,16 @@ with the uniqueness move and not before.
 ### 7.1 Bases
 
 ```text
-measured                     -- the producer established identity for the bytes
-                                it read, and bound the row in the transaction
-                                that recorded it
+measured                     -- the producer computed a content DIGEST for the
+                                bytes it read and bound the row on that digest,
+                                in the transaction that recorded it. Only the
+                                archive hasher can reach this today.
+stat_matched_revision        -- the producer measured bytes but computed no
+                                archive digest, and bound through the unique
+                                revision-bound hash row whose size and mtime
+                                equal the stat it captured. A stat match is not
+                                digest equality, so this basis is CONSERVATIVE
+                                and is consumed as proxy (§8.3).
 migration_014_identity_seed  -- this row created the revision's archive_sha256,
                                 which IS its immutable byte identity.
                                 archive_hashes only.
@@ -413,8 +432,9 @@ unresolved_drift             -- the row describes bytes no revision holds
 unresolved_no_identity       -- no digest was ever obtained for these bytes
 ```
 
-`measured` is **0** for every historical row: nothing in this backfill
-re-measures anything.
+`measured` and `stat_matched_revision` are both **0** for every historical
+row: nothing in this backfill measures or re-reads anything. They exist for
+producers, not for the backfill.
 
 The split between the two seed bases is the subject of §4.1 and is not
 cosmetic. An identity seed may be consumed as revision-granular evidence; a
@@ -428,21 +448,25 @@ field seed may not.
 | `archive_content_signatures` | 0 | 58,421 | 0 | 16 `drift` | 58,437 |
 | `archive_inspections` | 0 | 0 | 59,541 | 0 | 59,541 |
 | `archive_pages` | 0 | 0 | 2,954,623 | 768 `drift` | 2,955,391 |
-| `archive_quarantine` | 0 | 0 | 0 | 35 `no_identity` | 35 |
 | `near_duplicate_candidates` | 0 | 0 | 3,000 per side | 0 | 3,000 |
-| **total rows receiving a basis** | | | | | **3,135,945** |
+| **total rows receiving a basis** | | | | | **3,135,910** |
+
+`archive_quarantine`'s 35 rows are no longer in this table: it keeps
+`archive_id` alone (§5.1), which removes 35 from the earlier total of
+3,135,945.
 
 `page_hashes` receives no column; the 768 rows under drifted pages are reached
 through their parent and inherit its unresolved state.
 
 ### 7.3 Corrections to earlier drafts
 
-**All 35 quarantine rows are unresolved, not 34.** Every row is
-`failure_category = 'corrupt_archive'`, meaning the bytes could not be read. One
-of the 35 archives does carry an `archive_hashes` row, but that hash proves only
-that *some* bytes were once hashed — the quarantine record carries no digest and
-no stat tying its failed read to those bytes. A hash elsewhere on the archive is
-not evidence about this row.
+**Quarantine receives no ownership column at all.** Every row is
+`failure_category = 'corrupt_archive'`, meaning the bytes could not be read, so
+no digest was ever obtained. One of the 35 archives does carry an
+`archive_hashes` row, but that hash proves only that *some* bytes were once
+hashed; the quarantine record carries no digest and no stat tying its failed
+read to those bytes. Since every row would be permanently NULL, the column is
+not added — see §5.1.
 
 **The 147 provisional archives are a census gate, not a row classification.**
 Their only evidence is job rows, and jobs are excluded from provenance (§8.6),
@@ -496,13 +520,17 @@ another writer may have moved.
 | producer | writes | ownership path | first-write state |
 | --- | --- | --- | --- |
 | archive hashing | `archive_hashes` | **direct**: its own digest keys `record_or_reuse`; bind to the returned revision | `measured` |
-| page hashing | `archive_pages`, `page_hashes`, `archive_content_signatures` | **stat-matched**: it captures `source_file_size` / `source_modified_time_ns` for the file it read, and binds to the revision of the `archive_hashes` row whose `(file_size, modified_time_ns)` equal them | `measured` on match, else `unresolved_no_identity` |
-| inspection | `archive_inspections` | **initially unresolved, bound later**: an inspection has `inspected_file_size` / `inspected_modified_time_ns` but no digest, and normally runs *before* hashing, so at first write no revision may exist to bind to | `unresolved_no_identity`, then bound by the same stat match once a revision-bound hash exists |
+| page hashing | `archive_pages`, `page_hashes`, `archive_content_signatures` | **stat-matched**: it captures `source_file_size` / `source_modified_time_ns` for the file it read, and binds through the **unique** revision-bound `archive_hashes` row whose `(file_size, modified_time_ns)` equal them (§8.3) | `stat_matched_revision` on a single match, else `unresolved_no_identity` |
+| inspection | `archive_inspections` | **initially unresolved, bound later**: an inspection has `inspected_file_size` / `inspected_modified_time_ns` but no digest, and normally runs *before* hashing, so at first write no revision may exist to bind to | `unresolved_no_identity`, then `stat_matched_revision` once a single revision-bound hash matches |
 | near-duplicate | `near_duplicate_candidates` | **inherited per side**: each side takes the revision of the page evidence it compared | per side: inherited from the page rows, or unresolved if that side is |
-| quarantine | `archive_quarantine` | **unresolved**: the bytes could not be read, so no identity was ever obtained | `unresolved_no_identity` |
+| quarantine | `archive_quarantine` | **none** — identity-scoped by decision (§5.1); no ownership column exists to write | n/a |
 
-Only the first path can claim ownership from its own measurement. The others
-derive it, which is why the basis vocabulary distinguishes them.
+Only the first path establishes ownership from a digest it computed itself.
+The next two derive it from a stat, the fourth inherits it, and the fifth has
+no column at all — which is why the basis vocabulary distinguishes them
+rather than calling all of them `measured`. An earlier draft did call the
+stat-matched paths `measured` while stating two paragraphs later that a stat
+match is not digest equality; the two cannot both be true.
 
 ### 8.3 Why the stat match is sound, and where it stops
 
@@ -517,12 +545,33 @@ acs.source_modified_time_ns = fl.modified_time_ns`), so the technique is
 established here rather than introduced.
 
 It stops being sound in one direction that must be stated: a size-and-mtime
-match is not a proof of byte equality, only of an unchanged stat. That is why a
-stat-matched binding is `measured` for the *pairing* — the producer did measure
-the bytes it read — but the strength of the link to the hash's revision is a
-stat, not a digest. A later slice may harden this by having page hashing carry
-the archive digest forward from the job that computed it; that is not proposed
-here.
+match is not a proof of byte equality, only of an unchanged stat. Two byte
+states of one archive can share a size and an mtime — a size-preserving
+rewrite followed by a restored mtime is the obvious construction, and §4.2
+already measures 16 archives whose bytes changed under a stat the rest of the
+system treated as stable.
+
+Three consequences, all of them requirements rather than caveats:
+
+**The match must be unique.** The lookup binds only when **exactly one**
+revision-bound `archive_hashes` row for that archive has the captured size and
+mtime. Zero matches leaves the evidence `unresolved_no_identity`. *Two or more*
+matches also leaves it unresolved — once an archive has several revisions,
+two different digests sharing a stat is no longer hypothetical, and picking
+either one would be a coin flip recorded as a fact.
+
+**It gets its own basis.** `stat_matched_revision`, not `measured`. Its planner
+granularity is conservative (§10): a stat-matched row is proxy evidence, not
+revision-granular, until a producer carries a digest.
+
+**It is revalidated before COMMIT.** The location identity and the captured
+stat are re-checked immediately before COMMIT, exactly as the archive hasher
+does, so a file replaced between the match and the write cannot leave evidence
+bound to a revision it never described.
+
+The way to promote this basis later is to have page hashing carry the archive
+digest forward from the job that computed it, making the binding an identity
+match rather than a stat match. That is not proposed here.
 
 ### 8.4 The later-binding step for inspections
 
@@ -641,19 +690,26 @@ archive_content_signatures
     bound       (source_revision_id, algorithm, algorithm_version)
     unresolved  (archive_id, algorithm, algorithm_version)
 
-archive_pages
-    bound       (source_revision_id, page_index)
-    unresolved  (archive_id, page_index)
+archive_pages          -- NO active predicate; see below
+    bound       (source_revision_id, page_index)  WHERE bound
+    unresolved  (archive_id, page_index)          WHERE unresolved
 
-archive_quarantine
-    unresolved  (archive_id)                      -- all 35 rows today
-
-page_hashes
-    (page_id, algorithm, algorithm_version) WHERE active   -- unchanged shape
+page_hashes            -- NO active predicate; see below
+    (page_id, algorithm, algorithm_version)       -- unchanged shape
 ```
 
 where *bound* is `source_revision_id IS NOT NULL`, *unresolved* is
 `source_revision_id IS NULL`, and *active* is `superseded_at IS NULL`.
+
+`archive_quarantine` has no entry: it keeps `archive_id UNIQUE` unchanged,
+because it gains no ownership column (§5.1).
+
+**`archive_pages` and `page_hashes` deliberately carry no `WHERE active`
+predicate.** Page supersession is excluded from the schema slice pending the
+inventory-parent design (§9.5), so those two tables have no active/superseded
+state for a predicate to test — an earlier draft wrote `WHERE active` for
+them anyway, against columns that will not exist. Their interim indexes omit
+it, and the predicate is added by the inventory design, not before it.
 
 The unresolved keys are deliberately archive-scoped: an unresolved row cannot be
 distinguished by revision, so the conservative cap is one per archive per
@@ -663,53 +719,129 @@ loosening it while the bound population grows.
 `near_duplicate_candidates` uniqueness is defined in §9.6 and changes in
 **slice 5, not slice 4** — an earlier draft listed it in both.
 
-### 9.4 Supersession: what causes it, and what does not
+### 9.4 Supersession: a rerun is not automatically a replacement
 
-This is the part an earlier draft left incoherent, and the two errors point in
-opposite directions.
+Two earlier drafts were wrong here in opposite directions. The first let a new
+revision supersede older evidence; the second said any rerun supersedes. Both
+are too loose, and the missing distinction is what the *result* was.
 
-**A newer revision does not supersede older evidence.** An inspection of
-revision 1 remains a true and current statement about revision 1 for as long as
-revision 1 exists. Revision 2 appearing says nothing about it. Marking it
-superseded would destroy the per-revision history the whole step exists to
-create.
+**A newer revision never supersedes older evidence.** An inspection of revision
+1 remains a true and current statement about revision 1 for as long as revision
+1 exists. Revision 2 appearing says nothing about it. Marking it superseded
+would destroy the per-revision history the whole step exists to create.
 
-**Re-running the same method against the same revision does supersede.** If the
-page hasher runs `sha256 v1` twice over revision 7 and produces a second result,
-the two rows describe the same method over the same bytes: one of them is the
-current statement and the other is history. That, and only that, is supersession.
-
-So:
+**A rerun has three outcomes, and only one of them supersedes.** Let *evidence
+identity* be `(source_revision_id, algorithm, algorithm_version, parameters)`:
 
 ```text
-supersede when   (source_revision_id, method, version, parameters) collide
-                 and a new row is written
-never when       a new revision is created
-never when       a different method or version runs over the same revision --
-                 dhash v1 and phash v1 over revision 7 are both active
+same identity, byte-identical result
+    -> idempotent reuse. No new row, nothing superseded. The rerun may record
+       a processing run or an observation, which is where "it ran again" is
+       written down.
+
+same identity, DIFFERENT result
+    -> a contradiction: the same method over the same bytes produced two
+       answers. Either the method is nondeterministic, or something is wrong.
+       This may supersede, but only as an EXPLICIT replacement carrying a
+       reason -- it is not a routine outcome and must not be recorded as one.
+
+different identity (different revision, algorithm, version or parameters)
+    -> independent active evidence. dhash v1 and phash v1 over revision 7 are
+       both active, and so are sha256 v1 over revision 7 and over revision 8.
 ```
 
-Constraints on the pair:
+That is why supersession needs a reason column of its own:
 
 ```text
-CHECK ((superseded_at IS NULL) = (superseded_by_id IS NULL))   -- paired
-CHECK (superseded_by_id <> id)                                 -- no self-ref
-FOREIGN KEY (superseded_by_id) REFERENCES <same table>(id)     -- exists
-successor is in the same archive                               -- composite FK
-successor describes the same revision                          -- else it is
-                                                                  not a
-                                                                  replacement
-successor is active, or itself superseded by something newer   -- no chains
-                                                                  into a dead
-                                                                  end
+superseded_at      TEXT
+superseded_by_id   INTEGER
+superseded_reason  TEXT      -- non-blank, same trim() form as migration 012/013
 ```
 
-The "same revision" constraint is what makes the model coherent: a superseding
-row is a *replacement measurement of the same bytes*, not a later measurement of
-different bytes. Different bytes are a different revision and a different row,
-and both stay active.
+An automatic supersession with no stated reason is indistinguishable from a
+bug that wrote the same evidence twice.
 
-### 9.5 Page inventories probably need a batch parent — flagged, not settled
+#### 9.4.1 The write order is not obvious, and prose will not fix it
+
+The active partial unique key and the paired `superseded_by_id` conflict with
+each other under a naive write order:
+
+```text
+insert the successor first    -> it is active, and so is the predecessor, so
+                                 both sit in the active partial unique index:
+                                 constraint violation.
+supersede the predecessor
+first                         -> superseded_by_id must name a row that has not
+                                 been inserted yet: foreign-key violation.
+```
+
+The concrete pattern, which works because SQLite checks a **deferred** foreign
+key at COMMIT and an index immediately:
+
+```text
+1. preallocate the successor's rowid
+       SELECT IFNULL(MAX(id), 0) + 1 FROM <table>
+2. UPDATE the predecessor
+       SET superseded_at = <now>,
+           superseded_by_id = <preallocated>,
+           superseded_reason = <reason>
+   -- it leaves the active partial index at this point, and the dangling
+   -- superseded_by_id is legal because the self-FK is deferred
+3. INSERT the successor with that explicit id
+       -- the active index now has room; the deferred FK resolves
+4. COMMIT -- the deferred FK is checked here and succeeds
+```
+
+```text
+FOREIGN KEY (superseded_by_id) REFERENCES <same table>(id)
+    DEFERRABLE INITIALLY DEFERRED
+```
+
+Migration 014 already uses `DEFERRABLE INITIALLY DEFERRED` for its lineage key,
+so this is an established pattern in this schema rather than a new one. The
+whole sequence runs in one DAL-owned transaction; a rollback leaves neither row
+changed.
+
+#### 9.4.2 Cycles and dead ends need an enforcer, not a sentence
+
+An earlier draft listed "no chains into a dead end" as prose, which enforces
+nothing. Two mechanisms, both concrete:
+
+```text
+CHECK ((superseded_at IS NULL) = (superseded_by_id IS NULL))
+CHECK ((superseded_at IS NULL) = (superseded_reason IS NULL))
+CHECK (superseded_by_id IS NULL OR superseded_by_id > id)
+```
+
+The third does the real work. Rowids are allocated monotonically and the
+preallocation above preserves that, so requiring the successor's id to be
+**greater** makes a cycle impossible by construction and makes every chain
+finite and forward-ordered — no trigger walk, no recursive CTE, one CHECK.
+A chain must therefore terminate, and it can only terminate at a row with a
+NULL `superseded_by_id`, which is an active row. Dead ends are excluded by the
+same constraint that excludes cycles.
+
+What a CHECK cannot express, because it reads another row, is that the
+successor describes the *same* revision and the *same* evidence identity. That
+is a `BEFORE UPDATE` trigger, in the shape migration 014 already uses for
+`trg_archive_revisions_lineage_is_sequential`:
+
+```text
+trg_<table>_supersession_same_identity
+    BEFORE UPDATE OF superseded_by_id
+    WHEN NEW.superseded_by_id IS NOT NULL
+     AND NOT EXISTS (successor with the same archive_id,
+                     the same source_revision_id,
+                     and the same algorithm/version/parameters)
+    -> RAISE(ABORT, ...)
+```
+
+The "same revision, same identity" rule is what makes the model coherent: a
+superseding row is a *replacement measurement of the same bytes by the same
+method*, not a later measurement of anything else. Anything else is independent
+active evidence.
+
+### 9.5 Page inventories take a batch parent, and its design gates the schema
 
 Per-page supersession is very likely the wrong granularity for `archive_pages`.
 A re-extraction replaces an entire inventory, not individual pages; page counts
@@ -722,10 +854,18 @@ revision, extraction), carrying the supersession state, with `archive_pages` as
 its children. That is a larger structural change than the rest of slice 4 and
 touches the biggest table in the database.
 
-**Recorded as an open design question, not a proposal.** It needs its own
-round. Slice 4 should not attempt page supersession until it is settled; the
-alternative is that `archive_pages` keeps append-with-partial-uniqueness and
-gains supersession later, which is why the slice table below marks it explicitly.
+**Decided by the lead: this direction is accepted, and its design is a
+required pre-schema gate.** It is not a conditional slice after the migration.
+
+The reason is the cost of getting the order wrong. The inventory parent
+determines where page ownership, idempotency and supersession live — if it
+lands after a migration has already added `source_revision_id` to
+`archive_pages`, the 2,955,391-row table is rebuilt twice. Deciding first costs
+a design round; deciding second costs the largest table in the database twice
+over.
+
+It therefore becomes **slice 3**, before any schema change, and the migration
+slices renumber behind it.
 
 ### 9.6 `near_duplicate_candidates`: parameters must be in the key
 
@@ -747,18 +887,44 @@ Two ways to close it, and the recommendation is the first:
    failure mode is silent collision — exactly the class of error the roadmap's
    "algorithm versions cannot be silently mixed" criterion is aimed at.
 
-Proposed active key:
+Putting `parameters_digest` in the key reopens the NULL hole it was added to
+close: the 3,000 historical rows have no recorded parameters, so a NULL digest
+would make every one of them distinct from every other and permit duplicates
+under the very key meant to prevent them. **Four** partial indexes, split on
+whether parameters are known:
 
 ```text
-bound       (revision_a_id, revision_b_id, match_algorithm,
-             match_algorithm_version, parameters_digest)  WHERE bound AND active
-unresolved  (archive_a_id, archive_b_id, match_algorithm,
-             match_algorithm_version, parameters_digest)  WHERE unresolved AND active
+bound, parameters known
+    (revision_a_id, revision_b_id, match_algorithm,
+     match_algorithm_version, parameters_digest)
+    WHERE bound AND active AND parameters_digest IS NOT NULL
+
+bound, parameters unknown
+    (revision_a_id, revision_b_id, match_algorithm, match_algorithm_version)
+    WHERE bound AND active AND parameters_digest IS NULL
+
+unresolved, parameters known
+    (archive_a_id, archive_b_id, match_algorithm,
+     match_algorithm_version, parameters_digest)
+    WHERE unresolved AND active AND parameters_digest IS NOT NULL
+
+unresolved, parameters unknown
+    (archive_a_id, archive_b_id, match_algorithm, match_algorithm_version)
+    WHERE unresolved AND active AND parameters_digest IS NULL
 ```
 
-The existing 3,000 rows carry `ordered_perceptual_v1` with no recorded
-parameters. They are backfilled with the algorithm and version split out of the
-method string and a NULL `parameters_json` explained by a basis, not invented.
+The unknown-parameter keys are deliberately narrower, which makes them
+*stricter*: two legacy rows for the same pair and version collide and one must
+be resolved, rather than both surviving because their NULLs differ.
+
+The considered alternative was a non-NULL sentinel digest for legacy rows
+(`'unknown-legacy'` under a CHECK). It needs one index instead of four, but it
+asserts that all 3,000 rows shared one parameter set, which is not known to be
+true. The partial-index form declines to assert it.
+
+The existing 3,000 rows are backfilled with the algorithm and version split out
+of the method string and a NULL `parameters_json` explained by a basis, not
+invented.
 
 ### 9.7 `archive_hashes` after Step 4
 
@@ -767,12 +933,15 @@ construction, the revision's digest, plus the stat of the read that produced
 it — and that stat belongs in `archive_revision_observations`, which currently
 holds zero rows.
 
-Retiring it is **flagged, not proposed**, and is not folded into any slice. It
-does gain an ownership key in slice 3 like the other five, and §8.2 gives it a
-new load-bearing role in the meantime: it is the table page hashing and
-inspection bind *through*. That role is an argument against retiring it soon,
-and is recorded here so the question is decided on current facts rather than on
-this document's earlier framing.
+**Decided by the lead: `archive_hashes` is retained throughout Step 4.** It is
+now the binding anchor other producers reach through — §8.2 has page
+hashing and inspection resolve their revision via its rows — so retiring it
+would remove the only immutable identity source those consumers have.
+
+Retirement is not to be reconsidered until those consumers have another such
+source, which in practice means the digest-carrying producer change described
+at the end of §8.3. It gains an ownership key with the other four tables and is
+otherwise left alone.
 
 ### 9.8 Reconciliation invariants a backfill must satisfy
 
@@ -799,26 +968,32 @@ revision-granular.
 | `active_or_recoverable_job` | `jobs` | **permanently proxy** — jobs are identity-scoped by design (§8.6) and gain no key |
 | `unresolved_failure` | `jobs` | **permanently proxy**, same reason |
 | `open_review_work` | `near_duplicate_candidates` | **can become revision-granular**, per side, once slice 5 lands and only for bound sides |
-| `quarantine_or_resolution` | `archive_quarantine` **and** `archive_disposition_events` | **must be split** — see below |
+| `quarantine_or_resolution` | `archive_quarantine` **and** `archive_disposition_events` | **must be split**, and both halves stay proxy — §5.1 leaves quarantine identity-scoped, so neither half can ever be revision-granular |
 
 `quarantine_or_resolution` folds two different things into one reason: a
-quarantine row, which is revision-scoped and could be bound, and a disposition
-event, which is a decision about an identity and never will be. It should be
-split into `quarantine` and `disposition_history` so each rule has one meaning
-again. Modelling a hybrid rule is the wrong fix.
+quarantine row and a disposition event. They should still be split into
+`quarantine` and `disposition_history` so each rule has one meaning — but note
+that after §5.1 *neither* becomes revision-granular, because quarantine keeps
+`archive_id` alone. The split is for clarity, not for capability.
 
-Even after splitting, granularity is not a property of the rule alone. A
-`quarantine` reason is revision-granular when the row that fired it is bound and
-proxy when it is unresolved — and today all 35 are unresolved. The planner's
-`RULE_GRANULARITY` constant cannot express that, so it should become
-`RULE_MAX_GRANULARITY` — what the rule *could* achieve — with the actual
-granularity resolved per evidence row from that row's `provenance_basis`. The
-row-level "weakest wins" rule in `_evidence_granularity` is unchanged and
-already correct.
+Granularity is still not a property of the rule alone: `open_review_work` is
+revision-granular when the near-duplicate side that fired it is bound and proxy
+when it is not. The planner's `RULE_GRANULARITY` constant cannot express that,
+so it should become `RULE_MAX_GRANULARITY` — what the rule *could* achieve —
+with the actual granularity resolved per evidence row from that row's
+`provenance_basis`. The row-level "weakest wins" rule in
+`_evidence_granularity` is unchanged and already correct.
 
-One basis needs naming in that resolution: **`migration_014_field_seed` resolves
-to proxy**, never to revision granularity (§4.1). It is a causal record of what
-014 copied, not a statement that the row describes the revision's bytes.
+Two bases need naming in that resolution, and both resolve to **proxy**:
+
+- **`migration_014_field_seed`** (§4.1) is a causal record of what 014 copied,
+  not a statement that the row describes the revision's bytes.
+- **`stat_matched_revision`** (§8.3) is a size-and-mtime agreement, not a
+  digest match. It becomes eligible for revision granularity only when a
+  producer carries the archive digest into the binding.
+
+Only `measured`, `migration_014_identity_seed` and a future digest-carrying
+binding may resolve to revision granularity.
 
 Also affected: `perceptual_coverage_audit` (per-archive denominators;
 per-revision changes what "covered" means and needs its own decision),
@@ -836,19 +1011,22 @@ and must stay that way.
 | # | slice | gate |
 | --- | --- | --- |
 | **1** | *this document* | lead accepts the matrix, the census, the requirement coverage, the producer paths and the invariants |
-| **2** | read-only **backfill planner**: classify every evidence row into the six bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 exactly, totalling 3,135,945; `measured` is 0; identity seed is 59,541 and field seed 58,421; the 16 and their 768 pages are `unresolved_drift`; all 35 quarantine rows are `unresolved_no_identity`; the 147 provisional archives reported as an archive-level gate |
-| **3** | migration: ownership keys + **nullable** `provenance_basis` on all six tables, backfilling exactly what slice 2 planned. **Uniqueness unchanged.** Producers write a basis on the path they already take, plus an interim guard that **refuses** to overwrite a row bound to a different revision | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; recovery is restore-from-backup |
-| **4** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, supersession per §9.4, `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed. **Excludes `near_duplicate_candidates`. Excludes `archive_pages` supersession** pending §9.5 | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows; a second generation's evidence demonstrably coexists with the first; re-running a method against the same revision supersedes, creating a new revision does not |
-| **4a** | *(conditional)* page-inventory parent per §9.5, if the lead accepts that shape | own design round; not started before 4 merges |
-| **5** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, **begin writing `processing_runs`** and carry `processing_run_id`, move uniqueness per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at the same version cannot collide; new rows carry a run; the 3,000 historical rows carry NULL parameters and NULL run with an explaining basis |
-| **6** | planner: split `quarantine_or_resolution`, introduce `RULE_MAX_GRANULARITY`, resolve granularity per evidence row | see §11.2 |
+| **2** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 exactly, totalling **3,135,910**; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 and their 768 pages are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table |
+| **3** | **page-inventory design** (§9.5). Design only, no schema. Where page ownership, idempotency and supersession live | lead accepts the parent's shape and the migration path for 2,955,391 rows. **This gates every schema slice below** — deciding it after a migration means rebuilding the page table twice |
+| **4** | migration: ownership keys + **nullable** `provenance_basis` on the five receiving tables, backfilling exactly what slice 2 planned. **Uniqueness unchanged.** Producers write a basis on the path they already take, plus an interim guard that **refuses** to overwrite a row bound to a different revision | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; recovery is restore-from-backup |
+| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, supersession per §9.4 including the deferred self-FK and preallocated-id write order, `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed. Page tables adopt whatever slice 3 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible |
+| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, **begin writing `processing_runs`** and carry `processing_run_id`, four partial indexes per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run |
+| **7** | planner: split `quarantine_or_resolution`, introduce `RULE_MAX_GRANULARITY`, resolve granularity per evidence row | see §11.2 |
 
-Interim state after slice 3, stated plainly: attribution improves, retention
+Slice 3 moved ahead of the schema on the lead's decision (§9.5). Slice 4 was
+previously slice 3, and there is no longer a conditional 4a.
+
+Interim state after slice 4, stated plainly: attribution improves, retention
 does not. The interim guard is what keeps that window safe — an overwrite that
 would have silently discarded another revision's evidence becomes a failed job
-instead. Slice 4 removes the guard by removing the need for it.
+instead. Slice 5 removes the guard by removing the need for it.
 
-Slices 3, 4, 4a and 5 each touch production and each need the guarded-operation
+Slices 4, 5 and 6 each touch production and each need the guarded-operation
 sequence: dry run, protected backup, expected count plus snapshot digest, report
 before act, postflight reconciliation.
 
@@ -883,7 +1061,7 @@ rows the plan marked unresolved carry NULL and the planned reason
 
 ### 11.2 The planner gate for slice 6, respecified
 
-Slice 6 renames reasons — `quarantine_or_resolution` becomes `quarantine` and
+Slice 7 renames reasons — `quarantine_or_resolution` becomes `quarantine` and
 `disposition_history` — so it **cannot** reconcile byte-for-byte against slice
 2's output, and the plan digest is expected to change. Requiring otherwise would
 be requiring the split not to have happened.
@@ -911,13 +1089,21 @@ the reviewable artifact.
 
 ---
 
-## 12. Deliberate non-decisions, recorded
+## 12. Decisions and deliberate non-decisions
 
-- **`archive_hashes` retirement** (§9.7) is flagged, not proposed — and §8.2
-  gives it a new role as the table other producers bind through, which is an
-  argument against retiring it soon.
-- **Page-inventory supersession** (§9.5) is an open design question with a
-  recommended shape, not a proposal. Slice 4 excludes it.
+### 12.1 Decisions taken by the lead
+
+- **`archive_hashes` is retained throughout Step 4** (§9.7). It is the binding
+  anchor other producers reach through, and retirement is not reconsidered
+  until those consumers have another immutable identity source.
+- **The `page_inventory` parent direction is accepted, and its design is a
+  required pre-schema gate** (§9.5), now slice 3. Deciding it after a migration
+  would rebuild the 2,955,391-row page table twice.
+- **Quarantine stays identity-scoped** (§5.1), reducing the receiving tables
+  from six to five and the backfill population from 3,135,945 to 3,135,910. A
+  guaranteed-NULL ownership column adds no provenance.
+
+### 12.2 Deliberate non-decisions
 - **The 16 drift archives are not remediated here.** Resolving them needs a
   revision for the earlier generation, which belongs to a later, separately
   reviewed migration and remediation design.
@@ -928,9 +1114,10 @@ the reviewable artifact.
 - **`parameters_json` for `page_hashes` is deferred.** Version 1 perceptual
   hashing is frozen and its parameters are pinned by regression vectors, so
   there is nothing a parameters column would disambiguate until a v2 exists.
-- **Stat-matched binding is not digest equality** (§8.3). Hardening it by
-  carrying the archive digest into page hashing is possible and is not proposed
-  here.
+- **Stat-matched binding is not digest equality** (§8.3), which is why it has
+  its own basis and resolves to proxy granularity. Hardening it by carrying the
+  archive digest into page hashing is possible and is not proposed here; it is
+  also the change that would let `archive_hashes` retirement be reconsidered.
 - **No time-based or event-sourced provenance layer** is proposed. Direct
   foreign keys only.
 - **The 439 mtime-only drift archives are not treated as changed.** Size agrees
