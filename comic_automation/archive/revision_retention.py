@@ -62,7 +62,9 @@ only safe reading.
 The protection rules
 --------------------
 
-Eight rules, mapped to the roadmap's Step 3 keep-list:
+Nine rules: the roadmap's seven, plus revision-observation protection and
+`newer_than_current`. Both additions are named in the table rather than folded
+into a neighbouring rule, and both are explained below.
 
 ===========================  ==============  ==================================
 rule                         granularity     roadmap line
@@ -108,16 +110,23 @@ Failing closed
 `unexplained` is residue, never a positive predicate. A revision lands there
 only when an input the decision depends on could not be interpreted: a job,
 quarantine, review or disposition row carrying a status outside the vocabulary
-migration 014 and its predecessors declare; an archive with no current pointer;
-or a lineage link that contradicts the schema's own invariants. Residue is
-never a prune candidate, and `unexplained = 0` is the production gate --
-`plan_totals` reconciles it and the CLI refuses by default to report a plan
-that has any.
+migration 014 and its predecessors declare; an archive whose current pointer is
+NULL, dangling, or owned by another archive; or a lineage link that contradicts
+the schema's own invariants. Residue is never a prune candidate.
 
 A current revision is never residue and never a candidate. Unknown evidence on
 its archive is still recorded in its `unknown_evidence` list, and still forces
 the archive's noncurrent revisions to residue, but the current pointer is a
 fact the planner reads directly and does not need to interpret.
+
+That exemption is why `unexplained = 0` is **not** the whole production gate.
+Production holds one revision per archive and every one of them is current, so
+an uninterpretable job status there would produce zero residue -- there is no
+noncurrent revision for it to land on -- while the planner had in fact failed
+to read that archive. `RetentionPlan.gate_failures` therefore tests three
+independent conditions: classified residue, rows carrying unknown evidence
+(current rows included), and archives holding no revision row at all. The CLI
+refuses by default on any of them.
 
 Everything here is read-only. The planner never opens a writable connection;
 `plan_from_database` goes through `read_consistent_snapshot`, so the whole
@@ -152,6 +161,7 @@ __all__ = [
     "EXECUTION_STATUS",
     "RetentionPlannerError",
     "PinManifestError",
+    "OutputPathError",
     "PlannerInvariantError",
     "RetentionPolicy",
     "Pin",
@@ -260,6 +270,15 @@ class PinManifestError(RetentionPlannerError):
     """
 
 
+class OutputPathError(RetentionPlannerError):
+    """A report was about to be written somewhere it must not go.
+
+    Raised before any bytes are written. The planner's read-only guarantee
+    covers the database connection, not the output paths, and a report written
+    over its own source destroys exactly what it was reporting on.
+    """
+
+
 class PlannerInvariantError(RetentionPlannerError):
     """The planner's own reconciliation failed.
 
@@ -354,6 +373,7 @@ class PinManifest:
 
     pins: tuple[Pin, ...] = ()
     source: str | None = None
+    supplied: bool = False
 
     @property
     def revision_ids(self) -> frozenset[int]:
@@ -368,12 +388,30 @@ class PinManifest:
     def canonical_lines(self) -> list[str]:
         """The pin half of the hashed payload.
 
-        The count is emitted even when it is zero, so "no pins were supplied"
-        is itself part of the digest. Without it, a plan run with an empty
-        manifest and a plan run with no manifest at all would hash
-        identically, and the operator could not bind which one they reviewed.
+        Two markers, and both are load-bearing.
+
+        The count is emitted even when it is zero, so a section that hashed
+        nothing still contributes a line and cannot be dropped silently.
+
+        `supplied` distinguishes "an empty manifest was handed to the planner"
+        from "no manifest was named at all". The count cannot: both are zero.
+        They are different operator statements -- the first says the pin set
+        was reviewed and found empty, the second says pins were never
+        considered -- and without this marker the two runs hash identically
+        and an operator cannot bind which one they signed off. An earlier
+        version of this class claimed that distinction in its docstring while
+        the test beneath it asserted the opposite; the marker is what makes
+        the claim true.
+
+        The manifest's *path* is deliberately not hashed. It is
+        machine-specific, so including it would make the same reviewed pin set
+        produce different digests on two machines -- which is the opposite of
+        what a digest is for. The path travels in `source` for provenance.
         """
-        lines = [f"pins|count={len(self.pins)}"]
+        lines = [
+            f"pins|supplied={'true' if self.supplied else 'false'}",
+            f"pins|count={len(self.pins)}",
+        ]
         lines.extend(pin.canonical_line() for pin in self.pins)
         return lines
 
@@ -492,6 +530,42 @@ class RetentionPlan:
     revisions: tuple[RevisionPlan, ...]
     snapshot_digest: str
     totals: Mapping[str, int]
+    archives_without_revisions: tuple[int, ...] = ()
+
+    @property
+    def gate_failures(self) -> tuple[str, ...]:
+        """Every reason this plan does not pass the production gate.
+
+        Three independent conditions, because residue alone does not cover
+        them. A current revision stays `protected` even when its archive's
+        evidence could not be read, and an archive holding no revision rows
+        produces no row to classify at all -- so a plan can reconcile to
+        `unexplained = 0` while the planner failed to understand part of the
+        database. Each is reported separately so the operator is told which
+        one fired rather than being handed one boolean.
+        """
+        failures: list[str] = []
+
+        if self.totals["unexplained"]:
+            failures.append(
+                f"{self.totals['unexplained']} revision(s) classified as "
+                "unexplained residue"
+            )
+
+        if self.totals["rows_with_unknown_evidence"]:
+            failures.append(
+                f"{self.totals['rows_with_unknown_evidence']} revision(s) "
+                f"across {self.totals['archives_with_unknown_evidence']} "
+                "archive(s) carry evidence the planner could not interpret"
+            )
+
+        if self.totals["archives_without_revisions"]:
+            failures.append(
+                f"{self.totals['archives_without_revisions']} archive(s) hold "
+                "no revision row and could not be classified at all"
+            )
+
+        return tuple(failures)
 
     @property
     def candidates(self) -> tuple[RevisionPlan, ...]:
@@ -518,7 +592,10 @@ class RetentionPlan:
             "rule_granularity": dict(sorted(RULE_GRANULARITY.items())),
             "pins": self.pins.as_list(),
             "pin_source": self.pins.source,
+            "pin_manifest_supplied": self.pins.supplied,
             "totals": dict(self.totals),
+            "archives_without_revisions": list(self.archives_without_revisions),
+            "gate_failures": list(self.gate_failures),
             "revisions": [
                 plan.as_dict(
                     planner_version=self.planner_version,
@@ -600,7 +677,7 @@ def _normalize_reason(value: Any, *, revision_label: str) -> str:
 
 
 def _validate_pins(
-    entries: Sequence[Mapping[str, Any]],
+    entries: Sequence[Mapping[str, Any]] | None,
     revisions_by_id: Mapping[int, "_RevisionRow"],
     *,
     source: str | None,
@@ -612,10 +689,14 @@ def _validate_pins(
     a plan that quietly dropped one would report a revision as prunable that
     somebody had explicitly protected.
     """
+    # `None` means no manifest was named; an empty sequence means one was
+    # named and held no pins. The distinction reaches the digest, so it must
+    # not be flattened here.
+    supplied = entries is not None
     seen: dict[int, Mapping[str, Any]] = {}
     pins: list[Pin] = []
 
-    for index, entry in enumerate(entries):
+    for index, entry in enumerate(entries or ()):
         label = f"pin[{index}]"
 
         if not isinstance(entry, Mapping):
@@ -689,7 +770,7 @@ def _validate_pins(
         )
 
     pins.sort(key=lambda pin: pin.revision_id)
-    return PinManifest(pins=tuple(pins), source=source)
+    return PinManifest(pins=tuple(pins), source=source, supplied=supplied)
 
 
 # --- reading the database -------------------------------------------------
@@ -788,7 +869,14 @@ def _read_status_counts(
         archive_id = int(row["archive_id"])
         status = row["status"]
         key = "" if status is None else str(status)
-        counts.setdefault(archive_id, {})[key] = int(row["occurrences"])
+        bucket = counts.setdefault(archive_id, {})
+        # Accumulated, never assigned. A query that can return the same
+        # (archive, status) pair more than once -- the near-duplicate read
+        # below unions both sides of each pair -- would otherwise have its
+        # first count silently overwritten by its second, and the resulting
+        # undercount would reach the snapshot digest as if it were the
+        # measurement. Assignment here was a real defect, found in review.
+        bucket[key] = bucket.get(key, 0) + int(row["occurrences"])
 
     return counts
 
@@ -806,44 +894,31 @@ _QUARANTINE_STATUS_SQL = """
     GROUP BY archive_id, status
 """
 
-# Both sides of a near-duplicate pair are the archives under review, so each
-# row contributes to two archives.
+# Both sides of a near-duplicate pair are archives under review, so each row
+# contributes to two archives -- and an archive that is side B of one pair and
+# side A of another appears in both halves of the union.
+#
+# The outer aggregate is what makes those two appearances one count. Without
+# it the union yields the same (archive, status) key twice and the reader has
+# to combine them; relying on the reader to do that was a defect found in
+# review, so the summation is done here where SQLite can be asked for it
+# directly. `_read_status_counts` accumulates as well, which makes the two
+# independent: neither alone can produce an undercount.
 _REVIEW_STATUS_SQL = """
-    SELECT archive_a_id AS archive_id, review_status AS status,
-           COUNT(*) AS occurrences
-    FROM near_duplicate_candidates
-    GROUP BY archive_a_id, review_status
-    UNION ALL
-    SELECT archive_b_id AS archive_id, review_status AS status,
-           COUNT(*) AS occurrences
-    FROM near_duplicate_candidates
-    GROUP BY archive_b_id, review_status
-"""
-
-
-def _merge_status_counts(
-    counts: dict[int, dict[str, int]], addition: dict[int, dict[str, int]]
-) -> None:
-    for archive_id, statuses in addition.items():
-        target = counts.setdefault(archive_id, {})
-        for status, occurrences in statuses.items():
-            target[status] = target.get(status, 0) + occurrences
-
-
-def _read_review_status_counts(
-    connection: sqlite3.Connection,
-) -> dict[int, dict[str, int]]:
-    """Review counts per archive, summed across both sides of each pair.
-
-    The UNION ALL can return the same (archive, status) key twice -- once from
-    each side -- so the halves are merged additively rather than by dict
-    assignment, which would drop one side's count.
-    """
-    counts: dict[int, dict[str, int]] = {}
-    _merge_status_counts(
-        counts, _read_status_counts(connection, _REVIEW_STATUS_SQL)
+    SELECT archive_id, status, SUM(occurrences) AS occurrences
+    FROM (
+        SELECT archive_a_id AS archive_id, review_status AS status,
+               COUNT(*) AS occurrences
+        FROM near_duplicate_candidates
+        GROUP BY archive_a_id, review_status
+        UNION ALL
+        SELECT archive_b_id AS archive_id, review_status AS status,
+               COUNT(*) AS occurrences
+        FROM near_duplicate_candidates
+        GROUP BY archive_b_id, review_status
     )
-    return counts
+    GROUP BY archive_id, status
+"""
 
 
 def _read_disposition_archives(
@@ -904,7 +979,7 @@ def read_inputs(connection: sqlite3.Connection) -> _Inputs:
         quarantine_statuses=_read_status_counts(
             connection, _QUARANTINE_STATUS_SQL
         ),
-        review_statuses=_read_review_status_counts(connection),
+        review_statuses=_read_status_counts(connection, _REVIEW_STATUS_SQL),
         disposition_events=_read_disposition_archives(connection),
     )
 
@@ -1019,10 +1094,27 @@ def _structural_problems(
     ):
         problems.append("identity_state_disagrees_with_digest")
 
+    # The current pointer is resolved and checked for ownership, not merely
+    # tested for NULL. Migration 014 enforces ownership with two triggers, so
+    # a pointer naming another archive's revision is impossible -- but if one
+    # existed, treating "some revision somewhere has this id" as "this archive
+    # has a current revision" would mark the *other* archive's revision
+    # current and leave this one silently without any. Both halves of that
+    # failure are named here so they reach the report as residue.
     if row.archive_id not in inputs.current_pointers:
         problems.append("archive_row_missing")
-    elif inputs.current_pointers[row.archive_id] is None:
-        problems.append("archive_has_no_current_revision")
+    else:
+        pointer = inputs.current_pointers[row.archive_id]
+
+        if pointer is None:
+            problems.append("archive_has_no_current_revision")
+        else:
+            pointed_at = revisions_by_id.get(pointer)
+
+            if pointed_at is None:
+                problems.append("current_revision_missing")
+            elif pointed_at.archive_id != row.archive_id:
+                problems.append("current_revision_owned_by_another_archive")
 
     if row.previous_revision_id is not None:
         predecessor = revisions_by_id.get(row.previous_revision_id)
@@ -1061,18 +1153,31 @@ def _retention_window_ids(
     legitimate act -- so "current minus one" and "highest ordinal minus one"
     are different revisions the moment anyone does it.
 
-    The walk is bounded by a seen-set as well as by the generation count, so a
-    lineage cycle cannot spin here. A cycle is impossible under the schema's
-    CHECK and lineage trigger; it is bounded anyway because this function may
-    be pointed at a database those guards never ran against.
+    Every step is checked to stay inside the archive that owns the pointer.
+    The composite lineage foreign key makes a cross-archive chain impossible
+    in the database, but this walk begins at a pointer, and a pointer naming
+    another archive's revision would otherwise walk that archive's lineage and
+    protect its revisions on this archive's behalf. The walk refuses to start
+    from a foreign or dangling pointer at all: such an archive has no current
+    revision, `_structural_problems` says so, and there is no window to
+    compute from.
+
+    Bounded by a seen-set as well as by the generation count, so a lineage
+    cycle cannot spin here. A cycle is impossible under the schema's CHECK and
+    lineage trigger; it is bounded anyway because this function may be pointed
+    at a database those guards never ran against.
     """
     kept: set[int] = set()
 
-    for current_id in inputs.current_pointers.values():
+    for archive_id, current_id in inputs.current_pointers.items():
         if current_id is None:
             continue
 
         cursor = revisions_by_id.get(current_id)
+
+        if cursor is None or cursor.archive_id != archive_id:
+            continue
+
         seen: set[int] = set()
         remaining = policy.keep_previous_generations
 
@@ -1086,8 +1191,13 @@ def _retention_window_ids(
             if previous_id is None:
                 break
 
+            predecessor = revisions_by_id.get(previous_id)
+
+            if predecessor is None or predecessor.archive_id != archive_id:
+                break
+
             kept.add(previous_id)
-            cursor = revisions_by_id.get(previous_id)
+            cursor = predecessor
             remaining -= 1
 
     return kept
@@ -1299,13 +1409,27 @@ def compute_snapshot_digest(
 # --- the plan -------------------------------------------------------------
 
 
-def plan_totals(revisions: Iterable[RevisionPlan]) -> dict[str, int]:
+def plan_totals(
+    revisions: Iterable[RevisionPlan],
+    *,
+    archives_without_revisions: Sequence[int] = (),
+) -> dict[str, int]:
     """Reconcile the plan, and refuse to return unreconciled totals.
 
     The totals are the thing an operator is asked to trust, so they check
     themselves rather than trusting the classifier. Two independent
     decompositions of the same rows have to agree: current plus noncurrent,
     and protected plus candidate plus unexplained plus current.
+
+    `unexplained` counts rows *classified* as residue, and it is deliberately
+    not the whole story. A current revision keeps its `protected`
+    classification even when its archive carries evidence the planner could
+    not interpret, because which revision is current is read rather than
+    inferred -- so on production's one-revision-per-archive shape an
+    uninterpretable job status would leave `unexplained` at zero while a real
+    gap existed. `rows_with_unknown_evidence` and
+    `archives_with_unknown_evidence` count that independently, over every row
+    including current ones, and `gate_failures` treats them as blocking.
     """
     rows = list(revisions)
 
@@ -1359,6 +1483,8 @@ def plan_totals(revisions: Iterable[RevisionPlan]) -> dict[str, int]:
         and plan.feasible_under_schema_014
     )
 
+    rows_with_unknown = [plan for plan in rows if plan.unknown_evidence]
+
     return {
         "revisions": len(rows),
         "current": current,
@@ -1368,6 +1494,11 @@ def plan_totals(revisions: Iterable[RevisionPlan]) -> dict[str, int]:
         "unexplained": unexplained,
         "candidates_feasible_under_schema_014": feasible_candidates,
         "archives": len({plan.archive_id for plan in rows}),
+        "rows_with_unknown_evidence": len(rows_with_unknown),
+        "archives_with_unknown_evidence": len(
+            {plan.archive_id for plan in rows_with_unknown}
+        ),
+        "archives_without_revisions": len(archives_without_revisions),
     }
 
 
@@ -1375,7 +1506,7 @@ def build_plan(
     connection: sqlite3.Connection,
     *,
     policy: RetentionPolicy | None = None,
-    pin_entries: Sequence[Mapping[str, Any]] = (),
+    pin_entries: Sequence[Mapping[str, Any]] | None = None,
     pin_source: str | None = None,
 ) -> RetentionPlan:
     """Build a complete plan from an open read-only connection.
@@ -1390,12 +1521,22 @@ def build_plan(
     revisions_by_id = {row.revision_id: row for row in inputs.revisions}
     pins = _validate_pins(pin_entries, revisions_by_id, source=pin_source)
 
-    current_ids = {
-        current_id
-        for current_id in inputs.current_pointers.values()
-        if current_id is not None
-    }
     window_ids = _retention_window_ids(inputs, revisions_by_id, resolved_policy)
+
+    # An archive holding no revision rows at all produces no output row, so it
+    # would be invisible in a per-revision report -- and schema 014 makes it
+    # impossible, which is exactly why an occurrence has to be named rather
+    # than assumed away. Carried on the plan and counted in the totals so a
+    # reconciliation over 59,688 archives cannot come out clean while silently
+    # covering fewer.
+    archives_with_revisions = {row.archive_id for row in inputs.revisions}
+    archives_without_revisions = tuple(
+        sorted(
+            archive_id
+            for archive_id in inputs.current_pointers
+            if archive_id not in archives_with_revisions
+        )
+    )
 
     successors: dict[int, list[int]] = {}
     for row in inputs.revisions:
@@ -1405,15 +1546,18 @@ def build_plan(
             )
 
     # The current revision's ordinal per archive, used only to name the
-    # `newer_than_current` case. Absent for an archive whose pointer is NULL
-    # or dangling, in which case nothing is newer than anything and the row's
-    # structural problems carry it to residue instead.
+    # `newer_than_current` case. Absent for an archive whose pointer is NULL,
+    # dangling, or owned by another archive -- in which case nothing is newer
+    # than anything and the row's structural problems carry it to residue
+    # instead. The ownership test is the same one `is_current` applies: an
+    # ordinal borrowed from a foreign revision would compare two archives'
+    # generation numbers against each other.
     current_ordinal: dict[int, int] = {}
     for archive_id, current_id in inputs.current_pointers.items():
         if current_id is None:
             continue
         current_row = revisions_by_id.get(current_id)
-        if current_row is not None:
+        if current_row is not None and current_row.archive_id == archive_id:
             current_ordinal[archive_id] = current_row.revision_ordinal
 
     evidence_cache: dict[int, _ArchiveEvidence] = {}
@@ -1425,7 +1569,14 @@ def build_plan(
             evidence = _archive_evidence(row.archive_id, inputs)
             evidence_cache[row.archive_id] = evidence
 
-        is_current = row.revision_id in current_ids
+        # Resolved strictly against the revision's own archive. Testing
+        # membership of a global set of pointer values would let archive A's
+        # pointer mark archive B's revision current, and would leave A with
+        # no current revision at all -- a fail-open in the one field the whole
+        # policy is anchored on.
+        is_current = (
+            inputs.current_pointers.get(row.archive_id) == row.revision_id
+        )
         observation_count = inputs.observation_counts.get(row.revision_id, 0)
         ordinal_of_current = current_ordinal.get(row.archive_id)
         newer_than_current = (
@@ -1484,7 +1635,10 @@ def build_plan(
         pins=pins,
         revisions=tuple(plans),
         snapshot_digest=compute_snapshot_digest(inputs, resolved_policy, pins),
-        totals=plan_totals(plans),
+        totals=plan_totals(
+            plans, archives_without_revisions=archives_without_revisions
+        ),
+        archives_without_revisions=archives_without_revisions,
     )
 
 
@@ -1492,7 +1646,7 @@ def plan_from_database(
     database_path: str | Path,
     *,
     policy: RetentionPolicy | None = None,
-    pin_entries: Sequence[Mapping[str, Any]] = (),
+    pin_entries: Sequence[Mapping[str, Any]] | None = None,
     pin_source: str | None = None,
 ) -> ConsistentSnapshot[RetentionPlan]:
     """Build a plan under the repository's WAL-aware read guard.
@@ -1526,9 +1680,54 @@ def plan_from_database(
 # --- output ---------------------------------------------------------------
 
 
+# b"SQLite format 3\x00" -- the 16-byte header every SQLite database begins
+# with.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _refuse_to_clobber_a_database(path: Path) -> None:
+    """Refuse to overwrite an existing SQLite database with a report.
+
+    The planner opens its database read-only, but that protection ends when
+    the guarded read closes: these writers take a path and truncate it. An
+    operator who typed the database as an output path -- or a script that
+    interpolated the wrong variable -- would destroy the file the report was
+    about, and `mode=ro` would have prevented nothing.
+
+    The CLI refuses colliding paths before it opens anything, which is the
+    primary guard. This one is here because these functions are importable and
+    a caller that never goes through the CLI deserves the same protection.
+    Content-based rather than path-based on purpose: it catches the database
+    under any name, alias, or link that reaches the same bytes.
+    """
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(len(_SQLITE_MAGIC))
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise OutputPathError(
+            f"Refusing to write {path}: it exists but could not be "
+            f"inspected ({error}). A file that cannot be checked cannot be "
+            "cleared for overwriting."
+        ) from error
+
+    if header == _SQLITE_MAGIC:
+        raise OutputPathError(
+            f"Refusing to write a report over {path}: that file is a SQLite "
+            "database. Writing it would truncate the database this plan "
+            "describes."
+        )
+
+
 def write_json(plan: RetentionPlan, path: str | Path) -> Path:
-    """Deterministic JSON: sorted keys, fixed indent, trailing newline."""
+    """Deterministic JSON: sorted keys, fixed indent, trailing newline.
+
+    Refuses to overwrite an existing SQLite database; see
+    `_refuse_to_clobber_a_database`.
+    """
     resolved = Path(path)
+    _refuse_to_clobber_a_database(resolved)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     resolved.write_text(
         json.dumps(plan.as_dict(), indent=2, sort_keys=True) + "\n",
@@ -1557,8 +1756,12 @@ def write_csv(plan: RetentionPlan, path: str | Path) -> Path:
     and the same plan would hash differently depending on which the reader
     expected. List columns are joined with ';' because ',' is the delimiter
     and a quoted embedded comma is harder to diff.
+
+    Refuses to overwrite an existing SQLite database; see
+    `_refuse_to_clobber_a_database`.
     """
     resolved = Path(path)
+    _refuse_to_clobber_a_database(resolved)
     resolved.parent.mkdir(parents=True, exist_ok=True)
 
     with resolved.open("w", encoding="utf-8", newline="") as handle:
