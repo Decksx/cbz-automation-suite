@@ -1147,27 +1147,72 @@ def test_an_empty_database_still_yields_a_digest(
     assert plan.totals["unexplained"] == 0
 
 
-def test_the_digest_covers_a_supplied_but_empty_pin_manifest(
+def test_a_supplied_empty_manifest_differs_from_no_manifest(
     connection, database_path: Path
 ) -> None:
-    """An explicit empty manifest is not the same as no manifest.
+    """Two different operator statements must not share a digest.
 
-    Both produce zero pins, so without the count in the payload the two runs
-    would hash identically and an operator could not bind which they reviewed.
+    "I reviewed the pin set and it is empty" and "pins were never considered"
+    are different claims about what was signed off, and both produce zero
+    pins -- so a count alone cannot separate them. The `supplied` marker can.
+
+    An earlier version of this test asserted the two were *equal* while its
+    own docstring claimed they differed, which is worse than either behaviour
+    on its own: the test certified the contradiction.
     """
     _new_archive(connection)
 
-    assert (
-        _plan(database_path, pin_entries=[]).snapshot_digest
-        == _plan(database_path).snapshot_digest
+    no_manifest = _plan(database_path).snapshot_digest
+    empty_manifest = _plan(database_path, pin_entries=[]).snapshot_digest
+
+    assert no_manifest != empty_manifest
+
+
+def test_the_manifest_path_is_not_hashed_into_the_digest(
+    connection, database_path: Path, tmp_path: Path
+) -> None:
+    """The same pin set from two locations is the same reviewed state.
+
+    Hashing the path would make an identical manifest produce different
+    digests on two machines, or after a directory move, which is the opposite
+    of what a digest is for. The path travels in `source` instead.
+    """
+    archive_id = _new_archive(connection)
+    _generation(connection, archive_id, SHA_A)
+    origin = next(
+        row
+        for row in _plan(database_path).revisions
+        if row.revision_ordinal == 1
+    )
+    entries = [{"revision_id": origin.revision_id, "reason": "hold"}]
+
+    here = _plan(database_path, pin_entries=entries, pin_source="C:/one.json")
+    there = _plan(
+        database_path, pin_entries=entries, pin_source=str(tmp_path / "b.json")
     )
 
-    lines = planner.canonical_snapshot_lines(
+    assert here.snapshot_digest == there.snapshot_digest
+    assert here.pins.source != there.pins.source
+
+
+def test_both_pin_markers_appear_in_the_canonical_payload(
+    connection, database_path: Path
+) -> None:
+    """The section contributes lines even when it hashes no pins."""
+    empty = planner.canonical_snapshot_lines(
         planner._Inputs((), {}, {}, {}, {}, {}, {}),
         planner.RetentionPolicy(),
         planner.PinManifest(),
     )
-    assert "pins|count=0" in lines
+    supplied = planner.canonical_snapshot_lines(
+        planner._Inputs((), {}, {}, {}, {}, {}, {}),
+        planner.RetentionPolicy(),
+        planner.PinManifest(supplied=True),
+    )
+
+    assert "pins|count=0" in empty
+    assert "pins|supplied=false" in empty
+    assert "pins|supplied=true" in supplied
 
 
 def test_the_digest_is_stable_across_repeated_reads(
@@ -1185,17 +1230,20 @@ def test_the_digest_is_stable_across_repeated_reads(
 # --- determinism ----------------------------------------------------------
 
 
-def test_output_is_deterministic_across_insertion_order(
+def test_the_same_identities_inserted_in_opposite_orders_are_byte_identical(
     tmp_path: Path,
 ) -> None:
-    """Two databases with the same logical content, built in opposite orders.
+    """Same archives, same revisions, same ids -- evidence inserted backwards.
 
-    Row ids differ, so the digests legitimately differ; what must not differ
-    is the *shape* of the plan -- the ordering of rows by (archive, ordinal)
-    and every classification. A planner that leaked rowid order into its
-    output would produce two different reports for the same library state.
+    This is a real same-identities test, not a comparison of a reduced shape.
+    The archives and their revisions are built by an identical sequence in
+    both databases, so every id matches; only the order in which the evidence
+    rows are inserted differs. Evidence row ids are not decision-bearing, so a
+    correct planner must produce the same digest and byte-identical JSON and
+    CSV. Anything that leaked physical row order into the output would differ
+    here, and an assertion on a projected tuple could not see it.
     """
-    shapes = []
+    outputs = []
 
     for order in (0, 1):
         path = tmp_path / f"order-{order}.db"
@@ -1206,29 +1254,98 @@ def test_output_is_deterministic_across_insertion_order(
 
         conn = dal.open_connection(path)
         try:
-            archives = [_new_archive(conn), _new_archive(conn)]
-            pairs = list(zip(archives, (SHA_A, SHA_B)))
+            # Identical identity-creating sequence in both databases, so the
+            # archive and revision ids are the same on both sides.
+            first = _new_archive(conn)
+            second = _new_archive(conn)
+            _generation(conn, first, SHA_A)
+            _generation(conn, first, SHA_B)
+            _generation(conn, second, SHA_C)
 
-            for archive_id, digest in (pairs if order == 0 else pairs[::-1]):
-                _generation(conn, archive_id, digest)
+            revisions = dal.RevisionRepository(conn)
+            lineage = revisions.lineage_for(first)
+
+            # Each action runs inside the caller's transaction below, so none
+            # of them may open one of its own.
+            evidence = [
+                lambda: conn.execute(
+                    "INSERT INTO jobs (job_type, status, archive_id) "
+                    "VALUES ('inspect', 'running', ?)",
+                    (first,),
+                ),
+                lambda: conn.execute(
+                    "INSERT INTO jobs (job_type, status, archive_id) "
+                    "VALUES ('hash', 'failed', ?)",
+                    (second,),
+                ),
+                lambda: conn.execute(
+                    "INSERT INTO archive_quarantine (archive_id, source_path,"
+                    " quarantine_path, failure_category) "
+                    "VALUES (?, 'a', 'b', 'corrupt')",
+                    (second,),
+                ),
+                lambda: revisions.observe(revision_id=lineage[0].revision_id),
+                lambda: revisions.observe(revision_id=lineage[1].revision_id),
+            ]
+
+            for action in evidence if order == 0 else evidence[::-1]:
+                with dal.transaction(conn):
+                    action()
         finally:
             conn.close()
 
         plan = _plan(path)
-        shapes.append(
-            [
-                (
-                    row.archive_id,
-                    row.revision_ordinal,
-                    row.policy_classification,
-                    row.protection_reasons,
-                    row.evidence_granularity,
-                )
-                for row in plan.revisions
-            ]
+        outputs.append(
+            (
+                plan.snapshot_digest,
+                planner.write_json(plan, tmp_path / f"o{order}.json").read_bytes(),
+                planner.write_csv(plan, tmp_path / f"o{order}.csv").read_bytes(),
+            )
         )
 
-    assert shapes[0] == shapes[1]
+    assert outputs[0][0] == outputs[1][0], "snapshot digests differ"
+    assert outputs[0][1] == outputs[1][1], "JSON differs"
+    assert outputs[0][2] == outputs[1][2], "CSV differs"
+
+
+def test_the_plan_is_unchanged_when_rows_are_read_in_reverse_order(
+    connection, database_path: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """Read order must not reach the output, digest included.
+
+    The revision read carries an ORDER BY, so this reverses its result
+    directly rather than hoping SQLite returns rows differently. It isolates
+    the question the previous test cannot: whether the classifier and the
+    serializer depend on the order rows arrive in, with identities held
+    exactly fixed.
+    """
+    archive_id = _new_archive(connection)
+    _generation(connection, archive_id, SHA_A)
+    _generation(connection, archive_id, SHA_B)
+    other = _new_archive(connection)
+    _generation(connection, other, SHA_C)
+    connection.close()
+
+    forward = _plan(database_path)
+    forward_json = planner.write_json(forward, tmp_path / "f.json").read_bytes()
+    forward_csv = planner.write_csv(forward, tmp_path / "f.csv").read_bytes()
+
+    real_read = planner._read_revisions
+    monkeypatch.setattr(
+        planner, "_read_revisions", lambda conn: list(reversed(real_read(conn)))
+    )
+
+    backward = _plan(database_path)
+
+    assert backward.snapshot_digest == forward.snapshot_digest
+    assert (
+        planner.write_json(backward, tmp_path / "b.json").read_bytes()
+        == forward_json
+    )
+    assert (
+        planner.write_csv(backward, tmp_path / "b.csv").read_bytes()
+        == forward_csv
+    )
 
 
 def test_json_and_csv_are_byte_identical_when_rewritten(
@@ -1514,6 +1631,515 @@ def test_an_invalid_retention_window_is_refused(
             planner.RetentionPolicy(keep_previous_generations=bad)
 
 
+# --- current-pointer ownership --------------------------------------------
+
+
+def _drop_ownership_triggers(conn: sqlite3.Connection) -> None:
+    """Remove the triggers that make a bad current pointer impossible.
+
+    Migration 014 enforces pointer ownership with two triggers, so the states
+    below cannot be created through the schema. They are created anyway,
+    because a planner that can only be tested on databases obeying its
+    assumptions cannot report a database that does not.
+    """
+    with dal.transaction(conn):
+        for name in (
+            "trg_current_revision_owned_on_update",
+            "trg_current_revision_owned_on_insert",
+            "trg_current_revision_not_cleared",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def test_a_cross_owned_pointer_does_not_make_another_archive_current(
+    connection, database_path: Path
+) -> None:
+    """Archive A pointing at archive B's revision must not promote it.
+
+    The failure this guards is a fail-open in the one field the whole policy
+    is anchored on. Resolving current by membership of a global set of pointer
+    values would mark B's revision current on A's behalf -- and would leave A
+    with no current revision while nothing said so.
+    """
+    archive_a = _new_archive(connection)
+    archive_b = _new_archive(connection)
+    revision_b = _generation(connection, archive_b, SHA_B)
+
+    _drop_ownership_triggers(connection)
+    with dal.transaction(connection):
+        connection.execute(
+            "UPDATE archive_files SET current_revision_id = ? WHERE id = ?",
+            (revision_b, archive_a),
+        )
+
+    plan = _plan(database_path)
+    rows_a = [row for row in plan.revisions if row.archive_id == archive_a]
+    rows_b = [row for row in plan.revisions if row.archive_id == archive_b]
+
+    # B's revision is current for B, and only because B's own pointer says so.
+    current_b = [row for row in rows_b if row.is_current]
+    assert [row.revision_id for row in current_b] == [revision_b]
+
+    # A has no current revision, and every one of its rows says why.
+    assert not any(row.is_current for row in rows_a)
+    for row in rows_a:
+        assert row.policy_classification == planner.UNEXPLAINED
+        assert (
+            "current_revision_owned_by_another_archive" in row.unknown_evidence
+        )
+
+    assert plan.totals["archives_with_unknown_evidence"] == 1
+
+
+def test_a_dangling_pointer_leaves_its_archive_as_residue(
+    connection, database_path: Path
+) -> None:
+    """A pointer to a revision that does not exist is named, not ignored.
+
+    Testing the pointer only for NULL would let this through silently: the
+    archive would have no current revision and no structural finding either.
+    """
+    archive_id = _new_archive(connection)
+    _generation(connection, archive_id, SHA_A)
+
+    _drop_ownership_triggers(connection)
+
+    # The pointer's foreign key also refuses this, and `PRAGMA foreign_keys`
+    # is a no-op inside a transaction -- so it is toggled outside one. Both
+    # guards have to be stood down to build a state the schema forbids.
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with dal.transaction(connection):
+            connection.execute(
+                "UPDATE archive_files SET current_revision_id = 999999 "
+                "WHERE id = ?",
+                (archive_id,),
+            )
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+    plan = _plan(database_path)
+
+    assert plan.totals["current"] == 0
+    for row in plan.revisions:
+        assert row.policy_classification == planner.UNEXPLAINED
+        assert "current_revision_missing" in row.unknown_evidence
+
+
+def test_the_retention_window_cannot_cross_archive_identity(
+    connection, database_path: Path
+) -> None:
+    """A foreign pointer must not protect the other archive's history.
+
+    Archive A points into archive B's lineage. Walking back from that pointer
+    would add B's predecessor to A's retention window -- one archive's policy
+    silently keeping another's revisions, and, worse, the merging of two
+    identities that migration 014's composite lineage key exists to prevent.
+    """
+    archive_a = _new_archive(connection)
+    archive_b = _new_archive(connection)
+    _generation(connection, archive_b, SHA_A)
+    tip_b = _generation(connection, archive_b, SHA_B)
+
+    _drop_ownership_triggers(connection)
+    with dal.transaction(connection):
+        connection.execute(
+            "UPDATE archive_files SET current_revision_id = ? WHERE id = ?",
+            (tip_b, archive_a),
+        )
+
+    plan = _plan(
+        database_path,
+        policy=planner.RetentionPolicy(keep_previous_generations=5),
+    )
+    rows = _by_id(plan)
+
+    # B's own window still works, from B's own pointer.
+    assert rows[tip_b].is_current is True
+
+    # Nothing of A's was protected by B's lineage, and A is all residue.
+    for row in plan.revisions:
+        if row.archive_id == archive_a:
+            assert row.policy_classification == planner.UNEXPLAINED
+            assert row.protection_reasons == ()
+
+
+def test_an_archive_with_no_revision_row_is_counted_not_dropped(
+    connection, database_path: Path
+) -> None:
+    """An archive holding no revisions produces no row, so it is counted.
+
+    A per-revision report cannot represent it, which is exactly how a
+    reconciliation over 59,688 archives could come out clean while silently
+    covering fewer.
+    """
+    kept = _new_archive(connection)
+    emptied = _new_archive(connection)
+
+    with dal.transaction(connection):
+        connection.execute(
+            "DROP TRIGGER IF EXISTS trg_archive_revisions_not_deletable"
+        )
+        connection.execute("DROP TRIGGER IF EXISTS trg_current_revision_not_cleared")
+        connection.execute(
+            "UPDATE archive_files SET current_revision_id = NULL WHERE id = ?",
+            (emptied,),
+        )
+        connection.execute(
+            "DELETE FROM archive_revisions WHERE archive_id = ?", (emptied,)
+        )
+
+    plan = _plan(database_path)
+
+    assert plan.archives_without_revisions == (emptied,)
+    assert plan.totals["archives_without_revisions"] == 1
+    assert plan.totals["archives"] == 1
+    assert {row.archive_id for row in plan.revisions} == {kept}
+    assert any("no revision row" in reason for reason in plan.gate_failures)
+
+
+# --- the production gate --------------------------------------------------
+
+
+def test_unknown_evidence_on_a_current_only_archive_still_fails_the_gate(
+    connection, database_path: Path
+) -> None:
+    """Production's shape is the one where residue alone proves nothing.
+
+    One revision per archive, every one current. A current revision keeps its
+    `protected` classification even when its archive's evidence is
+    unreadable -- correctly, because the pointer is read rather than
+    interpreted -- so there is no noncurrent revision left for residue to land
+    on. `unexplained` is zero and the planner still failed to read the
+    archive. The unknown-evidence census is what catches it.
+    """
+    archive_id = _new_archive(connection)
+    _add_job(connection, archive_id, "some-new-status")
+
+    plan = _plan(database_path)
+
+    assert plan.totals["noncurrent"] == 0
+    assert plan.totals["unexplained"] == 0
+    assert plan.totals["candidates"] == 0
+
+    assert plan.totals["rows_with_unknown_evidence"] == 1
+    assert plan.totals["archives_with_unknown_evidence"] == 1
+    assert plan.gate_failures
+    assert any("could not interpret" in reason for reason in plan.gate_failures)
+
+    only = plan.revisions[0]
+    assert only.policy_classification == planner.PROTECTED
+    assert only.unknown_evidence == ("job_status:some-new-status",)
+
+
+@pytest.mark.parametrize(
+    "statement,parameters,expected",
+    [
+        (
+            "INSERT INTO archive_quarantine (archive_id, source_path, "
+            "quarantine_path, failure_category, status) "
+            "VALUES (?, 'a', 'b', 'corrupt', 'awaiting_triage')",
+            None,
+            "quarantine_status:awaiting_triage",
+        ),
+        (
+            "INSERT INTO near_duplicate_candidates (archive_a_id, "
+            "archive_b_id, match_method, similarity_score, page_match_ratio, "
+            "compared_page_count, page_count_a, page_count_b, "
+            "average_dhash_distance, average_phash_distance, metrics_json, "
+            "review_status) VALUES (?, ?, 'phash', 0.9, 0.9, 10, 10, 10, "
+            "1.0, 1.0, '{}', 'escalated')",
+            "pair",
+            "review_status:escalated",
+        ),
+        (
+            "INSERT INTO archive_disposition_events (archive_id, "
+            "disposition, action, reason, evidence) "
+            "VALUES (?, 'merged', 'recorded', 'a reason', 'some evidence')",
+            None,
+            "disposition:merged",
+        ),
+    ],
+)
+def test_unknown_values_in_every_evidence_table_fail_the_gate(
+    connection, database_path: Path, statement, parameters, expected
+) -> None:
+    """Each evidence vocabulary fails closed, not only `jobs.status`.
+
+    These three columns carry CHECK constraints, so enforcement is stood down
+    with `PRAGMA ignore_check_constraints` rather than by rewriting the
+    schema. The planner may be pointed at a backup, or at a database a later
+    migration has changed, and "the CHECK makes this impossible" is a
+    statement about the schema it was written against rather than about the
+    file in front of it.
+    """
+    archive_id = _new_archive(connection)
+    second = _new_archive(connection) if parameters == "pair" else None
+
+    connection.execute("PRAGMA ignore_check_constraints = ON")
+    try:
+        with dal.transaction(connection):
+            if parameters == "pair":
+                connection.execute(
+                    statement,
+                    (min(archive_id, second), max(archive_id, second)),
+                )
+            else:
+                connection.execute(statement, (archive_id,))
+    finally:
+        connection.execute("PRAGMA ignore_check_constraints = OFF")
+
+    plan = _plan(database_path)
+    unknown = {
+        value for row in plan.revisions for value in row.unknown_evidence
+    }
+
+    assert expected in unknown
+    assert plan.totals["rows_with_unknown_evidence"] >= 1
+    assert plan.gate_failures
+
+
+# --- near-duplicate review counts -----------------------------------------
+
+
+def test_review_counts_sum_across_both_sides_of_the_union(
+    connection, database_path: Path
+) -> None:
+    """An archive that is side B of one pair and side A of another counts twice.
+
+    The read unions both sides, so such an archive comes back once from each
+    half. Assigning rather than accumulating dropped one of them -- the count
+    read as 1 where the database held 2 -- and that undercount reached the
+    snapshot digest as if it were the measurement, so removing one of the two
+    review rows left the digest unchanged.
+    """
+    left, middle, right = (_new_archive(connection) for _ in range(3))
+
+    def add_pair(a: int, b: int) -> None:
+        with dal.transaction(connection):
+            connection.execute(
+                """
+                INSERT INTO near_duplicate_candidates (
+                    archive_a_id, archive_b_id, match_method,
+                    similarity_score, page_match_ratio, compared_page_count,
+                    page_count_a, page_count_b, average_dhash_distance,
+                    average_phash_distance, metrics_json, review_status
+                ) VALUES (?, ?, 'phash', 0.9, 0.9, 10, 10, 10, 1.0, 1.0,
+                          '{}', 'pending_review')
+                """,
+                (min(a, b), max(a, b)),
+            )
+
+    add_pair(left, middle)
+    add_pair(middle, right)
+
+    conn = dal.open_connection(database_path, readonly=True)
+    try:
+        counts = planner._read_status_counts(conn, planner._REVIEW_STATUS_SQL)
+    finally:
+        conn.close()
+
+    assert counts[middle] == {"pending_review": 2}
+    assert counts[left] == {"pending_review": 1}
+    assert counts[right] == {"pending_review": 1}
+
+
+def test_removing_one_review_row_moves_the_digest(
+    connection, database_path: Path
+) -> None:
+    """The regression the undercount actually caused.
+
+    With the counts collapsed to 1, deleting one of the middle archive's two
+    review rows left it at 1 and the digest unchanged -- a decision-bearing
+    input changed and the plan's identity did not.
+    """
+    left, middle, right = (_new_archive(connection) for _ in range(3))
+
+    with dal.transaction(connection):
+        for a, b in ((left, middle), (middle, right)):
+            connection.execute(
+                """
+                INSERT INTO near_duplicate_candidates (
+                    archive_a_id, archive_b_id, match_method,
+                    similarity_score, page_match_ratio, compared_page_count,
+                    page_count_a, page_count_b, average_dhash_distance,
+                    average_phash_distance, metrics_json, review_status
+                ) VALUES (?, ?, 'phash', 0.9, 0.9, 10, 10, 10, 1.0, 1.0,
+                          '{}', 'pending_review')
+                """,
+                (min(a, b), max(a, b)),
+            )
+
+    before = _plan(database_path).snapshot_digest
+
+    with dal.transaction(connection):
+        connection.execute(
+            "DELETE FROM near_duplicate_candidates WHERE archive_a_id = ? "
+            "OR archive_b_id = ?",
+            (min(left, middle), max(left, middle)),
+        )
+
+    assert _plan(database_path).snapshot_digest != before
+
+
+# --- output paths ---------------------------------------------------------
+
+
+def test_the_writers_refuse_to_overwrite_a_sqlite_database(
+    connection, database_path: Path
+) -> None:
+    """The read-only guarantee ends at the connection.
+
+    `mode=ro` makes it impossible for the reader to modify the database, and
+    none of that survives a report writer handed the database as its
+    destination: the guarded read has already closed, and `write_text`
+    truncates. Detected by content rather than by path, so the database is
+    caught under any name or link that reaches the same bytes.
+    """
+    _new_archive(connection)
+    plan = _plan(database_path)
+    original = database_path.read_bytes()
+
+    for writer in (planner.write_json, planner.write_csv):
+        with pytest.raises(planner.OutputPathError, match="SQLite database"):
+            writer(plan, database_path)
+
+    assert database_path.read_bytes() == original
+
+
+def test_the_cli_refuses_an_output_path_that_is_the_database(
+    connection, database_path: Path, capsys
+) -> None:
+    """Refused before anything is opened, so nothing is read or written."""
+    _new_archive(connection)
+    connection.close()
+    original = database_path.read_bytes()
+
+    for flag in ("--json-out", "--csv-out"):
+        code = cli.main(
+            ["--database", str(database_path), flag, str(database_path)]
+        )
+
+        assert code == cli.EXIT_FAILED
+        assert "Refusing to run" in capsys.readouterr().err
+        assert database_path.read_bytes() == original
+
+
+def test_the_cli_refuses_an_output_path_that_is_a_database_sidecar(
+    connection, database_path: Path, capsys
+) -> None:
+    """Truncating a WAL destroys uncommitted state; nobody types it on purpose."""
+    _new_archive(connection)
+    connection.close()
+
+    for suffix in ("-wal", "-shm"):
+        code = cli.main(
+            [
+                "--database",
+                str(database_path),
+                "--json-out",
+                str(database_path) + suffix,
+            ]
+        )
+
+        assert code == cli.EXIT_FAILED
+        assert "sidecar" in capsys.readouterr().err
+
+
+def test_the_cli_refuses_to_overwrite_the_pin_manifest(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """An input the operator authored is not an output slot."""
+    _new_archive(connection)
+    connection.close()
+
+    manifest = tmp_path / "pins.json"
+    manifest.write_text(json.dumps({"pins": []}), encoding="utf-8")
+
+    code = cli.main(
+        [
+            "--database",
+            str(database_path),
+            "--pins",
+            str(manifest),
+            "--csv-out",
+            str(manifest),
+        ]
+    )
+
+    assert code == cli.EXIT_FAILED
+    assert "pin manifest" in capsys.readouterr().err
+    assert json.loads(manifest.read_text(encoding="utf-8")) == {"pins": []}
+
+
+def test_the_cli_refuses_equal_json_and_csv_paths(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """Writing both would leave only CSV, with nothing saying so."""
+    _new_archive(connection)
+    connection.close()
+    target = tmp_path / "plan.out"
+
+    code = cli.main(
+        [
+            "--database",
+            str(database_path),
+            "--json-out",
+            str(target),
+            "--csv-out",
+            str(target),
+        ]
+    )
+
+    assert code == cli.EXIT_FAILED
+    assert "same file" in capsys.readouterr().err
+    assert not target.exists()
+
+
+def test_colliding_paths_are_caught_through_indirection(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """`..` segments and case differences reach the same file.
+
+    A textual comparison of the strings as typed would pass all of these.
+    """
+    _new_archive(connection)
+    connection.close()
+
+    indirect = str(
+        database_path.parent / "sub" / ".." / database_path.name
+    )
+    (database_path.parent / "sub").mkdir(exist_ok=True)
+
+    code = cli.main(
+        ["--database", str(database_path), "--json-out", indirect]
+    )
+
+    assert code == cli.EXIT_FAILED
+    assert "Refusing to run" in capsys.readouterr().err
+
+
+def test_a_failed_report_write_is_reported_as_a_failure(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """A write error is never mistaken for a policy outcome.
+
+    The plan itself was fine; the exit code says the report was not delivered.
+    """
+    _new_archive(connection)
+    connection.close()
+
+    directory = tmp_path / "occupied"
+    directory.mkdir()
+
+    code = cli.main(
+        ["--database", str(database_path), "--json-out", str(directory)]
+    )
+
+    assert code == cli.EXIT_FAILED
+    assert "FAILED to write the report" in capsys.readouterr().err
+
+
 # --- the CLI --------------------------------------------------------------
 
 
@@ -1560,7 +2186,8 @@ def test_the_cli_fails_on_unexplained_residue_by_default(
     captured = capsys.readouterr()
 
     assert code == cli.EXIT_UNEXPLAINED
-    assert "unexplained = 0" in captured.err
+    assert "classified as unexplained residue" in captured.err
+    assert "could not interpret" in captured.err
 
 
 def test_the_cli_can_be_told_to_allow_residue(
