@@ -1663,22 +1663,29 @@ def test_a_cross_owned_pointer_does_not_make_another_archive_current(
     """
     archive_a = _new_archive(connection)
     archive_b = _new_archive(connection)
-    revision_b = _generation(connection, archive_b, SHA_B)
+
+    # B has two generations and points at the newer one. A is aimed at the
+    # *older* one, which is the shape that discriminates: a global set of
+    # pointer values contains both B's own target and A's stray target, so
+    # membership would mark B's older revision current even though B's
+    # pointer names the newer. Resolving per archive cannot.
+    older_b = _generation(connection, archive_b, SHA_A)
+    newer_b = _generation(connection, archive_b, SHA_B)
 
     _drop_ownership_triggers(connection)
     with dal.transaction(connection):
         connection.execute(
             "UPDATE archive_files SET current_revision_id = ? WHERE id = ?",
-            (revision_b, archive_a),
+            (older_b, archive_a),
         )
 
     plan = _plan(database_path)
+    rows = _by_id(plan)
     rows_a = [row for row in plan.revisions if row.archive_id == archive_a]
-    rows_b = [row for row in plan.revisions if row.archive_id == archive_b]
 
-    # B's revision is current for B, and only because B's own pointer says so.
-    current_b = [row for row in rows_b if row.is_current]
-    assert [row.revision_id for row in current_b] == [revision_b]
+    # Exactly one revision of B is current, and it is the one B points at.
+    assert rows[newer_b].is_current is True
+    assert rows[older_b].is_current is False
 
     # A has no current revision, and every one of its rows says why.
     assert not any(row.is_current for row in rows_a)
@@ -1688,6 +1695,7 @@ def test_a_cross_owned_pointer_does_not_make_another_archive_current(
             "current_revision_owned_by_another_archive" in row.unknown_evidence
         )
 
+    assert plan.totals["current"] == 1
     assert plan.totals["archives_with_unknown_evidence"] == 1
 
 
@@ -1731,33 +1739,53 @@ def test_the_retention_window_cannot_cross_archive_identity(
 ) -> None:
     """A foreign pointer must not protect the other archive's history.
 
-    Archive A points into archive B's lineage. Walking back from that pointer
-    would add B's predecessor to A's retention window -- one archive's policy
-    silently keeping another's revisions, and, worse, the merging of two
-    identities that migration 014's composite lineage key exists to prevent.
+    Archive A points into the *middle* of archive B's lineage. Walking back
+    from that pointer would protect B's older generation on A's behalf -- one
+    archive's policy silently keeping another's revisions, and the merging of
+    two identities that migration 014's composite lineage key exists to
+    prevent.
+
+    The shape is chosen so the two behaviours differ. B's own window (one
+    generation) already covers the revision below B's pointer, so aiming A at
+    B's tip would protect nothing B had not protected itself and the test
+    would pass either way. Aiming A one link lower reaches a generation B's
+    own window does not, which is the only position where a crossed walk is
+    visible in the output.
+
+    A also holds generations above the ordinal it strays into, so a
+    `newer_than_current` decision made against a foreign ordinal would show up
+    here too.
     """
     archive_a = _new_archive(connection)
     archive_b = _new_archive(connection)
-    _generation(connection, archive_b, SHA_A)
-    tip_b = _generation(connection, archive_b, SHA_B)
+
+    # B: provisional origin + three generations, pointer at the tip.
+    oldest_b = _generation(connection, archive_b, SHA_A)
+    middle_b = _generation(connection, archive_b, SHA_B)
+    tip_b = _generation(connection, archive_b, SHA_C)
+
+    # A: provisional origin + two generations of its own.
+    _generation(connection, archive_a, SHA_B)
+    _generation(connection, archive_a, SHA_C)
 
     _drop_ownership_triggers(connection)
     with dal.transaction(connection):
         connection.execute(
             "UPDATE archive_files SET current_revision_id = ? WHERE id = ?",
-            (tip_b, archive_a),
+            (middle_b, archive_a),
         )
 
-    plan = _plan(
-        database_path,
-        policy=planner.RetentionPolicy(keep_previous_generations=5),
-    )
+    plan = _plan(database_path)
     rows = _by_id(plan)
 
-    # B's own window still works, from B's own pointer.
+    # B's own window still works, from B's own pointer: tip current, the
+    # generation below it kept, the one below that a candidate.
     assert rows[tip_b].is_current is True
+    assert rows[middle_b].protection_reasons == ("retention_window",)
+    assert rows[oldest_b].policy_classification == planner.CANDIDATE
 
-    # Nothing of A's was protected by B's lineage, and A is all residue.
+    # A's stray pointer protected nothing of B's beyond that, and gave A
+    # nothing either: every row of A is residue with no reason attached.
     for row in plan.revisions:
         if row.archive_id == archive_a:
             assert row.policy_classification == planner.UNEXPLAINED
@@ -2106,10 +2134,8 @@ def test_colliding_paths_are_caught_through_indirection(
     _new_archive(connection)
     connection.close()
 
-    indirect = str(
-        database_path.parent / "sub" / ".." / database_path.name
-    )
     (database_path.parent / "sub").mkdir(exist_ok=True)
+    indirect = str(database_path.parent / "sub" / ".." / database_path.name)
 
     code = cli.main(
         ["--database", str(database_path), "--json-out", indirect]
@@ -2117,6 +2143,42 @@ def test_colliding_paths_are_caught_through_indirection(
 
     assert code == cli.EXIT_FAILED
     assert "Refusing to run" in capsys.readouterr().err
+
+
+def test_two_outputs_that_do_not_exist_yet_are_still_compared(
+    connection, database_path: Path, tmp_path: Path, capsys
+) -> None:
+    """Path identity has to work before either file exists.
+
+    `os.path.samefile` needs both paths present, so for two output paths that
+    have not been created yet it can say nothing at all -- it is the resolved
+    textual comparison that catches them. This is the case that distinguishes
+    the two halves of `_same_file`: neither file exists, so only one half can
+    possibly fire.
+    """
+    _new_archive(connection)
+    connection.close()
+
+    (tmp_path / "sub").mkdir()
+    target = tmp_path / "plan.out"
+    same_target_by_another_name = tmp_path / "sub" / ".." / "plan.out"
+
+    assert not target.exists()
+
+    code = cli.main(
+        [
+            "--database",
+            str(database_path),
+            "--json-out",
+            str(target),
+            "--csv-out",
+            str(same_target_by_another_name),
+        ]
+    )
+
+    assert code == cli.EXIT_FAILED
+    assert "same file" in capsys.readouterr().err
+    assert not target.exists()
 
 
 def test_a_failed_report_write_is_reported_as_a_failure(
