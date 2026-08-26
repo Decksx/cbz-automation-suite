@@ -498,6 +498,11 @@ migration_014_field_seed     -- this row populated an ancillary revision field
                                 consumed as proxy, never as revision-granular.
 single_revision_inherited    -- exactly one candidate revision existed and
                                 nothing contradicted it; unverified
+inherited_from_page_evidence -- a downstream row took its revision from the
+                                page evidence it read, having read no archive
+                                bytes of its own. near_duplicate_candidates
+                                only, per side (§7.4). Always CONSERVATIVE and
+                                consumed as proxy, whatever the upstream was.
 unresolved_drift             -- the row describes bytes no revision holds
 unresolved_no_identity       -- no digest was ever obtained for these bytes
 ```
@@ -729,6 +734,7 @@ provenance_basis   TEXT
         'migration_014_identity_seed',
         'migration_014_field_seed',
         'single_revision_inherited',
+        'inherited_from_page_evidence',
         'unresolved_drift',
         'unresolved_no_identity'
     ))
@@ -738,7 +744,8 @@ CHECK (
                               'stat_matched_revision',
                               'migration_014_identity_seed',
                               'migration_014_field_seed',
-                              'single_revision_inherited'))
+                              'single_revision_inherited',
+                              'inherited_from_page_evidence'))
  OR (source_revision_id IS NULL
      AND provenance_basis LIKE 'unresolved%')
 )
@@ -750,6 +757,35 @@ proxy granularity), not in whether it may be bound. An earlier draft introduced
 the basis in §7 and the producer paths but left it out of this CHECK, which
 would have made every stat-matched binding fail the constraint the moment a
 producer wrote one.
+
+`inherited_from_page_evidence` is in the **bound** half for the same reason,
+and was omitted from this CHECK in exactly the same way. The basis was
+introduced in §7.4 and §9.4.2 without being added here or to §7.1, and the
+omission reproduces: with the earlier list, a candidate side carrying it was
+rejected on insert, as was the documented
+`unresolved_no_identity -> inherited_from_page_evidence` transition. That is
+the identical defect recorded in the paragraph above, committed a second time
+against a second basis — which is the argument for deriving each table's
+vocabulary from this union in the migration rather than restating it by hand.
+
+Executed against the corrected pair, applied twice to
+`near_duplicate_candidates` as §7.4 requires. The harness parses the
+vocabulary out of this section rather than restating it, so the test cannot
+pass against a list the document no longer contains:
+
+```text
+backfilled row: single_revision_inherited both sides        ACCEPTED
+producer row: inherited_from_page_evidence both sides       ACCEPTED
+mixed row: bound side inherited_from_page_evidence          ACCEPTED
+bound side inherited, other side single_revision_inherited  ACCEPTED
+side A binds: unresolved -> inherited_from_page_evidence    ACCEPTED
+a bound side carrying an unresolved basis                   REJECTED
+an unbound side carrying a bound basis                      REJECTED
+```
+
+The last two matter as much as the first five: widening the vocabulary must
+not weaken the pairing, and they confirm a side still cannot carry a revision
+without saying how it got one, or omit one without saying why.
 
 **This is the union, not any single table's vocabulary.** Each receiving table
 carries a narrower CHECK of its own (§9.4.2): `measured` is legal only on
@@ -792,9 +828,8 @@ archive_inspections    -- four branches: inspector_version may be NULL (§6.5)
     unresolved, version known    (archive_id, inspector_version)
     unresolved, version unknown  (archive_id)
 
-archive_hashes
+archive_hashes         -- ONE branch: this table has no unresolved state
     bound       (source_revision_id, algorithm, algorithm_version)
-    unresolved  (archive_id, algorithm, algorithm_version)
 
 archive_content_signatures
     bound       (source_revision_id, algorithm, algorithm_version)
@@ -813,6 +848,22 @@ where *bound* is `source_revision_id IS NOT NULL`, *unresolved* is
 
 `archive_quarantine` has no entry: it keeps `archive_id UNIQUE` unchanged,
 because it gains no ownership column (§5.1).
+
+**`archive_hashes` gets one branch, not two.** §9.4.2 removes
+`unresolved_no_identity` from its vocabulary — the hasher computes a digest
+and binds inside the same transaction, so an unresolved hash row is
+unreachable — which is what makes `source_revision_id` NOT NULL at the slice-5
+rebuild. An unresolved partial index on a NOT NULL column is dead on arrival:
+its `WHERE source_revision_id IS NULL` can never match a row. An earlier draft
+listed the pair here anyway, having been written before the vocabulary was
+tightened. Nothing would have failed — which is the problem, since a dead
+index is indistinguishable from a working one until someone relies on it.
+Measured against the post-rebuild shape:
+
+```text
+an unresolved archive_hashes row is unconstructible         REJECTED
+rows an unresolved partial index could ever hold                  0
+```
 
 **`archive_pages` and `page_hashes` deliberately carry no `WHERE active`
 predicate.** Page supersession is excluded from the schema slice pending the
@@ -1042,8 +1093,32 @@ generic four-column template could not express it.
 2. the idempotent-result lookup             (§9.4, "same identity")
 3. trg_<table>_supersede_checks_existing_successor
 4. trg_<table>_insert_checks_waiting_predecessors
-   plus the identity-immutability trigger, which lists exactly these columns
 ```
+
+**The identity-immutability trigger is not one of them.** An earlier draft
+appended it to this list as "the identity-immutability trigger, which lists
+exactly these columns", and taken literally that breaks the design: the
+evidence-identity tuple contains `source_revision_id`, which the disposition
+list below assigns to `attribution` — the one column with a guarded
+transition. A trigger generated from the tuple freezes it, and the documented
+`unresolved_no_identity -> stat_matched_revision` bind is then rejected.
+Measured both ways on the real column set:
+
+```text
+trigger generated from the evidence-identity tuple
+    documented binding transition                    REJECTED   WRONG
+trigger generated from the 'identity' disposition
+    documented binding transition                    ACCEPTED
+    and still freezes inspector_version              REJECTED
+```
+
+So the immutability trigger is generated from the **`identity` disposition**
+(`id`, `archive_id`, `inspector_version`, `inspector_version_basis` for this
+table), and the four mechanisms above are generated from the **evidence-identity
+tuple**. The two sets overlap without being the same set, and the difference
+is exactly `source_revision_id`: it participates in what makes two rows the
+same evidence, and it is still permitted to change once. Naming them
+separately is what keeps the attribution transition reachable.
 
 **Every comparison must be NULL-safe.** `source_revision_id`,
 `inspector_version`, `parameters_digest` and the near-duplicate revision
@@ -1419,7 +1494,7 @@ lifecycle            INSERT already superseded, mismatched        REJECTED
                      re-explain a historical row                  REJECTED
                      partial supersession (no reason)             REJECTED
 
-14 / 14 behaved as specified
+14 / 14 behaved as specified (SA-01 .. SA-14)
 ```
 
 And the disposition set, against the real 28-column `archive_inspections`
@@ -1451,15 +1526,70 @@ source context       repoint location_id                          REJECTED
                      direct clear while the location exists       REJECTED
                      genuine ON DELETE SET NULL cascade           ACCEPTED
 
-18 / 18 behaved as specified
+17 / 17 cases behaved as specified (DP-01 .. DP-17), plus the
+completeness assertion above, which is a check rather than a case
 ```
 
-Together with §9.3.1 and §9.6.1, every piece of SQL this document
-specifies has now been executed: 14 supersession and attribution cases, 18
-disposition cases, and 22 index and source-context cases. Slice 5's gate
-requires all of them as bypass proofs.
+Together with §9.2, §9.3, §9.3.1 and §9.6.1, every piece of SQL this
+document specifies has now been executed. Two earlier totals here -- 54, then
+63 -- were both arrived at by summing section subtotals, and both were wrong.
+Summing subtotals cannot detect a case that appears in two of them, so the
+cases now carry stable identifiers and are counted by identity.
 
-Slice 5's gate carries these as bypass proofs, each disabled one at a time.
+```text
+group                            ids                        registered
+§9.4.2  supersession/attribution  SA-01 .. SA-14                    14
+§9.4.2  column dispositions       DP-01 .. DP-17                    17
+§9.4.2  immutability source       IT-01 .. IT-03                     3
+§9.3.1  inspection indexes        II-01 .. II-10                    10
+§9.6.1  candidate indexes         CI-01 .. CI-09                     9
+§9.2    basis vocabulary          VB-01 .. VB-07                     7
+§9.3    archive_hashes            AH-01                              1
+                                                                  ----
+registered executions                                               61
+duplicate registrations (below)                                     -3
+                                                                  ----
+UNIQUE EXECUTIONS                                                   58
+```
+
+Three registered cases assert a behaviour another case already asserts. Two
+cases are the same execution when the initial state, the mutating operation
+and the expected outcome all match; which trigger subset the harness had
+installed is a property of the proof, not of the behaviour, so it does not
+make a second case:
+
+```text
+bind-unresolved-inspection-correct-basis   SA-02  DP-14  IT-02
+change-inspector_version                   SA-09  IT-03
+```
+
+The three questions this resolves, answered explicitly rather than left to the
+arithmetic:
+
+**The three source-context cases stay inside the disposition block.** They are
+DP-15, DP-16 and DP-17, they are counted once, there, and the earlier "22
+index and source-context cases" phrasing that added them a second time is
+retired. Nothing outside §9.4.2 counts them.
+
+**The two unresolved-to-bound inspection cases are the same execution.** SA-02
+and DP-14 set up an unresolved row, bind it with the correct basis, and expect
+ACCEPTED. So does IT-02. All three are one behaviour, counted once. That is
+what took the pre-existing total from 50 registered to 49 unique before any of
+this round's cases were added.
+
+**Two of this round's new cases were not new.** This round registered 11 --
+VB-01..07, AH-01, IT-01..03 -- not the 12 previously claimed: the twelfth was
+a derived observation (that an unresolved `archive_hashes` partial index can
+hold zero rows), which follows from AH-01 rather than being executed
+separately, and is recorded in §9.3 as an observation. Of the 11, IT-02 and
+IT-03 duplicate SA-02 and SA-09. **Nine are new unique executions**, which is
+49 + 9 = 58.
+
+Two assertions are executed but are not accept/reject cases and are counted in
+neither total: the disposition-completeness check in the block above (28
+columns, 28 assigned) and the zero-row observation in §9.3.
+
+Slice 5's gate requires all 58 as bypass proofs, each disabled one at a time.
 
 The "same revision, same identity" rule is what makes the model coherent: a
 superseding row is a *replacement measurement of the same bytes by the same
@@ -1684,7 +1814,7 @@ revision-granular.
 | --- | --- | --- |
 | `active_or_recoverable_job` | `jobs` | **permanently proxy** — jobs are identity-scoped by design (§8.6) and gain no key |
 | `unresolved_failure` | `jobs` | **permanently proxy**, same reason |
-| `open_review_work` | `near_duplicate_candidates` | **can become revision-granular**, per side, once slice 6 lands and only for bound sides |
+| `open_review_work` | `near_duplicate_candidates` | **proxy throughout Step 4** — binding a side improves attribution but not granularity, because every basis a candidate side may carry resolves to proxy (below) |
 | `quarantine_or_resolution` | `archive_quarantine` **and** `archive_disposition_events` | **must be split**, and both halves stay proxy — §5.1 leaves quarantine identity-scoped, so neither half can ever be revision-granular |
 
 `quarantine_or_resolution` folds two different things into one reason: a
@@ -1693,24 +1823,52 @@ quarantine row and a disposition event. They should still be split into
 that after §5.1 *neither* becomes revision-granular, because quarantine keeps
 `archive_id` alone. The split is for clarity, not for capability.
 
-Granularity is still not a property of the rule alone: `open_review_work` is
-revision-granular when the near-duplicate side that fired it is bound and proxy
-when it is not. The planner's `RULE_GRANULARITY` constant cannot express that,
-so it should become `RULE_MAX_GRANULARITY` — what the rule *could* achieve —
-with the actual granularity resolved per evidence row from that row's
-`provenance_basis`. The row-level "weakest wins" rule in
-`_evidence_granularity` is unchanged and already correct.
+An earlier draft said `open_review_work` becomes revision-granular for bound
+sides once slice 6 lands. It does not, and the contradiction was internal to
+this document: §9.4.2 permits a candidate side only
+`inherited_from_page_evidence`, `single_revision_inherited` or
+`unresolved_no_identity`, and none of the three is on the revision-granular
+list below. A bound side is therefore better *attributed* — it names a
+revision — without being better *evidence*, which is exactly the distinction
+§7.4 draws when it refuses to let a candidate copy its upstream's basis.
 
-Two bases need naming in that resolution, and both resolve to **proxy**:
+Three bases need naming in that resolution, and all three resolve to **proxy**:
 
 - **`migration_014_field_seed`** (§4.1) is a causal record of what 014 copied,
   not a statement that the row describes the revision's bytes.
 - **`stat_matched_revision`** (§8.3) is a size-and-mtime agreement, not a
   digest match. It becomes eligible for revision granularity only when a
   producer carries the archive digest into the binding.
+- **`inherited_from_page_evidence`** (§7.4) is a revision taken from page
+  evidence the candidate producer read, having read no archive bytes itself.
+  It is proxy unconditionally, and never stronger than the upstream it
+  inherits from — including after that upstream is promoted, since the
+  candidate still measured nothing.
 
 Only `measured`, `migration_014_identity_seed` and a future digest-carrying
 binding may resolve to revision granularity.
+
+**Consequence for the planner slice, ruled on by the lead.** With
+`open_review_work` proxy as well, all four `archive_proxy` rules are proxy for
+the whole of Step 4, so no rule's actual granularity can differ from its
+maximum and per-row resolution cannot move a single row. An earlier draft kept
+both the `RULE_MAX_GRANULARITY` rename and the per-row resolution as a
+standalone planner slice on that basis, which would have been a roadmap gate
+that changes no output. The lead's ruling splits them:
+
+- **The rename rides the reason split.** `RULE_GRANULARITY` is keyed by rule
+  name, so splitting `quarantine_or_resolution` into `quarantine` and
+  `disposition_history` already rewrites its keys. Renaming the constant in
+  that same edit costs nothing extra and removes the misreading the name
+  invites — that granularity is a property of the rule. It is terminology
+  carried by a change that has its own justification, not a gate of its own.
+- **Per-row resolution is deferred** until a basis exists that resolves to
+  revision granularity (§12.2). Building the machinery now would be building
+  for an anticipated need, and it cannot be tested against a row that
+  exercises it.
+
+The row-level "weakest wins" rule in `_evidence_granularity` is unchanged and
+already correct either way.
 
 Also affected: `perceptual_coverage_audit` (per-archive denominators;
 per-revision changes what "covered" means and needs its own decision),
@@ -1731,9 +1889,9 @@ and must stay that way.
 | **2** | **page-inventory design** (§9.5). Design only, no schema, no planner. Decides whether page ownership lives on 2,955,391 `archive_pages` rows or on ~58,432 inventory parents, and where page idempotency and supersession live | lead accepts the parent's shape, the **authoritative backfill unit**, and the migration path. **This gates the planner as well as the schema** — see §11.3 |
 | **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table; every inspection is planned as `inspector_version_basis = 'unknown_legacy'` with a NULL version, and every near-duplicate row as `parameters_basis = 'unknown_legacy'`, both contributing to the plan digest |
 | **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, plus `inspector_version` / `inspector_version_basis` (§6.5) and `parameters_basis` (§9.6), backfilling exactly what slice 3 planned. **Uniqueness unchanged.** Producers write a basis on the path they already take. **The measurement-immutability triggers of §9.4.2 land here, not in slice 5** — they are what makes the interim window safe (§11.4) | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; **a rerun that would change any measurement value fails, on bound and unresolved rows alike, while a byte-identical rerun passes**; recovery is restore-from-backup |
-| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, producers begin requiring `inspector_version_basis = 'known'`. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; all 54 executed cases reproduce (14 supersession/attribution and 18 disposition in §9.4.2, 10 inspection-index in §9.3.1, 9 candidate-index in §9.6.1, 3 source-context), each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
+| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, producers begin requiring `inspector_version_basis = 'known'`. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows on every table that has both — `archive_hashes` is bound-only (§9.3) and is proven on its single branch; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; all 58 unique executed cases reproduce, by the identifiers in §9.4.2, each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
 | **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, **begin requiring `parameters_basis = 'known'`** and populating those fields for new rows (the column itself arrived in slice 4), **begin writing `processing_runs`** and carry `processing_run_id`, four partial indexes per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run |
-| **7** | planner: split `quarantine_or_resolution`, introduce `RULE_MAX_GRANULARITY`, resolve granularity per evidence row | see §11.2 |
+| **7** | planner: split `quarantine_or_resolution` into `quarantine` and `disposition_history`, renaming `RULE_GRANULARITY` to `RULE_MAX_GRANULARITY` in the same edit because the split rewrites its keys anyway (§10). **Per-row granularity resolution is not in this slice** — it is deferred until a revision-granular basis exists (§12.2), so this slice changes the reason census and nothing else | see §11.2 |
 
 ### 11.1 The migration gate, respecified
 
@@ -1806,6 +1964,10 @@ the set of protected revisions                  identical
 the set of candidates                           identical (0 on production)
 unexplained                                     identical (0 on production)
 gate_failures                                   identical (none on production)
+evidence_granularity per row                    identical -- every rule is
+                                                proxy for all of Step 4 (§10),
+                                                and per-row resolution is not
+                                                in this slice at all
 ```
 
 What is expected to change, and must be reported rather than hidden:
@@ -1813,7 +1975,6 @@ What is expected to change, and must be reported rather than hidden:
 ```text
 the reason census                 quarantine_or_resolution splits into two
 the plan digest                   reason names are decision-bearing inputs
-evidence_granularity per row      where a bound row upgrades from proxy
 ```
 
 The verdict must not move. The explanation may, and the diff of explanations is
@@ -1912,6 +2073,14 @@ before act, postflight reconciliation.
   its own basis and resolves to proxy granularity. Hardening it by carrying the
   archive digest into page hashing is possible and is not proposed here; it is
   also the change that would let `archive_hashes` retirement be reconsidered.
+- **Per-row granularity resolution in the planner is deferred** (§10). Every
+  `archive_proxy` rule is proxy for the whole of Step 4, so resolving
+  granularity per evidence row cannot move a row and could not be tested
+  against one that exercises it. It becomes worth building when a basis
+  resolves to revision granularity — which today means the digest-carrying
+  producer change of §8.3, and nothing sooner. The `RULE_MAX_GRANULARITY`
+  rename is *not* deferred with it: it rides slice 7's reason split, which
+  rewrites the same constant's keys regardless.
 - **No time-based or event-sourced provenance layer** is proposed. Direct
   foreign keys only.
 - **The 439 mtime-only drift archives are not treated as changed.** Size agrees
