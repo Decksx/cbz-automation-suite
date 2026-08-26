@@ -378,9 +378,33 @@ own slice.
 ### 6.3 Run provenance: historical backfill deferred, future rows are not
 
 `processing_runs` and `processing_stages` both hold **0 rows**. That is a
-sufficient reason why the **3,135,910 historical rows** cannot be given a
+sufficient reason why the historical rows cannot be given a
 `processing_run_id`: there is no run to point at, and inventing one would
 manufacture provenance rather than record it.
+
+**Run provenance has a different population from ownership, and an earlier
+draft used the ownership figure for both.** It cited 3,135,910 here, which is
+the count of rows *receiving an ownership column* (§7.2). `page_hashes`
+receives no ownership column — it reaches its revision through
+`archive_pages.page_id` (§5) — but that is an argument about ownership only.
+Run provenance is not inherited: a page hash is computed by a run of its own,
+`dhash v1` and `phash v1` over one page were not necessarily produced by the
+same run as its `sha256 v1`, and §6.1 marks the column missing for that table
+while §12.2 counts it among the five non-candidate tables whose run provenance
+is deferred. So its 8,821,073 rows belong in this population:
+
+```text
+ownership-receiving rows (§7.2)                     3,135,910
+page_hashes                                         8,821,073
+                                                   ----------
+rows with no run provenance and nothing to point at 11,956,983
+```
+
+The ownership total stays 3,135,910 and is still provisional on slice 2
+(§7.2); this figure is the run-provenance population and is provisional in the
+same way, since the page-inventory design may change where a page hash's run
+would be recorded. Two populations, two numbers, and the smaller one is not a
+subset boundary anyone should read as the whole.
 
 It is **not** a reason to keep creating new evidence without run provenance,
 and an earlier draft of this document elided the two. The roadmap requires
@@ -1315,8 +1339,9 @@ Measured on SQLite 3.40.1 rather than inferred from the cascade order.
 CREATE TRIGGER trg_archive_inspections_source_context_only_clears
 BEFORE UPDATE OF location_id ON archive_inspections
 FOR EACH ROW
-WHEN NEW.location_id IS NOT NULL
-  OR EXISTS (SELECT 1 FROM file_locations WHERE id = OLD.location_id)
+WHEN NEW.location_id IS NOT OLD.location_id
+ AND (NEW.location_id IS NOT NULL
+   OR EXISTS (SELECT 1 FROM file_locations WHERE id = OLD.location_id))
 BEGIN
     SELECT RAISE(ABORT, 'location_id may only be cleared by ON DELETE SET NULL');
 END;
@@ -1409,7 +1434,9 @@ revision is deferred to a later remediation design.
 CREATE TRIGGER trg_archive_inspections_attribution_binds_once
 BEFORE UPDATE OF source_revision_id, provenance_basis ON archive_inspections
 FOR EACH ROW
-WHEN NOT (
+WHEN (NEW.source_revision_id IS NOT OLD.source_revision_id
+   OR NEW.provenance_basis   IS NOT OLD.provenance_basis)
+ AND NOT (
         OLD.source_revision_id IS NULL
     AND NEW.source_revision_id IS NOT NULL
     AND OLD.provenance_basis = 'unresolved_no_identity'
@@ -1423,6 +1450,48 @@ BEGIN
         'attribution binds once: unresolved_no_identity -> stat_matched_revision');
 END;
 ```
+
+##### Every transition trigger needs a value-change guard first
+
+The measurement trigger compares values because a column-list trigger fires
+whether or not the value changed (above). The same argument applies to every
+trigger whose `WHEN` tests a *transition*, and an earlier draft applied it to
+none of them. `BEFORE UPDATE OF <cols> WHEN NOT (<valid transition>)` asks
+"is this a valid transition" without first asking "is this a transition at
+all", so a rewrite that changes nothing is judged as though it were a move:
+
+```text
+SET source_revision_id = source_revision_id,
+    provenance_basis   = provenance_basis            REJECTED   WRONG
+SET superseded_at      = superseded_at,
+    superseded_by_id   = superseded_by_id,
+    superseded_reason  = superseded_reason           REJECTED   WRONG
+SET location_id        = location_id                 REJECTED   WRONG
+```
+
+None of those is a transition and all three should be no-ops. This is the
+same defect the measurement trigger was corrected for, in three more places,
+and it defeats idempotent reuse the same way: a producer that rewrites a row
+byte-identically -- exactly what §9.4 calls a no-op -- writes every column,
+not only the ones it changed, so it trips a trigger that never looked at the
+values. The source-context case was not among the two the review named; it was
+found by testing the whole class rather than the reported instances.
+
+The fix is one NULL-safe clause in front of each `WHEN`, and it is `IS NOT`
+rather than `<>` for the reason given above -- every column involved is
+nullable:
+
+```sql
+WHEN (NEW.source_revision_id IS NOT OLD.source_revision_id
+   OR NEW.provenance_basis   IS NOT OLD.provenance_basis)
+ AND NOT ( ... the transition ... )
+```
+
+The guard must not weaken any rejection the trigger already made, which is
+the half worth measuring rather than assuming. All eleven real rejections and
+the `ON DELETE SET NULL` cascade behave exactly as before (VI-01..VI-05 record
+the no-op cases; the rejections they must not weaken are SA-03, SA-04, SA-12,
+SA-13, SA-14, DP-12, DP-13, DP-15, DP-16, SA-11 and the cascade DP-17).
 
 ##### The supersession fields have a lifecycle, and it is one-way
 
@@ -1455,7 +1524,10 @@ CREATE TRIGGER trg_archive_inspections_supersession_is_terminal
 BEFORE UPDATE OF superseded_at, superseded_by_id, superseded_reason
     ON archive_inspections
 FOR EACH ROW
-WHEN NOT (OLD.superseded_at IS NULL
+WHEN (NEW.superseded_at     IS NOT OLD.superseded_at
+   OR NEW.superseded_by_id  IS NOT OLD.superseded_by_id
+   OR NEW.superseded_reason IS NOT OLD.superseded_reason)
+ AND NOT (OLD.superseded_at IS NULL
       AND NEW.superseded_at IS NOT NULL
       AND NEW.superseded_by_id IS NOT NULL
       AND NEW.superseded_reason IS NOT NULL)
@@ -1532,24 +1604,25 @@ completeness assertion above, which is a check rather than a case
 
 Together with §9.2, §9.3, §9.3.1 and §9.6.1, every piece of SQL this
 document specifies has now been executed. Two earlier totals here -- 54, then
-63 -- were both arrived at by summing section subtotals, and both were wrong.
-Summing subtotals cannot detect a case that appears in two of them, so the
-cases now carry stable identifiers and are counted by identity.
+63 -- were both reached by summing section subtotals, which cannot detect a
+case counted in two of them, so cases carry stable identifiers and are counted
+by identity.
 
 ```text
 group                            ids                        registered
 §9.4.2  supersession/attribution  SA-01 .. SA-14                    14
 §9.4.2  column dispositions       DP-01 .. DP-17                    17
 §9.4.2  immutability source       IT-01 .. IT-03                     3
+§9.4.2  value-identical rewrites  VI-01 .. VI-05                     5
 §9.3.1  inspection indexes        II-01 .. II-10                    10
 §9.6.1  candidate indexes         CI-01 .. CI-09                     9
 §9.2    basis vocabulary          VB-01 .. VB-07                     7
 §9.3    archive_hashes            AH-01                              1
                                                                   ----
-registered executions                                               61
+registered executions                                               66
 duplicate registrations (below)                                     -3
                                                                   ----
-UNIQUE EXECUTIONS                                                   58
+UNIQUE EXECUTIONS                                                   63
 ```
 
 Three registered cases assert a behaviour another case already asserts. Two
@@ -1563,33 +1636,54 @@ bind-unresolved-inspection-correct-basis   SA-02  DP-14  IT-02
 change-inspector_version                   SA-09  IT-03
 ```
 
-The three questions this resolves, answered explicitly rather than left to the
-arithmetic:
+The three questions an earlier review posed, answered explicitly rather than
+left to the arithmetic:
 
 **The three source-context cases stay inside the disposition block.** They are
-DP-15, DP-16 and DP-17, they are counted once, there, and the earlier "22
-index and source-context cases" phrasing that added them a second time is
-retired. Nothing outside §9.4.2 counts them.
+DP-15, DP-16 and DP-17, counted once, there. The "22 index and source-context
+cases" phrasing that added them a second time is retired.
 
 **The two unresolved-to-bound inspection cases are the same execution.** SA-02
 and DP-14 set up an unresolved row, bind it with the correct basis, and expect
-ACCEPTED. So does IT-02. All three are one behaviour, counted once. That is
-what took the pre-existing total from 50 registered to 49 unique before any of
-this round's cases were added.
+ACCEPTED. So does IT-02. All three are one behaviour, counted once.
 
-**Two of this round's new cases were not new.** This round registered 11 --
-VB-01..07, AH-01, IT-01..03 -- not the 12 previously claimed: the twelfth was
-a derived observation (that an unresolved `archive_hashes` partial index can
-hold zero rows), which follows from AH-01 rather than being executed
-separately, and is recorded in §9.3 as an observation. Of the 11, IT-02 and
-IT-03 duplicate SA-02 and SA-09. **Nine are new unique executions**, which is
-49 + 9 = 58.
+**A twelfth "new" case did not exist.** The round that added VB and AH
+registered 11, not 12: the twelfth was a derived observation -- that an
+unresolved `archive_hashes` partial index can hold zero rows -- which follows
+from AH-01 rather than being executed, and is recorded in §9.3 as an
+observation.
 
-Two assertions are executed but are not accept/reject cases and are counted in
-neither total: the disposition-completeness check in the block above (28
-columns, 28 assigned) and the zero-row observation in §9.3.
+Two executed assertions are counted in neither total: the
+disposition-completeness check in the block above (28 columns, 28 assigned)
+and the zero-row observation in §9.3.
 
-Slice 5's gate requires all 58 as bypass proofs, each disabled one at a time.
+##### Cases belong to the slice that builds what they test
+
+An earlier draft made slice 5's gate "all cases reproduce". That gate was
+impossible: it included CI-01..CI-09, which exercise the candidate partial
+indexes, and slice 5 explicitly excludes `near_duplicate_candidates` — those
+indexes do not exist until slice 6. A gate cannot require proof of a mechanism
+its own slice does not build.
+
+Each case is therefore owned by the slice that introduces the mechanism it
+exercises, and each slice's gate requires its own cases plus everything
+already proven:
+
+```text
+slice  own  cumulative  cases
+    4   16          16  DP-01..DP-10  (measurement immutability, which
+                        §11 lands in slice 4), VB-01..VB-06 (the basis
+                        CHECK, which arrives with the column)
+    5   37          53  SA-01..SA-14, VI-01..VI-05, DP-11..DP-17,
+                        IT-01, II-01..II-10, AH-01 -- the trigger set,
+                        the inspection indexes, and the NOT NULL rebuild
+    6   10          63  CI-01..CI-09 and VB-07 -- the candidate indexes
+                        and the per-side attribution transition, none of
+                        which exist before this slice
+```
+
+"All 63 by the end of slice 6" survives as an aggregate gate. What does not
+survive is asking any earlier slice to prove a mechanism it has not built.
 
 The "same revision, same identity" rule is what makes the model coherent: a
 superseding row is a *replacement measurement of the same bytes by the same
@@ -1708,6 +1802,31 @@ The paired CHECK does the same job as the ownership one: it makes "we know the
 parameters" and "we recorded them" the same statement, so a NULL cannot pass as
 an unstated known value. All 3,000 existing rows are `unknown_legacy`; every
 row a producer writes after slice 6 is `known`.
+
+**`parameters_basis` cannot arrive before the fields it describes.** An
+earlier draft added and backfilled it in slice 4 while `parameters_json`,
+`parameters_digest` and the producer requirement waited for slice 6. That
+leaves an interval in which a candidate written by the detector has nowhere
+honest to go: labelled `unknown_legacy` it is a fresh row calling itself
+historical; labelled `known` it asserts parameters the schema has no column to
+hold; and refusing the insert stops candidate production for two slices. The
+paired CHECK above makes the second impossible, so the interval could only
+resolve as the first or the third -- a false label or an outage.
+
+The column therefore lands in **slice 6**, with `parameters_json` and
+`parameters_digest`, and the same migration that backfills the 3,000 rows as
+`unknown_legacy` requires `known` from every new row. Basis and fields arrive
+together, which is what makes the pairing enforceable from its first moment.
+
+The same reasoning fixes the analogous gap for inspections, in the other
+direction. `inspector_version` and `inspector_version_basis` do land in slice
+4, because §11.1 needs them in that slice's binding digest, so the producer
+requirement moves *forward* to meet them: inspection producers write
+`known` from slice 4, in the same migration that adds the column. Slice 5 then
+only makes structural what producers already do. Without that, every
+inspection written between slices 4 and 5 would be stamped `unknown_legacy` --
+a brand-new row asserting nobody knows which code produced it, which is
+exactly the false claim §6.5 refuses to make about the historical 59,541.
 
 The considered alternative was a non-NULL sentinel digest for legacy rows
 (`'unknown-legacy'` under a CHECK). It needs one index instead of four, but it
@@ -1887,10 +2006,10 @@ and must stay that way.
 | --- | --- | --- |
 | **1** | *this document* | lead accepts the matrix, the census, the requirement coverage, the producer paths and the invariants |
 | **2** | **page-inventory design** (§9.5). Design only, no schema, no planner. Decides whether page ownership lives on 2,955,391 `archive_pages` rows or on ~58,432 inventory parents, and where page idempotency and supersession live | lead accepts the parent's shape, the **authoritative backfill unit**, and the migration path. **This gates the planner as well as the schema** — see §11.3 |
-| **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table; every inspection is planned as `inspector_version_basis = 'unknown_legacy'` with a NULL version, and every near-duplicate row as `parameters_basis = 'unknown_legacy'`, both contributing to the plan digest |
-| **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, plus `inspector_version` / `inspector_version_basis` (§6.5) and `parameters_basis` (§9.6), backfilling exactly what slice 3 planned. **Uniqueness unchanged.** Producers write a basis on the path they already take. **The measurement-immutability triggers of §9.4.2 land here, not in slice 5** — they are what makes the interim window safe (§11.4) | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; **a rerun that would change any measurement value fails, on bound and unresolved rows alike, while a byte-identical rerun passes**; recovery is restore-from-backup |
-| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, producers begin requiring `inspector_version_basis = 'known'`. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows on every table that has both — `archive_hashes` is bound-only (§9.3) and is proven on its single branch; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; all 58 unique executed cases reproduce, by the identifiers in §9.4.2, each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
-| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, **begin requiring `parameters_basis = 'known'`** and populating those fields for new rows (the column itself arrived in slice 4), **begin writing `processing_runs`** and carry `processing_run_id`, four partial indexes per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run |
+| **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table; every inspection is planned as `inspector_version_basis = 'unknown_legacy'` with a NULL version, with the near-duplicate parameter classification planned but **not** applied until slice 6, so it contributes to the plan digest without implying a slice-4 write |
+| **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, plus `inspector_version` / `inspector_version_basis` (§6.5), backfilling exactly what slice 3 planned. **`parameters_basis` is not in this slice** — it lands in slice 6 with the parameter fields that give it meaning (§9.6). **Inspection producers begin writing `inspector_version_basis = 'known'` here, in the same slice that adds the column**, so no row written after the migration is labelled legacy. **Uniqueness unchanged.** Producers write a basis on the path they already take. **The measurement-immutability triggers of §9.4.2 land here, not in slice 5** — they are what makes the interim window safe (§11.4) | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; **a rerun that would change any measurement value fails, on bound and unresolved rows alike, while a byte-identical rerun passes**; slice 4's own 16 cases reproduce (DP-01..DP-10, VB-01..VB-06); recovery is restore-from-backup |
+| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, and the `inspector_version_basis = 'known'` requirement producers already follow since slice 4 becomes structurally enforced. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows on every table that has both — `archive_hashes` is bound-only (§9.3) and is proven on its single branch; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; slice 5's own 37 cases reproduce and the 16 from slice 4 still do, 53 cumulative, by the identifiers and the ownership table in §9.4.2 -- the candidate-index cases belong to slice 6 and are not required here, each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
+| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, add `parameters_basis` and backfill all 3,000 historical rows as `unknown_legacy`, **requiring `known` for every new row from the same migration**, **begin writing `processing_runs`** and carry `processing_run_id`, four partial indexes per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run; slice 6's own 10 cases reproduce (CI-01..CI-09, VB-07) and the full 63 hold cumulatively, which is the aggregate gate §9.4.2 defines |
 | **7** | planner: split `quarantine_or_resolution` into `quarantine` and `disposition_history`, renaming `RULE_GRANULARITY` to `RULE_MAX_GRANULARITY` in the same edit because the split rewrites its keys anyway (§10). **Per-row granularity resolution is not in this slice** — it is deferred until a revision-granular basis exists (§12.2), so this slice changes the reason census and nothing else | see §11.2 |
 
 ### 11.1 The migration gate, respecified
@@ -1929,8 +2048,11 @@ binding digest   computed after the migration over (table, row id, and
 
                      near_duplicate_candidates
                          revision_a_id, revision_b_id,
-                         provenance_basis_a, provenance_basis_b,
-                         parameters_basis
+                         provenance_basis_a, provenance_basis_b
+
+                 parameters_basis is absent because slice 4 no longer
+                 writes it; it enters slice 6's own binding digest with
+                 parameters_json and parameters_digest (§9.6).
 ```
 
 An earlier draft fixed this tuple at `(table, row id, source_revision_id,
