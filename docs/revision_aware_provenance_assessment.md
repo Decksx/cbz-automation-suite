@@ -837,16 +837,21 @@ how it got one, or be NULL without saying why.
 
 **`provenance_basis` is nullable during slice 4 and becomes `NOT NULL` in
 slice 5 — except on `near_duplicate_candidates`, where it becomes `NOT NULL`
-in slice 6.** Slice 5 excludes that table, so its two per-side bases cannot be
-rebuilt then; they are structurally non-null from the slice-6 rebuild that
-also lands its indexes and triggers (§9.6.1). The window in which a NULL basis
-is possible is one slice long for five tables and two for the sixth, and it is
-closed by a gate in both cases rather than by convention. SQLite cannot add a NOT NULL column without a default, and a default
-would let an unattributed row pass as attributed. So slice 4 adds it nullable,
-its gate proves every existing row is populated, and slice 5's table rebuild —
-which is happening anyway for the uniqueness change — makes it structurally
-NOT NULL. The window in which a NULL basis is possible is one slice long and is
-closed by a gate rather than by convention.
+in slice 6.** SQLite cannot add a NOT NULL column without a default, and a
+default would let an unattributed row pass as attributed. So slice 4 adds it
+nullable, its gate proves every existing row is populated, and a later table
+rebuild — happening anyway for the uniqueness change — makes it structurally
+NOT NULL.
+
+Which rebuild, and therefore how long the window lasts, differs by table.
+There are five receiving tables in all (§5). The four non-candidate ones are
+rebuilt in slice 5, one slice after the window opens. The fifth is
+`near_duplicate_candidates`, which slice 5 excludes: its two per-side bases
+cannot be rebuilt then, and they become structurally non-null in the slice-6
+rebuild that also lands its indexes and triggers (§9.6.1) — two slices after
+the window opens. An earlier draft said "one slice long" without qualification,
+which was true of four tables out of five. Both windows are closed by a gate
+rather than by convention.
 
 ### 9.3 Uniqueness must be partial, and must cover unresolved rows
 
@@ -1626,7 +1631,7 @@ DP-17  genuine ON DELETE SET NULL cascade               ACCEPTED  s5
 completeness assertion above, which is a check rather than a case
 ```
 
-Together with §9.2, §9.3, §9.3.1 and §9.6.1, every piece of SQL this
+Together with §9.2, §9.3, §9.3.1, §9.6.1 and §9.6.2, every piece of SQL this
 document specifies has now been executed. Two earlier totals here -- 54, then
 63 -- were both reached by summing section subtotals, which cannot detect a
 case counted in two of them, so cases carry stable identifiers and are counted
@@ -1639,15 +1644,15 @@ group                            ids                        registered
 §9.4.2  immutability source       IT-01 .. IT-03                     3
 §9.4.2  value-identical rewrites  VI-01 .. VI-05                     5
 §9.3.1  inspection indexes        II-01 .. II-10                    10
-§9.6.1  candidate triggers        ND-01 .. ND-15                    15
+§9.6.1  candidate triggers        ND-01 .. ND-16                    16
 §9.6.2  candidate indexes         CI-01 .. CI-09                     9
 §9.2    basis vocabulary          VB-01 .. VB-07                     7
 §9.3    archive_hashes            AH-01                              1
                                                                   ----
-registered executions                                               81
+registered executions                                               82
 duplicate registrations (below)                                     -3
                                                                   ----
-UNIQUE EXECUTIONS                                                   78
+UNIQUE EXECUTIONS                                                   79
 ```
 
 Three registered cases assert a behaviour another case already asserts. Two
@@ -1712,12 +1717,12 @@ slice  own  cumulative  cases
     5   37          54  SA-01..SA-14, VI-01..VI-05, DP-11..DP-17, IT-01,
                         II-01..II-10, AH-01 -- the inspections trigger
                         set, the inspection indexes, the NOT NULL rebuild
-    6   24          78  ND-01..ND-15 and CI-01..CI-09 -- the candidate
+    6   25          79  ND-01..ND-16 and CI-01..CI-09 -- the candidate
                         trigger set and the candidate indexes, neither of
                         which exists before this slice
 ```
 
-"All 63 by the end of slice 6" survives as an aggregate gate. What does not
+"All 79 by the end of slice 6" survives as an aggregate gate. What does not
 survive is asking any earlier slice to prove a mechanism it has not built.
 
 The "same revision, same identity" rule is what makes the model coherent: a
@@ -1901,10 +1906,20 @@ ND-12  successor with a different parameters_digest    REJECTED  s6
 ND-13  successor with a different algorithm version    REJECTED  s6
 ND-14  attribution rewrite, value-identical            ACCEPTED  s6
 ND-15  supersession rewrite, value-identical           ACCEPTED  s6
+ND-16  both sides bind in one statement                ACCEPTED  s6
 ```
 
 `ND-05` is the pairwise analogue of `DP-13`: a side may not transition to
 `single_revision_inherited`, which the backfill writes and no producer may.
+`ND-16` binds both sides in **one** `UPDATE`. That is not `ND-01` and
+`ND-02` run in sequence: it fires both `UPDATE OF` triggers within a single
+SQLite statement, each seeing the same `OLD` row while `NEW` already carries
+the other side's change. Whether that combination is accepted is a property of
+statement-level trigger evaluation rather than of either trigger alone, so it
+is measured rather than deduced from the two single-side cases. It is what
+makes the two-trigger design usable by a producer that learns both revisions
+at once.
+
 `ND-11..ND-13` are the cases a single-sided successor check would miss — a
 successor agreeing on side A and differing on side B, on the parameters
 digest, or on the version — and they are why the tuple is spelled out per
@@ -2086,7 +2101,7 @@ and must stay that way.
 | **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table; every inspection is planned as `inspector_version_basis = 'unknown_legacy'` with a NULL version, with the near-duplicate parameter classification planned but **not** applied until slice 6, so it contributes to the plan digest without implying a slice-4 write |
 | **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, plus `inspector_version` / `inspector_version_basis` (§6.5), backfilling exactly what slice 3 planned. **`parameters_basis` is not in this slice** — it lands in slice 6 with the parameter fields that give it meaning (§9.6). **Inspection producers begin writing `inspector_version_basis = 'known'` here, in the same slice that adds the column**, so no row written after the migration is labelled legacy. **Uniqueness unchanged.** Producers write a basis on the path they already take. **The measurement-immutability triggers of §9.4.2 land here, not in slice 5** — they are what makes the interim window safe (§11.4) | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; **a rerun that would change any measurement value fails, on bound and unresolved rows alike, while a byte-identical rerun passes**; slice 4's own 17 cases reproduce (DP-01..DP-10, VB-01..VB-07); recovery is restore-from-backup |
 | **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, and the `inspector_version_basis = 'known'` requirement producers already follow since slice 4 becomes structurally enforced. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows on every table that has both — `archive_hashes` is bound-only (§9.3) and is proven on its single branch; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; slice 5's own 37 cases reproduce and the 17 from slice 4 still do, 54 cumulative, by the identifiers and the ownership table in §9.4.2 -- every candidate case, index and trigger alike, belongs to slice 6 and is not required here, each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
-| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, add `parameters_basis` and backfill all 3,000 historical rows as `unknown_legacy`, **requiring `known` for every new row from the same migration**, **begin writing `processing_runs`** and carry `processing_run_id`, the four partial indexes of §9.6.2, **and the full candidate trigger set of §9.6.1** — per-side attribution transitions, the supersession lifecycle, and the pairwise successor-identity pair, all carrying the value-change guard — plus the `NOT NULL` rebuild of both per-side bases, which slice 5 could not perform on this table | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run; slice 6's own 24 cases reproduce (ND-01..ND-15, CI-01..CI-09) and the full 78 hold cumulatively, which is the aggregate gate §9.4.2 defines |
+| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, add `parameters_basis` and backfill all 3,000 historical rows as `unknown_legacy`, **requiring `known` for every new row from the same migration**, **begin writing `processing_runs`** and carry `processing_run_id`, the four partial indexes of §9.6.2, **and the full candidate trigger set of §9.6.1** — per-side attribution transitions, the supersession lifecycle, and the pairwise successor-identity pair, all carrying the value-change guard — plus the `NOT NULL` rebuild of both per-side bases, which slice 5 could not perform on this table | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run; slice 6's own 25 cases reproduce (ND-01..ND-16, CI-01..CI-09) and the full 79 hold cumulatively, which is the aggregate gate §9.4.2 defines |
 | **7** | planner: split `quarantine_or_resolution` into `quarantine` and `disposition_history`, renaming `RULE_GRANULARITY` to `RULE_MAX_GRANULARITY` in the same edit because the split rewrites its keys anyway (§10). **Per-row granularity resolution is not in this slice** — it is deferred until a revision-granular basis exists (§12.2), so this slice changes the reason census and nothing else | see §11.2 |
 
 ### 11.1 The migration gate, respecified
