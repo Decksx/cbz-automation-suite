@@ -415,8 +415,9 @@ recommendation is the former: a table that exists and is unused is a cheaper
 answer than a second mechanism.
 
 For the other tables the requirement is **deferred past slice 5**, with a
-reason rather than by omission. Their producers do change in slice 5, but slice
-5 adds no `processing_run_id` because nothing writes a `processing_runs` row
+reason rather than by omission. Their producers change in slices 4 and 5 —
+slice 4 for the basis and inspector-version rules of §6.5, slice 5 for the
+append switch — but neither slice adds a `processing_run_id` because nothing writes a `processing_runs` row
 until slice 6 introduces run-writing for the near-duplicate detector. Adding
 the column in slice 5 would create a foreign key to an empty table that every
 producer would populate with NULL — the same objection that defers the
@@ -457,8 +458,10 @@ and the two inspections would be indistinguishable in the table.
 
 So an `inspector_version` column is introduced in slice 4, with the rest of
 the backfill, so that its value and its basis enter the same binding digest as
-every other column that migration writes (§11.1). Slice 5 adds the uniqueness
-branches and the producer requirement.
+every other column that migration writes (§11.1). **The producer requirement
+lands in slice 4 too**, in the same migration that adds the column: an
+inspection written after it must carry `known` and a version. Slice 5 adds
+only the uniqueness branches and makes the requirement structural.
 
 **Historical rows must not be given the current version.** An earlier draft
 proposed backfilling all 59,541 rows with whatever the present inspector
@@ -483,10 +486,21 @@ CHECK (
 ```
 
 All 59,541 historical rows are `unknown_legacy` with a NULL version, written
-by slice 4. Every row a producer writes after slice 5 requires `known` and a
-non-NULL version. Both the status and the version are decision-bearing, so both
-go into the slice-3 plan digest and the slice-4 binding digest — which is
-why the columns must exist by slice 4 rather than 5.
+by slice 4. Every row a producer writes **from slice 4 onward** requires
+`known` and a non-NULL version. Both the status and the version are
+decision-bearing, so both go into the slice-3 plan digest and the slice-4
+binding digest — which is why the columns must exist by slice 4 rather than 5.
+
+An earlier draft deferred the producer requirement to slice 5 while adding the
+column in slice 4, which opens a window where a brand-new inspection is
+labelled `unknown_legacy`. That is the same false claim this section refuses
+to make about the historical 59,541, made about rows whose version is known
+perfectly well. `unknown_legacy` describes evidence produced before the column
+existed; it must never describe evidence produced after it. Where the column
+and the producer rule cannot land together — `parameters_basis`, whose paired
+CHECK needs fields that arrive later — the *column* moves to meet the
+producer instead (§9.6), rather than the label being stretched to cover rows
+it does not describe.
 
 Because the version may be NULL, the active uniqueness needs the same
 known/unknown split the near-duplicate table uses (§9.3).
@@ -593,7 +607,7 @@ be unresolved, and the backfill planner reports the count so the gate is visible
 A candidate row is one comparison of two page sets, and each side is bound
 independently. One `provenance_basis` cannot describe a pair whose sides
 differ — a bound side compared against an unresolved one is an ordinary
-case, and §9.6.1 measures what the index set does with it. The table
+case, and §9.6.2 measures what the index set does with it. The table
 therefore takes `provenance_basis_a` and `provenance_basis_b`, each paired to
 its own revision key by its own CHECK.
 
@@ -798,13 +812,13 @@ vocabulary out of this section rather than restating it, so the test cannot
 pass against a list the document no longer contains:
 
 ```text
-backfilled row: single_revision_inherited both sides        ACCEPTED
-producer row: inherited_from_page_evidence both sides       ACCEPTED
-mixed row: bound side inherited_from_page_evidence          ACCEPTED
-bound side inherited, other side single_revision_inherited  ACCEPTED
-side A binds: unresolved -> inherited_from_page_evidence    ACCEPTED
-a bound side carrying an unresolved basis                   REJECTED
-an unbound side carrying a bound basis                      REJECTED
+VB-01  backfilled row: single_revision_inherited both sides      ACCEPTED  s4
+VB-02  producer row: inherited_from_page_evidence both sides     ACCEPTED  s4
+VB-03  mixed row: bound side inherited, other unresolved         ACCEPTED  s4
+VB-04  bound side inherited, other single_revision_inherited     ACCEPTED  s4
+VB-05  a bound side carrying an unresolved basis                 REJECTED  s4
+VB-06  an unbound side carrying a bound basis                    REJECTED  s4
+VB-07  side A binds: unresolved -> inherited_from_page_evidence  ACCEPTED  s4
 ```
 
 The last two matter as much as the first five: widening the vocabulary must
@@ -822,7 +836,12 @@ how it got one, or be NULL without saying why.
 `near_duplicate_candidates` carries this pair twice, once per side.
 
 **`provenance_basis` is nullable during slice 4 and becomes `NOT NULL` in
-slice 5.** SQLite cannot add a NOT NULL column without a default, and a default
+slice 5 — except on `near_duplicate_candidates`, where it becomes `NOT NULL`
+in slice 6.** Slice 5 excludes that table, so its two per-side bases cannot be
+rebuilt then; they are structurally non-null from the slice-6 rebuild that
+also lands its indexes and triggers (§9.6.1). The window in which a NULL basis
+is possible is one slice long for five tables and two for the sixth, and it is
+closed by a gate in both cases rather than by convention. SQLite cannot add a NOT NULL column without a default, and a default
 would let an unattributed row pass as attributed. So slice 4 adds it nullable,
 its gate proves every existing row is populated, and slice 5's table rebuild —
 which is happening anyway for the uniqueness change — makes it structurally
@@ -885,8 +904,8 @@ index is indistinguishable from a working one until someone relies on it.
 Measured against the post-rebuild shape:
 
 ```text
-an unresolved archive_hashes row is unconstructible         REJECTED
-rows an unresolved partial index could ever hold                  0
+AH-01  an unresolved archive_hashes row is unconstructible  REJECTED  s5
+       rows such an index could ever hold (observation)            0
 ```
 
 **`archive_pages` and `page_hashes` deliberately carry no `WHERE active`
@@ -934,16 +953,16 @@ CREATE UNIQUE INDEX ui_insp_unresolved_unknown
 ```
 
 ```text
-two active bound rows, same revision + version              REJECTED
-two active bound rows, same revision, both versions NULL    REJECTED
-bound + unresolved for the same archive coexist             ACCEPTED
-two active unresolved rows, same archive, versions NULL     REJECTED
-two active unresolved rows, same archive, same version      REJECTED
-same identity, one superseded -> coexist                    ACCEPTED
-different version, both active -> coexist                   ACCEPTED
-known-version and unknown-version bound rows coexist        ACCEPTED
-unresolved -> bound colliding with an existing bound row    REJECTED
-unresolved -> bound with no collision                       ACCEPTED
+II-01  two active bound rows, same revision + version            REJECTED  s5
+II-02  two active bound rows, same revision, versions NULL       REJECTED  s5
+II-03  bound + unresolved for the same archive coexist           ACCEPTED  s5
+II-04  two active unresolved rows, same archive, versions NULL   REJECTED  s5
+II-05  two active unresolved rows, same archive, same version    REJECTED  s5
+II-06  same identity, one superseded -> coexist                  ACCEPTED  s5
+II-07  different version, both active -> coexist                 ACCEPTED  s5
+II-08  known-version and unknown-version bound rows coexist      ACCEPTED  s5
+II-09  unresolved -> bound colliding with an existing bound row  REJECTED  s5
+II-10  unresolved -> bound with no collision                     ACCEPTED  s5
 ```
 
 Two results are worth drawing out because they are the ones prose would have
@@ -1129,11 +1148,11 @@ transition. A trigger generated from the tuple freezes it, and the documented
 Measured both ways on the real column set:
 
 ```text
-trigger generated from the evidence-identity tuple
-    documented binding transition                    REJECTED   WRONG
-trigger generated from the 'identity' disposition
-    documented binding transition                    ACCEPTED
-    and still freezes inspector_version              REJECTED
+IT-01  trigger from the evidence-identity tuple:
+       the documented binding transition                 REJECTED  s5  WRONG
+IT-02  trigger from the 'identity' disposition:
+       the documented binding transition                 ACCEPTED  s5
+IT-03  the same trigger still freezes inspector_version  REJECTED  s5
 ```
 
 So the immutability trigger is generated from the **`identity` disposition**
@@ -1461,12 +1480,21 @@ none of them. `BEFORE UPDATE OF <cols> WHEN NOT (<valid transition>)` asks
 all", so a rewrite that changes nothing is judged as though it were a move:
 
 ```text
-SET source_revision_id = source_revision_id,
-    provenance_basis   = provenance_basis            REJECTED   WRONG
-SET superseded_at      = superseded_at,
-    superseded_by_id   = superseded_by_id,
-    superseded_reason  = superseded_reason           REJECTED   WRONG
-SET location_id        = location_id                 REJECTED   WRONG
+VI-01  attribution rewrite, bound row        as documented: REJECTED  WRONG
+VI-02  attribution rewrite, unresolved row   as documented: REJECTED  WRONG
+VI-03  supersession rewrite, active row      as documented: REJECTED  WRONG
+VI-04  supersession rewrite, historical row  as documented: REJECTED  WRONG
+VI-05  source-context rewrite                as documented: REJECTED  WRONG
+
+       the statements, in the same order:
+         SET source_revision_id = source_revision_id,
+             provenance_basis   = provenance_basis           (VI-01, VI-02)
+         SET superseded_at      = superseded_at,
+             superseded_by_id   = superseded_by_id,
+             superseded_reason  = superseded_reason          (VI-03, VI-04)
+         SET location_id        = location_id                (VI-05)
+
+       all five ACCEPTED once guarded; all owned by slice 5
 ```
 
 None of those is a transition and all three should be no-ops. This is the
@@ -1551,20 +1579,20 @@ reading it.
 The corrected set was executed in memory against every case above:
 
 ```text
-happy paths          valid deferred replacement                   ACCEPTED
-                     unresolved -> bound inspection               ACCEPTED
-attribution guards   rebind an already-bound row                  REJECTED
-                     unbind a bound row                           REJECTED
-                     bind a superseded row                        REJECTED
-                     bind a row a predecessor points at           REJECTED
-measurement          result payload UPDATE                        REJECTED
-                     page_count UPDATE                            REJECTED
-                     identity UPDATE (inspector_version)          REJECTED
-lifecycle            INSERT already superseded, mismatched        REJECTED
-                     redirect an existing successor               REJECTED
-                     un-supersede a historical row                REJECTED
-                     re-explain a historical row                  REJECTED
-                     partial supersession (no reason)             REJECTED
+SA-01  valid deferred replacement             ACCEPTED  s5
+SA-02  unresolved -> bound inspection         ACCEPTED  s5
+SA-03  rebind an already-bound row            REJECTED  s5
+SA-04  unbind a bound row                     REJECTED  s5
+SA-05  bind a superseded row                  REJECTED  s5
+SA-06  bind a row a predecessor points at     REJECTED  s5
+SA-07  result payload UPDATE                  REJECTED  s5
+SA-08  page_count UPDATE                      REJECTED  s5
+SA-09  identity UPDATE (inspector_version)    REJECTED  s5
+SA-10  INSERT already superseded, mismatched  REJECTED  s5
+SA-11  redirect an existing successor         REJECTED  s5
+SA-12  un-supersede a historical row          REJECTED  s5
+SA-13  re-explain a historical row            REJECTED  s5
+SA-14  partial supersession (no reason)       REJECTED  s5
 
 14 / 14 behaved as specified (SA-01 .. SA-14)
 ```
@@ -1576,27 +1604,23 @@ including it:
 ```text
 completeness         28 columns, 28 assigned, 0 missing, 0 unassigned
 
-columns the old      status rewrite                               REJECTED
-trigger missed       inspected_path rewrite                       REJECTED
-                     archive_format rewrite                       REJECTED
-                     encrypted rewrite                            REJECTED
-                     comic_info_present rewrite                   REJECTED
-                     comic_info_error rewrite                     REJECTED
-                     created_at rewrite                           REJECTED
-                     updated_at rewrite (legitimately mutable)    ACCEPTED
-
-idempotent reuse     byte-identical rewrite of the whole result   ACCEPTED
-                     one differing column among identical ones    REJECTED
-
-vocabulary and       INSERT with basis 'measured'                 REJECTED
-transition           unresolved -> measured                       REJECTED
-                     unresolved -> single_revision_inherited      REJECTED
-                     unresolved_no_identity ->
-                         stat_matched_revision                    ACCEPTED
-
-source context       repoint location_id                          REJECTED
-                     direct clear while the location exists       REJECTED
-                     genuine ON DELETE SET NULL cascade           ACCEPTED
+DP-01  status rewrite                                   REJECTED  s4
+DP-02  inspected_path rewrite                           REJECTED  s4
+DP-03  archive_format rewrite                           REJECTED  s4
+DP-04  encrypted rewrite                                REJECTED  s4
+DP-05  comic_info_present rewrite                       REJECTED  s4
+DP-06  comic_info_error rewrite                         REJECTED  s4
+DP-07  created_at rewrite                               REJECTED  s4
+DP-08  updated_at rewrite (legitimately mutable)        ACCEPTED  s4
+DP-09  byte-identical rewrite of the whole result       ACCEPTED  s4
+DP-10  one differing column among identical ones        REJECTED  s4
+DP-11  INSERT with basis 'measured'                     REJECTED  s5
+DP-12  unresolved -> measured                           REJECTED  s5
+DP-13  unresolved -> single_revision_inherited          REJECTED  s5
+DP-14  unresolved_no_identity -> stat_matched_revision  ACCEPTED  s5
+DP-15  repoint location_id                              REJECTED  s5
+DP-16  direct clear while the location exists           REJECTED  s5
+DP-17  genuine ON DELETE SET NULL cascade               ACCEPTED  s5
 
 17 / 17 cases behaved as specified (DP-01 .. DP-17), plus the
 completeness assertion above, which is a check rather than a case
@@ -1615,14 +1639,15 @@ group                            ids                        registered
 §9.4.2  immutability source       IT-01 .. IT-03                     3
 §9.4.2  value-identical rewrites  VI-01 .. VI-05                     5
 §9.3.1  inspection indexes        II-01 .. II-10                    10
-§9.6.1  candidate indexes         CI-01 .. CI-09                     9
+§9.6.1  candidate triggers        ND-01 .. ND-15                    15
+§9.6.2  candidate indexes         CI-01 .. CI-09                     9
 §9.2    basis vocabulary          VB-01 .. VB-07                     7
 §9.3    archive_hashes            AH-01                              1
                                                                   ----
-registered executions                                               66
+registered executions                                               81
 duplicate registrations (below)                                     -3
                                                                   ----
-UNIQUE EXECUTIONS                                                   63
+UNIQUE EXECUTIONS                                                   78
 ```
 
 Three registered cases assert a behaviour another case already asserts. Two
@@ -1646,6 +1671,16 @@ cases" phrasing that added them a second time is retired.
 **The two unresolved-to-bound inspection cases are the same execution.** SA-02
 and DP-14 set up an unresolved row, bind it with the correct basis, and expect
 ACCEPTED. So does IT-02. All three are one behaviour, counted once.
+
+**`VB-07` belongs to slice 4, not slice 6.** An earlier draft assigned it to
+slice 6 as "the per-side attribution transition". It is not one: §9.2's harness
+installs the paired CHECK and no triggers, so `VB-07` proves the CHECK admits
+the *state* a bound side reaches, not that any trigger permits the move. The
+transition itself is `ND-01` and `ND-02`, which are slice 6. All seven `VB`
+cases test the CHECK and land with it in slice 4. The misreading was possible
+because the displayed block carried no identifiers and its fifth line was the
+one labelled `VB-07`; every block now names its case on the line, which is
+what makes the identifiers reproducible rather than merely stable.
 
 **A twelfth "new" case did not exist.** The round that added VB and AH
 registered 11, not 12: the twelfth was a derived observation -- that an
@@ -1671,15 +1706,15 @@ already proven:
 
 ```text
 slice  own  cumulative  cases
-    4   16          16  DP-01..DP-10  (measurement immutability, which
-                        §11 lands in slice 4), VB-01..VB-06 (the basis
-                        CHECK, which arrives with the column)
-    5   37          53  SA-01..SA-14, VI-01..VI-05, DP-11..DP-17,
-                        IT-01, II-01..II-10, AH-01 -- the trigger set,
-                        the inspection indexes, and the NOT NULL rebuild
-    6   10          63  CI-01..CI-09 and VB-07 -- the candidate indexes
-                        and the per-side attribution transition, none of
-                        which exist before this slice
+    4   17          17  DP-01..DP-10, the measurement-immutability set,
+                        which §11 lands in slice 4; VB-01..VB-07, the
+                        paired basis CHECK, which arrives with the column
+    5   37          54  SA-01..SA-14, VI-01..VI-05, DP-11..DP-17, IT-01,
+                        II-01..II-10, AH-01 -- the inspections trigger
+                        set, the inspection indexes, the NOT NULL rebuild
+    6   24          78  ND-01..ND-15 and CI-01..CI-09 -- the candidate
+                        trigger set and the candidate indexes, neither of
+                        which exists before this slice
 ```
 
 "All 63 by the end of slice 6" survives as an aggregate gate. What does not
@@ -1833,7 +1868,49 @@ The considered alternative was a non-NULL sentinel digest for legacy rows
 asserts that all 3,000 rows shared one parameter set, which is not known to be
 true. The partial-index form declines to assert it.
 
-#### 9.6.1 The executable form, and what it was measured to do
+#### 9.6.1 The trigger set, which slice 5 cannot carry
+
+Slice 5 excludes `near_duplicate_candidates`, so every trigger the other
+receiving tables gain in that slice arrives here instead. An earlier draft
+named only this table's columns, run provenance and indexes for slice 6 and
+left the trigger set unstated, which would have shipped a table with partial
+uniqueness and no attribution, supersession or successor-identity enforcement
+at all. `CI-01..CI-09` prove the indexes; they prove nothing about triggers.
+
+The set mirrors §9.4.2 with one structural difference: identity is pairwise,
+so the attribution transition is **per side** — two triggers, not one — and
+the successor-identity comparison spans both revisions, both archives, the
+algorithm, the version and the parameters digest (the tuple §9.4.2 names for
+this table). Every comparison is `IS NOT`, and every transition trigger opens
+with the value-change guard of §9.4.2, because a pairwise row is exactly as
+liable to a byte-identical rewrite as a single-sided one.
+
+```text
+ND-01  side A binds unresolved -> inherited            ACCEPTED  s6
+ND-02  side B binds unresolved -> inherited            ACCEPTED  s6
+ND-03  rebind an already-bound side A                  REJECTED  s6
+ND-04  unbind a bound side A                           REJECTED  s6
+ND-05  side A binds to a basis it may not carry        REJECTED  s6
+ND-06  INSERT already carrying a supersession pointer  REJECTED  s6
+ND-07  valid deferred pairwise replacement             ACCEPTED  s6
+ND-08  un-supersede a historical candidate             REJECTED  s6
+ND-09  redirect an existing successor                  REJECTED  s6
+ND-10  partial supersession (no reason)                REJECTED  s6
+ND-11  successor naming a different revision_b         REJECTED  s6
+ND-12  successor with a different parameters_digest    REJECTED  s6
+ND-13  successor with a different algorithm version    REJECTED  s6
+ND-14  attribution rewrite, value-identical            ACCEPTED  s6
+ND-15  supersession rewrite, value-identical           ACCEPTED  s6
+```
+
+`ND-05` is the pairwise analogue of `DP-13`: a side may not transition to
+`single_revision_inherited`, which the backfill writes and no producer may.
+`ND-11..ND-13` are the cases a single-sided successor check would miss — a
+successor agreeing on side A and differing on side B, on the parameters
+digest, or on the version — and they are why the tuple is spelled out per
+table rather than templated.
+
+#### 9.6.2 The executable index form, and what it was measured to do
 
 ```sql
 CREATE UNIQUE INDEX ui_nd_bound_known
@@ -1870,15 +1947,15 @@ deterministic expressions over the table's own columns and it was not obvious
 that this qualifies.
 
 ```text
-two bound rows, same revisions + same parameters            REJECTED
-two bound rows, same revisions, different parameters        ACCEPTED
-two legacy rows, same pair, both parameters NULL            REJECTED
-legacy (NULL params) and new (known params) coexist         ACCEPTED
-two mixed-side rows for the same archive pair collide       REJECTED
-mixed-side and fully bound coexist                          ACCEPTED
-two fully unresolved rows, same pair, same parameters       REJECTED
-same identity, one superseded -> coexist                    ACCEPTED
-different algorithm version -> coexist                      ACCEPTED
+CI-01  two bound rows, same revisions + same parameters       REJECTED  s6
+CI-02  two bound rows, same revisions, different parameters   ACCEPTED  s6
+CI-03  two legacy rows, same pair, both parameters NULL       REJECTED  s6
+CI-04  legacy (NULL params) and new (known params) coexist    ACCEPTED  s6
+CI-05  two mixed-side rows for the same archive pair collide  REJECTED  s6
+CI-06  mixed-side and fully bound coexist                     ACCEPTED  s6
+CI-07  two fully unresolved rows, same pair, same parameters  REJECTED  s6
+CI-08  same identity, one superseded -> coexist               ACCEPTED  s6
+CI-09  different algorithm version -> coexist                 ACCEPTED  s6
 ```
 
 The mixed-side results are the ones that justify §9.6's definition. Two
@@ -2007,9 +2084,9 @@ and must stay that way.
 | **1** | *this document* | lead accepts the matrix, the census, the requirement coverage, the producer paths and the invariants |
 | **2** | **page-inventory design** (§9.5). Design only, no schema, no planner. Decides whether page ownership lives on 2,955,391 `archive_pages` rows or on ~58,432 inventory parents, and where page idempotency and supersession live | lead accepts the parent's shape, the **authoritative backfill unit**, and the migration path. **This gates the planner as well as the schema** — see §11.3 |
 | **3** | read-only **backfill planner**: classify every evidence row into the bases of §7.1, with a snapshot digest, deterministic JSON/CSV, and totals reconciling per table | counts reproduce §7.2 for whatever unit slice 2 settled; `measured` and `stat_matched_revision` are both 0; identity seed 59,541, field seed 58,421; the 16 drift signatures and their page evidence are `unresolved_drift`; the 147 provisional archives reported as an archive-level gate; quarantine appears in no table; every inspection is planned as `inspector_version_basis = 'unknown_legacy'` with a NULL version, with the near-duplicate parameter classification planned but **not** applied until slice 6, so it contributes to the plan digest without implying a slice-4 write |
-| **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, plus `inspector_version` / `inspector_version_basis` (§6.5), backfilling exactly what slice 3 planned. **`parameters_basis` is not in this slice** — it lands in slice 6 with the parameter fields that give it meaning (§9.6). **Inspection producers begin writing `inspector_version_basis = 'known'` here, in the same slice that adds the column**, so no row written after the migration is labelled legacy. **Uniqueness unchanged.** Producers write a basis on the path they already take. **The measurement-immutability triggers of §9.4.2 land here, not in slice 5** — they are what makes the interim window safe (§11.4) | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; **a rerun that would change any measurement value fails, on bound and unresolved rows alike, while a byte-identical rerun passes**; slice 4's own 16 cases reproduce (DP-01..DP-10, VB-01..VB-06); recovery is restore-from-backup |
-| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, and the `inspector_version_basis = 'known'` requirement producers already follow since slice 4 becomes structurally enforced. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows on every table that has both — `archive_hashes` is bound-only (§9.3) and is proven on its single branch; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; slice 5's own 37 cases reproduce and the 16 from slice 4 still do, 53 cumulative, by the identifiers and the ownership table in §9.4.2 -- the candidate-index cases belong to slice 6 and are not required here, each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
-| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, add `parameters_basis` and backfill all 3,000 historical rows as `unknown_legacy`, **requiring `known` for every new row from the same migration**, **begin writing `processing_runs`** and carry `processing_run_id`, four partial indexes per §9.6 | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run; slice 6's own 10 cases reproduce (CI-01..CI-09, VB-07) and the full 63 hold cumulatively, which is the aggregate gate §9.4.2 defines |
+| **4** | migration: ownership keys + **nullable** `provenance_basis` on the receiving tables, plus `inspector_version` / `inspector_version_basis` (§6.5), backfilling exactly what slice 3 planned. **`parameters_basis` is not in this slice** — it lands in slice 6 with the parameter fields that give it meaning (§9.6). **Inspection producers begin writing `inspector_version_basis = 'known'` here, in the same slice that adds the column**, so no row written after the migration is labelled legacy. **Uniqueness unchanged.** Producers write a basis on the path they already take. **The measurement-immutability triggers of §9.4.2 land here, not in slice 5** — they are what makes the interim window safe (§11.4) | protected backup verified first; row counts unchanged; all hash and signature values byte-identical; every row has a non-NULL basis at the gate even though the column permits NULL; planned-vs-applied reconciliation of §11.1 passes; **a rerun that would change any measurement value fails, on bound and unresolved rows alike, while a byte-identical rerun passes**; slice 4's own 17 cases reproduce (DP-01..DP-10, VB-01..VB-07); recovery is restore-from-backup |
+| **5** | uniqueness → the partial indexes of §9.3 (bound **and** unresolved), producers switch UPSERT → append, the remainder of §9.4.2's trigger set — the attribution transition, the supersession lifecycle, and both complementary identity triggers — `provenance_basis` becomes `NOT NULL` via the table rebuild, interim guard removed, and the `inspector_version_basis = 'known'` requirement producers already follow since slice 4 becomes structurally enforced. Page tables adopt whatever slice 2 decided. **Excludes `near_duplicate_candidates`** | idempotency re-established on the new keys and proven by bypass, for bound *and* unresolved rows on every table that has both — `archive_hashes` is bound-only (§9.3) and is proven on its single branch; a second generation's evidence demonstrably coexists with the first; a byte-identical rerun is a no-op, a differing rerun requires a reason, a new revision supersedes nothing; the id-ordering CHECK makes a cycle unconstructible; slice 5's own 37 cases reproduce and the 17 from slice 4 still do, 54 cumulative, by the identifiers and the ownership table in §9.4.2 -- every candidate case, index and trigger alike, belongs to slice 6 and is not required here, each guard proven by disabling it alone — including the three the earlier design let through: an INSERT already carrying a supersession pointer, un-supersession, and successor rewiring; and the one it wrongly refused, an unresolved inspection binding to a revision |
+| **6** | `near_duplicate_candidates`: split `match_method` into algorithm + version, add `parameters_json` + `parameters_digest`, add `parameters_basis` and backfill all 3,000 historical rows as `unknown_legacy`, **requiring `known` for every new row from the same migration**, **begin writing `processing_runs`** and carry `processing_run_id`, the four partial indexes of §9.6.2, **and the full candidate trigger set of §9.6.1** — per-side attribution transitions, the supersession lifecycle, and the pairwise successor-identity pair, all carrying the value-change guard — plus the `NOT NULL` rebuild of both per-side bases, which slice 5 could not perform on this table | no v1 row reinterpreted; a v2 row can coexist; two parameter sets at one version cannot collide; two legacy rows with unknown parameters cannot both survive; new rows carry a run; slice 6's own 24 cases reproduce (ND-01..ND-15, CI-01..CI-09) and the full 78 hold cumulatively, which is the aggregate gate §9.4.2 defines |
 | **7** | planner: split `quarantine_or_resolution` into `quarantine` and `disposition_history`, renaming `RULE_GRANULARITY` to `RULE_MAX_GRANULARITY` in the same edit because the split rewrites its keys anyway (§10). **Per-row granularity resolution is not in this slice** — it is deferred until a revision-granular basis exists (§12.2), so this slice changes the reason census and nothing else | see §11.2 |
 
 ### 11.1 The migration gate, respecified
