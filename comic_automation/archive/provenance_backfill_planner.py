@@ -26,19 +26,27 @@ import csv
 import hashlib
 import io
 import json
+import os
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from comic_automation.archive import output_guards
 from comic_automation.database.read_guards import read_consistent_snapshot
 
 # Bumped whenever a classification rule, its inputs, or the canonical digest
 # rendering changes, so a plan produced by an older planner can never collide
 # with this one's digest even over an identical database.
-PLANNER_VERSION = "provenance-backfill-planner/1"
-SNAPSHOT_DIGEST_VERSION = "provenance-backfill-snapshot/1"
+# Version 2 across all three markers. The canonical rendering changed from
+# delimiter-joined `name=value` to canonical JSON, and both digests now cover
+# inputs they previously ignored, so a version 1 digest and a version 2 digest
+# over the identical database are different strings and must not be compared.
+# Any plan digest recorded against version 1 -- including any quoted in a
+# review or handoff -- is superseded rather than contradicted.
+PLANNER_VERSION = "provenance-backfill-planner/2"
+SNAPSHOT_DIGEST_VERSION = "provenance-backfill-snapshot/2"
 
 # This planner reads. The constant exists so a reader of the emitted artifact
 # never has to infer it from the absence of an "applied" field.
@@ -152,6 +160,53 @@ class OutputPathError(BackfillPlannerError):
     """An output path would overwrite something, or sits beside the database."""
 
 
+def _canonical(value: Any) -> Any:
+    """Reduce a value to something JSON renders injectively.
+
+    Only `None`, `bool`, `int` and `str` are accepted as scalars, plus
+    mappings and sequences of them. The rejection is load-bearing rather than
+    defensive: `float` is the type that would silently reintroduce ambiguity,
+    because two different floats can share a repr and `json` would render
+    them identically, so a digest could stop distinguishing them. Nothing in
+    the plan is a float today, and this is what makes that a checked property
+    instead of a habit.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+
+    if isinstance(value, Mapping):
+        return {str(name): _canonical(item) for name, item in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [_canonical(item) for item in value]
+
+    raise PlannerInvariantError(
+        f"{type(value).__name__} cannot be canonically rendered; a digest over "
+        "it would not be reproducible"
+    )
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> str:
+    """One digest line, rendered so no two distinct payloads can collide.
+
+    JSON, not `name=value` joined by `|`. The previous rendering escaped
+    nothing, so a value containing a delimiter could reproduce another
+    record's line exactly -- two different valid binding shapes were shown to
+    produce identical canonical lines and therefore identical plan digests.
+    JSON escapes the delimiters inside strings, so no value can forge
+    structure; `sort_keys` and explicit separators keep it deterministic;
+    `ensure_ascii` keeps it byte-stable regardless of locale; and `None`
+    renders as `null`, distinct from the empty string that the old rendering
+    substituted for it.
+    """
+    return json.dumps(
+        _canonical(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
 @dataclass(frozen=True)
 class SideAttribution:
     """One side's ownership, because some tables have more than one.
@@ -262,27 +317,37 @@ class PlannedBinding:
         return all(side.bound for side in self.sides)
 
     def canonical_line(self) -> str:
-        """One digest line. Field names travel with values so reordering
-        cannot collide, and both sides and values are rendered in a fixed
-        order for the same reason.
+        """One digest line, canonically encoded.
+
+        Field names travelling with values is not sufficient on its own, which
+        is what the previous `name=value` rendering joined by `|` assumed.
+        Nothing escaped the delimiters, so a value containing one could
+        reproduce a different binding's line exactly -- two distinct valid
+        binding shapes were demonstrated to render identically and therefore
+        to produce the same plan digest. `_canonical_json` is injective: the
+        delimiters are escaped inside strings, the nesting keeps sides and
+        values in their own scopes rather than flattened into one stream, and
+        a missing value is `null` rather than the empty string.
         """
-        rendered = "|".join(
-            f"{name}={'' if value is None else value}"
-            for name, value in sorted(self.values.items())
-        )
-        sides = "|".join(
-            f"side{side.suffix()}|archive={side.archive_id}"
-            f"|revision={'' if side.source_revision_id is None else side.source_revision_id}"
-            f"|basis={side.provenance_basis}"
-            for side in self.sides
-        )
-        return (
-            f"binding|table={self.table}"
-            f"|key_kind={self.key_kind}|key={self.key}"
-            f"|archive_id={self.archive_id}"
-            f"|bound={int(self.bound)}"
-            f"|{sides}"
-            + (f"|{rendered}" if rendered else "")
+        return _canonical_json(
+            {
+                "k": "binding",
+                "table": self.table,
+                "key_kind": self.key_kind,
+                "key": self.key,
+                "archive_id": self.archive_id,
+                "bound": self.bound,
+                "sides": [
+                    {
+                        "label": side.label,
+                        "archive_id": side.archive_id,
+                        "source_revision_id": side.source_revision_id,
+                        "provenance_basis": side.provenance_basis,
+                    }
+                    for side in self.sides
+                ],
+                "values": dict(self.values),
+            }
         )
 
     def as_dict(self, *, planner_version: str, snapshot_digest: str,
@@ -375,8 +440,15 @@ class _Inputs:
     decision was drawn from.
     """
 
-    revisions: Mapping[int, tuple[int, str, str | None]]
-    """revision_id -> (archive_id, identity_state, archive_sha256)"""
+    revisions: Mapping[int, tuple[int, str, str | None, str | None]]
+    """revision_id -> (archive_id, identity_state, archive_sha256, content_signature)
+
+    Both digests travel, and not only so the snapshot digest covers them.
+    They are what a seed basis is VALIDATED against: migration 014 built
+    `archive_sha256` from `archive_hashes.digest` and `content_signature`
+    from `archive_content_signatures.digest`, so a seed binding asserts a
+    relationship that can be checked rather than assumed.
+    """
     revision_by_archive: Mapping[int, int]
     """archive_id -> revision_id, ESTABLISHED revisions only.
 
@@ -387,11 +459,27 @@ class _Inputs:
     behaviour the classifier wants.
     """
     provisional_by_archive: Mapping[int, int]
-    hashes: tuple[tuple[int, int], ...]
+    hashes: tuple[tuple[int, int, str], ...]
+    """(row_id, archive_id, digest)
+
+    The digest is read because the identity seed is checked against it and
+    because both digests must cover it. Hashing only ids meant a changed
+    `archive_hashes.digest` left the snapshot digest and the plan digest
+    byte-identical, so the state a plan was approved against could be edited
+    without invalidating the plan.
+    """
     signatures: tuple[tuple[int, int, int, str, int | None, str], ...]
     inspections: tuple[tuple[int, int], ...]
-    page_archives: Mapping[int, tuple[int, str, int | None]]
-    """archive_id -> (page_count, min_child_created_at, location_id)"""
+    page_archives: Mapping[int, tuple[int, str, int | None, int, int, int, int]]
+    """archive_id -> (page_count, min_child_created_at, location_id,
+    distinct_location_ids, null_location_pages, min_index, max_index)
+
+    The two location counters are separate on purpose. An earlier revision
+    asked for `count(DISTINCT ifnull(location_id, -1))`, which cannot tell an
+    unknown location from a legitimate location id of -1: one NULL child plus
+    one child at -1 counted as a single location, and a genuinely mixed page
+    set passed validation.
+    """
     candidates: tuple[tuple[int, int, int], ...]
     signature_by_archive: Mapping[int, tuple[int, int | None, str]]
     """archive_id -> (page_count, location_id, calculated_at)"""
@@ -406,18 +494,20 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
     """One pass over the snapshot. Every query here is a SELECT."""
     connection.row_factory = sqlite3.Row
 
-    revisions: dict[int, tuple[int, str, str | None]] = {}
+    revisions: dict[int, tuple[int, str, str | None, str | None]] = {}
     revision_by_archive: dict[int, int] = {}
     provisional_by_archive: dict[int, int] = {}
 
     for row in connection.execute(
-        "SELECT id, archive_id, identity_state, archive_sha256 "
+        "SELECT id, archive_id, identity_state, archive_sha256, "
+        "       content_signature "
         "FROM archive_revisions ORDER BY id"
     ):
         revisions[int(row["id"])] = (
             int(row["archive_id"]),
             str(row["identity_state"]),
             row["archive_sha256"],
+            row["content_signature"],
         )
         # Slice 1 §3.1 measured exactly one revision per archive. If that ever
         # stops being true the planner must not silently pick one, so the
@@ -445,9 +535,9 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
         )
 
     hashes = tuple(
-        (int(row["id"]), int(row["archive_id"]))
+        (int(row["id"]), int(row["archive_id"]), str(row["digest"]))
         for row in connection.execute(
-            "SELECT id, archive_id FROM archive_hashes ORDER BY id"
+            "SELECT id, archive_id, digest FROM archive_hashes ORDER BY id"
         )
     )
 
@@ -483,7 +573,8 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
             int(row["page_count"]),
             str(row["extracted_at"]),
             None if row["location_id"] is None else int(row["location_id"]),
-            int(row["distinct_locations"]),
+            int(row["distinct_location_ids"]),
+            int(row["null_location_pages"]),
             int(row["min_index"]),
             int(row["max_index"]),
         )
@@ -491,7 +582,13 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
             "SELECT archive_id, count(*) AS page_count, "
             "       min(created_at) AS extracted_at, "
             "       min(location_id) AS location_id, "
-            "       count(DISTINCT ifnull(location_id, -1)) AS distinct_locations, "
+            # count(DISTINCT location_id) ignores NULLs entirely, so the NULL
+            # rows are counted in their own term. Folding them in with
+            # ifnull(location_id, -1) conflates "no location" with location
+            # id -1 and accepts a mixed set as a single location.
+            "       count(DISTINCT location_id) AS distinct_location_ids, "
+            "       sum(CASE WHEN location_id IS NULL THEN 1 ELSE 0 END) "
+            "           AS null_location_pages, "
             "       min(page_index) AS min_index, "
             "       max(page_index) AS max_index "
             "FROM archive_pages GROUP BY archive_id ORDER BY archive_id"
@@ -527,7 +624,7 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
 
     provisional_archives = tuple(
         archive_id
-        for revision_id, (archive_id, state, _digest) in sorted(revisions.items())
+        for revision_id, (archive_id, state, _sha, _sig) in sorted(revisions.items())
         if state == "provisional"
     )
 
@@ -552,6 +649,25 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
         archive_id: digest
         for _id, archive_id, _pages, digest, _loc, _calc in signatures
     }
+
+    # Slice 2 §10.1 makes the SIGNATURE the authority for which archives hold
+    # an extraction result, and `_classify` iterates signatures for exactly
+    # that reason. That leaves page rows whose archive has no signature with
+    # nowhere to go: they produced no inventory, no gate failure and no
+    # mention anywhere in the plan, so page evidence could disappear from a
+    # backfill that reported success. There is no basis to classify them
+    # under -- the signature is what a `page_inventory` row is seeded from --
+    # so this refuses rather than inventing one.
+    orphaned_page_archives = sorted(set(page_archives) - set(signature_by_archive))
+
+    if orphaned_page_archives:
+        shown = ", ".join(str(a) for a in orphaned_page_archives[:10])
+        raise PlannerInvariantError(
+            f"{len(orphaned_page_archives)} archive(s) hold page rows but no "
+            "content signature, so no inventory would be planned for them and "
+            f"their page evidence would leave the plan unreported: {shown}"
+            + ("" if len(orphaned_page_archives) <= 10 else ", ...")
+        )
 
     return _Inputs(
         revisions=revisions,
@@ -587,6 +703,44 @@ def _signature_digest(inputs: "_Inputs", archive_id: int) -> str:
         )
 
     return digest
+
+
+# Where each seed basis's expected value sits in an `_Inputs.revisions`
+# tuple. Migration 014 populated both columns from the tables being classified
+# here, which is the relationship `_validate_seed` re-checks.
+_SEED_FIELDS: Mapping[str, int] = {"archive_sha256": 2, "content_signature": 3}
+
+
+def _validate_seed(inputs: "_Inputs", *, table: str, archive_id: int,
+                   revision_id: int, observed: str, field: str) -> None:
+    """Refuse a seed binding whose digest disagrees with the revision it names.
+
+    A seed basis is a CLAIM about where a revision's identity came from:
+    migration 014 built `archive_sha256` from `archive_hashes.digest` and
+    `content_signature` from `archive_content_signatures.digest`. Labelling a
+    row `migration_014_identity_seed` without checking that relationship
+    asserts a provenance the data may no longer support.
+
+    Nothing else would catch it. Until both digests covered these values, a
+    changed `archive_hashes.digest` left the snapshot digest and the plan
+    digest byte-identical, so the row was still labelled a seed and no
+    artifact recorded that its basis had stopped being true.
+    """
+    expected = inputs.revisions[revision_id][_SEED_FIELDS[field]]
+
+    if expected is None:
+        raise PlannerInvariantError(
+            f"{table}: archive {archive_id} binds to revision {revision_id} as "
+            f"a seed, but that revision carries no {field}; the relationship "
+            "migration 014 established is not there to verify"
+        )
+
+    if observed != expected:
+        raise PlannerInvariantError(
+            f"{table}: archive {archive_id} holds digest {observed!r} while "
+            f"revision {revision_id} records {field} {expected!r}; a seed "
+            "basis here would assert a provenance the data contradicts"
+        )
 
 
 def _single(archive_id: int, revision_id: int | None, basis: str) -> tuple:
@@ -641,7 +795,8 @@ def _validate_page_population(inputs: "_Inputs", archive_id: int,
             )
         return 0, None
 
-    count, extracted_at, location_id, distinct_locations, min_index, max_index = child
+    (count, extracted_at, location_id, distinct_location_ids,
+     null_location_pages, min_index, max_index) = child
 
     if count != signature_pages:
         raise PlannerInvariantError(
@@ -655,10 +810,17 @@ def _validate_page_population(inputs: "_Inputs", archive_id: int,
             f"run (min {min_index}, max {max_index})"
         )
 
+    # NULL is counted as its own location rather than folded in with a
+    # sentinel. `count(DISTINCT ifnull(location_id, -1))` cannot tell an
+    # unknown location from a real location id of -1, so a set holding one of
+    # each counted as a single location and was accepted.
+    distinct_locations = distinct_location_ids + (1 if null_location_pages else 0)
+
     if distinct_locations != 1:
         raise PlannerInvariantError(
             f"archive {archive_id}: page rows span {distinct_locations} "
-            "locations; the inventory carries one"
+            f"location(s) -- {distinct_location_ids} distinct id(s) and "
+            f"{null_location_pages} row(s) with none; the inventory carries one"
         )
 
     if location_id != signature_location:
@@ -680,10 +842,17 @@ def _classify(inputs: "_Inputs") -> list[PlannedBinding]:
     bindings: list[PlannedBinding] = []
 
     # --- archive_hashes: the identity seed, and the only table that has one.
-    for row_id, archive_id in inputs.hashes:
+    for row_id, archive_id, digest in inputs.hashes:
         revision_id, basis = _resolve(
             inputs, archive_id, "archive_hashes", IDENTITY_SEED
         )
+
+        if basis == IDENTITY_SEED:
+            _validate_seed(
+                inputs, table="archive_hashes", archive_id=archive_id,
+                revision_id=revision_id, observed=digest, field="archive_sha256",
+            )
+
         bindings.append(
             PlannedBinding(
                 table="archive_hashes",
@@ -696,13 +865,24 @@ def _classify(inputs: "_Inputs") -> list[PlannedBinding]:
 
     # --- archive_content_signatures: field seeds, except where the signature
     # describes a byte generation no revision holds.
-    for row_id, archive_id, _pages, _digest, _loc, _calc in inputs.signatures:
+    for row_id, archive_id, _pages, digest, _loc, _calc in inputs.signatures:
         if archive_id in inputs.drift_archives:
             revision_id, basis = None, UNRESOLVED_DRIFT
         else:
             revision_id, basis = _resolve(
                 inputs, archive_id, "archive_content_signatures", FIELD_SEED
             )
+
+            # The same defect class as the identity seed, checked the same
+            # way: a field seed claims the revision's `content_signature` came
+            # from this row's digest, so a disagreement makes the basis false.
+            if basis == FIELD_SEED:
+                _validate_seed(
+                    inputs, table="archive_content_signatures",
+                    archive_id=archive_id, revision_id=revision_id,
+                    observed=digest, field="content_signature",
+                )
+
         bindings.append(
             PlannedBinding(
                 table="archive_content_signatures",
@@ -825,60 +1005,144 @@ def canonical_snapshot_lines(inputs: "_Inputs") -> list[str]:
     cannot produce a colliding digest, and field names travel with their
     values so reordering cannot either.
     """
-    lines = [SNAPSHOT_DIGEST_VERSION, "planner_version=" + PLANNER_VERSION]
+    lines = [
+        _canonical_json(
+            {
+                "k": "version",
+                "snapshot": SNAPSHOT_DIGEST_VERSION,
+                "planner": PLANNER_VERSION,
+            }
+        ),
+        _canonical_json(
+            {"k": "count", "section": "revisions", "n": len(inputs.revisions)}
+        ),
+    ]
 
-    lines.append("revisions|count=%d" % len(inputs.revisions))
     for revision_id in sorted(inputs.revisions):
-        archive_id, state, digest = inputs.revisions[revision_id]
+        archive_id, state, sha256_digest, content_signature = inputs.revisions[
+            revision_id
+        ]
         lines.append(
-            "revision|id=%d|archive_id=%d|identity_state=%s|sha256=%s"
-            % (revision_id, archive_id, state, "" if digest is None else digest)
+            _canonical_json(
+                {
+                    "k": "revision",
+                    "id": revision_id,
+                    "archive_id": archive_id,
+                    "identity_state": state,
+                    # Both seed columns, because both are now what a seed
+                    # basis is validated against. Omitting them let the state
+                    # a plan was drawn from change without the digest moving.
+                    "archive_sha256": sha256_digest,
+                    "content_signature": content_signature,
+                }
+            )
         )
 
-    for label, rows in (("hashes", inputs.hashes), ("inspections", inputs.inspections)):
-        lines.append("%s|count=%d" % (label, len(rows)))
-        for row_id, archive_id in rows:
-            lines.append("%s|id=%d|archive_id=%d" % (label, row_id, archive_id))
+    lines.append(
+        _canonical_json({"k": "count", "section": "hashes", "n": len(inputs.hashes)})
+    )
+    for row_id, archive_id, digest in inputs.hashes:
+        lines.append(
+            _canonical_json(
+                {
+                    "k": "hash",
+                    "id": row_id,
+                    "archive_id": archive_id,
+                    # The value, not only the row's existence. Hashing ids
+                    # alone meant editing a digest changed neither this digest
+                    # nor the plan's.
+                    "digest": digest,
+                }
+            )
+        )
 
-    lines.append("signatures|count=%d" % len(inputs.signatures))
+    lines.append(
+        _canonical_json(
+            {"k": "count", "section": "inspections", "n": len(inputs.inspections)}
+        )
+    )
+    for row_id, archive_id in inputs.inspections:
+        lines.append(
+            _canonical_json(
+                {"k": "inspection", "id": row_id, "archive_id": archive_id}
+            )
+        )
+
+    lines.append(
+        _canonical_json(
+            {"k": "count", "section": "signatures", "n": len(inputs.signatures)}
+        )
+    )
     for row_id, archive_id, pages, digest, location, calculated in inputs.signatures:
         lines.append(
-            "signature|id=%d|archive_id=%d|pages=%d|digest=%s|location=%s"
-            "|calculated_at=%s"
-            % (row_id, archive_id, pages, digest,
-               "" if location is None else location, calculated)
+            _canonical_json(
+                {
+                    "k": "signature",
+                    "id": row_id,
+                    "archive_id": archive_id,
+                    "pages": pages,
+                    "digest": digest,
+                    "location": location,
+                    "calculated_at": calculated,
+                }
+            )
         )
 
-    lines.append("page_archives|count=%d" % len(inputs.page_archives))
+    lines.append(
+        _canonical_json(
+            {"k": "count", "section": "page_archives", "n": len(inputs.page_archives)}
+        )
+    )
     for archive_id in sorted(inputs.page_archives):
-        (pages, extracted_at, location, distinct_locations,
-         min_index, max_index) = inputs.page_archives[archive_id]
+        (pages, extracted_at, location, distinct_location_ids,
+         null_location_pages, min_index, max_index) = inputs.page_archives[archive_id]
         lines.append(
-            "page_archive|archive_id=%d|pages=%d|extracted_at=%s|location=%s"
-            "|distinct_locations=%d|min_index=%d|max_index=%d"
-            % (archive_id, pages, extracted_at,
-               "" if location is None else location,
-               distinct_locations, min_index, max_index)
+            _canonical_json(
+                {
+                    "k": "page_archive",
+                    "archive_id": archive_id,
+                    "pages": pages,
+                    "extracted_at": extracted_at,
+                    "location": location,
+                    "distinct_location_ids": distinct_location_ids,
+                    "null_location_pages": null_location_pages,
+                    "min_index": min_index,
+                    "max_index": max_index,
+                }
+            )
         )
 
-    lines.append("candidates|count=%d" % len(inputs.candidates))
+    lines.append(
+        _canonical_json(
+            {"k": "count", "section": "candidates", "n": len(inputs.candidates)}
+        )
+    )
     for row_id, archive_a, archive_b in inputs.candidates:
-        lines.append("candidate|id=%d|a=%d|b=%d" % (row_id, archive_a, archive_b))
+        lines.append(
+            _canonical_json({"k": "candidate", "id": row_id, "a": archive_a,
+                             "b": archive_b})
+        )
 
-    for label, values in (
+    for section, values in (
         ("drift", sorted(inputs.drift_archives)),
         ("provisional", list(inputs.provisional_archives)),
         ("archive_without_revision", list(inputs.archives_without_revision)),
     ):
-        lines.append("%s|count=%d" % (label, len(values)))
+        lines.append(
+            _canonical_json({"k": "count", "section": section, "n": len(values)})
+        )
         for archive_id in values:
-            lines.append("%s|archive_id=%d" % (label, archive_id))
+            lines.append(
+                _canonical_json({"k": section, "archive_id": archive_id})
+            )
 
-    lines.append("quarantine|rows=%d" % inputs.quarantine_rows)
+    lines.append(
+        _canonical_json({"k": "quarantine", "rows": inputs.quarantine_rows})
+    )
     return lines
 
 
-PLAN_DIGEST_VERSION = "provenance-backfill-plan/1"
+PLAN_DIGEST_VERSION = "provenance-backfill-plan/2"
 
 
 def canonical_plan_lines(bindings, snapshot_digest: str) -> list[str]:
@@ -1080,7 +1344,7 @@ class BackfillPlan:
 
         return tuple(failures)
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, *, csv_sha256: str | None = None) -> dict[str, Any]:
         """The plan envelope. Per-row bindings travel in the CSV.
 
         The split is deliberate: 238,956 rows of JSON is an artifact nobody
@@ -1093,6 +1357,12 @@ class BackfillPlan:
         return {
             "planner_version": self.planner_version,
             "execution_status": EXECUTION_STATUS,
+            # The envelope is written last and names the bindings file it was
+            # written with, so its presence attests that the CSV beside it
+            # completed and this digest proves the two are the same pair
+            # rather than two files that share a directory. `None` when this
+            # call wrote no CSV -- there is then nothing to attest.
+            "artifacts": {"csv_sha256": csv_sha256},
             "snapshot_digest": self.snapshot_digest,
             "plan_digest": self.plan_digest,
             "target_states": list(TARGET_STATES),
@@ -1151,21 +1421,63 @@ def plan_backfill(database: str | Path):
 
 # --- artifacts ------------------------------------------------------------
 
+# Artifacts are written under this suffix and renamed into place, so no reader
+# ever sees a partially written plan under a name it would trust.
+STAGING_SUFFIX = ".partial"
+
+
+def _staging_path(target: Path) -> Path:
+    """Where an artifact is written before it is committed to its real name."""
+    return target.with_name(target.name + STAGING_SUFFIX)
+
 
 def _check_output_path(path: Path, database: Path | None) -> None:
-    if path.exists():
+    """Refuse an output path before anything is written to it.
+
+    Every check is made against the RESOLVED target rather than the typed
+    name, and that distinction is the whole of it. `Path.parent` on
+    `allowed/link.json` answers `allowed/` however the link points, so a
+    lexical parent check accepted a symlink in an allowed directory whose
+    target was a nonexistent file beside the database -- and the write then
+    created that file exactly where the rule forbids one.
+    `Path.resolve(strict=False)` does not close it either: on a dangling link
+    it returns the link's own path. `output_guards.resolved_parent` asks where
+    the write would actually land, which is the question.
+
+    Order matters. The collision checks run before the existence check so an
+    operator who names the database is told that it is the database, rather
+    than that a file already exists there.
+    """
+    if database is not None:
+        for protected, description in output_guards.protected_database_paths(database):
+            if output_guards.same_file(path, protected):
+                raise OutputPathError(
+                    f"refusing to write the plan over {description} "
+                    f"({os.path.realpath(protected)}): the database is read "
+                    "through a read-only connection, but that guarantee stops "
+                    "at the connection and this write would truncate the file "
+                    "the plan describes"
+                )
+
+        if output_guards.resolved_parent(path) == output_guards.resolved_parent(database):
+            # The guarded-operation rules keep reports away from the database
+            # directory, so a read-only planner can never be the thing that
+            # put a file next to production.
+            raise OutputPathError(
+                "refusing to write beside the database: "
+                f"{os.path.dirname(os.path.realpath(path))}"
+            )
+
+    # lexists, not exists: a dangling symlink is not a file, so `exists()`
+    # says False and the write would then create its target. Refusing the
+    # NAME refuses that.
+    if os.path.lexists(path):
         raise OutputPathError(f"refusing to overwrite an existing file: {path}")
 
-    if database is not None and path.parent.resolve() == database.parent.resolve():
-        # The guarded-operation rules keep reports away from the database
-        # directory, so a read-only planner can never be the thing that put a
-        # file next to production.
-        raise OutputPathError(
-            f"refusing to write beside the database: {path.parent}"
-        )
+    parent = Path(os.path.realpath(path)).parent
 
-    if not path.parent.is_dir():
-        raise OutputPathError(f"output directory does not exist: {path.parent}")
+    if not parent.is_dir():
+        raise OutputPathError(f"output directory does not exist: {parent}")
 
 
 def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
@@ -1173,9 +1485,13 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
 
     An earlier revision checked each path as it wrote it, so a valid JSON path
     and an invalid CSV path produced a written envelope, a failure, and no
-    bindings -- a half-pair on disk that looks like a complete plan until
-    someone notices the missing file. Both are checked first, so either both
-    are written or neither is.
+    bindings. Both are checked first, and each artifact's staging path is
+    checked too -- a stale `.partial` left by an earlier failed run is refused
+    rather than silently overwritten, because this planner cannot know what
+    put it there.
+
+    Preflight is necessary and not sufficient: it sees only the failures that
+    are already visible. `write_plan_artifacts` handles the ones that are not.
     """
     targets = {}
 
@@ -1184,9 +1500,9 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
             continue
         targets[label] = Path(value)
 
-    resolved = {label: path.resolve() for label, path in targets.items()}
-
-    if len(set(resolved.values())) != len(resolved):
+    # same_file rather than comparing resolved strings: two output paths can
+    # be hard links to one file, which resolve differently and share an inode.
+    if len(targets) == 2 and output_guards.same_file(targets["json"], targets["csv"]):
         raise OutputPathError(
             "the JSON and CSV artifacts must be different files; "
             "writing both to one path would leave only the second"
@@ -1196,6 +1512,7 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
 
     for path in targets.values():
         _check_output_path(path, database_path)
+        _check_output_path(_staging_path(path), database_path)
 
     return targets
 
@@ -1214,23 +1531,37 @@ def _write_text(path: Path, payload: str) -> Path:
     return path
 
 
-def write_plan_json(plan: "BackfillPlan", path, *, database=None) -> Path:
-    """Write the plan envelope. Deterministic: sorted keys, fixed separators."""
-    target = preflight_output_paths(json_path=path, database=database)["json"]
-    return _write_text(
-        target, json.dumps(plan.as_dict(), indent=2, sort_keys=True) + "\n"
-    )
+def _discard(paths: Iterable[Path]) -> list[Path]:
+    """Remove files a failed write created, and report what survived.
+
+    Best effort by necessity -- a filesystem refusing writes may refuse
+    unlinks too -- so each removal is attempted independently. What it must
+    not do is fail silently: a surviving file would contradict the
+    both-or-neither guarantee, so the paths that could not be removed are
+    returned and the caller names them in the error rather than leaving
+    residue nobody was told about.
+    """
+    survived: list[Path] = []
+
+    for path in paths:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            survived.append(path)
+
+    return survived
 
 
-def write_plan_csv(plan: "BackfillPlan", path, *, database=None) -> Path:
-    """Write one row per planned binding, in the plan's canonical order.
+def render_plan_csv(plan: "BackfillPlan") -> str:
+    """One row per planned binding, in the plan's canonical order.
 
     `extrasaction="raise"`: a binding carrying a field the column list does
     not know about is a defect to surface, not a field to drop. The previous
     "ignore" silently discarded `archive_b_id` and `revision_b_id` from every
     candidate row.
     """
-    target = preflight_output_paths(csv_path=path, database=database)["csv"]
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS, extrasaction="raise",
                             restval="")
@@ -1245,40 +1576,117 @@ def write_plan_csv(plan: "BackfillPlan", path, *, database=None) -> Path:
             )
         )
 
-    return _write_text(target, buffer.getvalue())
+    return buffer.getvalue()
+
+
+def render_plan_json(plan: "BackfillPlan", *, csv_sha256: str | None = None) -> str:
+    """The plan envelope. Deterministic: sorted keys, fixed indentation."""
+    return json.dumps(
+        plan.as_dict(csv_sha256=csv_sha256), indent=2, sort_keys=True
+    ) + "\n"
 
 
 def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                          database=None) -> dict:
     """Write both artifacts, or neither.
 
-    Preflight runs over both paths first, so a bad CSV path cannot leave a
-    written JSON envelope behind it.
+    Preflight alone never delivered that, and saying it did was the defect.
+    Preflight refuses paths that are *already* unusable; it cannot see the
+    case where the first write succeeds and the second fails -- a full disk, a
+    revoked permission, a directory removed between the two -- which left an
+    envelope on disk with no bindings beside it. That looks like a complete
+    plan until somebody notices the missing file.
+
+    So the writes are staged and then committed:
+
+    1. both payloads are rendered in memory, so a rendering failure happens
+       before the filesystem is touched at all;
+    2. each is written to a sibling `.partial` file;
+    3. the CSV is renamed into place first, the envelope second.
+
+    The envelope is the commit marker. It is renamed last and it carries the
+    CSV's SHA-256, so its presence attests that the bindings finished writing
+    and `artifacts.csv_sha256` proves they are the bindings this envelope
+    approved -- something migration 015 can verify rather than infer from two
+    files sharing a directory.
+
+    If any step fails, every file this call created is removed, one already
+    renamed into place included, so the failure leaves neither artifact. A
+    file that cannot be removed is named in the error rather than left as
+    residue nobody was told about.
     """
     targets = preflight_output_paths(
         json_path=json_path, csv_path=csv_path, database=database
     )
-    written = {}
-
-    if "json" in targets:
-        written["json"] = _write_text(
-            targets["json"],
-            json.dumps(plan.as_dict(), indent=2, sort_keys=True) + "\n",
-        )
+    payloads: dict[str, str] = {}
 
     if "csv" in targets:
-        buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS,
-                                extrasaction="raise", restval="")
-        writer.writeheader()
-        for binding in plan.bindings:
-            writer.writerow(
-                binding.as_dict(
-                    planner_version=plan.planner_version,
-                    snapshot_digest=plan.snapshot_digest,
-                    plan_digest=plan.plan_digest,
-                )
-            )
-        written["csv"] = _write_text(targets["csv"], buffer.getvalue())
+        payloads["csv"] = render_plan_csv(plan)
 
-    return written
+    if "json" in targets:
+        payloads["json"] = render_plan_json(
+            plan,
+            csv_sha256=(
+                hashlib.sha256(payloads["csv"].encode("utf-8")).hexdigest()
+                if "csv" in payloads
+                else None
+            ),
+        )
+
+    staged: dict[str, Path] = {}
+    committed: dict[str, Path] = {}
+
+    # BaseException, not Exception: a KeyboardInterrupt between the two
+    # renames would otherwise leave exactly the half-pair this exists to
+    # prevent.
+    try:
+        for label in ("csv", "json"):
+            if label in payloads:
+                staged[label] = _write_text(
+                    _staging_path(targets[label]), payloads[label]
+                )
+
+        # Commit order is load-bearing: bindings first, envelope last, so the
+        # envelope's existence is never a promise about a CSV that is not
+        # there yet.
+        for label in ("csv", "json"):
+            if label in staged:
+                try:
+                    os.replace(staged[label], targets[label])
+                except OSError as error:
+                    raise OutputPathError(
+                        f"could not commit {targets[label]}: {error}"
+                    ) from error
+
+                committed[label] = targets[label]
+    except BaseException as error:
+        residue = _discard(
+            list(committed.values())
+            + [path for label, path in staged.items() if label not in committed]
+        )
+
+        if residue:
+            raise OutputPathError(
+                f"{error}; and these files could not be removed afterwards, so "
+                "the plan is left incomplete on disk rather than absent: "
+                + ", ".join(str(path) for path in residue)
+            ) from error
+
+        raise
+
+    return committed
+
+
+def write_plan_json(plan: "BackfillPlan", path, *, database=None) -> Path:
+    """Write the plan envelope alone.
+
+    Goes through the same staged commit as the pair, so an interrupted write
+    leaves no envelope rather than a truncated one. `artifacts.csv_sha256` is
+    null: this call wrote no bindings, so the envelope attests to none.
+    """
+    return write_plan_artifacts(plan, json_path=path, database=database)["json"]
+
+
+def write_plan_csv(plan: "BackfillPlan", path, *, database=None) -> Path:
+    """Write the per-row bindings alone, through the same staged commit."""
+    return write_plan_artifacts(plan, csv_path=path, database=database)["csv"]
