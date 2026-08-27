@@ -872,16 +872,20 @@ def test_an_output_path_that_is_a_database_sidecar_is_refused(db, tmp_path):
 # --- blocker 4: "both artifacts or neither" was not implemented -----------
 
 
-def test_a_failure_committing_the_envelope_leaves_neither_artifact(
+def test_a_failure_after_the_bindings_commit_leaves_them_and_reports_it(
     db, tmp_path, monkeypatch
 ):
-    """The case preflight cannot see.
+    """The weakened contract, stated as a test.
 
-    Preflight refuses paths that are already unusable. It cannot refuse a
-    write that fails halfway -- a full disk, a revoked permission -- and the
-    sequential writes left the first artifact on disk when the second failed.
-    Here the CSV commits and the envelope's rename fails, which is exactly
-    that shape.
+    This used to assert that neither artifact survived, and that assertion
+    was only satisfiable by deleting a final name -- which is what the
+    device/inode rollback did, and what deleted another writer's replacement
+    on a filesystem that recycles file ids.
+
+    A final name is exposed to every other writer by definition and the
+    ownership anchor cannot survive promotion, so a committed artifact is now
+    left in place and named. The disposition is the same one a crash
+    produces: bindings with no envelope, which reads as incomplete.
     """
     plan = build_plan(db)
     json_path = tmp_path / "plan.json"
@@ -896,13 +900,16 @@ def test_a_failure_committing_the_envelope_leaves_neither_artifact(
 
     monkeypatch.setattr(planner, "_promote", failing_promote)
 
-    with pytest.raises(OutputPathError, match="could not commit"):
+    with pytest.raises(OutputPathError, match="deliberately NOT removed") as raised:
         planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
 
-    # Neither artifact, and no staging residue under either name.
+    # The committed bindings survive; the envelope does not; and no staging
+    # file is left behind, because those are the ones this call can still
+    # prove it owns.
+    assert csv_path.exists()
     assert not json_path.exists()
-    assert not csv_path.exists()
-    assert sorted(p.name for p in tmp_path.iterdir()) == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["plan.csv"]
+    assert str(csv_path) in str(raised.value)
 
 
 def test_a_successful_write_leaves_no_staging_files(db, tmp_path):
@@ -1183,31 +1190,25 @@ def test_a_staging_write_that_fails_after_creating_the_file_leaves_nothing(
     the time the error is raised for the test to mean anything.
     """
     plan = build_plan(db)
-    real_fdopen = os.fdopen
+    real_write = os.write
     calls = []
 
-    def failing_fdopen(descriptor, *args, **kwargs):
-        stream = real_fdopen(descriptor, *args, **kwargs)
+    def failing_write(descriptor, data):
+        """Let part of the payload land, then fail -- what a full disk does.
+
+        Injected at os.write because that is where the staging bytes go now;
+        the descriptor is held by the record rather than handed to a stream,
+        so os.fdopen is no longer on this path at all.
+        """
         calls.append(descriptor)
 
-        if len(calls) > 1:
-            return stream
+        if len(calls) == 1:
+            real_write(descriptor, data[:50])
+            raise OSError("no space left on device")
 
-        class PartialThenFails:
-            def __enter__(self):
-                return self
+        return real_write(descriptor, data)
 
-            def __exit__(self, *exc_info):
-                stream.close()
-                return False
-
-            def write(self, payload):
-                stream.write(payload[:50])
-                raise OSError("no space left on device")
-
-        return PartialThenFails()
-
-    monkeypatch.setattr(planner.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(planner.os, "write", failing_write)
 
     with pytest.raises(OutputPathError, match="could not write"):
         planner.write_plan_artifacts(
@@ -1285,11 +1286,14 @@ def test_a_committed_artifact_replaced_before_rollback_is_left_alone(
 ):
     """The rollback's half of the same defect.
 
-    The cleanup set held bare pathnames, so when another writer replaced the
-    committed CSV between the commit and the envelope's failure, the rollback
-    deleted the REPLACEMENT -- contradicting the stated invariant that every
-    file it removes belongs to this invocation. Ownership is now the
-    device/inode pair captured at exclusive creation.
+    The cleanup set first held bare pathnames, then a device/inode pair --
+    and neither is an identity. File ids are reusable: on a filesystem that
+    recycles them, a replacement created right after the deletion receives
+    the same pair, and the rollback deleted it believing it was its own.
+
+    The fix is not a better comparison. A promoted name is simply never a
+    deletion candidate, so this passes without the rollback needing to
+    decide anything about the file it finds there.
     """
     plan = build_plan(db)
     json_path = tmp_path / "plan.json"
@@ -1305,7 +1309,7 @@ def test_a_committed_artifact_replaced_before_rollback_is_left_alone(
 
     monkeypatch.setattr(planner, "_promote", promote_then_fail)
 
-    with pytest.raises(OutputPathError, match="replaced by another writer") as raised:
+    with pytest.raises(OutputPathError, match="deliberately NOT removed") as raised:
         planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
 
     assert csv_path.read_text(encoding="utf-8") == "REPLACEMENT BY ANOTHER PROCESS"
@@ -1313,26 +1317,35 @@ def test_a_committed_artifact_replaced_before_rollback_is_left_alone(
     assert str(csv_path) in str(raised.value)
 
 
-def test_promotion_preserves_the_identity_captured_at_creation(tmp_path):
-    """What makes the ownership check work across the commit.
+def test_a_promoted_file_is_never_a_deletion_candidate(tmp_path):
+    """The structural answer to the file-id reuse finding.
 
-    The rollback compares against the device/inode captured when the staging
-    file was exclusively created, so promotion has to carry that identity to
-    the final name. `os.link` does; this pins it, because a promotion that
-    silently produced a new inode would make every post-commit ownership
-    check fail closed and leave residue on every rollback.
+    No comparison can prove that the file at a final path is still the one
+    this call put there -- device and inode are reusable, and the anchor
+    cannot survive promotion because Windows will not rename or unlink a file
+    it holds open. So a promoted record is skipped outright.
+
+    Constructed so the identity MATCHES exactly, which is the state file-id
+    reuse produces on a filesystem that recycles them: even then, nothing is
+    deleted.
     """
     created = []
     staging = tmp_path / "plan.csv.partial"
-    owned = planner._create_and_write(staging, "payload", created)
+    record = planner._create_and_write(staging, "payload", created)
     final = tmp_path / "plan.csv"
 
-    promoted, staging_gone = planner._promote(owned, final)
+    planner._promote(record, final)
 
-    assert staging_gone
+    assert record.promoted
+    assert record.path == final
     assert not staging.exists()
-    assert (promoted.device, promoted.inode) == (owned.device, owned.inode)
-    assert promoted.identifies(os.stat(final))
+    # The identity still matches -- and is deliberately not consulted.
+    assert record.identifies(os.stat(final))
+
+    survived, foreign, unverified = planner._discard(created)
+
+    assert final.read_text(encoding="utf-8") == "payload"
+    assert (survived, foreign, unverified) == ([], [], [])
 
 
 def test_a_file_whose_identity_cannot_be_established_is_never_removed(tmp_path):
@@ -1345,15 +1358,17 @@ def test_a_file_whose_identity_cannot_be_established_is_never_removed(tmp_path):
     """
     victim = tmp_path / "artifact.csv"
     victim.write_text("not ours", encoding="utf-8")
-    unidentifiable = planner._OwnedFile(victim, device=0, inode=0)
+    unidentifiable = planner._StagedFile(
+        path=victim, descriptor=None, device=0, inode=0
+    )
 
     assert not unidentifiable.identifies(os.stat(victim))
 
-    survived, foreign = planner._discard([unidentifiable])
+    survived, foreign, unverified = planner._discard([unidentifiable])
 
     assert victim.read_text(encoding="utf-8") == "not ours"
     assert foreign == [victim]
-    assert survived == []
+    assert (survived, unverified) == ([], [])
 
 
 def test_an_inode_of_zero_never_identifies_a_file():
@@ -1367,10 +1382,153 @@ def test_an_inode_of_zero_never_identifies_a_file():
     cannot prove is its own. A synthetic stat_result is the only way to reach
     that state without such a volume to hand.
     """
-    owned = planner._OwnedFile(Path("artifact.csv"), device=0, inode=0)
+    owned = planner._StagedFile(
+        path=Path("artifact.csv"), descriptor=None, device=0, inode=0
+    )
     unusable = os.stat_result((0o100644, 0, 0, 1, 0, 0, 0, 0, 0, 0))
 
     # The volume reports nothing usable, and both sides agree on that...
     assert (unusable.st_dev, unusable.st_ino) == (owned.device, owned.inode)
     # ...which must still not count as proof of ownership.
     assert not owned.identifies(unusable)
+
+
+# --- review round 5: the anchor, and what cannot be proven ----------------
+
+
+def test_identity_acquisition_failure_releases_its_descriptor(tmp_path):
+    """A held descriptor on an unidentifiable file blocks everyone.
+
+    When `os.fstat` fails on the fresh descriptor there is no identity to be
+    had, and holding the file open would pin something unprovable -- on
+    Windows blocking every other process from clearing it, an operator's own
+    cleanup included. The descriptor is released and the file is left for a
+    human, named in the error.
+
+    The deletion at the end is the real assertion: on Windows it fails with
+    PermissionError while any handle is open, so a passing unlink is proof
+    that none is.
+    """
+    staging = tmp_path / "plan.csv.partial"
+    created = []
+    real_fstat = os.fstat
+
+    def failing_fstat(descriptor):
+        raise OSError("injected identity failure")
+
+    try:
+        planner.os.fstat = failing_fstat
+        with pytest.raises(OutputPathError, match="could not establish the identity"):
+            planner._create_and_write(staging, "payload", created)
+    finally:
+        planner.os.fstat = real_fstat
+
+    # Registered, so the caller can report it...
+    assert len(created) == 1
+    assert created[0].identity_unverified
+    assert created[0].descriptor is None
+    # ...left in place, because ownership cannot be proven...
+    assert staging.exists()
+    # ...and not held open by anything.
+    staging.unlink()
+
+
+def test_an_unverifiable_staging_file_is_reported_not_deleted(tmp_path):
+    """The same rule that protects a promoted name protects this one."""
+    staging = tmp_path / "plan.csv.partial"
+    staging.write_text("created but never identified", encoding="utf-8")
+    record = planner._StagedFile(
+        path=staging, descriptor=None, identity_unverified=True
+    )
+
+    survived, foreign, unverified = planner._discard([record])
+
+    assert staging.read_text(encoding="utf-8") == "created but never identified"
+    assert unverified == [staging]
+    assert (survived, foreign) == ([], [])
+
+
+def test_a_verified_staging_file_is_still_removed(tmp_path):
+    """The positive control: declining to delete must not become never
+    deleting, or the rollback would leave residue on every ordinary failure.
+    """
+    staging = tmp_path / "plan.csv.partial"
+    created = []
+    record = planner._create_and_write(staging, "payload", created)
+
+    assert staging.exists()
+    assert record.inode is not None
+
+    survived, foreign, unverified = planner._discard(created)
+
+    assert not staging.exists()
+    assert (survived, foreign, unverified) == ([], [], [])
+
+
+def test_a_successful_write_releases_every_descriptor(tmp_path, db):
+    """Anchors are held for the life of the call and no longer.
+
+    A descriptor surviving the call would leak, and on Windows would keep the
+    committed artifact locked against the operator who asked for it. The
+    unlinks are the assertion, for the same reason as above.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+
+    planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    json_path.unlink()
+    csv_path.unlink()
+
+
+def test_file_id_reuse_cannot_make_the_rollback_delete_a_replacement(
+    db, tmp_path, monkeypatch
+):
+    """The reviewed failure, forced rather than waited for.
+
+    On Linux the replacement created immediately after a deletion receives the
+    same (st_dev, st_ino) as the file it replaced, 5 runs out of 5. On Windows
+    it does not -- re-measured 0 of 5 -- which is precisely why green Windows
+    CI never exercised this and why the earlier device/inode design looked
+    sound here.
+
+    Rather than depend on which filesystem the suite happens to run on, this
+    forces the worst case: os.lstat is made to report the record's own
+    identity for the replacement. Nothing is deleted, because a promoted name
+    is skipped before any identity is consulted -- so the guarantee does not
+    rest on file ids being unique.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+    real_promote = planner._promote
+    real_lstat = os.lstat
+    records = []
+
+    def promote_then_fail(record, final):
+        if str(final).endswith(".json"):
+            csv_path.unlink()
+            csv_path.write_text("REPLACEMENT", encoding="utf-8")
+            raise OutputPathError("could not commit the envelope")
+        real_promote(record, final)
+        records.append(record)
+
+    def reusing_lstat(path, *args, **kwargs):
+        """Every stat answers with the promoted record's identity, which is
+        what a filesystem recycling file ids would hand back."""
+        status = real_lstat(path, *args, **kwargs)
+        if records and str(path) == str(csv_path):
+            return os.stat_result((
+                status.st_mode, records[0].inode, records[0].device, 1, 0, 0,
+                status.st_size, 0, 0, 0,
+            ))
+        return status
+
+    monkeypatch.setattr(planner, "_promote", promote_then_fail)
+    monkeypatch.setattr(planner.os, "lstat", reusing_lstat)
+
+    with pytest.raises(OutputPathError, match="deliberately NOT removed"):
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    assert csv_path.read_text(encoding="utf-8") == "REPLACEMENT"
