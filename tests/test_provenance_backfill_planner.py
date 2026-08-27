@@ -1354,3 +1354,23 @@ def test_a_file_whose_identity_cannot_be_established_is_never_removed(tmp_path):
     assert victim.read_text(encoding="utf-8") == "not ours"
     assert foreign == [victim]
     assert survived == []
+
+
+def test_an_inode_of_zero_never_identifies_a_file():
+    """The fail-closed guard, isolated from the comparison that masks it.
+
+    A bypass run on 2026-08-27 removed the inode-0 check and no test failed:
+    every other case stats a real file whose device and inode are nonzero, so
+    the tuple comparison rejects the match anyway. The guard only bites on a
+    volume that reports 0 for BOTH sides -- FAT and exFAT do -- where the
+    comparison would answer True and the rollback would delete a file it
+    cannot prove is its own. A synthetic stat_result is the only way to reach
+    that state without such a volume to hand.
+    """
+    owned = planner._OwnedFile(Path("artifact.csv"), device=0, inode=0)
+    unusable = os.stat_result((0o100644, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+    # The volume reports nothing usable, and both sides agree on that...
+    assert (unusable.st_dev, unusable.st_ino) == (owned.device, owned.inode)
+    # ...which must still not count as proof of ownership.
+    assert not owned.identifies(unusable)
