@@ -7,6 +7,7 @@ by inspection instead of by arithmetic over 238,956 rows.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -1058,3 +1059,56 @@ def test_the_snapshot_rendering_is_canonical_json_throughout():
 
     for line in planner.canonical_snapshot_lines(inputs):
         assert isinstance(json.loads(line), dict)
+
+
+# --- properties the bypass run found nothing failing for ------------------
+
+
+def test_the_snapshot_digest_covers_the_hash_digest(db):
+    """The snapshot digest is an identity for the state, not for what the
+    classifier looked at.
+
+    Removing this field from the rendering failed no test, because every
+    reachable hash-digest change is already refused by `_validate_seed`. The
+    coverage still matters -- it is what the digest CLAIMS -- so it is pinned
+    here by rendering a mutated `_Inputs` directly, which is the only way to
+    reach a state classification would refuse.
+    """
+    inputs = planner._read_inputs(db)
+    rewritten = dataclasses.replace(
+        inputs,
+        hashes=tuple(
+            (row_id, archive_id, "rewritten" if archive_id == 1 else digest)
+            for row_id, archive_id, digest in inputs.hashes
+        ),
+    )
+
+    assert planner.compute_snapshot_digest(rewritten) != planner.compute_snapshot_digest(
+        inputs
+    )
+
+
+def test_the_bindings_are_committed_before_the_envelope(db, tmp_path, monkeypatch):
+    """The envelope is renamed last, so its presence attests to a finished CSV.
+
+    Reversing the order failed no test, because the rollback removes both
+    artifacts either way. The order is not for the errors cleanup can reach:
+    it is for a kill between the two renames, where the surviving state
+    should be a CSV with no envelope -- recognisably incomplete -- rather
+    than an envelope with no bindings, which reads as a complete plan. That
+    crash cannot be reproduced here, so the sequence is pinned instead.
+    """
+    plan = build_plan(db)
+    real_replace = os.replace
+    committed = []
+
+    def recording_replace(source, destination, *args, **kwargs):
+        committed.append(Path(destination).suffix)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(planner.os, "replace", recording_replace)
+    planner.write_plan_artifacts(
+        plan, json_path=tmp_path / "plan.json", csv_path=tmp_path / "plan.csv"
+    )
+
+    assert committed == [".csv", ".json"]
