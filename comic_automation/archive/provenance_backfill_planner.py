@@ -1456,9 +1456,16 @@ def _check_output_path(path: Path, database: Path | None) -> None:
     lexical parent check accepted a symlink in an allowed directory whose
     target was a nonexistent file beside the database -- and the write then
     created that file exactly where the rule forbids one.
-    `Path.resolve(strict=False)` does not close it either: on a dangling link
-    it returns the link's own path. `output_guards.resolved_parent` asks where
-    the write would actually land, which is the question.
+
+    The defect was the ORDER, not the resolver. Measured on 2026-08-27,
+    Python 3.11.3 / win32: `Path(link).resolve(strict=False)` on a dangling
+    link returns the link's TARGET, so resolving the path itself would have
+    been sound -- what failed was taking `.parent` first and resolving that,
+    which answers a question about the name rather than about the write. An
+    earlier revision of this comment claimed `resolve(strict=False)` returned
+    the link itself; that was false and is corrected here rather than left to
+    be read as current. `output_guards.resolved_parent` resolves first and
+    takes the directory second, which is the order that matters.
 
     Order matters. The collision checks run before the existence check so an
     operator who names the database is told that it is the database, rather
@@ -1501,10 +1508,10 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
 
     An earlier revision checked each path as it wrote it, so a valid JSON path
     and an invalid CSV path produced a written envelope, a failure, and no
-    bindings. Both are checked first, and each artifact's staging path is
-    checked too -- a stale `.partial` left by an earlier failed run is refused
+    bindings. Every path is now checked first -- each artifact's staging path
+    included, so a stale `.partial` from an earlier failed run is refused
     rather than silently overwritten, because this planner cannot know what
-    put it there.
+    put it there -- and all four names are compared against each other.
 
     Preflight is necessary and not sufficient: it sees only the failures that
     are already visible. `write_plan_artifacts` handles the ones that are not.
@@ -1516,13 +1523,32 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
             continue
         targets[label] = Path(value)
 
-    # same_file rather than comparing resolved strings: two output paths can
-    # be hard links to one file, which resolve differently and share an inode.
-    if len(targets) == 2 and output_guards.same_file(targets["json"], targets["csv"]):
-        raise OutputPathError(
-            "the JSON and CSV artifacts must be different files; "
-            "writing both to one path would leave only the second"
-        )
+    # Every name this call may create, compared pairwise -- both finals AND
+    # both staging paths. Comparing only the two finals was not enough, and
+    # the gap was not theoretical: with --json plan and --csv plan.partial,
+    # the JSON's staging path IS the CSV's final path. Staging wrote the
+    # envelope to `plan.partial`, committing the CSV renamed its own staging
+    # file over it, and committing the envelope then renamed the CSV's bytes
+    # to `plan`. The call reported success with both artifacts named, while
+    # on disk the CSV was gone and the envelope held CSV content.
+    #
+    # same_file rather than comparing resolved strings: two of these can be
+    # hard links to one file, which resolve differently and share an inode.
+    claimed: list[tuple[str, Path]] = []
+
+    for label, path in targets.items():
+        claimed.append((f"--{label}", path))
+        claimed.append((f"--{label}'s staging file", _staging_path(path)))
+
+    for index, (left_role, left) in enumerate(claimed):
+        for right_role, right in claimed[index + 1:]:
+            if output_guards.same_file(left, right):
+                raise OutputPathError(
+                    f"{left_role} ({left}) and {right_role} ({right}) are the "
+                    "same file; every artifact and staging name this call "
+                    "creates must be distinct, or one write silently "
+                    "destroys another"
+                )
 
     database_path = Path(database) if database is not None else None
 
@@ -1533,14 +1559,50 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
     return targets
 
 
-def _write_text(path: Path, payload: str) -> Path:
-    """Write, turning a filesystem failure into a planner refusal.
+def _create_and_write(path: Path, payload: str, created: list[Path]) -> Path:
+    """Create a staging file exclusively, record it, then fill it.
 
-    A bare OSError from here reads as a crash in the planner rather than as
-    "the artifact could not be written", which is what it is.
+    The order is the whole correction. An earlier version wrote through
+    `Path.write_text` and added the path to the cleanup set only after the
+    write RETURNED, so a write that created the file and then failed -- a
+    full disk is the ordinary way for that to happen -- left a file no
+    cleanup knew about. The path is registered here the moment creation
+    succeeds and before a single byte is written.
+
+    `O_EXCL` rather than a plain open, because it is what makes the cleanup
+    set honest: creation is the act that claims the name, so every file
+    `_discard` later removes is one this call is known to have created. A
+    plain open would let cleanup delete a file some other process created in
+    the window between the preflight check and this write.
+
+    `O_BINARY` where the platform has it, with the newline translation left
+    to the text wrapper, so the bytes on disk are exactly the payload.
     """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+
     try:
-        path.write_text(payload, encoding="utf-8", newline="\n")
+        descriptor = os.open(path, flags)
+    except FileExistsError as error:
+        raise OutputPathError(
+            f"refusing to overwrite an existing staging file: {path}"
+        ) from error
+    except OSError as error:
+        raise OutputPathError(f"could not create {path}: {error}") from error
+
+    # Ours from here: whatever happens next, cleanup may remove it.
+    created.append(path)
+
+    try:
+        stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+    except BaseException:
+        # fdopen did not take ownership, so the descriptor is still this
+        # function's to close.
+        os.close(descriptor)
+        raise
+
+    try:
+        with stream:
+            stream.write(payload)
     except OSError as error:
         raise OutputPathError(f"could not write {path}: {error}") from error
 
@@ -1604,14 +1666,25 @@ def render_plan_json(plan: "BackfillPlan", *, csv_sha256: str | None = None) -> 
 
 def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                          database=None) -> dict:
-    """Write both artifacts, or neither.
+    """Write both artifacts, or roll back to neither.
 
-    Preflight alone never delivered that, and saying it did was the defect.
-    Preflight refuses paths that are *already* unusable; it cannot see the
-    case where the first write succeeds and the second fails -- a full disk, a
-    revoked permission, a directory removed between the two -- which left an
-    envelope on disk with no bindings beside it. That looks like a complete
-    plan until somebody notices the missing file.
+    The contract stated exactly, because "both artifacts, or neither"
+    promised more than this code can deliver and the analysis further down
+    already contradicted it:
+
+    * a **recoverable** failure -- a refused path, a failed write, a failed
+      rename -- is rolled back, leaving neither artifact. Anything that
+      cannot be removed is named in the error rather than left silently.
+    * an **interruption the process does not survive** -- a power loss, a
+      kill -- can leave the CSV committed with no envelope beside it. That
+      is the state the commit order is chosen to produce: bindings with no
+      envelope read as incomplete, where an envelope with no bindings would
+      read as a finished plan.
+
+    Preflight alone delivered neither of those, and saying it did was the
+    original defect. Preflight refuses paths that are *already* unusable; it
+    cannot see the case where the first write succeeds and the second fails,
+    which left an envelope on disk with no bindings beside it.
 
     So the writes are staged and then committed:
 
@@ -1626,10 +1699,11 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     approved -- something migration 015 can verify rather than infer from two
     files sharing a directory.
 
-    If any step fails, every file this call created is removed, one already
-    renamed into place included, so the failure leaves neither artifact. A
-    file that cannot be removed is named in the error rather than left as
-    residue nobody was told about.
+    If any step fails, every file this call created is removed -- one already
+    renamed into place included -- so a recoverable failure leaves neither
+    artifact. Staging files are created with `O_EXCL`, so every name the
+    rollback removes is one this call is known to have created rather than
+    one that merely has the expected shape.
     """
     targets = preflight_output_paths(
         json_path=json_path, csv_path=csv_path, database=database
@@ -1651,6 +1725,10 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
 
     staged: dict[str, Path] = {}
     committed: dict[str, Path] = {}
+    # Every name this call has created and not yet renamed away. Maintained
+    # as the writes happen rather than reconstructed afterwards, so a failure
+    # at any point can remove exactly what exists.
+    created: list[Path] = []
 
     # BaseException, not Exception: a KeyboardInterrupt between the two
     # renames would otherwise leave exactly the half-pair this exists to
@@ -1658,8 +1736,8 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     try:
         for label in ("csv", "json"):
             if label in payloads:
-                staged[label] = _write_text(
-                    _staging_path(targets[label]), payloads[label]
+                staged[label] = _create_and_write(
+                    _staging_path(targets[label]), payloads[label], created
                 )
 
         # Commit order: bindings first, envelope last, so the envelope's
@@ -1685,12 +1763,14 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                         f"could not commit {targets[label]}: {error}"
                     ) from error
 
+                # The staging name no longer exists and the final one now
+                # does, so the cleanup set follows the rename rather than
+                # holding a name that is gone.
+                created.remove(staged[label])
+                created.append(targets[label])
                 committed[label] = targets[label]
     except BaseException as error:
-        residue = _discard(
-            list(committed.values())
-            + [path for label, path in staged.items() if label not in committed]
-        )
+        residue = _discard(created)
 
         if residue:
             raise OutputPathError(
