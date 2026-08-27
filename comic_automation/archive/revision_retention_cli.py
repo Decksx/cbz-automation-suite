@@ -45,6 +45,7 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from comic_automation.archive import output_guards
 from comic_automation.archive.revision_retention import (
     EXECUTION_STATUS,
     PLANNER_VERSION,
@@ -127,34 +128,21 @@ def build_parser() -> argparse.ArgumentParser:
 def _identity(path: str) -> str:
     """A comparable identity for a path that may not exist yet.
 
-    `realpath` resolves symlinks, junctions and `..` segments; `normcase`
-    folds case and separators, which matters because this repository's
-    library volumes are case-insensitive and `X:/a` and `x:\\a` are one file.
-    Neither requires the path to exist, so an output file can be checked
-    before it is created.
+    Delegates to `output_guards.path_identity`, which is where this logic now
+    lives so the provenance backfill planner shares it rather than carrying a
+    second copy. The name is kept because it is what this module's callers and
+    tests already say.
     """
-    return os.path.normcase(os.path.realpath(path))
+    return output_guards.path_identity(path)
 
 
 def _same_file(left: str, right: str) -> bool:
     """True when two paths reach the same file.
 
-    Two tests, because neither alone is sufficient. The textual comparison
-    catches paths that do not exist yet, which is the ordinary case for an
-    output file. `os.path.samefile` catches what text cannot: hard links and
-    distinct paths onto the same volume that resolve differently but share an
-    inode or file index. It needs both files to exist, so it only supplements.
+    Delegates to `output_guards.same_file`. See there for why a textual
+    comparison and `os.path.samefile` are both required.
     """
-    if _identity(left) == _identity(right):
-        return True
-
-    try:
-        return os.path.samefile(left, right)
-    except OSError:
-        # One of them does not exist, or is not stat-able. The textual test
-        # above has already had its say; an unreadable path is not evidence
-        # of sameness.
-        return False
+    return output_guards.same_file(left, right)
 
 
 def protected_inputs(
@@ -162,61 +150,14 @@ def protected_inputs(
 ) -> list[tuple[str, str]]:
     """Every path an output must not collide with, and what each one is.
 
-    Deduplicated by resolved identity, and returned rather than consumed in
-    place so the set itself is inspectable. `_refuse_colliding_outputs` raises
-    on its first match, which means a duplicated entry has no observable
-    effect there -- the deduplication is only checkable by looking at the list,
-    so the list is something you can look at.
-
-    The WAL and SHM sidecars are included. They are not the database file, but
-    truncating either one destroys uncommitted state or forces recovery, and
-    an operator who typed one of those paths did not mean to.
-
-    Sidecars are derived from **both** the typed path and its fully resolved
-    target, and that is not belt-and-braces. `read_guards` opens the database
-    through `path.resolve(strict=True)`, so when the typed path is a symlink
-    or sits under a junction, SQLite works against the resolved file and puts
-    its WAL and SHM beside *that* -- while a sidecar name built by
-    concatenating onto the typed path names a different, quite possibly
-    nonexistent, file. Protecting only the typed form leaves the real WAL
-    unguarded: it matches neither the typed sidecar nor the database itself,
-    `samefile` cannot help while it does not yet exist, and the writers'
-    SQLite-header check does not recognise a WAL or SHM file either, since
-    neither begins with the database magic. Every layer misses it, so the
-    resolved names are enumerated here.
-
-    For an ordinary path the two derivations name the same files and collapse
-    to three entries; only a link makes them five.
+    The database and its WAL/SHM sidecars -- derived from both the typed and
+    the resolved form -- come from `output_guards.protected_database_paths`.
+    The pin manifest is this CLI's own input and is passed in as an extra, so
+    it is deduplicated by the same identity rule as everything else rather
+    than appended afterwards and compared differently.
     """
-    protected: list[tuple[str, str]] = [(database, "the database being read")]
-
-    # os.path.realpath rather than Path.resolve: it does not raise on a
-    # missing path, and the database's existence is SQLite's to complain
-    # about, with a better message than this function could give.
-    for base in (database, os.path.realpath(database)):
-        protected.extend(
-            (base + suffix, "a database sidecar")
-            for suffix in ("-wal", "-shm")
-        )
-
-    if pins is not None:
-        protected.append((pins, "the pin manifest"))
-
-    seen: set[str] = set()
-    deduplicated: list[tuple[str, str]] = []
-
-    for path, description in protected:
-        key = _identity(path)
-
-        if key in seen:
-            continue
-
-        # First occurrence wins, which is why the typed database leads the
-        # list: a collision is reported under the name the operator wrote.
-        seen.add(key)
-        deduplicated.append((path, description))
-
-    return deduplicated
+    extra = [(pins, "the pin manifest")] if pins is not None else None
+    return output_guards.protected_database_paths(database, extra=extra)
 
 
 def _refuse_colliding_outputs(
