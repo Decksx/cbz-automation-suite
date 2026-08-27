@@ -332,46 +332,43 @@ Stated as requirements for review, not as a migration.
 ### 6.1 The parent
 
 ```sql
-CREATE TABLE page_inventory (
-    id                 INTEGER PRIMARY KEY,
-    archive_id         INTEGER NOT NULL,
-    source_revision_id INTEGER,
-    provenance_basis   TEXT NOT NULL
-        CHECK (provenance_basis IN ('stat_matched_revision',
-                                    'single_revision_inherited',
-                                    'unresolved_drift',
-                                    'unresolved_no_identity')),
-    location_id        INTEGER,
-    page_count         INTEGER NOT NULL CHECK (page_count >= 0),
-    content_digest     TEXT NOT NULL,
-    extracted_at       TEXT NOT NULL,
-    sealed_at          TEXT,
-    created_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    superseded_at      TEXT,
-    superseded_by_id   INTEGER,
-    superseded_reason  TEXT,
-
-    UNIQUE (id, archive_id),
-
-    CHECK ((superseded_at IS NULL) = (superseded_by_id IS NULL)),
-    CHECK ((superseded_at IS NULL) = (superseded_reason IS NULL)),
-    CHECK (superseded_by_id IS NULL OR superseded_by_id > id),
-    -- an inventory still being built is not yet evidence of anything, so it
-    -- cannot be superseded; supersession relates two completed extractions
-    CHECK (superseded_at IS NULL OR sealed_at IS NOT NULL),
-    CHECK ((source_revision_id IS NOT NULL
-            AND provenance_basis IN ('stat_matched_revision',
-                                     'single_revision_inherited'))
-        OR (source_revision_id IS NULL
-            AND provenance_basis LIKE 'unresolved%')),
-
-    FOREIGN KEY (source_revision_id, archive_id)
-        REFERENCES archive_revisions(id, archive_id),
-    FOREIGN KEY (archive_id) REFERENCES archive_files(id) ON DELETE CASCADE,
-    FOREIGN KEY (location_id) REFERENCES file_locations(id) ON DELETE SET NULL,
-    FOREIGN KEY (superseded_by_id) REFERENCES page_inventory(id)
-        DEFERRABLE INITIALLY DEFERRED
-);
+CREATE TABLE page_inventory(
+  id INTEGER PRIMARY KEY,
+  archive_id INTEGER NOT NULL,
+  source_revision_id INTEGER,
+  provenance_basis TEXT NOT NULL
+    CHECK (provenance_basis IN ('stat_matched_revision',
+          'single_revision_inherited','unresolved_drift','unresolved_no_identity')),
+  location_id INTEGER,
+  page_count INTEGER NOT NULL CHECK (page_count >= 0),
+  content_digest TEXT NOT NULL,
+  extracted_at TEXT NOT NULL,
+  extracted_at_basis TEXT NOT NULL
+    CHECK (extracted_at_basis IN ('first_page_persistence',
+                                  'signature_calculated_at')),
+  sealed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT '2026-01-01',
+  superseded_at TEXT, superseded_by_id INTEGER,
+  superseded_reason TEXT CHECK (superseded_reason IS NULL OR length(
+      trim(superseded_reason, char(32) || char(9) || char(10) || char(13))) > 0),
+  UNIQUE (id, archive_id),
+  -- a zero-page inventory must not claim a child timestamp it cannot have
+  CHECK ((extracted_at_basis = 'first_page_persistence' AND page_count > 0)
+      OR (extracted_at_basis = 'signature_calculated_at')),
+  CHECK ((superseded_at IS NULL) = (superseded_by_id IS NULL)),
+  CHECK ((superseded_at IS NULL) = (superseded_reason IS NULL)),
+  CHECK (superseded_by_id IS NULL OR superseded_by_id > id),
+  -- an unsealed inventory is still being built and cannot be superseded
+  CHECK (superseded_at IS NULL OR sealed_at IS NOT NULL),
+  CHECK ((source_revision_id IS NOT NULL AND provenance_basis IN
+            ('stat_matched_revision','single_revision_inherited'))
+      OR (source_revision_id IS NULL AND provenance_basis LIKE 'unresolved%')),
+  FOREIGN KEY (source_revision_id, archive_id)
+      REFERENCES archive_revisions(id, archive_id),
+  FOREIGN KEY (archive_id) REFERENCES archive_files(id) ON DELETE CASCADE,
+  FOREIGN KEY (location_id) REFERENCES file_locations(id) ON DELETE SET NULL,
+  FOREIGN KEY (superseded_by_id) REFERENCES page_inventory(id)
+      DEFERRABLE INITIALLY DEFERRED);
 ```
 
 `content_digest` is the ordered-page digest over the sealed set, in the
@@ -720,21 +717,52 @@ this design.
 That matters because §8.4 step 3 makes idempotency depend on this value: a
 wrong digest makes an identical re-extraction look different, or a different
 one look identical. **The guarantee is therefore producer-level and
-migration-level, not schema-level**, and this document records it as an
-accepted limitation rather than leaving it to be discovered:
+migration-level, not schema-level.**
 
-- the **producer** computes the digest from the pages it just read, in the
-  same call that writes them, and its test proves the written value equals a
-  digest recomputed from the stored children;
-- the **migration** recomputes all 58,437 digests from the children it
-  attached and compares, out of band, in Python — `PI-54` executes exactly
-  that check and shows it catching a row sealing accepted;
-- the **reconciliation** of §11 carries that comparison as a gate.
+**The producer must recompute, not merely be tested.** An earlier draft said
+its test "proves the written value equals a digest recomputed from the stored
+children", which is a test of the happy path and not an enforcement mechanism
+at all — it says nothing about a run where the two disagree. The obligation is
+executable and belongs inside the transaction:
 
-The alternative — a user-defined `sha256` function registered on every
-connection — would move the guarantee into the schema, but it would also make
-the database unreadable by any tool that does not register it, including
-`sqlite3` at a shell. Not proposed, and recorded here as considered.
+```text
+4. ... insert the inventory, insert its children, insert their sha256 rows
+   RECOMPUTE the digest from the sha256 rows just stored, in page_index order
+   if it differs from the declared content_digest -> ABORT
+   seal
+   COMMIT
+```
+
+Because the recomputation happens before `COMMIT`, a mismatch takes the whole
+replacement with it: the successor inventory, its children, their hashes, and
+the predecessor's supersession all roll back together. `PI-74` injects a
+corrupted page digest and asserts exactly that — row counts unchanged in all
+three tables, and the predecessor still active rather than left superseded by
+a successor that never landed. `PI-75` is the same sequence with an agreeing
+digest, committing.
+
+The migration carries the same obligation over the backfill: it recomputes all
+58,437 digests from the children it attached and compares out of band in
+Python (`PI-54`), and §11's reconciliation carries that comparison as a gate.
+
+**On the alternative.** A user-defined `sha256` registered on every connection
+would move the guarantee into the schema. An earlier draft declined it on the
+grounds that it would make the database unreadable by tools that do not
+register the function. **That reason is wrong**, and measured to be:
+
+```text
+inspect the schema without the UDF registered     ACCEPTED
+read a table without the UDF registered           ACCEPTED
+a write that fires the UDF-dependent trigger      REJECTED  (no such function)
+a write that does not fire it                     ACCEPTED
+```
+
+The database stays readable; only writes that fire the trigger require the
+function. It is declined for the accurate reason instead: it expands the
+connection contract — every writer, every migration, every future tool that
+inserts a page must register the function or fail — and it expands slice 4p's
+scope from a schema change into a change of how connections are opened
+everywhere. Recorded as considered and declined, with the real cost named.
 
 ### 8.5 Both complementary triggers are required, and the prototype proved it
 
@@ -784,12 +812,46 @@ measurements — §4.3 established that the perceptual run is a separate
 production event — so they take a disposition of their own:
 
 ```text
-enrichment   NULL -> value, once, all three together; never rewritten
+enrichment   width and height NULL -> value together, once, in a single
+             write that also carries whatever image_format the decoder
+             produced -- including NULL; never rewritten afterwards
 ```
 
-`PI-64` enriches a sealed page and passes. `PI-65` refuses a rewrite,
-`PI-66` refuses a partial write that would leave a page half-known, and
-`PI-67` confirms the extraction measurements stay frozen throughout.
+**`image_format` is optional within that write, and the rule had to be
+loosened to say so.** `PagePerceptualHash` types it `str | None` while `width`
+and `height` are plain `int`, so a decoder that reads dimensions without
+identifying a format is representable in the producer today. An earlier draft
+required all three non-NULL together and would have rejected exactly that row.
+
+Censused before loosening it, because the alternative was designing against a
+hypothetical:
+
+```text
+pages with all three present                  2,932,841
+pages with all three absent                      22,550
+pages with known dimensions, NULL format              0
+pages with one dimension but not the other            0
+pages with a format but no dimensions                 0
+formats in use          JPEG 1,778,001   PNG 600,326   WEBP 523,057
+                        AVIF 24,938      GIF 6,519
+```
+
+So production holds no such row **today** — every page is enriched fully or
+not at all — and the loosened rule changes nothing about the existing 2.9M.
+It is the producer's own type that makes the row possible, and a constraint
+that rejects what the producer can legitimately emit is a constraint that will
+fail in production rather than in review.
+
+`PI-64` enriches a sealed page and passes; `PI-72` does the same with a NULL
+format. `PI-65` refuses a rewrite, `PI-66` refuses a partial write that would
+leave a page half-known, and `PI-67` confirms the extraction measurements stay
+frozen throughout.
+
+One consequence worth stating rather than discovering: **a format learned
+later cannot be backfilled** (`PI-73`). Enrichment is one event, and filling
+in a field afterwards is a second write to a frozen row. If a decoder upgrade
+should be able to name formats it previously could not, that is a new
+generation of evidence, not an edit to an old one.
 
 ### 8.6.2 Every current consumer scopes by `archive_id`
 
@@ -830,21 +892,45 @@ archive, so the check fails permanently rather than silently:
 PI-69  page_index list under two generations   [0,0,1,1,2,2,3]
 ```
 
-**Slice 4p must therefore either rescope every site above or disable it.**
-There is no version of this migration that lands the parent and leaves these
-callers alone, because the moment a second generation exists they are wrong.
-Two acceptable shapes, and the choice is the lead's:
+**Ruled by the lead: slice 4p rescopes every site atomically. Disabling is
+rejected**, because it would create a degraded interval of uncertain length
+and merely defer work that has to happen anyway.
 
-- **atomic rescope** — every site above moves to the revision-scoped join in
-  the same migration as the schema and the producer cutover; or
-- **explicit disable** — the perceptual and near-duplicate paths are refused
-  at entry until their revision-aware consumers land, which is honest but
-  stops that work for the duration.
+Each call site is assigned an explicit semantic scope rather than being
+mechanically rewritten:
 
-Neither is free, and doing neither is not available. Note that today's
-production data has exactly one generation per archive, so nothing is
-currently wrong — the defect arrives with the first re-extraction after 4p,
-which is precisely what 4p exists to enable.
+```text
+current-file operations     join through archive_files.current_revision_id
+                            (PI-76) -- "the pages of this file as it is now"
+revision-specific           take a revision or inventory identifier as an
+operations                  argument; no implicit "current" (PI-08)
+historical audits           deliberately select ALL generations and GROUP BY
+                            inventory (PI-77) -- coverage denominators and
+                            reuse analysis mean every generation, not the
+                            latest one
+```
+
+**No unqualified `archive_pages WHERE archive_id = ?` may remain** unless it
+is explicitly registered as an all-generation query, which is the third
+category above. The registration is what separates a deliberate
+all-generation read from one that simply never considered the question — and
+since every one of the eleven sites today is the latter, the distinction has
+to be made site by site rather than assumed.
+
+The gate is two-part:
+
+- **two active revisions at every call-site group.** A fixture with one
+  archive holding two sealed active inventories, exercised through each
+  group, so a site that combines generations fails rather than returning a
+  plausible wrong answer. `PI-68` and `PI-69` are that fixture's shape.
+- **a code-search assertion** that fails on a new unscoped
+  `archive_pages`-by-`archive_id` query, so the property survives the
+  migration that established it. Without it the rescope is a one-time cleanup
+  and the next caller reintroduces the defect.
+
+Note that today's production data has exactly one generation per archive, so
+nothing is currently wrong — the defect arrives with the first re-extraction
+after 4p, which is precisely what 4p exists to enable.
 
 ### 8.6.3 Column dispositions, total for both tables
 
@@ -853,17 +939,16 @@ one disposition, and the migration to assert the assignment is total so a
 later column fails rather than becoming silently mutable. Both new shapes:
 
 ```text
-page_inventory                                                 -- 15 of 15
+page_inventory                -- 14 of 14
 identity             id, archive_id
 attribution          source_revision_id, provenance_basis
 source_context       location_id
-measurement          page_count, content_digest, extracted_at,
-                     extracted_at_basis
-seal                 sealed_at
+measurement          page_count, content_digest, extracted_at, extracted_at_basis
 lifecycle_immutable  created_at
+seal                 sealed_at
 supersession         superseded_at, superseded_by_id, superseded_reason
 
-archive_pages                                                  -- 12 of 12
+archive_pages                 -- 13 of 13
 identity             id, inventory_id, archive_id, page_index
 measurement          entry_name, entry_size, compressed_size, crc32
 enrichment           width, height, image_format
@@ -871,8 +956,16 @@ lifecycle_immutable  created_at
 lifecycle_mutable    updated_at
 ```
 
-`PI-70` and `PI-71` assert totality against `PRAGMA table_info` for each
-table, which is the durable form of the check rather than this listing.
+**Both this block and the `CREATE TABLE` in §6.1 are generated from the same
+registry the prototype executes**, which is the only reason they agree. An
+earlier draft maintained them by hand and they diverged in three ways at once:
+`extracted_at_basis` was required by §4.2 and absent from the displayed table,
+`superseded_reason`'s non-blank CHECK lived only in prose, and the headers
+claimed 15 and 12 columns over lists of 14 and 13. `PI-70` and `PI-71` assert
+totality against `PRAGMA table_info`, so a column added later fails rather than
+becoming silently mutable — but that check could not have caught a *displayed*
+schema drifting from the executed one, which is why generation replaced
+transcription.
 
 `seal` is a disposition of its own rather than part of `supersession`: it is
 one-way like supersession but earlier in the lifecycle, and conflating them
@@ -965,6 +1058,8 @@ PI-51  build a candidate before deciding, same revision                   REJECT
 PI-52  decide first, then supersede/build/fill/seal atomically            ACCEPTED
 PI-53  seal accepts a content_digest that does not describe the children  ACCEPTED
 PI-54  the producer-level digest check catches what seal cannot           ACCEPTED
+PI-74  digest mismatch rolls back inventory, children and hashes          ACCEPTED
+PI-75  matching digest commits the whole replacement                      ACCEPTED
 
 reason and context
 PI-59  empty superseded_reason                 REJECTED
@@ -978,17 +1073,21 @@ PI-64  perceptual run enriches a sealed page        ACCEPTED
 PI-65  rewrite an existing enrichment value         REJECTED
 PI-66  partial enrichment leaves a half-known page  REJECTED
 PI-67  extraction measurements stay frozen          REJECTED
+PI-72  decoder returns dimensions with no format    ACCEPTED
+PI-73  filling in a format learned later            REJECTED
 
 consumer scoping
 PI-68  a by-archive_id page query combines two generations       ACCEPTED
 PI-69  the page-index sanity check breaks under two generations  ACCEPTED
+PI-76  current-file scope resolves through current_revision_id   ACCEPTED
+PI-77  historical-audit scope sees all generations, grouped      ACCEPTED
 
 dispositions
 PI-70  page_inventory columns are all assigned  ACCEPTED
 PI-71  archive_pages columns are all assigned   ACCEPTED
 
-registered 71   duplicate registrations 0   unique 71
-all 71 produced the outcome recorded here
+registered 77   duplicate registrations 0   unique 77
+all 77 produced the outcome recorded here
 ```
 
 `PI-29`, `PI-30` and `PI-31` are end-to-end: each drives a producer-shaped
@@ -1024,13 +1123,37 @@ earlier draft listed five and omitted `location_id`, `extracted_at`,
 them written by the migration, and therefore all of them part of what the lead
 approves before it runs:
 
+Not every migration-written field is a *plannable value*, though, and an
+earlier draft flattened the distinction: it listed an exact `sealed_at` whose
+source it never defined, and omitted `created_at` entirely. Both are
+migration-time facts — they record when the migration wrote and sealed the
+row, not anything about the extraction being described — and a plan computed
+before the migration runs cannot name them without predicting a clock.
+
 ```text
-plan row, per archive_id
+frozen VALUES, derived from existing data and digested by the plan
     provenance_basis        source_revision_id
     page_count              content_digest
     location_id             extracted_at
-    extracted_at_basis      sealed_at
+    extracted_at_basis
+
+target STATES, asserted by the plan, valued only when the migration runs
+    sealed                  every minted inventory is sealed (§11)
+    created_at              the migration's own clock
 ```
+
+The plan therefore says *"this inventory will be sealed"*, not *"sealed at
+14:03:22"*. The applied binding digest carries the actual `created_at` and
+`sealed_at` alongside the planned key, so the values are recorded and
+reviewable after the fact without the plan having had to invent them. The
+reconciliation gate checks the *state* — every minted inventory is sealed —
+rather than a timestamp equality that could only ever have been vacuous.
+
+`location_id` is a frozen value for every inventory, including the five
+zero-page ones: `archive_content_signatures.location_id` is populated for all
+five, agrees with their `archive_hashes.location_id`, and disagrees with the
+page rows' location in **0** of the 58,432 archives that have both. It is
+planned from the signature rather than as NULL.
 
 Slice 4's binding digest records, per row, the `archive_id` it planned and the
 `page_inventory.id` it actually minted, over that full tuple. The
@@ -1186,7 +1309,11 @@ post-hoc audit.
   slice** (§10.2, §10.3), ordered slice 4 -> 4p -> 5 by the lead.
 - **`width`, `height` and `image_format` are enrichment**, written once by the
   later perceptual run and never rewritten, rather than extraction
-  measurements frozen at seal (§8.6.1).
+  measurements frozen at seal. `width` and `height` bind together;
+  `image_format` may be NULL in that same write, because the producer's own
+  type permits it (§8.6.1).
+- **Slice 4p rescopes every consumer atomically**, ruled by the lead;
+  disabling is rejected (§8.6.2).
 - **The child keeps its direct `ON DELETE CASCADE` to `archive_files`**;
   without it an archive with an inventory cannot be deleted (§6.2).
 - **Deletion guards use parent-existence** to tell a direct delete from a
@@ -1196,12 +1323,12 @@ post-hoc audit.
 
 - **Sealing cannot verify `content_digest` against the children** (§8.4.1).
   Stock SQLite has no `sha256()`, so the guarantee is producer-level and
-  migration-level. Accepted, with the compensating checks named; a
-  user-defined function was considered and declined because it would make the
-  database unreadable by tools that do not register it.
-- **Whether slice 4p rescopes every consumer or disables them is not decided**
-  (§8.6.2). Both are viable, neither is free, and doing neither is not
-  available. This is the lead's call.
+  migration-level: the producer recomputes from the stored sha256 rows inside
+  the transaction and aborts on disagreement (`PI-74`), and the migration does
+  the same over the backfill (`PI-54`). A user-defined function was considered
+  and declined because it expands the connection contract and slice 4p's
+  scope — not, as an earlier draft claimed, because it would make the database
+  unreadable, which is measurably false.
 - **The 15 `sha256` hashes written after their page row are not explained**
   (§4.3). Recorded as a gap; no reconstruction is offered.
 - **Perceptual-hash run provenance is not designed here.** §4.3 establishes
