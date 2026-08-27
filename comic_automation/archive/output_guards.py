@@ -35,14 +35,19 @@ def path_identity(path: str | Path) -> str:
     folds case and separators, which matters because this repository's
     library volumes are case-insensitive and `X:/a` and `x:\\a` are one file.
 
-    Neither operation requires the path to exist, and that is the point.
-    `Path.resolve(strict=True)` would raise on the ordinary case -- an output
-    file that has not been created yet -- and `Path.resolve(strict=False)`
-    on a **broken** symlink returns the link's own path rather than its
-    target, which is precisely the escape this function exists to close: a
-    link in an allowed directory pointing at a nonexistent file beside the
-    database resolves to the link, passes a parent-directory check, and then
-    creates the target on write.
+    Neither operation requires the path to exist, and that is the point:
+    `Path.resolve(strict=True)` would raise on the ordinary case, an output
+    file that has not been created yet.
+
+    `Path.resolve(strict=False)` would in fact be sound here, and an earlier
+    revision of this docstring claimed the opposite -- that on a dangling
+    symlink it returned the link's own path rather than its target, and that
+    this was the escape the module exists to close. That was false. Measured
+    2026-08-27 on Python 3.11.3 / win32: it returns the TARGET. The escape it
+    was offered to explain came from somewhere else entirely -- a caller
+    taking `.parent` and resolving THAT, which is what `resolved_parent`
+    below exists to prevent. `realpath` is kept because it never raises and
+    accepts a str or a Path uniformly, not because `resolve` is unsafe.
     """
     return os.path.normcase(os.path.realpath(str(path)))
 
