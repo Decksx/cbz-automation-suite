@@ -1337,15 +1337,19 @@ def test_a_promoted_file_is_never_a_deletion_candidate(tmp_path):
     planner._promote(record, final)
 
     assert record.promoted
-    assert record.path == final
+    assert record.final == final
+    # `path` stays the staging name so a residue can still be named; the
+    # promotion records the final separately rather than overwriting it.
+    assert record.path == staging
+    assert record.staging_removed
     assert not staging.exists()
     # The identity still matches -- and is deliberately not consulted.
     assert record.identifies(os.stat(final))
 
-    survived, foreign, unverified = planner._discard(created)
+    report = planner._discard(created)
 
     assert final.read_text(encoding="utf-8") == "payload"
-    assert (survived, foreign, unverified) == ([], [], [])
+    assert not any(report.values())
 
 
 def test_a_file_whose_identity_cannot_be_established_is_never_removed(tmp_path):
@@ -1364,11 +1368,11 @@ def test_a_file_whose_identity_cannot_be_established_is_never_removed(tmp_path):
 
     assert not unidentifiable.identifies(os.stat(victim))
 
-    survived, foreign, unverified = planner._discard([unidentifiable])
+    report = planner._discard([unidentifiable])
 
     assert victim.read_text(encoding="utf-8") == "not ours"
-    assert foreign == [victim]
-    assert (survived, unverified) == ([], [])
+    assert report["foreign"] == [victim]
+    assert not report["survived"] and not report["unverified"]
 
 
 def test_an_inode_of_zero_never_identifies_a_file():
@@ -1441,11 +1445,11 @@ def test_an_unverifiable_staging_file_is_reported_not_deleted(tmp_path):
         path=staging, descriptor=None, identity_unverified=True
     )
 
-    survived, foreign, unverified = planner._discard([record])
+    report = planner._discard([record])
 
     assert staging.read_text(encoding="utf-8") == "created but never identified"
-    assert unverified == [staging]
-    assert (survived, foreign) == ([], [])
+    assert report["unverified"] == [staging]
+    assert not report["survived"] and not report["foreign"]
 
 
 def test_a_verified_staging_file_is_still_removed(tmp_path):
@@ -1459,10 +1463,10 @@ def test_a_verified_staging_file_is_still_removed(tmp_path):
     assert staging.exists()
     assert record.inode is not None
 
-    survived, foreign, unverified = planner._discard(created)
+    report = planner._discard(created)
 
     assert not staging.exists()
-    assert (survived, foreign, unverified) == ([], [], [])
+    assert not any(report.values())
 
 
 def test_a_successful_write_releases_every_descriptor(tmp_path, db):
@@ -1564,3 +1568,138 @@ def test_the_anchor_is_held_until_the_file_is_promoted_or_discarded(tmp_path):
 
     planner._discard(created)
     assert record.descriptor is None
+
+
+# --- review round 6: the writer's remaining edges -------------------------
+
+
+def test_a_short_write_is_completed_rather_than_accepted(db, tmp_path, monkeypatch):
+    """`os.write` may accept fewer bytes than it is given, without raising.
+
+    Calling it once and discarding the count produced a truncated CSV that
+    the call still reported as a complete pair -- and whose SHA-256 then
+    disagreed with the digest the envelope had already recorded for it, so
+    the artifacts were internally inconsistent as well as short. The write
+    now loops until the whole payload is accepted.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+    real_write = os.write
+    calls = []
+
+    def short_first_write(descriptor, data):
+        """Accept half the payload on the first call, as a filesystem may."""
+        calls.append(descriptor)
+
+        if len(calls) == 1:
+            return real_write(descriptor, data[: max(1, len(data) // 2)])
+
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(planner.os, "write", short_first_write)
+    planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    # More than one write happened, so the short count was really returned.
+    assert len(calls) > 2
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    assert envelope["artifacts"]["csv_sha256"] == hashlib.sha256(
+        csv_path.read_bytes()
+    ).hexdigest()
+    # Bytes, not text: csv.DictWriter emits CRLF and read_text would
+    # translate it back to LF, hiding whatever the writer actually put down.
+    assert csv_path.read_bytes() == planner.render_plan_csv(plan).encode("utf-8")
+
+
+def test_a_write_that_accepts_nothing_is_a_refusal_not_a_spin(tmp_path, monkeypatch):
+    """Zero is not progress.
+
+    Looping until the payload is written is only safe if a zero-byte write
+    ends the loop; otherwise the correction for a short write would turn a
+    stuck filesystem into an infinite one.
+    """
+    staging = tmp_path / "plan.csv.partial"
+    created = []
+
+    monkeypatch.setattr(planner.os, "write", lambda descriptor, data: 0)
+
+    with pytest.raises(OutputPathError, match="would be truncated"):
+        planner._create_and_write(staging, "payload", created)
+
+    # Registered, so the rollback still clears it.
+    assert len(created) == 1
+
+
+def test_a_staging_name_that_outlives_its_promotion_fails_the_call(
+    db, tmp_path, monkeypatch
+):
+    """A successful return must mean no staging file is left anywhere.
+
+    The hard link succeeded and the staging name could not be unlinked. That
+    was swallowed: the call returned success while a `.partial` sat beside
+    the artifact, and because the record's path had been overwritten with the
+    final name, nothing could even say which file was left.
+    """
+    plan = build_plan(db)
+    csv_path = tmp_path / "plan.csv"
+    staging = tmp_path / "plan.csv.partial"
+    real_unlink = os.unlink
+    injected = []
+
+    def failing_unlink(path):
+        if Path(path) == staging and not injected:
+            injected.append(path)
+            raise OSError("injected staging-name removal failure")
+        return real_unlink(path)
+
+    monkeypatch.setattr(planner.os, "unlink", failing_unlink)
+
+    with pytest.raises(OutputPathError) as raised:
+        planner.write_plan_csv(plan, csv_path)
+
+    message = str(raised.value)
+    # Both survivors named: the committed artifact and the staging residue.
+    assert str(csv_path) in message
+    assert str(staging) in message
+    assert csv_path.exists()
+    assert staging.exists()
+
+
+def test_a_promotion_is_recorded_before_its_staging_name_is_cleared(tmp_path):
+    """Ordering, so a later failure cannot put a committed file back in reach.
+
+    If `promoted` were set after the unlink, a failure clearing the staging
+    name would leave the record unpromoted -- and the rollback would then
+    treat the committed final as its own to delete, which is the defect two
+    rounds of this review have been removing.
+    """
+    staging = tmp_path / "plan.csv.partial"
+    final = tmp_path / "plan.csv"
+    created = []
+    record = planner._create_and_write(staging, "payload", created)
+
+    original_unlink = os.unlink
+
+    def refuse_staging_unlink(path):
+        if Path(path) == staging:
+            raise OSError("injected")
+        return original_unlink(path)
+
+    planner.os.unlink = refuse_staging_unlink
+    try:
+        with pytest.raises(OutputPathError, match="could not remove its staging"):
+            planner._promote(record, final)
+    finally:
+        planner.os.unlink = original_unlink
+
+    # Committed despite the failure, so the rollback leaves it alone...
+    assert record.promoted
+    assert record.final == final
+    assert not record.staging_removed
+
+    report = planner._discard([record])
+
+    assert final.exists()
+    assert staging.exists()
+    # ...and the surviving staging name is reported rather than lost.
+    assert report["staging_residue"] == [staging]
