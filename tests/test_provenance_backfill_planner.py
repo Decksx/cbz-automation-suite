@@ -7,11 +7,16 @@ by inspection instead of by arithmetic over 238,956 rows.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 
 import pytest
 
+from pathlib import Path
+
+from comic_automation.archive import output_guards
 from comic_automation.archive import provenance_backfill_planner as planner
 from comic_automation.archive.provenance_backfill_planner import (
     SideAttribution,
@@ -40,7 +45,7 @@ CREATE TABLE archive_revisions(
   id INTEGER PRIMARY KEY, archive_id INTEGER NOT NULL,
   revision_ordinal INTEGER NOT NULL DEFAULT 1,
   identity_state TEXT NOT NULL DEFAULT 'established',
-  archive_sha256 TEXT);
+  archive_sha256 TEXT, content_signature TEXT);
 CREATE TABLE archive_hashes(
   id INTEGER PRIMARY KEY, archive_id INTEGER NOT NULL, digest TEXT NOT NULL);
 CREATE TABLE archive_content_signatures(
@@ -77,12 +82,19 @@ def _archive(c, archive_id, *, pages=2, size=1000, signature_size=None,
     )
 
     if revision:
+        # Migration 014 seeded archive_sha256 from archive_hashes.digest and
+        # content_signature from archive_content_signatures.digest, so the
+        # revision here carries the SAME values the evidence rows below do.
+        # An earlier fixture gave the revision unrelated digests, which made
+        # every seed binding a disagreement the planner now refuses -- and
+        # which is why the defect was invisible from the tests.
         c.execute(
-            "INSERT INTO archive_revisions(id,archive_id,identity_state,archive_sha256)"
-            " VALUES(?,?,?,?)",
+            "INSERT INTO archive_revisions(id,archive_id,identity_state,"
+            "archive_sha256,content_signature) VALUES(?,?,?,?,?)",
             (archive_id * 10, archive_id,
              "provisional" if provisional else "established",
-             None if provisional else "d%064d" % archive_id),
+             None if provisional else "h%d" % archive_id,
+             None if provisional else "sig%d" % archive_id),
         )
 
     if provisional:
@@ -569,7 +581,7 @@ def test_sparse_page_indexes_are_refused(db):
 
 def test_a_mixed_location_page_set_is_refused(db):
     db.execute("UPDATE archive_pages SET location_id = 999 WHERE id = 101")
-    with pytest.raises(PlannerInvariantError, match="span 2 locations"):
+    with pytest.raises(PlannerInvariantError, match="span 2 location"):
         build_plan(db)
 
 
@@ -644,3 +656,405 @@ def test_a_missing_output_directory_is_a_planner_refusal(db, tmp_path):
     plan = build_plan(db)
     with pytest.raises(OutputPathError, match="directory does not exist"):
         write_plan_json(plan, tmp_path / "nope" / "p.json")
+
+
+# --- review round 2: the six blockers -------------------------------------
+#
+# Each of these reproduces a defect the lead demonstrated executably against
+# 0e6907e. They are grouped by blocker so a later reader can tell which
+# finding a test is guarding rather than inferring it from the name.
+
+
+def _symlink_or_skip(link, target):
+    """Create a symlink, or skip -- Windows needs a privilege for this.
+
+    The escape being reproduced requires a real link: `..` segments resolve
+    identically under a lexical and a resolved parent, so only a link
+    separates the two readings. Where the privilege is absent the test cannot
+    run at all, and skipping says so rather than passing vacuously.
+    """
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as error:  # pragma: no cover
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+
+# --- blocker 1: the digests ignored archive-hash values -------------------
+
+
+def test_a_hash_digest_change_moves_both_digests(db):
+    """Editing the hashed VALUE must invalidate a plan drawn from it.
+
+    Before this, both digests covered only hash row ids and archive ids, so
+    `archive_hashes.digest` could be rewritten and the snapshot digest and
+    plan digest stayed byte-identical -- a plan approved against one state
+    would apply against another without anything detecting it. The revision is
+    updated alongside the hash, because the two are a seed pair and changing
+    one alone is a different defect (refused below).
+    """
+    before = build_plan(db)
+    db.execute("UPDATE archive_hashes SET digest = 'rewritten' WHERE archive_id = 1")
+    db.execute("UPDATE archive_revisions SET archive_sha256 = 'rewritten' "
+               "WHERE archive_id = 1")
+    after = build_plan(db)
+
+    assert after.snapshot_digest != before.snapshot_digest
+    assert after.plan_digest != before.plan_digest
+
+
+def test_a_hash_digest_disagreeing_with_its_revision_is_refused(db):
+    """`migration_014_identity_seed` is a claim, and it is now checked.
+
+    Migration 014 built `archive_revisions.archive_sha256` from
+    `archive_hashes.digest`. Labelling the row a seed while the two disagree
+    asserts a provenance the data contradicts.
+    """
+    db.execute("UPDATE archive_hashes SET digest = 'drifted' WHERE archive_id = 1")
+    with pytest.raises(PlannerInvariantError, match="seed basis here would assert"):
+        build_plan(db)
+
+
+def test_a_signature_digest_disagreeing_with_its_revision_is_refused(db):
+    """The same defect class on the field seed, per the review's instruction.
+
+    `content_signature` was seeded from `archive_content_signatures.digest`
+    exactly as `archive_sha256` was seeded from the hash, so the same
+    disagreement makes `migration_014_field_seed` false in the same way.
+    """
+    db.execute("UPDATE archive_content_signatures SET digest = 'drifted' "
+               "WHERE archive_id = 1")
+    with pytest.raises(PlannerInvariantError, match="seed basis here would assert"):
+        build_plan(db)
+
+
+def test_a_seed_whose_revision_records_no_digest_is_refused(db):
+    """A missing seed column is a missing relationship, not a passing check.
+
+    Comparing against NULL would be an equality test that silently never
+    fires, which is how a validation becomes decorative.
+    """
+    db.execute("UPDATE archive_revisions SET content_signature = NULL "
+               "WHERE archive_id = 1")
+    with pytest.raises(PlannerInvariantError, match="carries no content_signature"):
+        build_plan(db)
+
+
+# --- blocker 2: page rows with no signature vanished ----------------------
+
+
+def test_page_rows_without_a_content_signature_are_refused(db):
+    """Evidence must not leave the plan unreported.
+
+    Classification iterates `signature_by_archive`, so an archive holding page
+    rows but no signature produced no inventory, no gate failure and no
+    mention anywhere -- the rows simply were not in the plan, and the plan
+    said it had no failures.
+    """
+    db.execute("DELETE FROM archive_content_signatures WHERE archive_id = 1")
+
+    with pytest.raises(PlannerInvariantError, match="page rows but no") as raised:
+        build_plan(db)
+
+    # The refusal names the archive, so an operator can go look at it.
+    assert "1" in str(raised.value)
+
+
+def test_the_orphan_refusal_reports_the_full_count_but_a_bounded_sample(db):
+    """A refusal that pastes 58,000 ids is a refusal nobody reads."""
+    for archive_id in range(100, 115):
+        db.execute("INSERT INTO archive_files VALUES(?,NULL)", (archive_id,))
+        db.execute(
+            "INSERT INTO archive_pages(id,archive_id,page_index,location_id,"
+            "created_at) VALUES(?,?,0,?,'2026-07-27 12:00:00')",
+            (archive_id * 100, archive_id, archive_id),
+        )
+
+    with pytest.raises(PlannerInvariantError) as raised:
+        build_plan(db)
+
+    message = str(raised.value)
+    assert "15 archive(s) hold page rows" in message
+    assert message.rstrip().endswith(", ...")
+
+
+# --- blocker 3: the output guard compared the lexical parent --------------
+
+
+def test_a_broken_symlink_cannot_escape_into_the_database_directory(db, tmp_path):
+    """The reproduction from the review, end to end.
+
+    A link inside an allowed directory targeting a nonexistent file beside the
+    database passed preflight, because `Path.parent` answered `allowed/`
+    regardless of where the link pointed -- and `Path.resolve(strict=False)`
+    would not have helped, since on a dangling link it returns the link
+    itself. The write then created the target next to production.
+    """
+    plan = build_plan(db)
+    database_directory = tmp_path / "prod"
+    database_directory.mkdir()
+    database = database_directory / "inspection.db"
+    database.write_bytes(b"")
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+
+    escape = database_directory / "escaped.json"
+    link = allowed / "plan.json"
+    _symlink_or_skip(link, escape)
+
+    with pytest.raises(OutputPathError, match="beside the database"):
+        write_plan_json(plan, link, database=database)
+
+    # The refusal is only meaningful if nothing was created through the link.
+    assert not escape.exists()
+
+
+def test_the_resolved_parent_of_a_dangling_link_is_its_target_directory(tmp_path):
+    """The property the guard rests on, pinned directly.
+
+    `Path.resolve(strict=False)` returns the link for a dangling link, which
+    is why the guard uses `os.path.realpath` instead. Asserting that here
+    means a future simplification back to `resolve()` fails a test rather than
+    silently reopening the escape.
+    """
+    target_directory = tmp_path / "elsewhere"
+    target_directory.mkdir()
+    link = tmp_path / "link.json"
+    _symlink_or_skip(link, target_directory / "missing.json")
+
+    assert not link.exists()          # dangling
+    assert os.path.lexists(link)      # but the name is taken
+    assert output_guards.resolved_parent(link) == output_guards.path_identity(
+        target_directory
+    )
+    # The reading the old guard used, kept here to show they differ.
+    assert Path(link).parent != target_directory
+
+
+def test_an_output_path_that_is_the_database_is_refused(db, tmp_path):
+    """No privilege required, and the most direct form of the same hole."""
+    plan = build_plan(db)
+    database = tmp_path / "prod" / "inspection.db"
+    database.parent.mkdir()
+    database.write_bytes(b"")
+
+    with pytest.raises(OutputPathError, match="the database being read"):
+        write_plan_json(plan, database, database=database)
+
+    assert database.read_bytes() == b""
+
+
+def test_an_output_path_that_is_a_database_sidecar_is_refused(db, tmp_path):
+    """Truncating a WAL destroys uncommitted state as surely as truncating
+    the database does, so the sidecars are protected by name."""
+    plan = build_plan(db)
+    database = tmp_path / "prod" / "inspection.db"
+    database.parent.mkdir()
+    database.write_bytes(b"")
+
+    with pytest.raises(OutputPathError, match="a database sidecar"):
+        write_plan_json(plan, Path(str(database) + "-wal"), database=database)
+
+
+# --- blocker 4: "both artifacts or neither" was not implemented -----------
+
+
+def test_a_failure_committing_the_envelope_leaves_neither_artifact(
+    db, tmp_path, monkeypatch
+):
+    """The case preflight cannot see.
+
+    Preflight refuses paths that are already unusable. It cannot refuse a
+    write that fails halfway -- a full disk, a revoked permission -- and the
+    sequential writes left the first artifact on disk when the second failed.
+    Here the CSV commits and the envelope's rename fails, which is exactly
+    that shape.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+    real_replace = os.replace
+
+    def failing_replace(source, destination, *args, **kwargs):
+        if str(destination).endswith(".json"):
+            raise OSError("no space left on device")
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(planner.os, "replace", failing_replace)
+
+    with pytest.raises(OutputPathError, match="could not commit"):
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    # Neither artifact, and no staging residue under either name.
+    assert not json_path.exists()
+    assert not csv_path.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_a_successful_write_leaves_no_staging_files(db, tmp_path):
+    plan = build_plan(db)
+    written = planner.write_plan_artifacts(
+        plan, json_path=tmp_path / "plan.json", csv_path=tmp_path / "plan.csv"
+    )
+
+    assert set(written) == {"json", "csv"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["plan.csv", "plan.json"]
+
+
+def test_the_envelope_carries_the_digest_of_the_csv_beside_it(db, tmp_path):
+    """The commit marker, and what makes the pair verifiable.
+
+    The envelope is renamed last, so its presence attests the CSV finished
+    writing; `artifacts.csv_sha256` is what lets migration 015 prove the
+    bindings beside it are the ones this envelope approved, rather than two
+    files that happen to share a directory.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+    planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    assert envelope["artifacts"]["csv_sha256"] == hashlib.sha256(
+        csv_path.read_bytes()
+    ).hexdigest()
+
+
+def test_an_envelope_written_alone_attests_to_no_bindings(db, tmp_path):
+    """Null rather than a digest of nothing: this call wrote no CSV, so there
+    is nothing for the envelope to vouch for and it says so."""
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    write_plan_json(plan, json_path)
+
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    assert envelope["artifacts"]["csv_sha256"] is None
+
+
+def test_a_stale_staging_file_is_refused_rather_than_overwritten(db, tmp_path):
+    """The planner cannot know what put it there, so it does not destroy it."""
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    (tmp_path / "plan.json.partial").write_text("residue", encoding="utf-8")
+
+    with pytest.raises(OutputPathError, match="overwrite"):
+        write_plan_json(plan, json_path)
+
+    assert (tmp_path / "plan.json.partial").read_text(encoding="utf-8") == "residue"
+
+
+# --- blocker 5: the NULL/-1 location collision ---------------------------
+
+
+def test_a_null_location_and_a_minus_one_location_are_not_one_location(db):
+    """`count(DISTINCT ifnull(location_id, -1))` cannot tell them apart.
+
+    One child with no location and one child at a legitimate location id of
+    -1 counted as a single location, so a genuinely mixed page set passed the
+    validation that exists to refuse exactly that.
+    """
+    db.execute("UPDATE archive_pages SET location_id = NULL WHERE id = 100")
+    db.execute("UPDATE archive_pages SET location_id = -1 WHERE id = 101")
+
+    with pytest.raises(PlannerInvariantError, match="span 2 location"):
+        build_plan(db)
+
+
+def test_pages_that_all_lack_a_location_are_a_single_location(db):
+    """The positive control the counting change must not break.
+
+    Every child NULL is one location -- the unknown one -- and the signature
+    agreeing that it has none is a consistent state, not a mixed one.
+    """
+    db.execute("UPDATE archive_pages SET location_id = NULL WHERE archive_id = 1")
+    db.execute("UPDATE archive_content_signatures SET location_id = NULL "
+               "WHERE archive_id = 1")
+
+    inventory = next(
+        b for b in build_plan(db).bindings
+        if b.table == "page_inventory" and b.archive_id == 1
+    )
+    assert inventory.values["location_id"] is None
+
+
+# --- blocker 6: the canonical encoding was not injective ------------------
+
+
+def _inspection_binding(values):
+    return PlannedBinding(
+        table="archive_inspections",
+        key=1,
+        key_kind="row_id",
+        archive_id=1,
+        sides=(SideAttribution("", 1, 10, SINGLE_REVISION_INHERITED),),
+        values=values,
+    )
+
+
+def test_delimiter_injection_cannot_forge_a_colliding_canonical_line():
+    """Two different bindings that rendered to the same line, byte for byte.
+
+    The old rendering joined unescaped `name=value` fields with `|`, so a
+    value containing those characters could reproduce a different binding's
+    line exactly. These two are the demonstration: under the old encoding both
+    became `...|inspector_version=a|inspector_version_basis=b|
+    inspector_version_basis=c`, and therefore shared a plan digest.
+    """
+    left = _inspection_binding(
+        {"inspector_version": "a|inspector_version_basis=b",
+         "inspector_version_basis": "c"}
+    )
+    right = _inspection_binding(
+        {"inspector_version": "a",
+         "inspector_version_basis": "b|inspector_version_basis=c"}
+    )
+
+    assert left.canonical_line() != right.canonical_line()
+    assert planner.compute_plan_digest([left], "s") != planner.compute_plan_digest(
+        [right], "s"
+    )
+
+
+def test_a_null_value_and_an_empty_string_are_different_bindings():
+    """The old rendering substituted `''` for `None`, conflating "unknown"
+    with "known to be empty" -- two states this schema deliberately keeps
+    apart everywhere else."""
+    absent = _inspection_binding(
+        {"inspector_version": None, "inspector_version_basis": "unknown_legacy"}
+    )
+    empty = _inspection_binding(
+        {"inspector_version": "", "inspector_version_basis": "unknown_legacy"}
+    )
+
+    assert absent.canonical_line() != empty.canonical_line()
+
+
+def test_a_value_that_cannot_be_rendered_reproducibly_is_refused():
+    """A float is the type that would quietly reintroduce ambiguity.
+
+    Two different floats can share a repr, so a digest over one would stop
+    distinguishing them. Nothing in the plan is a float today; this is what
+    makes that a checked property rather than a habit.
+    """
+    binding = _inspection_binding(
+        {"inspector_version": 1.5, "inspector_version_basis": "unknown_legacy"}
+    )
+
+    with pytest.raises(PlannerInvariantError, match="canonically rendered"):
+        binding.canonical_line()
+
+
+def test_the_snapshot_rendering_is_canonical_json_throughout():
+    """Applied to the snapshot as well as the bindings, per the review.
+
+    Every line parses as one JSON object, which is the property that makes the
+    encoding injective; a line that fell back to the old `name=value` form
+    would fail to parse and fail here.
+    """
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(SCHEMA)
+    _archive(connection, 1, pages=2)
+
+    inputs = planner._read_inputs(connection)
+
+    for line in planner.canonical_snapshot_lines(inputs):
+        assert isinstance(json.loads(line), dict)
