@@ -14,6 +14,7 @@ import pytest
 
 from comic_automation.archive import provenance_backfill_planner as planner
 from comic_automation.archive.provenance_backfill_planner import (
+    SideAttribution,
     FIELD_SEED,
     FIRST_PAGE_PERSISTENCE,
     IDENTITY_SEED,
@@ -136,10 +137,13 @@ def test_every_receiving_table_is_planned_and_quarantine_is_not(db):
 
 def test_hashes_are_the_only_identity_seed(db):
     plan = build_plan(db)
-    seeds = {b.table for b in plan.bindings if b.provenance_basis == IDENTITY_SEED}
+    seeds = {
+        b.table for b in plan.bindings
+        if any(s.provenance_basis == IDENTITY_SEED for s in b.sides)
+    }
     assert seeds == {"archive_hashes"}
     assert all(
-        b.provenance_basis == IDENTITY_SEED
+        b.sides[0].provenance_basis == IDENTITY_SEED
         for b in plan.bindings
         if b.table == "archive_hashes"
     )
@@ -151,10 +155,10 @@ def test_signatures_are_field_seeds_except_where_they_drift(db):
         b.archive_id: b for b in plan.bindings
         if b.table == "archive_content_signatures"
     }
-    assert by_archive[1].provenance_basis == FIELD_SEED
-    assert by_archive[1].source_revision_id == 10
-    assert by_archive[3].provenance_basis == UNRESOLVED_DRIFT
-    assert by_archive[3].source_revision_id is None
+    assert by_archive[1].sides[0].provenance_basis == FIELD_SEED
+    assert by_archive[1].sides[0].source_revision_id == 10
+    assert by_archive[3].sides[0].provenance_basis == UNRESOLVED_DRIFT
+    assert by_archive[3].sides[0].source_revision_id is None
 
 
 def test_page_inventory_is_planned_by_archive_not_by_page_row(db):
@@ -242,7 +246,7 @@ def test_the_digest_moves_when_only_a_drift_classification_would(db):
         b for b in after.bindings
         if b.table == "archive_content_signatures" and b.archive_id == 1
     )
-    assert signature.provenance_basis == UNRESOLVED_DRIFT
+    assert signature.sides[0].provenance_basis == UNRESOLVED_DRIFT
 
 
 def test_bindings_are_emitted_in_a_deterministic_order(db):
@@ -257,7 +261,7 @@ def test_a_bound_basis_without_a_revision_is_refused():
     with pytest.raises(PlannerInvariantError, match="with no revision"):
         PlannedBinding(
             table="archive_hashes", key=1, key_kind="row_id", archive_id=1,
-            source_revision_id=None, provenance_basis=IDENTITY_SEED,
+            sides=(SideAttribution("", 1, None, IDENTITY_SEED),),
         )
 
 
@@ -265,8 +269,7 @@ def test_an_unresolved_basis_carrying_a_revision_is_refused():
     with pytest.raises(PlannerInvariantError, match="carries revision"):
         PlannedBinding(
             table="archive_content_signatures", key=1, key_kind="row_id",
-            archive_id=1, source_revision_id=10,
-            provenance_basis=UNRESOLVED_DRIFT,
+            archive_id=1, sides=(SideAttribution("", 1, 10, UNRESOLVED_DRIFT),),
         )
 
 
@@ -275,7 +278,9 @@ def test_a_basis_outside_the_tables_vocabulary_is_refused():
     with pytest.raises(PlannerInvariantError, match="not in that table's vocabulary"):
         PlannedBinding(
             table="archive_inspections", key=1, key_kind="row_id", archive_id=1,
-            source_revision_id=10, provenance_basis=planner.MEASURED,
+            sides=(SideAttribution("", 1, 10, planner.MEASURED),),
+            values={"inspector_version": None,
+                    "inspector_version_basis": "unknown_legacy"},
         )
 
 
@@ -283,15 +288,15 @@ def test_unreconciled_totals_are_refused_rather_than_returned(monkeypatch):
     """Bypass the classifier's correctness and confirm plan_totals catches it."""
     good = PlannedBinding(
         table="archive_hashes", key=1, key_kind="row_id", archive_id=1,
-        source_revision_id=10, provenance_basis=IDENTITY_SEED,
+        sides=(SideAttribution("", 1, 10, IDENTITY_SEED),),
     )
     # object.__setattr__ defeats the frozen dataclass, which is the only way
     # to construct the inconsistency __post_init__ exists to prevent.
     broken = PlannedBinding(
         table="archive_hashes", key=2, key_kind="row_id", archive_id=2,
-        source_revision_id=10, provenance_basis=IDENTITY_SEED,
+        sides=(SideAttribution("", 2, 10, IDENTITY_SEED),),
     )
-    object.__setattr__(broken, "provenance_basis", "not_a_basis")
+    object.__setattr__(broken.sides[0], "provenance_basis", "not_a_basis")
 
     with pytest.raises(PlannerInvariantError, match="unknown basis"):
         plan_totals([good, broken])
@@ -332,7 +337,8 @@ def test_json_and_csv_are_written_deterministically(db, tmp_path):
     envelope = json.loads(first.read_text(encoding="utf-8"))
     assert envelope["execution_status"] == "not_performed"
     assert envelope["snapshot_digest"] == plan.snapshot_digest
-    assert envelope["target_states"] == ["sealed"]
+    assert envelope["target_states"] == [
+        "sealed", "created_at_from_migration_clock"]
     # every CSV row carries the digest, so a detached CSV can still be tied
     # back to the envelope that approved it
     assert plan.snapshot_digest in csv_a.read_text(encoding="utf-8")
@@ -360,7 +366,7 @@ def test_a_miscounting_accumulator_is_caught_by_the_recount(monkeypatch):
     bindings = [
         PlannedBinding(
             table="archive_hashes", key=n, key_kind="row_id", archive_id=n,
-            source_revision_id=n * 10, provenance_basis=IDENTITY_SEED,
+            sides=(SideAttribution("", n, n * 10, IDENTITY_SEED),),
         )
         for n in (1, 2, 3)
     ]
@@ -384,8 +390,257 @@ def test_a_miscounting_accumulator_is_caught_by_the_recount(monkeypatch):
 def test_a_binding_naming_an_unknown_table_is_refused():
     good = PlannedBinding(
         table="archive_hashes", key=1, key_kind="row_id", archive_id=1,
-        source_revision_id=10, provenance_basis=IDENTITY_SEED,
+        sides=(SideAttribution("", 1, 10, IDENTITY_SEED),),
     )
     object.__setattr__(good, "table", "not_a_table")
     with pytest.raises(PlannerInvariantError, match="not a receiving table"):
         plan_totals([good])
+
+
+# --- blocker 1: candidate sides bind independently ------------------------
+
+
+def _candidate(db, archive_a, archive_b, row_id=99):
+    db.execute("INSERT INTO near_duplicate_candidates VALUES(?,?,?)",
+               (row_id, archive_a, archive_b))
+    binding = next(
+        b for b in build_plan(db).bindings
+        if b.table == "near_duplicate_candidates" and b.key == row_id
+    )
+    return {side.label: side for side in binding.sides}, binding
+
+
+def test_candidate_both_sides_bound(db):
+    sides, binding = _candidate(db, 1, 2)
+    assert sides["a"].source_revision_id == 10
+    assert sides["b"].source_revision_id == 20
+    assert sides["a"].provenance_basis == SINGLE_REVISION_INHERITED
+    assert sides["b"].provenance_basis == SINGLE_REVISION_INHERITED
+    assert binding.bound is True
+
+
+def test_candidate_a_bound_b_unresolved(db):
+    """Archive 5 is provisional, so its side cannot bind -- and A's valid
+    attribution must survive that rather than being discarded with it."""
+    sides, binding = _candidate(db, 1, 5)
+    assert sides["a"].source_revision_id == 10
+    assert sides["a"].provenance_basis == SINGLE_REVISION_INHERITED
+    assert sides["b"].source_revision_id is None
+    assert sides["b"].provenance_basis == planner.UNRESOLVED_NO_IDENTITY
+    # The ROW is unresolved -- a comparison is only as well attributed as its
+    # weaker side (slice 1 9.6) -- while A's binding is still recorded.
+    assert binding.bound is False
+
+
+def test_candidate_a_unresolved_b_bound(db):
+    """The mirror of the case above, with the unbound side first."""
+    db.execute("INSERT INTO archive_files VALUES(6,NULL)")
+    db.execute(
+        "INSERT INTO archive_revisions(id,archive_id,identity_state,archive_sha256)"
+        " VALUES(60,6,'provisional',NULL)")
+    sides, binding = _candidate(db, 5, 6, row_id=98)
+    assert sides["a"].source_revision_id is None
+    # rebuild with a bound B side
+    sides, binding = _candidate(db, 5, 2, row_id=97)
+    assert sides["a"].source_revision_id is None
+    assert sides["a"].provenance_basis == planner.UNRESOLVED_NO_IDENTITY
+    assert sides["b"].source_revision_id == 20
+    assert sides["b"].provenance_basis == SINGLE_REVISION_INHERITED
+    assert binding.bound is False
+
+
+def test_candidate_both_sides_unresolved(db):
+    db.execute("INSERT INTO archive_files VALUES(6,NULL)")
+    db.execute(
+        "INSERT INTO archive_revisions(id,archive_id,identity_state,archive_sha256)"
+        " VALUES(60,6,'provisional',NULL)")
+    sides, binding = _candidate(db, 5, 6)
+    assert sides["a"].source_revision_id is None
+    assert sides["b"].source_revision_id is None
+    assert binding.bound is False
+
+
+def test_sides_are_counted_separately_from_rows(db):
+    plan = build_plan(db)
+    # one candidate row contributes two sides
+    assert plan.totals["planned_sides"] == plan.totals["planned_rows"] + 1
+
+
+# --- blocker 2: the CSV carries every planned field -----------------------
+
+
+def test_csv_carries_both_candidate_sides(db, tmp_path):
+    plan = build_plan(db)
+    path = write_plan_csv(plan, tmp_path / "p.csv")
+    text = path.read_text(encoding="utf-8")
+    header = text.splitlines()[0].split(",")
+
+    for column in ("archive_b_id", "revision_a_id", "revision_b_id",
+                   "provenance_basis_a", "provenance_basis_b",
+                   "inspector_version", "plan_digest"):
+        assert column in header, column
+
+    candidate = next(
+        line for line in text.splitlines()
+        if line.startswith("near_duplicate_candidates,")
+    ).split(",")
+    assert candidate[header.index("archive_b_id")] != ""
+    assert candidate[header.index("revision_b_id")] != ""
+
+
+def test_a_binding_whose_values_do_not_match_its_table_is_refused():
+    """The artifact writer can no longer drop a field, because a field it
+    would drop cannot be constructed."""
+    with pytest.raises(PlannerInvariantError, match="artifact columns"):
+        PlannedBinding(
+            table="archive_hashes", key=1, key_kind="row_id", archive_id=1,
+            sides=(SideAttribution("", 1, 10, IDENTITY_SEED),),
+            values={"unexpected": 1},
+        )
+
+    with pytest.raises(PlannerInvariantError, match="artifact columns"):
+        PlannedBinding(
+            table="archive_inspections", key=1, key_kind="row_id", archive_id=1,
+            sides=(SideAttribution("", 1, 10, SINGLE_REVISION_INHERITED),),
+            values={"inspector_version_basis": "unknown_legacy"},
+        )
+
+
+def test_inspections_plan_a_null_version_explicitly(db):
+    plan = build_plan(db)
+    inspection = next(b for b in plan.bindings if b.table == "archive_inspections")
+    assert inspection.values["inspector_version"] is None
+    assert inspection.values["inspector_version_basis"] == "unknown_legacy"
+
+
+# --- blocker 3: the plan digest binds the bindings ------------------------
+
+
+def test_the_plan_digest_covers_the_bindings_not_just_the_inputs(db):
+    plan = build_plan(db)
+    assert plan.plan_digest != plan.snapshot_digest
+
+    altered = list(plan.bindings)
+    index = next(i for i, b in enumerate(altered) if b.table == "page_inventory")
+    victim = altered[index]
+    tampered = dict(victim.values)
+    tampered["page_count"] = 999
+    altered[index] = PlannedBinding(
+        table=victim.table, key=victim.key, key_kind=victim.key_kind,
+        archive_id=victim.archive_id, sides=victim.sides, values=tampered,
+    )
+    assert (
+        planner.compute_plan_digest(altered, plan.snapshot_digest)
+        != plan.plan_digest
+    )
+
+
+def test_both_artifacts_carry_the_plan_digest(db, tmp_path):
+    plan = build_plan(db)
+    written = planner.write_plan_artifacts(
+        plan, json_path=tmp_path / "p.json", csv_path=tmp_path / "p.csv")
+    envelope = json.loads(written["json"].read_text(encoding="utf-8"))
+    assert envelope["plan_digest"] == plan.plan_digest
+    assert plan.plan_digest in written["csv"].read_text(encoding="utf-8")
+
+
+# --- blocker 4: invalid page populations are refused ----------------------
+
+
+def test_a_signature_claiming_pages_with_no_page_rows_is_refused(db):
+    db.execute("UPDATE archive_content_signatures SET page_count = 2 "
+               "WHERE archive_id = 4")
+    with pytest.raises(PlannerInvariantError, match="no page rows exist"):
+        build_plan(db)
+
+
+def test_a_child_count_disagreeing_with_the_signature_is_refused(db):
+    db.execute("UPDATE archive_content_signatures SET page_count = 9 "
+               "WHERE archive_id = 1")
+    with pytest.raises(PlannerInvariantError, match="page row"):
+        build_plan(db)
+
+
+def test_sparse_page_indexes_are_refused(db):
+    db.execute("UPDATE archive_pages SET page_index = 7 WHERE id = 101")
+    with pytest.raises(PlannerInvariantError, match="dense"):
+        build_plan(db)
+
+
+def test_a_mixed_location_page_set_is_refused(db):
+    db.execute("UPDATE archive_pages SET location_id = 999 WHERE id = 101")
+    with pytest.raises(PlannerInvariantError, match="span 2 locations"):
+        build_plan(db)
+
+
+def test_page_location_disagreeing_with_the_signature_is_refused(db):
+    db.execute("UPDATE archive_content_signatures SET location_id = 42 "
+               "WHERE archive_id = 1")
+    with pytest.raises(PlannerInvariantError, match="the signature at"):
+        build_plan(db)
+
+
+def test_the_inventory_location_comes_from_the_signature(db):
+    plan = build_plan(db)
+    inventory = next(
+        b for b in plan.bindings
+        if b.table == "page_inventory" and b.archive_id == 2
+    )
+    signature_location = db.execute(
+        "SELECT location_id FROM archive_content_signatures WHERE archive_id = 2"
+    ).fetchone()[0]
+    assert inventory.values["location_id"] == signature_location
+
+
+# --- blocker 5: provisional revisions never bind --------------------------
+
+
+def test_evidence_under_a_provisional_revision_stays_unresolved(db):
+    """Archive 5 is provisional. Give it an inspection: the plan must refuse
+    to bind that to a digestless revision."""
+    db.execute("INSERT INTO archive_inspections VALUES(500,5)")
+    plan = build_plan(db)
+    inspection = next(
+        b for b in plan.bindings
+        if b.table == "archive_inspections" and b.archive_id == 5
+    )
+    assert inspection.sides[0].source_revision_id is None
+    assert inspection.sides[0].provenance_basis == planner.UNRESOLVED_NO_IDENTITY
+
+
+def test_a_hash_under_a_provisional_revision_is_an_impossible_state(db):
+    """archive_hashes has no unresolved basis: the hasher computes a digest
+    and binds in the same transaction, so this state should not exist and
+    normalising it would hide that."""
+    db.execute("INSERT INTO archive_hashes VALUES(500,5,'h5')")
+    with pytest.raises(PlannerInvariantError, match="no established revision"):
+        build_plan(db)
+
+
+# --- the artifact preflight correction ------------------------------------
+
+
+def test_neither_artifact_is_written_when_one_path_is_bad(db, tmp_path):
+    plan = build_plan(db)
+    good = tmp_path / "p.json"
+    blocked = tmp_path / "p.csv"
+    blocked.write_text("already here", encoding="utf-8")
+
+    with pytest.raises(OutputPathError, match="overwrite"):
+        planner.write_plan_artifacts(plan, json_path=good, csv_path=blocked)
+
+    # the envelope must NOT have been written first
+    assert not good.exists()
+
+
+def test_the_two_artifacts_must_be_different_files(db, tmp_path):
+    plan = build_plan(db)
+    same = tmp_path / "both"
+    with pytest.raises(OutputPathError, match="different files"):
+        planner.write_plan_artifacts(plan, json_path=same, csv_path=same)
+
+
+def test_a_missing_output_directory_is_a_planner_refusal(db, tmp_path):
+    plan = build_plan(db)
+    with pytest.raises(OutputPathError, match="directory does not exist"):
+        write_plan_json(plan, tmp_path / "nope" / "p.json")
