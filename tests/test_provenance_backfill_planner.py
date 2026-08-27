@@ -1532,3 +1532,35 @@ def test_file_id_reuse_cannot_make_the_rollback_delete_a_replacement(
         planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
 
     assert csv_path.read_text(encoding="utf-8") == "REPLACEMENT"
+
+
+def test_the_anchor_is_held_until_the_file_is_promoted_or_discarded(tmp_path):
+    """The descriptor IS the ownership proof, so it has to still be open.
+
+    A bypass run on 2026-08-27 released the anchor as soon as the payload was
+    written and no test failed, because nothing in the suite swaps a file
+    underneath the writer -- that needs a second process. The property is
+    pinned structurally instead, and then by the platform mechanism it
+    actually relies on.
+    """
+    staging = tmp_path / "plan.csv.partial"
+    created = []
+    record = planner._create_and_write(staging, "payload", created)
+
+    # Structural, and true everywhere: the anchor outlives the write.
+    assert record.descriptor is not None
+
+    if os.name == "nt":
+        # Windows opens without delete-sharing, so while this descriptor is
+        # held no other process can remove or rename the file. Measured.
+        with pytest.raises(PermissionError):
+            os.unlink(staging)
+    else:
+        # POSIX allows the unlink but keeps the inode allocated while the
+        # descriptor lives, which is what stops the id being recycled and
+        # handed to somebody else's file.
+        os.unlink(staging)
+        assert os.fstat(record.descriptor).st_size >= 0
+
+    planner._discard(created)
+    assert record.descriptor is None

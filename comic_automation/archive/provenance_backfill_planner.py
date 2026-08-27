@@ -1991,11 +1991,14 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
 
         raise
 
-    # Success: release every anchor. The files are committed and no longer
-    # need one, and a descriptor held past the call would leak.
-    for record in created:
-        record.close()
-
+    # No anchor to release here: _promote closes each descriptor before it
+    # links, because Windows will not rename or unlink a file it holds open,
+    # so by this point every record has already been released. A loop here
+    # was written first and removed after a bypass run showed it could not
+    # fail anything -- every success path passes through _promote. The
+    # property it was meant to guarantee is pinned by
+    # test_a_successful_write_releases_every_descriptor, which deletes both
+    # artifacts and would fail on Windows if any handle were still open.
     return committed
 
 
