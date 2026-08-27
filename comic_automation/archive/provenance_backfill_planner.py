@@ -1051,6 +1051,22 @@ def canonical_snapshot_lines(inputs: "_Inputs") -> list[str]:
                     # The value, not only the row's existence. Hashing ids
                     # alone meant editing a digest changed neither this digest
                     # nor the plan's.
+                    #
+                    # This overlaps with `_validate_seed`, and the overlap is
+                    # deliberate. A bypass run on 2026-08-27 removed this
+                    # field and no test failed: every hash row either
+                    # validates against its revision or belongs to an archive
+                    # with no established revision, which `_resolve` refuses,
+                    # so no reachable state has a hash digest the seed check
+                    # would not already have caught. It stays because the
+                    # snapshot digest's contract is to be an identity for the
+                    # state read, not a summary of whatever the classifier
+                    # happened to look at -- and because a later slice that
+                    # relaxes the seed check would otherwise silently reopen
+                    # the original defect. It is pinned directly by
+                    # test_the_snapshot_digest_covers_the_hash_digest, which
+                    # renders the snapshot without going through
+                    # classification.
                     "digest": digest,
                 }
             )
@@ -1646,9 +1662,20 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                     _staging_path(targets[label]), payloads[label]
                 )
 
-        # Commit order is load-bearing: bindings first, envelope last, so the
-        # envelope's existence is never a promise about a CSV that is not
-        # there yet.
+        # Commit order: bindings first, envelope last, so the envelope's
+        # existence is never a promise about a CSV that is not there yet.
+        #
+        # What this can and cannot promise is worth stating exactly. Against
+        # an error the process survives, the rollback below is what delivers
+        # "neither", and a bypass run on 2026-08-27 reversing this order
+        # failed no test for precisely that reason -- the cleanup masks it.
+        # The order earns its place against what cleanup cannot reach: a
+        # power loss or a kill between the two renames, where the surviving
+        # state is a CSV with no envelope (recognisably incomplete) rather
+        # than an envelope with no bindings (indistinguishable from a plan).
+        # That is not reproducible in a test, so the sequence itself is
+        # pinned by test_the_bindings_are_committed_before_the_envelope and
+        # the reasoning is recorded here rather than only in a review.
         for label in ("csv", "json"):
             if label in staged:
                 try:
