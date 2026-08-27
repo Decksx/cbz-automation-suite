@@ -148,6 +148,31 @@ available and means the last such write; the 197 are the population that makes
 the two distinguishable, and the choice is recorded rather than taken
 silently.
 
+**A zero-page inventory has no children to take it from.** `MIN` over an empty
+child set is NULL (`PI-47`) and `extracted_at` is `NOT NULL`, so the five
+inventories of §4.5 could not be written at all under the rule above — a
+defect introduced by including them without revisiting the rule that assumed
+children. Their source is `archive_content_signatures.calculated_at`, which
+every one of them carries and which records when that extraction's result was
+computed.
+
+Two sources means the column needs a basis, exactly as slice 1 requires of
+every value that could otherwise be read as something it is not:
+
+```text
+extracted_at_basis TEXT NOT NULL
+    CHECK (extracted_at_basis IN ('first_page_persistence',
+                                  'signature_calculated_at'))
+CHECK ((extracted_at_basis = 'first_page_persistence' AND page_count > 0)
+    OR (extracted_at_basis = 'signature_calculated_at'))
+```
+
+The paired CHECK refuses a zero-page inventory that claims a child timestamp
+it cannot have (`PI-48`). It deliberately does **not** refuse a populated
+inventory on the signature basis (`PI-50`): a future producer may know the
+signature time and not yet have written a first page, and forbidding that
+would constrain a producer this design has not seen.
+
 ### 4.3 Page hashes are two production events, not one
 
 ```text
@@ -162,9 +187,18 @@ by algorithm, written later:
     phash                                    2,932,841   (all of them)
 ```
 
-`sha256 v1` is computed during extraction and written in the same transaction
-as its page — 2,955,376 of 2,955,391. **Every** `dhash v1` and `phash v1` row
-was written later, by the separate perceptual-hashing run.
+`sha256 v1` shares a `created_at` with its page row in 2,955,376 of
+2,955,391 cases. **Every** `dhash v1` and `phash v1` row carries a later one.
+
+Stated precisely, because the two halves rest on different evidence: the
+*timestamps* establish equality and lateness, and nothing more. That the equal
+ones were written in the same transaction is established by **reading the
+current producer** (§3), which inserts the page and its sha256 row inside one
+`save`. The historical rows were written by code that has changed since, so
+what is measured about them is timestamp equality; same-transaction is an
+inference from today's code, not a property the data records. The lateness of
+every perceptual row needs no such inference — a later timestamp is a later
+write however it was produced.
 
 This is decisive for §7. The inventory parent describes **an extraction**. It
 owns the page rows and the sha256 hashes produced with them. It does *not* own
@@ -178,10 +212,12 @@ pages with sha256 but no phash                  22,550
 archives mixing hashed and unhashed pages            0
 ```
 
-Perceptual hashing is **all-or-nothing per archive**. The 22,550 are whole
-archives never perceptually hashed, not partial coverage, so perceptual-hash
-state is a property of (archive, run) and needs no per-page bookkeeping in the
-parent.
+Perceptual hashing is **all-or-nothing per archive**: no archive has some
+pages hashed and others not. The 22,550 is a count of *pages*, and because no
+archive is mixed, those pages fall entirely within archives that were never
+perceptually hashed — it is not partial coverage spread across many archives.
+So perceptual-hash state is a property of (archive, run) and needs no per-page
+bookkeeping in the parent.
 
 **The 15 `sha256` rows written after their page row are not explained.** They
 are 0.0005% of the sha256 population and could be a retry, a resumed batch, or
@@ -400,6 +436,66 @@ something and one that merely repeats it.
 pages are the retention this whole design exists to create; a cascade would
 delete exactly what is being kept (`PI-27`).
 
+**The child keeps its direct `ON DELETE CASCADE` to `archive_files`**, from
+migration 007. Dropping it looks harmless and is not: deleting an archive
+cascades to `page_inventory`, and the surviving page rows then reference a
+vanished parent under a `NO ACTION` key, so **the archive becomes
+undeletable**. Measured — `PI-56` failed exactly that way against a draft
+schema that omitted it.
+
+#### 6.3 Deletion guards, and telling a cascade from a direct delete
+
+Two holes the child foreign key does not close.
+
+**A zero-page inventory has no children to protect it.** `PI-27` refuses
+deleting an inventory that has page rows, but that refusal comes from the
+child key — with no children there is nothing to violate, and an entire
+extraction result can be deleted outright. Measured as ACCEPTED against the
+earlier schema.
+
+**A guard that simply refuses deletion makes archives undeletable.** The
+sealed-child rule of §8.3 must fire for a direct delete and stand down for a
+whole-archive cascade, or removing an archive becomes impossible.
+
+Both use migration 014's measured parent-existence discriminator: during
+`ON DELETE CASCADE` from `archive_files` the archive row is already gone.
+
+```sql
+CREATE TRIGGER trg_page_inventory_delete_guard
+BEFORE DELETE ON page_inventory FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM archive_files WHERE id = OLD.archive_id)
+BEGIN
+    SELECT RAISE(ABORT, 'an inventory may only be removed with its archive');
+END;
+
+CREATE TRIGGER trg_archive_pages_sealed_delete_guard
+BEFORE DELETE ON archive_pages FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM archive_files WHERE id = OLD.archive_id)
+ AND (SELECT sealed_at FROM page_inventory
+       WHERE id = OLD.inventory_id) IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'pages of a sealed inventory may not be deleted');
+END;
+```
+
+Direct deletes are refused (`PI-55`, `PI-58`), and a whole-archive delete
+still succeeds with pages present (`PI-56`) and with a zero-page inventory
+(`PI-57`).
+
+The parent's `location_id` takes slice 1 §9.4.2's source-context guard
+unchanged, including its value-change clause: repointing is refused
+(`PI-61`), a direct clear while the location still exists is refused
+(`PI-62`), and the genuine `ON DELETE SET NULL` cascade passes (`PI-63`).
+
+`superseded_reason` takes the non-blank CHECK slice 1 requires, in migration
+012's exact character-set form — one-argument `trim()` strips only spaces, so
+a lone tab would otherwise pass as a reason (`PI-59`, `PI-60`):
+
+```sql
+superseded_reason TEXT CHECK (superseded_reason IS NULL OR length(
+    trim(superseded_reason, char(32) || char(9) || char(10) || char(13))) > 0)
+```
+
 `page_hashes` is **unchanged**. It keeps `UNIQUE (page_id, algorithm,
 algorithm_version)` — already the shape the roadmap asks for — and keeps its
 `ON DELETE CASCADE` from `archive_pages`.
@@ -568,7 +664,79 @@ into.
 `content_digest` is immutable from insert (`PI-44`), so the digest a producer
 declares before filling is the one it is held to at seal.
 
-### 8.4 Both complementary triggers are required, and the prototype proved it
+### 8.4 The producer decides before it builds, not after
+
+An earlier draft described the producer sequence as "build, fill, seal, then
+decide". **That order is unexecutable**, and the index that makes it so is one
+this design already relies on: `ui_page_inventory_bound` permits one active
+inventory per revision, so a candidate for a revision that already has a live
+inventory cannot be inserted at all.
+
+```text
+PI-51  build a candidate before deciding, same revision      REJECTED
+```
+
+The workable order compares first and writes only once it knows what it is
+writing:
+
+```text
+1. extract in memory; compute page_count and content_digest
+2. SELECT the active sealed inventory for this revision
+3. if it exists and its content_digest equals the computed one
+       -> return. Nothing is written. This is idempotent reuse.
+4. otherwise, in ONE transaction:
+       preallocate the successor's rowid
+       supersede the predecessor, if there is one, with a reason
+       insert the inventory (active, unsealed)
+       insert its children
+       seal it
+   COMMIT
+```
+
+Step 3 is why the digest is on the parent (§12.1): it is the only value that
+can answer "same result?" without re-reading the children. `PI-52` executes
+the full order; `PI-29` through `PI-31` drive it for the three outcomes of
+§8.1.
+
+Note that a *different revision* skips step 3's comparison entirely — there is
+no active inventory for a revision that has never been extracted, so the
+producer opens one and supersedes nothing (`PI-31`).
+
+#### 8.4.1 Sealing cannot verify the digest, and that is a limit worth stating
+
+Sealing checks the child count and its density (§8.3). It does **not** check
+that `content_digest` describes those children, and it cannot:
+
+```text
+PI-53  seal accepts a content_digest that does not describe the children
+       ACCEPTED
+```
+
+Stock SQLite has no `sha256()` — measured, along with `sha3()` and `md5()` —
+so no trigger can recompute the digest from the child rows. An inventory
+sealed with a hand-written wrong digest is accepted by every constraint in
+this design.
+
+That matters because §8.4 step 3 makes idempotency depend on this value: a
+wrong digest makes an identical re-extraction look different, or a different
+one look identical. **The guarantee is therefore producer-level and
+migration-level, not schema-level**, and this document records it as an
+accepted limitation rather than leaving it to be discovered:
+
+- the **producer** computes the digest from the pages it just read, in the
+  same call that writes them, and its test proves the written value equals a
+  digest recomputed from the stored children;
+- the **migration** recomputes all 58,437 digests from the children it
+  attached and compares, out of band, in Python — `PI-54` executes exactly
+  that check and shows it catching a row sealing accepted;
+- the **reconciliation** of §11 carries that comparison as a gate.
+
+The alternative — a user-defined `sha256` function registered on every
+connection — would move the guarantee into the schema, but it would also make
+the database unreadable by any tool that does not register it, including
+`sqlite3` at a shell. Not proposed, and recorded here as considered.
+
+### 8.5 Both complementary triggers are required, and the prototype proved it
 
 The successor-identity check cannot be one trigger. A `BEFORE UPDATE OF
 superseded_by_id` trigger cannot see a successor that does not exist yet,
@@ -593,6 +761,125 @@ the successor's rowid, update the predecessor, insert the successor, commit.
 
 ---
 
+## 8.6 Producers and consumers of the page tables
+
+An earlier draft designed the tables and never reconciled them against the
+code that reads and writes them. Two defects follow, both measured.
+
+### 8.6.1 Migration 008's columns are enrichment, not extraction
+
+Migration 008 added `width`, `height` and `image_format` to `archive_pages`,
+and the **perceptual** producer populates them long after extraction:
+
+```python
+# perceptual_hashing.py:623 -- "Backfill the width/height/image_format
+# columns added by migration 008, now that they're known."
+UPDATE archive_pages SET width = ?, height = ?, image_format = ?, ...
+WHERE id = ?
+```
+
+A blanket page-measurement immutability rule freezes those columns at seal
+and breaks that producer on its next run. They are not extraction
+measurements — §4.3 established that the perceptual run is a separate
+production event — so they take a disposition of their own:
+
+```text
+enrichment   NULL -> value, once, all three together; never rewritten
+```
+
+`PI-64` enriches a sealed page and passes. `PI-65` refuses a rewrite,
+`PI-66` refuses a partial write that would leave a page half-known, and
+`PI-67` confirms the extraction measurements stay frozen throughout.
+
+### 8.6.2 Every current consumer scopes by `archive_id`
+
+A census of every SQL reference to `archive_pages` in the package:
+
+```text
+site                                            scoping        4p action
+perceptual_hashing.py:584   page lookup          archive_id    rescope
+perceptual_hashing.py:623   enrichment UPDATE    page id       unchanged
+perceptual_hashing.py:770   enqueue predicate    archive_id    rescope
+perceptual_hashing.py:1029  batch selection      archive_id    rescope
+perceptual_hash_cli.py:137  CLI selection        archive_id    rescope
+near_duplicate.py:286       candidate loading    archive_id    rescope
+classification.py:511       per-archive counts   archive_id    rescope
+perceptual_coverage_audit.py:358   denominator   archive_id    rescope
+perceptual_reuse_analysis.py:37,83,118           archive_id    rescope
+source_drift_recovery.py:175,672,685             archive_id    rescope
+page_hashing.py:173         DELETE by archive    archive_id    cut over (§10.3)
+page_hashing.py:180         INSERT               archive_id    cut over (§10.3)
+```
+
+Every one of them means "this archive's pages" and gets the right answer only
+while an archive has one generation. With two active inventories they combine
+generations:
+
+```text
+PI-68  SELECT ... WHERE archive_id = 1   returns 7 rows across 2 generations
+                                         the revision-scoped query returns 4
+```
+
+One is worse than a wrong count. `perceptual_hashing.py:584` selects
+`ORDER BY page_index` and compares the result against the archive's actual
+entries "to sanity-check the page inventory hasn't drifted underneath us".
+Under two generations that list is `0,0,1,1,2,2,3` and can never equal the
+archive, so the check fails permanently rather than silently:
+
+```text
+PI-69  page_index list under two generations   [0,0,1,1,2,2,3]
+```
+
+**Slice 4p must therefore either rescope every site above or disable it.**
+There is no version of this migration that lands the parent and leaves these
+callers alone, because the moment a second generation exists they are wrong.
+Two acceptable shapes, and the choice is the lead's:
+
+- **atomic rescope** — every site above moves to the revision-scoped join in
+  the same migration as the schema and the producer cutover; or
+- **explicit disable** — the perceptual and near-duplicate paths are refused
+  at entry until their revision-aware consumers land, which is honest but
+  stops that work for the duration.
+
+Neither is free, and doing neither is not available. Note that today's
+production data has exactly one generation per archive, so nothing is
+currently wrong — the defect arrives with the first re-extraction after 4p,
+which is precisely what 4p exists to enable.
+
+### 8.6.3 Column dispositions, total for both tables
+
+Slice 1 §9.4.2 requires every column of every receiving table to carry exactly
+one disposition, and the migration to assert the assignment is total so a
+later column fails rather than becoming silently mutable. Both new shapes:
+
+```text
+page_inventory                                                 -- 15 of 15
+identity             id, archive_id
+attribution          source_revision_id, provenance_basis
+source_context       location_id
+measurement          page_count, content_digest, extracted_at,
+                     extracted_at_basis
+seal                 sealed_at
+lifecycle_immutable  created_at
+supersession         superseded_at, superseded_by_id, superseded_reason
+
+archive_pages                                                  -- 12 of 12
+identity             id, inventory_id, archive_id, page_index
+measurement          entry_name, entry_size, compressed_size, crc32
+enrichment           width, height, image_format
+lifecycle_immutable  created_at
+lifecycle_mutable    updated_at
+```
+
+`PI-70` and `PI-71` assert totality against `PRAGMA table_info` for each
+table, which is the durable form of the check rather than this listing.
+
+`seal` is a disposition of its own rather than part of `supersession`: it is
+one-way like supersession but earlier in the lifecycle, and conflating them
+would let a trigger generated from the set treat sealing as a terminal state.
+
+---
+
 ## 9. Executed cases
 
 In-memory SQLite 3.40.1. Stable identifiers, semantic signatures, unique
@@ -600,12 +887,12 @@ executions counted rather than summed.
 
 ```text
 parent uniqueness
-PI-01  two active inventories, same revision                  REJECTED
-PI-02  superseded + active for one revision                   ACCEPTED
-PI-03  two active unresolved for one archive                  REJECTED
-PI-04  bound + unresolved for one archive coexist             ACCEPTED
-PI-05  inventory bound to another archive's revision          REJECTED
-PI-06  two inventories building for one archive               REJECTED
+PI-01  two active inventories, same revision          REJECTED
+PI-02  superseded + active for one revision           ACCEPTED
+PI-03  two active unresolved for one archive          REJECTED
+PI-04  bound + unresolved for one archive coexist     ACCEPTED
+PI-05  inventory bound to another archive's revision  REJECTED
+PI-06  two inventories building for one archive       REJECTED
 
 independent generations
 PI-07  two revisions, both sealed and active                  ACCEPTED
@@ -614,63 +901,100 @@ PI-09  current-revision query returns exactly one generation  ACCEPTED
 PI-10  a new revision supersedes nothing                      ACCEPTED
 
 sealing
-PI-11  seal with fewer children than page_count               REJECTED
-PI-12  seal with more children than page_count                REJECTED
-PI-13  seal a dense matching child set                        ACCEPTED
-PI-14  seal a sparse child set of the right size              REJECTED
-PI-15  seal a zero-page inventory                             ACCEPTED
-PI-16  re-seal an already sealed inventory                    REJECTED
-PI-17  un-seal an inventory                                   REJECTED
-PI-18  supersede an unsealed inventory                        REJECTED
+PI-11  seal with fewer children than page_count   REJECTED
+PI-12  seal with more children than page_count    REJECTED
+PI-13  seal a dense matching child set            ACCEPTED
+PI-14  seal a sparse child set of the right size  REJECTED
+PI-15  seal a zero-page inventory                 ACCEPTED
+PI-16  re-seal an already sealed inventory        REJECTED
+PI-17  un-seal an inventory                       REJECTED
+PI-18  supersede an unsealed inventory            REJECTED
 
 child confinement
-PI-19  add a page to a sealed inventory                       REJECTED
-PI-20  delete a page from a sealed inventory                  REJECTED
-PI-21  delete a page while still building                     ACCEPTED
-PI-22  same page_index twice in one inventory                 REJECTED
-PI-23  same page_index under two inventories                  ACCEPTED
-PI-24  child naming another archive's inventory               REJECTED
-PI-25  reparent a page to another inventory                   REJECTED
+PI-19  add a page to a sealed inventory          REJECTED
+PI-20  delete a page from a sealed inventory     REJECTED
+PI-21  delete a page while still building        ACCEPTED
+PI-22  same page_index twice in one inventory    REJECTED
+PI-23  same page_index under two inventories     ACCEPTED
+PI-24  child naming another archive's inventory  REJECTED
+PI-25  reparent a page to another inventory      REJECTED
 
 retention
-PI-26  superseding keeps the old generation's pages           ACCEPTED
-PI-27  deleting an inventory that still has pages             REJECTED
-PI-28  page_hashes survive under a superseded parent          ACCEPTED
+PI-26  superseding keeps the old generation's pages     ACCEPTED
+PI-27  deleting an inventory that still has pages       REJECTED
+PI-28  page_hashes survive under a superseded parent    ACCEPTED
+PI-55  direct delete of a sealed zero-page inventory    REJECTED
+PI-56  whole-archive delete still succeeds              ACCEPTED
+PI-57  whole-archive delete with a zero-page inventory  ACCEPTED
+PI-58  direct delete of a sealed page                   REJECTED
 
 end-to-end rerun
-PI-29  identical rerun writes nothing                         ACCEPTED
-PI-30  differing rerun replaces, retaining both               ACCEPTED
-PI-31  a different revision leaves both active                ACCEPTED
+PI-29  identical rerun writes nothing            ACCEPTED
+PI-30  differing rerun replaces, retaining both  ACCEPTED
+PI-31  a different revision leaves both active   ACCEPTED
 
 attribution
-PI-32  unresolved -> bound                                    ACCEPTED
-PI-33  rebind an already-bound inventory                      REJECTED
-PI-34  attribution rewrite, value-identical                   ACCEPTED
-PI-35  bind to a basis the table may not carry                REJECTED
+PI-32  unresolved -> bound                      ACCEPTED
+PI-33  rebind an already-bound inventory        REJECTED
+PI-34  attribution rewrite, value-identical     ACCEPTED
+PI-35  bind to a basis the table may not carry  REJECTED
 
 supersession
-PI-36  INSERT already carrying a pointer                      REJECTED
-PI-37  INSERT already sealed                                  REJECTED
-PI-38  un-supersede a historical inventory                    REJECTED
-PI-39  supersession rewrite, value-identical                  ACCEPTED
-PI-40  successor of another archive                           REJECTED
-PI-41  successor naming a different revision                  REJECTED
-PI-42  successor id must exceed predecessor id                REJECTED
+PI-36  INSERT already carrying a pointer        REJECTED
+PI-37  INSERT already sealed                    REJECTED
+PI-38  un-supersede a historical inventory      REJECTED
+PI-39  supersession rewrite, value-identical    ACCEPTED
+PI-40  successor of another archive             REJECTED
+PI-41  successor naming a different revision    REJECTED
+PI-42  successor id must exceed predecessor id  REJECTED
 
 immutability
-PI-43  rewrite inventory page_count                           REJECTED
-PI-44  rewrite inventory content_digest                       REJECTED
-PI-45  rewrite a page measurement                             REJECTED
-PI-46  byte-identical inventory rewrite                       ACCEPTED
+PI-43  rewrite inventory page_count      REJECTED
+PI-44  rewrite inventory content_digest  REJECTED
+PI-45  rewrite a page measurement        REJECTED
+PI-46  byte-identical inventory rewrite  ACCEPTED
 
-registered 46   duplicate registrations 0   unique 46
-all 46 produced the outcome recorded here
+zero-page timestamp
+PI-47  MIN(child created_at) over no children is NULL          ACCEPTED
+PI-48  zero-page inventory claiming a child timestamp          REJECTED
+PI-49  zero-page inventory on the signature timestamp          ACCEPTED
+PI-50  a populated inventory claiming the signature timestamp  ACCEPTED
+
+producer order
+PI-51  build a candidate before deciding, same revision                   REJECTED
+PI-52  decide first, then supersede/build/fill/seal atomically            ACCEPTED
+PI-53  seal accepts a content_digest that does not describe the children  ACCEPTED
+PI-54  the producer-level digest check catches what seal cannot           ACCEPTED
+
+reason and context
+PI-59  empty superseded_reason                 REJECTED
+PI-60  whitespace-only superseded_reason       REJECTED
+PI-61  repoint the inventory's location_id     REJECTED
+PI-62  direct clear while the location exists  REJECTED
+PI-63  genuine ON DELETE SET NULL cascade      ACCEPTED
+
+enrichment
+PI-64  perceptual run enriches a sealed page        ACCEPTED
+PI-65  rewrite an existing enrichment value         REJECTED
+PI-66  partial enrichment leaves a half-known page  REJECTED
+PI-67  extraction measurements stay frozen          REJECTED
+
+consumer scoping
+PI-68  a by-archive_id page query combines two generations       ACCEPTED
+PI-69  the page-index sanity check breaks under two generations  ACCEPTED
+
+dispositions
+PI-70  page_inventory columns are all assigned  ACCEPTED
+PI-71  archive_pages columns are all assigned   ACCEPTED
+
+registered 71   duplicate registrations 0   unique 71
+all 71 produced the outcome recorded here
 ```
 
 `PI-29`, `PI-30` and `PI-31` are end-to-end: each drives a producer-shaped
-sequence — build, fill, seal, then decide — rather than asserting a single
-statement, which is what makes them evidence about idempotency rather than
-about one trigger.
+sequence rather than asserting a single statement, which is what makes them
+evidence about idempotency rather than about one trigger. §8.5 gives the
+sequence they actually execute.
 
 `PI-07` and `PI-31` state the point of the design: two revisions of one
 archive coexist, both active, neither superseding the other.
@@ -694,9 +1018,23 @@ per archive and `archive_id` identifies it uniquely. The planner emits:
 archive_id, provenance_basis, source_revision_id, page_count, content_digest
 ```
 
-and slice 4's binding digest records, per row, the `archive_id` it planned and
-the `page_inventory.id` it actually minted. The reconciliation is
-**planned-key to applied-row**, not id to id:
+and it must name **every field the migration writes**, not a subset. An
+earlier draft listed five and omitted `location_id`, `extracted_at`,
+`extracted_at_basis` and `sealed_at` — all of them decision-bearing, all of
+them written by the migration, and therefore all of them part of what the lead
+approves before it runs:
+
+```text
+plan row, per archive_id
+    provenance_basis        source_revision_id
+    page_count              content_digest
+    location_id             extracted_at
+    extracted_at_basis      sealed_at
+```
+
+Slice 4's binding digest records, per row, the `archive_id` it planned and the
+`page_inventory.id` it actually minted, over that full tuple. The
+reconciliation is **planned-key to applied-row**, not id to id:
 
 ```text
 every planned archive_id was minted exactly once
@@ -761,18 +1099,30 @@ is the same rebuild that changes the unique key.
 slice 3   planner            plans 238,956 bindings; page evidence keyed by
                              archive_id (§10.1); no schema
 slice 4   other four tables  exactly as slice 1 §11 specifies
-slice 4p  page tables        ONE migration: create page_inventory, mint
-                             58,437 rows, rebuild archive_pages into its
-                             final shape, populate inventory_id, and cut the
-                             producer over to build/fill/seal
+slice 4p  page tables        ONE migration and its own PR: create
+                             page_inventory, mint 58,437 rows, rebuild
+                             archive_pages into its final shape, populate
+                             inventory_id, cut the producer over to
+                             build/fill/seal, and rescope or disable every
+                             consumer of §8.6.2
 slice 5   other four tables  exactly as slice 1 §11 specifies; page tables
                              have nothing left to do here
 ```
 
-`4p` is drawn as a sibling of slice 4 rather than a renumbering, so slice 1's
-sequence for the other tables is untouched. Whether it runs before, after or
-in the same operator window as slice 4 is a sequencing question this document
-does not decide.
+**Ordered by the lead: slice 4 -> slice 4p -> slice 5.** Two reasons, both
+recorded here so the sequence is not re-derived later:
+
+- **4p must follow 4** because page hashing resolves its revision through
+  `archive_hashes` (slice 1 §8.2), and that binding anchor is what slice 4
+  lands. A producer cut over to build/fill/seal before slice 4 would have
+  nothing to stat-match against.
+- **4p stays a separate migration and PR** because it combines the
+  largest-table rebuild in the database with an atomic producer cutover, and
+  that pairing deserves its own protected backup, its own reconciliation gate
+  and its own review rather than riding inside another slice's.
+
+An earlier draft left this as "before, after, or in the same operator window";
+that is retired.
 
 ---
 
@@ -815,7 +1165,9 @@ post-hoc audit.
 - **The five zero-page archives receive inventories** (§4.5). Corroborated by
   the inspector, the revision and the canonical empty-tuple digest.
 - **`extracted_at` is `MIN(created_at)` of the children**, understood as the
-  first persistence timestamp after extraction completed (§4.2).
+  first persistence timestamp after extraction completed, with
+  `signature_calculated_at` as the basis for the five zero-page inventories
+  that have no children to take it from (§4.2).
 - **The inventory carries its own `content_digest`.** An earlier draft
   declined this as duplicating `archive_content_signatures`. That was wrong
   for a reason the earlier draft did not consider: `archive_content_signatures`
@@ -831,14 +1183,27 @@ post-hoc audit.
   is the composite foreign key's second column (§6.2).
 - **A page hash inherits its revision, never its run** (§7).
 - **The child table is rebuilt once, with the producer cutover in the same
-  slice** (§10.2, §10.3).
+  slice** (§10.2, §10.3), ordered slice 4 -> 4p -> 5 by the lead.
+- **`width`, `height` and `image_format` are enrichment**, written once by the
+  later perceptual run and never rewritten, rather than extraction
+  measurements frozen at seal (§8.6.1).
+- **The child keeps its direct `ON DELETE CASCADE` to `archive_files`**;
+  without it an archive with an inventory cannot be deleted (§6.2).
+- **Deletion guards use parent-existence** to tell a direct delete from a
+  whole-archive cascade (§6.3).
 
-### 12.2 Deliberate non-decisions
+### 12.2 Deliberate non-decisions and accepted limitations
 
+- **Sealing cannot verify `content_digest` against the children** (§8.4.1).
+  Stock SQLite has no `sha256()`, so the guarantee is producer-level and
+  migration-level. Accepted, with the compensating checks named; a
+  user-defined function was considered and declined because it would make the
+  database unreadable by tools that do not register it.
+- **Whether slice 4p rescopes every consumer or disables them is not decided**
+  (§8.6.2). Both are viable, neither is free, and doing neither is not
+  available. This is the lead's call.
 - **The 15 `sha256` hashes written after their page row are not explained**
   (§4.3). Recorded as a gap; no reconstruction is offered.
-- **Where slice 4p sits relative to slice 4 is not decided** (§10.3). It is a
-  sequencing question for the operator and the lead.
 - **Perceptual-hash run provenance is not designed here.** §4.3 establishes
   that it is a separate production event; what column records it belongs to
   the slice slice 1 §6.3 defers past slice 6.
