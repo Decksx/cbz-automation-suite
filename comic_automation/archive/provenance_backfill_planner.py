@@ -1559,7 +1559,45 @@ def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
     return targets
 
 
-def _create_and_write(path: Path, payload: str, created: list[Path]) -> Path:
+@dataclass(frozen=True)
+class _OwnedFile:
+    """A file this call created, identified by more than its pathname.
+
+    A pathname is not an identity. The rollback used to hold bare paths, so
+    when another writer replaced a committed artifact between the commit and
+    the failure, the rollback deleted the REPLACEMENT -- while the invariant
+    in the docstring claimed every file it removed was known to belong to
+    this invocation. `O_EXCL` established that for the staging name only, and
+    only at the instant of creation.
+
+    Device and inode are captured from `os.fstat` on the descriptor that
+    exclusively created the file, so the identity is the file itself rather
+    than anything about where it currently sits. Measured 2026-08-27 on
+    Python 3.11.3 / win32: `os.link` preserves the pair, and a replacement by
+    another writer produces a different one.
+    """
+
+    path: Path
+    device: int
+    inode: int
+
+    def identifies(self, status: "os.stat_result") -> bool:
+        """Whether `status` describes the same file this call created.
+
+        An inode of 0 means the volume does not report a usable file id --
+        FAT and exFAT do this, and exFAT has already been measured on this
+        repository's library volume once. Identity cannot be established
+        there, so the answer is no and the caller leaves the file alone:
+        residue is recoverable, deleting somebody else's file is not.
+        """
+        if not self.inode:
+            return False
+
+        return (status.st_dev, status.st_ino) == (self.device, self.inode)
+
+
+def _create_and_write(path: Path, payload: str,
+                      created: list["_OwnedFile"]) -> "_OwnedFile":
     """Create a staging file exclusively, record it, then fill it.
 
     The order is the whole correction. An earlier version wrote through
@@ -1589,8 +1627,12 @@ def _create_and_write(path: Path, payload: str, created: list[Path]) -> Path:
     except OSError as error:
         raise OutputPathError(f"could not create {path}: {error}") from error
 
-    # Ours from here: whatever happens next, cleanup may remove it.
-    created.append(path)
+    # Ours from here: whatever happens next, cleanup may remove it. The
+    # identity is taken from the descriptor that created the file, before any
+    # bytes are written and before any other name can refer to it.
+    status = os.fstat(descriptor)
+    owned = _OwnedFile(path, status.st_dev, status.st_ino)
+    created.append(owned)
 
     try:
         stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
@@ -1606,30 +1648,117 @@ def _create_and_write(path: Path, payload: str, created: list[Path]) -> Path:
     except OSError as error:
         raise OutputPathError(f"could not write {path}: {error}") from error
 
-    return path
+    return owned
 
 
-def _discard(paths: Iterable[Path]) -> list[Path]:
-    """Remove files a failed write created, and report what survived.
+def _discard(owned_files: Iterable["_OwnedFile"]) -> tuple[list[Path], list[Path]]:
+    """Remove files this call created, and never one it merely named.
 
-    Best effort by necessity -- a filesystem refusing writes may refuse
-    unlinks too -- so each removal is attempted independently. What it must
-    not do is fail silently: a surviving file would contradict the
-    both-or-neither guarantee, so the paths that could not be removed are
-    returned and the caller names them in the error rather than leaving
-    residue nobody was told about.
+    Ownership is checked by device and inode, not by pathname. That is the
+    correction: the cleanup set used to hold bare paths, so a rollback that
+    ran after another writer had replaced a committed artifact deleted the
+    replacement -- while the docstring claimed every file removed was known
+    to belong to this invocation. `O_EXCL` establishes that for the staging
+    name at the instant of creation and for nothing afterwards.
+
+    Fail-closed in both directions. A file that is not ours is left alone; a
+    file whose identity cannot be established at all is also left alone.
+    Leaving residue is recoverable and reportable; deleting somebody else's
+    file is neither.
+
+    Returns what could not be removed and what was found to be no longer
+    ours, kept apart because they are different things to tell an operator:
+    one is a filesystem that would not cooperate, the other is another writer
+    having taken the name.
     """
     survived: list[Path] = []
+    foreign: list[Path] = []
 
-    for path in paths:
+    for owned in owned_files:
         try:
-            os.unlink(path)
+            # lstat, not stat: a symlink placed at our path describes the
+            # link, whose identity is not ours, so it is left alone.
+            status = os.lstat(owned.path)
         except FileNotFoundError:
             continue
         except OSError:
-            survived.append(path)
+            survived.append(owned.path)
+            continue
 
-    return survived
+        if not owned.identifies(status):
+            foreign.append(owned.path)
+            continue
+
+        try:
+            os.unlink(owned.path)
+        except OSError:
+            survived.append(owned.path)
+
+    return survived, foreign
+
+
+def _promote(owned: "_OwnedFile", final: Path) -> tuple["_OwnedFile", bool]:
+    """Move a staged file onto its final name without clobbering anything.
+
+    `os.replace` was the obvious call and the wrong one: overwriting the
+    destination is exactly what it is for, so a file that appeared after the
+    preflight check was destroyed and the write still reported success.
+    Preflight cannot close that window -- it runs before the payload is even
+    rendered -- so the promotion itself has to be no-clobber.
+
+    Measured 2026-08-27, Python 3.11.3 / win32: `os.link` and `os.rename`
+    both raise FileExistsError when the destination exists; `os.replace` does
+    not. A hard link followed by unlinking the staging name is preferred over
+    `os.rename` because it is no-clobber on POSIX too, where `os.rename`
+    silently overwrites -- and because the link preserves the device/inode
+    pair captured at creation, which is what lets the rollback prove
+    ownership afterwards.
+
+    Returns the promoted file's identity and whether the staging name is
+    gone. A staging name that survives is not a failed commit: the artifact
+    is committed and correct, and the leftover link stays in the cleanup set.
+    """
+    try:
+        os.link(owned.path, final)
+    except FileExistsError as error:
+        raise OutputPathError(
+            f"refusing to overwrite {final}: something created it after the "
+            "preflight check passed, so it is not this call's to replace"
+        ) from error
+    except OSError as error:
+        # Hard links are not available on every volume this repository
+        # touches; exFAT was measured on the library volume once already.
+        # On Windows `os.rename` is no-clobber and is the fallback. On a
+        # POSIX volume without link support there is no no-clobber rename at
+        # all, so refusing is the only honest answer -- silently overwriting
+        # is the defect being corrected.
+        if os.name != "nt":
+            raise OutputPathError(
+                f"cannot promote {owned.path} to {final} without hard-link "
+                f"support, because rename would overwrite silently: {error}"
+            ) from error
+
+        try:
+            os.rename(owned.path, final)
+        except FileExistsError as rename_error:
+            raise OutputPathError(
+                f"refusing to overwrite {final}: something created it after "
+                "the preflight check passed, so it is not this call's to "
+                "replace"
+            ) from rename_error
+        except OSError as rename_error:
+            raise OutputPathError(
+                f"could not commit {final}: {rename_error}"
+            ) from rename_error
+
+        return _OwnedFile(final, owned.device, owned.inode), True
+
+    try:
+        os.unlink(owned.path)
+    except OSError:
+        return _OwnedFile(final, owned.device, owned.inode), False
+
+    return _OwnedFile(final, owned.device, owned.inode), True
 
 
 def render_plan_csv(plan: "BackfillPlan") -> str:
@@ -1700,10 +1829,17 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     files sharing a directory.
 
     If any step fails, every file this call created is removed -- one already
-    renamed into place included -- so a recoverable failure leaves neither
-    artifact. Staging files are created with `O_EXCL`, so every name the
-    rollback removes is one this call is known to have created rather than
-    one that merely has the expected shape.
+    promoted included -- so a recoverable failure leaves neither artifact.
+
+    Both halves of that are ownership-checked rather than name-checked, which
+    is what the earlier revision got wrong. Promotion is no-clobber, so a
+    destination that appeared after preflight is preserved and the commit
+    refused instead of the other file being destroyed. Removal compares the
+    device and inode captured when the staging file was exclusively created,
+    so a committed artifact that another writer replaced before the rollback
+    ran is recognised as no longer ours and left alone. Anything the rollback
+    could not remove, and anything it declined to remove, is named in the
+    error.
     """
     targets = preflight_output_paths(
         json_path=json_path, csv_path=csv_path, database=database
@@ -1723,12 +1859,13 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
             ),
         )
 
-    staged: dict[str, Path] = {}
+    staged: dict[str, _OwnedFile] = {}
     committed: dict[str, Path] = {}
-    # Every name this call has created and not yet renamed away. Maintained
-    # as the writes happen rather than reconstructed afterwards, so a failure
-    # at any point can remove exactly what exists.
-    created: list[Path] = []
+    # Every file this call has created, by identity rather than by name.
+    # Maintained as the writes happen rather than reconstructed afterwards,
+    # so a failure at any point can remove exactly what it created and
+    # nothing else.
+    created: list[_OwnedFile] = []
 
     # BaseException, not Exception: a KeyboardInterrupt between the two
     # renames would otherwise leave exactly the half-pair this exists to
@@ -1740,6 +1877,10 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                     _staging_path(targets[label]), payloads[label], created
                 )
 
+        # Promotion is no-clobber, so a destination that appeared after
+        # preflight is preserved and the commit refused rather than the other
+        # file being destroyed.
+        #
         # Commit order: bindings first, envelope last, so the envelope's
         # existence is never a promise about a CSV that is not there yet.
         #
@@ -1756,27 +1897,37 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
         # the reasoning is recorded here rather than only in a review.
         for label in ("csv", "json"):
             if label in staged:
-                try:
-                    os.replace(staged[label], targets[label])
-                except OSError as error:
-                    raise OutputPathError(
-                        f"could not commit {targets[label]}: {error}"
-                    ) from error
+                promoted, staging_gone = _promote(staged[label], targets[label])
 
-                # The staging name no longer exists and the final one now
-                # does, so the cleanup set follows the rename rather than
-                # holding a name that is gone.
-                created.remove(staged[label])
-                created.append(targets[label])
+                # The cleanup set follows the file, not the name. When the
+                # staging link could not be removed it stays in the set, so a
+                # later failure still clears it.
+                if staging_gone:
+                    created.remove(staged[label])
+
+                created.append(promoted)
                 committed[label] = targets[label]
     except BaseException as error:
-        residue = _discard(created)
+        survived, foreign = _discard(created)
+        problems: list[str] = []
 
-        if residue:
+        if survived:
+            problems.append(
+                "could not be removed: "
+                + ", ".join(str(path) for path in survived)
+            )
+
+        if foreign:
+            problems.append(
+                "were replaced by another writer after this call committed "
+                "them and were left untouched: "
+                + ", ".join(str(path) for path in foreign)
+            )
+
+        if problems:
             raise OutputPathError(
-                f"{error}; and these files could not be removed afterwards, so "
-                "the plan is left incomplete on disk rather than absent: "
-                + ", ".join(str(path) for path in residue)
+                f"{error}; and the rollback was incomplete -- these artifacts "
+                + "; ".join(problems)
             ) from error
 
         raise
