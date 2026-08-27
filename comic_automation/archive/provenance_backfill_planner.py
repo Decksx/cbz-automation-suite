@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import sqlite3
 from collections import Counter
@@ -103,10 +104,35 @@ NATURAL_KEY_TABLES = frozenset({"page_inventory"})
 FIRST_PAGE_PERSISTENCE = "first_page_persistence"
 SIGNATURE_CALCULATED_AT = "signature_calculated_at"
 
-# Slice 2 §11: every inventory the migration mints is minted sealed, because
-# the extraction it describes completed long ago. The plan asserts the state;
-# the migration supplies the timestamp.
-TARGET_STATES = ("sealed",)
+# Slice 2 §10.1 and §11: the two facts the plan asserts and only the
+# migration can value. `sealed` because every minted inventory describes an
+# extraction that completed long ago; `created_at` because a plan computed
+# before the migration runs cannot name the migration's own clock. An earlier
+# revision of this module listed only the first, which read as though
+# `created_at` had been forgotten rather than deliberately deferred.
+TARGET_STATES = ("sealed", "created_at_from_migration_clock")
+
+# What each receiving table's plan row carries beyond the ownership pair.
+# Artifact columns are generated from this rather than from a hand-kept list,
+# and a binding whose values do not match its table's tuple EXACTLY is
+# refused -- neither a missing field nor an unexpected one may pass.
+ARTIFACT_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "archive_hashes": (),
+    "archive_content_signatures": (),
+    "archive_inspections": ("inspector_version", "inspector_version_basis"),
+    "page_inventory": (
+        "page_count",
+        "content_digest",
+        "location_id",
+        "extracted_at",
+        "extracted_at_basis",
+    ),
+    "near_duplicate_candidates": ("archive_b_id", "parameters_basis"),
+}
+
+# Tables whose attribution is pairwise. Their sides bind independently, so a
+# single ownership pair cannot describe them (slice 1 §7.4).
+PAIRWISE_TABLES = frozenset({"near_duplicate_candidates"})
 
 
 class BackfillPlannerError(RuntimeError):
@@ -127,6 +153,30 @@ class OutputPathError(BackfillPlannerError):
 
 
 @dataclass(frozen=True)
+class SideAttribution:
+    """One side's ownership, because some tables have more than one.
+
+    `near_duplicate_candidates` compares two page sets and each side binds
+    independently (slice 1 §7.4), so a single revision/basis pair cannot
+    describe it: a candidate whose A side is bound and whose B side is not is
+    an ordinary case, and collapsing that to one pair discards A's valid
+    attribution. Single-sided tables carry exactly one side, labelled "".
+    """
+
+    label: str
+    archive_id: int
+    source_revision_id: int | None
+    provenance_basis: str
+
+    @property
+    def bound(self) -> bool:
+        return self.provenance_basis in BOUND_BASES
+
+    def suffix(self) -> str:
+        return f"_{self.label}" if self.label else ""
+
+
+@dataclass(frozen=True)
 class PlannedBinding:
     """One row that migration 015 will write, and how it was classified.
 
@@ -140,106 +190,156 @@ class PlannedBinding:
     key: int
     key_kind: str
     archive_id: int
-    source_revision_id: int | None
-    provenance_basis: str
-    # Table-specific frozen values, empty for tables that write only the
-    # ownership pair. Kept as a mapping rather than a widening set of
-    # optional columns so a table that gains a planned field does not change
-    # this class's shape.
+    sides: tuple[SideAttribution, ...]
+    # Table-specific frozen values. Checked against ARTIFACT_COLUMNS exactly,
+    # so a field the artifact writer would drop cannot be created here.
     values: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.provenance_basis not in ALL_BASES:
-            raise PlannerInvariantError(
-                f"{self.table} row {self.key}: unknown basis "
-                f"{self.provenance_basis!r}"
-            )
-
         vocabulary = TABLE_VOCABULARY.get(self.table)
 
         if vocabulary is None:
             raise PlannerInvariantError(f"unknown receiving table {self.table!r}")
 
-        if self.provenance_basis not in vocabulary:
+        expected_labels = ("a", "b") if self.table in PAIRWISE_TABLES else ("",)
+        labels = tuple(side.label for side in self.sides)
+
+        if labels != expected_labels:
             raise PlannerInvariantError(
-                f"{self.table} row {self.key}: basis "
-                f"{self.provenance_basis!r} is not in that table's vocabulary"
+                f"{self.table} row {self.key}: sides {labels} do not match "
+                f"the expected {expected_labels}"
             )
 
-        bound = self.provenance_basis in BOUND_BASES
+        for side in self.sides:
+            if side.provenance_basis not in ALL_BASES:
+                raise PlannerInvariantError(
+                    f"{self.table} row {self.key} side {side.label!r}: unknown "
+                    f"basis {side.provenance_basis!r}"
+                )
 
-        # The paired invariant of slice 1 §9.2, enforced at plan time rather
-        # than left for the migration's CHECK to discover: a row may not
-        # carry a revision without saying how it got one, or omit one
-        # without saying why.
-        if bound and self.source_revision_id is None:
-            raise PlannerInvariantError(
-                f"{self.table} row {self.key}: bound basis "
-                f"{self.provenance_basis!r} with no revision"
-            )
+            if side.provenance_basis not in vocabulary:
+                raise PlannerInvariantError(
+                    f"{self.table} row {self.key} side {side.label!r}: basis "
+                    f"{side.provenance_basis!r} is not in that table's vocabulary"
+                )
 
-        if not bound and self.source_revision_id is not None:
+            # The paired invariant of slice 1 §9.2, per side, enforced at plan
+            # time rather than left for the migration's CHECK to discover.
+            if side.bound and side.source_revision_id is None:
+                raise PlannerInvariantError(
+                    f"{self.table} row {self.key} side {side.label!r}: bound "
+                    f"basis {side.provenance_basis!r} with no revision"
+                )
+
+            if not side.bound and side.source_revision_id is not None:
+                raise PlannerInvariantError(
+                    f"{self.table} row {self.key} side {side.label!r}: "
+                    f"unresolved basis {side.provenance_basis!r} carries "
+                    f"revision {side.source_revision_id}"
+                )
+
+        expected_values = set(ARTIFACT_COLUMNS[self.table])
+        supplied = set(self.values)
+
+        if supplied != expected_values:
+            missing = sorted(expected_values - supplied)
+            unexpected = sorted(supplied - expected_values)
             raise PlannerInvariantError(
-                f"{self.table} row {self.key}: unresolved basis "
-                f"{self.provenance_basis!r} carries revision "
-                f"{self.source_revision_id}"
+                f"{self.table} row {self.key}: planned values do not match the "
+                f"table's artifact columns (missing {missing}, unexpected "
+                f"{unexpected})"
             )
 
     @property
     def bound(self) -> bool:
-        return self.provenance_basis in BOUND_BASES
+        """A row is bound only when EVERY side is.
+
+        Slice 1 §9.6 defines a mixed-side candidate as unresolved, because a
+        comparison is only as well-attributed as its weaker side. The per-side
+        detail is not lost -- it travels in `sides` and is counted per side in
+        the totals.
+        """
+        return all(side.bound for side in self.sides)
 
     def canonical_line(self) -> str:
         """One digest line. Field names travel with values so reordering
-        cannot collide, and `values` is rendered sorted for the same reason.
+        cannot collide, and both sides and values are rendered in a fixed
+        order for the same reason.
         """
         rendered = "|".join(
             f"{name}={'' if value is None else value}"
             for name, value in sorted(self.values.items())
         )
+        sides = "|".join(
+            f"side{side.suffix()}|archive={side.archive_id}"
+            f"|revision={'' if side.source_revision_id is None else side.source_revision_id}"
+            f"|basis={side.provenance_basis}"
+            for side in self.sides
+        )
         return (
             f"binding|table={self.table}"
             f"|key_kind={self.key_kind}|key={self.key}"
             f"|archive_id={self.archive_id}"
-            f"|revision={'' if self.source_revision_id is None else self.source_revision_id}"
-            f"|basis={self.provenance_basis}"
+            f"|bound={int(self.bound)}"
+            f"|{sides}"
             + (f"|{rendered}" if rendered else "")
         )
 
-    def as_dict(self, *, planner_version: str, snapshot_digest: str) -> dict[str, Any]:
+    def as_dict(self, *, planner_version: str, snapshot_digest: str,
+                plan_digest: str) -> dict[str, Any]:
         row: dict[str, Any] = {
             "table": self.table,
             "key_kind": self.key_kind,
             "key": self.key,
             "archive_id": self.archive_id,
-            "source_revision_id": self.source_revision_id,
-            "provenance_basis": self.provenance_basis,
             "bound": self.bound,
             "planner_version": planner_version,
             "snapshot_digest": snapshot_digest,
+            "plan_digest": plan_digest,
         }
+
+        for side in self.sides:
+            if side.label:
+                row[f"archive_{side.label}_id"] = side.archive_id
+                row[f"revision_{side.label}_id"] = side.source_revision_id
+                row[f"provenance_basis_{side.label}"] = side.provenance_basis
+            else:
+                row["source_revision_id"] = side.source_revision_id
+                row["provenance_basis"] = side.provenance_basis
+
         row.update(self.values)
         return row
 
 
-CSV_COLUMNS = (
-    "table",
-    "key_kind",
-    "key",
-    "archive_id",
-    "source_revision_id",
-    "provenance_basis",
-    "bound",
-    "page_count",
-    "content_digest",
-    "location_id",
-    "extracted_at",
-    "extracted_at_basis",
-    "inspector_version_basis",
-    "parameters_basis",
-    "planner_version",
-    "snapshot_digest",
-)
+def _csv_columns() -> tuple[str, ...]:
+    """Every column any binding can emit, derived rather than hand-kept.
+
+    An earlier revision listed these by hand and omitted `archive_b_id` and
+    `revision_b_id`, which `DictWriter(extrasaction="ignore")` then dropped
+    from the artifact without error. Both halves of that are fixed: the list
+    is generated from `ARTIFACT_COLUMNS` and the side labels, and the writer
+    raises on anything it did not expect.
+    """
+    columns = ["table", "key_kind", "key", "archive_id", "bound"]
+    columns += ["source_revision_id", "provenance_basis"]
+
+    for label in ("a", "b"):
+        columns += [
+            f"archive_{label}_id",
+            f"revision_{label}_id",
+            f"provenance_basis_{label}",
+        ]
+
+    for table in RECEIVING_TABLES:
+        for name in ARTIFACT_COLUMNS[table]:
+            if name not in columns:
+                columns.append(name)
+
+    columns += ["planner_version", "snapshot_digest", "plan_digest"]
+    return tuple(columns)
+
+
+CSV_COLUMNS = _csv_columns()
 
 
 @dataclass(frozen=True)
@@ -278,6 +378,15 @@ class _Inputs:
     revisions: Mapping[int, tuple[int, str, str | None]]
     """revision_id -> (archive_id, identity_state, archive_sha256)"""
     revision_by_archive: Mapping[int, int]
+    """archive_id -> revision_id, ESTABLISHED revisions only.
+
+    A provisional revision has no digest, so binding evidence to it would
+    assert an identity the database explicitly says is unknown. Slice 1 §7.3
+    requires such evidence to stay unresolved, so provisional archives are
+    absent from this map and every lookup against it misses, which is the
+    behaviour the classifier wants.
+    """
+    provisional_by_archive: Mapping[int, int]
     hashes: tuple[tuple[int, int], ...]
     signatures: tuple[tuple[int, int, int, str, int | None, str], ...]
     inspections: tuple[tuple[int, int], ...]
@@ -299,6 +408,7 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
 
     revisions: dict[int, tuple[int, str, str | None]] = {}
     revision_by_archive: dict[int, int] = {}
+    provisional_by_archive: dict[int, int] = {}
 
     for row in connection.execute(
         "SELECT id, archive_id, identity_state, archive_sha256 "
@@ -313,7 +423,10 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
         # stops being true the planner must not silently pick one, so the
         # reconciliation below counts archives with more than one and the gate
         # reports them rather than this dict quietly keeping the last.
-        revision_by_archive.setdefault(int(row["archive_id"]), int(row["id"]))
+        if str(row["identity_state"]) == "provisional":
+            provisional_by_archive.setdefault(int(row["archive_id"]), int(row["id"]))
+        else:
+            revision_by_archive.setdefault(int(row["archive_id"]), int(row["id"]))
 
     multi = [
         int(row["archive_id"])
@@ -361,17 +474,26 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
     )
 
     # Page evidence is aggregated to its inventory here, which is the whole
-    # point of slice 2: 58,437 planned rows rather than 2,955,391.
+    # point of slice 2: 58,437 planned rows rather than 2,955,391. Everything
+    # the validation of `_classify` needs is aggregated in the same pass --
+    # index bounds and the DISTINCT location count, not min(location_id),
+    # because a minimum silently hides a mixed-location page set.
     page_archives = {
         int(row["archive_id"]): (
             int(row["page_count"]),
             str(row["extracted_at"]),
             None if row["location_id"] is None else int(row["location_id"]),
+            int(row["distinct_locations"]),
+            int(row["min_index"]),
+            int(row["max_index"]),
         )
         for row in connection.execute(
             "SELECT archive_id, count(*) AS page_count, "
             "       min(created_at) AS extracted_at, "
-            "       min(location_id) AS location_id "
+            "       min(location_id) AS location_id, "
+            "       count(DISTINCT ifnull(location_id, -1)) AS distinct_locations, "
+            "       min(page_index) AS min_index, "
+            "       max(page_index) AS max_index "
             "FROM archive_pages GROUP BY archive_id ORDER BY archive_id"
         )
     }
@@ -434,6 +556,7 @@ def _read_inputs(connection: sqlite3.Connection) -> _Inputs:
     return _Inputs(
         revisions=revisions,
         revision_by_archive=revision_by_archive,
+        provisional_by_archive=provisional_by_archive,
         hashes=hashes,
         signatures=signatures,
         inspections=inspections,
@@ -466,6 +589,87 @@ def _signature_digest(inputs: "_Inputs", archive_id: int) -> str:
     return digest
 
 
+def _single(archive_id: int, revision_id: int | None, basis: str) -> tuple:
+    return (SideAttribution("", archive_id, revision_id, basis),)
+
+
+def _resolve(inputs: "_Inputs", archive_id: int, table: str,
+             bound_basis: str) -> tuple[int | None, str]:
+    """Which revision an archive's evidence binds to, and on what basis.
+
+    Provisional archives are the case this exists for. Their revision carries
+    no digest, so binding to it would assert an identity the database says is
+    unknown; slice 1 §7.3 requires the evidence to stay unresolved instead.
+    `revision_by_archive` holds established revisions only, so the miss is
+    what produces `unresolved_no_identity` rather than a special case here.
+    """
+    revision_id = inputs.revision_by_archive.get(archive_id)
+
+    if revision_id is not None:
+        return revision_id, bound_basis
+
+    if UNRESOLVED_NO_IDENTITY not in TABLE_VOCABULARY[table]:
+        # `archive_hashes` has no unresolved state: the hasher computes a
+        # digest and binds in the same transaction, so a hash row under a
+        # digestless revision is not a row to classify conservatively -- it is
+        # a state that should not exist, and normalising it would hide that.
+        raise PlannerInvariantError(
+            f"{table}: archive {archive_id} has evidence but no established "
+            "revision, which this table has no unresolved basis to express"
+        )
+
+    return None, UNRESOLVED_NO_IDENTITY
+
+
+def _validate_page_population(inputs: "_Inputs", archive_id: int,
+                              signature_pages: int, signature_location: int | None):
+    """Refuse a page population the plan cannot honestly describe.
+
+    Every check here is a disagreement between two things production is
+    measured to agree on (slice 2 §4.4), so any of them firing means the
+    database is not in the shape the design was drawn against -- which is a
+    reason to stop planning, not to pick one side and continue.
+    """
+    child = inputs.page_archives.get(archive_id)
+
+    if child is None:
+        if signature_pages != 0:
+            raise PlannerInvariantError(
+                f"archive {archive_id}: signature claims {signature_pages} "
+                "page(s) but no page rows exist; a zero-page inventory here "
+                "would record a result the signature contradicts"
+            )
+        return 0, None
+
+    count, extracted_at, location_id, distinct_locations, min_index, max_index = child
+
+    if count != signature_pages:
+        raise PlannerInvariantError(
+            f"archive {archive_id}: signature claims {signature_pages} page(s), "
+            f"{count} page row(s) exist"
+        )
+
+    if min_index != 0 or max_index != count - 1:
+        raise PlannerInvariantError(
+            f"archive {archive_id}: page indexes are not a dense 0..{count - 1} "
+            f"run (min {min_index}, max {max_index})"
+        )
+
+    if distinct_locations != 1:
+        raise PlannerInvariantError(
+            f"archive {archive_id}: page rows span {distinct_locations} "
+            "locations; the inventory carries one"
+        )
+
+    if location_id != signature_location:
+        raise PlannerInvariantError(
+            f"archive {archive_id}: page rows are at location {location_id}, "
+            f"the signature at {signature_location}"
+        )
+
+    return count, extracted_at
+
+
 def _classify(inputs: "_Inputs") -> list[PlannedBinding]:
     """Turn the snapshot into one planned binding per receiving row.
 
@@ -476,69 +680,84 @@ def _classify(inputs: "_Inputs") -> list[PlannedBinding]:
     bindings: list[PlannedBinding] = []
 
     # --- archive_hashes: the identity seed, and the only table that has one.
-    # Each of these rows IS what created its revision's archive_sha256, so
-    # binding it records the actual causal history of the identity.
     for row_id, archive_id in inputs.hashes:
+        revision_id, basis = _resolve(
+            inputs, archive_id, "archive_hashes", IDENTITY_SEED
+        )
         bindings.append(
             PlannedBinding(
                 table="archive_hashes",
                 key=row_id,
                 key_kind="row_id",
                 archive_id=archive_id,
-                source_revision_id=inputs.revision_by_archive.get(archive_id),
-                provenance_basis=IDENTITY_SEED,
+                sides=_single(archive_id, revision_id, basis),
             )
         )
 
     # --- archive_content_signatures: field seeds, except where the signature
     # describes a byte generation no revision holds.
     for row_id, archive_id, _pages, _digest, _loc, _calc in inputs.signatures:
-        drift = archive_id in inputs.drift_archives
+        if archive_id in inputs.drift_archives:
+            revision_id, basis = None, UNRESOLVED_DRIFT
+        else:
+            revision_id, basis = _resolve(
+                inputs, archive_id, "archive_content_signatures", FIELD_SEED
+            )
         bindings.append(
             PlannedBinding(
                 table="archive_content_signatures",
                 key=row_id,
                 key_kind="row_id",
                 archive_id=archive_id,
-                source_revision_id=(
-                    None if drift else inputs.revision_by_archive.get(archive_id)
-                ),
-                provenance_basis=UNRESOLVED_DRIFT if drift else FIELD_SEED,
+                sides=_single(archive_id, revision_id, basis),
             )
         )
 
-    # --- archive_inspections: inherited. Migration 014 never joined this
-    # table; exactly one candidate revision existed and nothing contradicted
-    # it. Unique, unchallenged, and unverified.
+    # --- archive_inspections: inherited, and explicitly version-unknown.
+    # `inspector_version` is planned as NULL rather than left unstated: the
+    # migration writes both columns, so both belong in the plan and in the
+    # binding digest that reconciles against it (slice 1 §6.5).
     for row_id, archive_id in inputs.inspections:
+        revision_id, basis = _resolve(
+            inputs, archive_id, "archive_inspections", SINGLE_REVISION_INHERITED
+        )
         bindings.append(
             PlannedBinding(
                 table="archive_inspections",
                 key=row_id,
                 key_kind="row_id",
                 archive_id=archive_id,
-                source_revision_id=inputs.revision_by_archive.get(archive_id),
-                provenance_basis=SINGLE_REVISION_INHERITED,
-                values={"inspector_version_basis": "unknown_legacy"},
+                sides=_single(archive_id, revision_id, basis),
+                values={
+                    "inspector_version": None,
+                    "inspector_version_basis": "unknown_legacy",
+                },
             )
         )
 
     # --- page_inventory: one row per extraction result, planned by
     # archive_id because the row does not exist yet (slice 2 §10.1). The
-    # SIGNATURE is the authority for which archives have an extraction
-    # result, not archive_pages: a zero-page result has a signature and no
-    # page rows at all (slice 2 §4.5).
+    # SIGNATURE is the authority throughout -- for which archives have a
+    # result, for the page count, and for the location.
     for archive_id in sorted(inputs.signature_by_archive):
-        _pages, sig_location, calculated_at = inputs.signature_by_archive[archive_id]
-        drift = archive_id in inputs.drift_archives
-        child = inputs.page_archives.get(archive_id)
+        sig_pages, sig_location, calculated_at = inputs.signature_by_archive[archive_id]
+        page_count, child_extracted_at = _validate_page_population(
+            inputs, archive_id, sig_pages, sig_location
+        )
 
-        if child is None:
-            page_count, extracted_at, location_id = 0, calculated_at, sig_location
+        if child_extracted_at is None:
+            extracted_at = calculated_at
             extracted_at_basis = SIGNATURE_CALCULATED_AT
         else:
-            page_count, extracted_at, location_id = child
+            extracted_at = child_extracted_at
             extracted_at_basis = FIRST_PAGE_PERSISTENCE
+
+        if archive_id in inputs.drift_archives:
+            revision_id, basis = None, UNRESOLVED_DRIFT
+        else:
+            revision_id, basis = _resolve(
+                inputs, archive_id, "page_inventory", SINGLE_REVISION_INHERITED
+            )
 
         bindings.append(
             PlannedBinding(
@@ -546,43 +765,46 @@ def _classify(inputs: "_Inputs") -> list[PlannedBinding]:
                 key=archive_id,
                 key_kind="archive_id",
                 archive_id=archive_id,
-                source_revision_id=(
-                    None if drift else inputs.revision_by_archive.get(archive_id)
-                ),
-                provenance_basis=(
-                    UNRESOLVED_DRIFT if drift else SINGLE_REVISION_INHERITED
-                ),
+                sides=_single(archive_id, revision_id, basis),
                 values={
                     "page_count": page_count,
                     "content_digest": _signature_digest(inputs, archive_id),
-                    "location_id": location_id,
+                    # The signature's location, not the children's: slice 2
+                    # §10.1 makes the signature the planned authority, and a
+                    # zero-page result has no child to take one from at all.
+                    "location_id": sig_location,
                     "extracted_at": extracted_at,
                     "extracted_at_basis": extracted_at_basis,
                 },
             )
         )
 
-    # --- near_duplicate_candidates: the 3,000 backfilled rows were bound by
-    # the one-revision-per-archive census, not from page evidence, so they
-    # take `single_revision_inherited` rather than the producer's
+    # --- near_duplicate_candidates: two sides, bound independently. The 3,000
+    # backfilled rows were bound by the one-revision-per-archive census rather
+    # than from page evidence, so a bound side takes
+    # `single_revision_inherited` and not the producer's
     # `inherited_from_page_evidence` (slice 1 §7.4).
     for row_id, archive_a, archive_b in inputs.candidates:
-        revision_a = inputs.revision_by_archive.get(archive_a)
-        revision_b = inputs.revision_by_archive.get(archive_b)
-        both_bound = revision_a is not None and revision_b is not None
+        sides = []
+
+        for label, side_archive in (("a", archive_a), ("b", archive_b)):
+            revision_id, basis = _resolve(
+                inputs, side_archive, "near_duplicate_candidates",
+                SINGLE_REVISION_INHERITED,
+            )
+            sides.append(
+                SideAttribution(label, side_archive, revision_id, basis)
+            )
+
         bindings.append(
             PlannedBinding(
                 table="near_duplicate_candidates",
                 key=row_id,
                 key_kind="row_id",
                 archive_id=archive_a,
-                source_revision_id=revision_a if both_bound else None,
-                provenance_basis=(
-                    SINGLE_REVISION_INHERITED if both_bound else UNRESOLVED_NO_IDENTITY
-                ),
+                sides=tuple(sides),
                 values={
                     "archive_b_id": archive_b,
-                    "revision_b_id": revision_b if both_bound else None,
                     "parameters_basis": "unknown_legacy",
                 },
             )
@@ -629,11 +851,14 @@ def canonical_snapshot_lines(inputs: "_Inputs") -> list[str]:
 
     lines.append("page_archives|count=%d" % len(inputs.page_archives))
     for archive_id in sorted(inputs.page_archives):
-        pages, extracted_at, location = inputs.page_archives[archive_id]
+        (pages, extracted_at, location, distinct_locations,
+         min_index, max_index) = inputs.page_archives[archive_id]
         lines.append(
             "page_archive|archive_id=%d|pages=%d|extracted_at=%s|location=%s"
+            "|distinct_locations=%d|min_index=%d|max_index=%d"
             % (archive_id, pages, extracted_at,
-               "" if location is None else location)
+               "" if location is None else location,
+               distinct_locations, min_index, max_index)
         )
 
     lines.append("candidates|count=%d" % len(inputs.candidates))
@@ -651,6 +876,42 @@ def canonical_snapshot_lines(inputs: "_Inputs") -> list[str]:
 
     lines.append("quarantine|rows=%d" % inputs.quarantine_rows)
     return lines
+
+
+PLAN_DIGEST_VERSION = "provenance-backfill-plan/1"
+
+
+def canonical_plan_lines(bindings, snapshot_digest: str) -> list[str]:
+    """Every planned binding, canonically rendered.
+
+    The snapshot digest identifies the STATE a plan was drawn from; it says
+    nothing about the plan. An earlier revision shipped only that, and
+    `canonical_line` was written and never called -- so a CSV row's revision,
+    basis, page count, digest or timestamp could be altered while the artifact
+    still carried the digest that appeared to approve it. Verified: the
+    envelope held no bindings and the CSV merely repeated the input digest.
+
+    This hashes the decisions. Migration 015 recomputes it from the artifact
+    it is about to apply and refuses if it differs, which is what makes the
+    approved plan and the applied plan the same object rather than two things
+    that share a filename.
+    """
+    lines = [
+        PLAN_DIGEST_VERSION,
+        "planner_version=" + PLANNER_VERSION,
+        "snapshot_digest=" + snapshot_digest,
+        "target_states|count=%d" % len(TARGET_STATES),
+    ]
+    lines.extend("target_state|%s" % state for state in TARGET_STATES)
+    lines.append("bindings|count=%d" % len(bindings))
+    lines.extend(binding.canonical_line() for binding in bindings)
+    return lines
+
+
+def compute_plan_digest(bindings, snapshot_digest: str) -> str:
+    """SHA-256 over `canonical_plan_lines`, lowercase hex."""
+    payload = "\n".join(canonical_plan_lines(bindings, snapshot_digest)) + "\n"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def compute_snapshot_digest(inputs: "_Inputs") -> str:
@@ -681,6 +942,7 @@ def plan_totals(bindings: Sequence[PlannedBinding]) -> dict[str, Any]:
         per_table[table] = {"rows": 0, "bound": 0, "unresolved": 0}
 
     per_basis: dict[str, int] = {basis: 0 for basis in sorted(ALL_BASES)}
+    planned_sides = 0
 
     for binding in bindings:
         bucket = per_table.get(binding.table)
@@ -690,7 +952,12 @@ def plan_totals(bindings: Sequence[PlannedBinding]) -> dict[str, Any]:
                 f"binding names {binding.table!r}, which is not a receiving table"
             )
 
-        if binding.provenance_basis not in per_basis:
+        unknown = [
+            side.provenance_basis for side in binding.sides
+            if side.provenance_basis not in per_basis
+        ]
+
+        if unknown:
             # Reachable only if a binding was built around __post_init__ --
             # which the reconciliation tests do deliberately. A KeyError here
             # would be a crash rather than a refusal, and the whole point of
@@ -698,14 +965,20 @@ def plan_totals(bindings: Sequence[PlannedBinding]) -> dict[str, Any]:
             # cannot stand behind.
             raise PlannerInvariantError(
                 f"{binding.table} row {binding.key}: unknown basis "
-                f"{binding.provenance_basis!r} reached the totals"
+                f"{unknown[0]!r} reached the totals"
             )
 
         bucket["rows"] += 1
         bucket["bound" if binding.bound else "unresolved"] += 1
-        bucket.setdefault(binding.provenance_basis, 0)
-        bucket[binding.provenance_basis] += 1
-        per_basis[binding.provenance_basis] += 1
+
+        # Bases are counted per SIDE, because a pairwise row can carry two
+        # different ones. Rows and sides are therefore different totals and
+        # are reconciled separately rather than being made to agree.
+        for side in binding.sides:
+            planned_sides += 1
+            bucket.setdefault(side.provenance_basis, 0)
+            bucket[side.provenance_basis] += 1
+            per_basis[side.provenance_basis] += 1
 
     for table, bucket in per_table.items():
         if bucket["bound"] + bucket["unresolved"] != bucket["rows"]:
@@ -721,7 +994,9 @@ def plan_totals(bindings: Sequence[PlannedBinding]) -> dict[str, Any]:
     # classification is. Recounting from the sequence catches a bug in the
     # loop, which is the only thing this check can usefully catch.
     recount_rows = Counter(binding.table for binding in bindings)
-    recount_basis = Counter(binding.provenance_basis for binding in bindings)
+    recount_basis = Counter(
+        side.provenance_basis for binding in bindings for side in binding.sides
+    )
     recount_bound = Counter(
         binding.table for binding in bindings if binding.bound
     )
@@ -755,6 +1030,7 @@ def plan_totals(bindings: Sequence[PlannedBinding]) -> dict[str, Any]:
 
     return {
         "planned_rows": total_rows,
+        "planned_sides": planned_sides,
         "bound": sum(b["bound"] for b in per_table.values()),
         "unresolved": sum(b["unresolved"] for b in per_table.values()),
         "per_table": {t: dict(sorted(b.items())) for t, b in per_table.items()},
@@ -768,6 +1044,7 @@ class BackfillPlan:
 
     planner_version: str
     snapshot_digest: str
+    plan_digest: str
     bindings: tuple[PlannedBinding, ...]
     totals: Mapping[str, Any]
     gates: ArchiveGate
@@ -808,13 +1085,16 @@ class BackfillPlan:
 
         The split is deliberate: 238,956 rows of JSON is an artifact nobody
         reads, while the envelope is the part a reviewer actually checks. Both
-        carry the same digest, so a CSV can always be tied back to the
-        envelope that approved it.
+        carry the `plan_digest`, which is computed over the bindings
+        themselves -- so a CSV whose rows were altered no longer matches the
+        envelope that approved it, which the snapshot digest alone could not
+        detect.
         """
         return {
             "planner_version": self.planner_version,
             "execution_status": EXECUTION_STATUS,
             "snapshot_digest": self.snapshot_digest,
+            "plan_digest": self.plan_digest,
             "target_states": list(TARGET_STATES),
             "receiving_tables": list(RECEIVING_TABLES),
             "natural_key_tables": sorted(NATURAL_KEY_TABLES),
@@ -839,9 +1119,12 @@ def build_plan(connection: sqlite3.Connection) -> BackfillPlan:
     bindings = _classify(inputs)
     bindings.sort(key=lambda b: (b.table, b.key))
 
+    snapshot_digest = compute_snapshot_digest(inputs)
+
     return BackfillPlan(
         planner_version=PLANNER_VERSION,
-        snapshot_digest=compute_snapshot_digest(inputs),
+        snapshot_digest=snapshot_digest,
+        plan_digest=compute_plan_digest(bindings, snapshot_digest),
         bindings=tuple(bindings),
         totals=plan_totals(bindings),
         gates=ArchiveGate(
@@ -869,7 +1152,7 @@ def plan_backfill(database: str | Path):
 # --- artifacts ------------------------------------------------------------
 
 
-def _refuse_unsafe_output(path: Path, database: Path | None) -> None:
+def _check_output_path(path: Path, database: Path | None) -> None:
     if path.exists():
         raise OutputPathError(f"refusing to overwrite an existing file: {path}")
 
@@ -881,37 +1164,121 @@ def _refuse_unsafe_output(path: Path, database: Path | None) -> None:
             f"refusing to write beside the database: {path.parent}"
         )
 
-
-def write_plan_json(plan: BackfillPlan, path: str | Path, *,
-                    database: str | Path | None = None) -> Path:
-    """Write the plan envelope. Deterministic: sorted keys, fixed separators."""
-    target = Path(path)
-    _refuse_unsafe_output(target, Path(database) if database else None)
-    target.write_text(
-        json.dumps(plan.as_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    return target
+    if not path.parent.is_dir():
+        raise OutputPathError(f"output directory does not exist: {path.parent}")
 
 
-def write_plan_csv(plan: BackfillPlan, path: str | Path, *,
-                   database: str | Path | None = None) -> Path:
-    """Write one row per planned binding, in the plan's canonical order."""
-    target = Path(path)
-    _refuse_unsafe_output(target, Path(database) if database else None)
+def preflight_output_paths(json_path=None, csv_path=None, *, database=None):
+    """Check every path BEFORE writing any of them.
 
-    with target.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle, fieldnames=CSV_COLUMNS, extrasaction="ignore"
+    An earlier revision checked each path as it wrote it, so a valid JSON path
+    and an invalid CSV path produced a written envelope, a failure, and no
+    bindings -- a half-pair on disk that looks like a complete plan until
+    someone notices the missing file. Both are checked first, so either both
+    are written or neither is.
+    """
+    targets = {}
+
+    for label, value in (("json", json_path), ("csv", csv_path)):
+        if value is None:
+            continue
+        targets[label] = Path(value)
+
+    resolved = {label: path.resolve() for label, path in targets.items()}
+
+    if len(set(resolved.values())) != len(resolved):
+        raise OutputPathError(
+            "the JSON and CSV artifacts must be different files; "
+            "writing both to one path would leave only the second"
         )
+
+    database_path = Path(database) if database is not None else None
+
+    for path in targets.values():
+        _check_output_path(path, database_path)
+
+    return targets
+
+
+def _write_text(path: Path, payload: str) -> Path:
+    """Write, turning a filesystem failure into a planner refusal.
+
+    A bare OSError from here reads as a crash in the planner rather than as
+    "the artifact could not be written", which is what it is.
+    """
+    try:
+        path.write_text(payload, encoding="utf-8", newline="\n")
+    except OSError as error:
+        raise OutputPathError(f"could not write {path}: {error}") from error
+
+    return path
+
+
+def write_plan_json(plan: "BackfillPlan", path, *, database=None) -> Path:
+    """Write the plan envelope. Deterministic: sorted keys, fixed separators."""
+    target = preflight_output_paths(json_path=path, database=database)["json"]
+    return _write_text(
+        target, json.dumps(plan.as_dict(), indent=2, sort_keys=True) + "\n"
+    )
+
+
+def write_plan_csv(plan: "BackfillPlan", path, *, database=None) -> Path:
+    """Write one row per planned binding, in the plan's canonical order.
+
+    `extrasaction="raise"`: a binding carrying a field the column list does
+    not know about is a defect to surface, not a field to drop. The previous
+    "ignore" silently discarded `archive_b_id` and `revision_b_id` from every
+    candidate row.
+    """
+    target = preflight_output_paths(csv_path=path, database=database)["csv"]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS, extrasaction="raise",
+                            restval="")
+    writer.writeheader()
+
+    for binding in plan.bindings:
+        writer.writerow(
+            binding.as_dict(
+                planner_version=plan.planner_version,
+                snapshot_digest=plan.snapshot_digest,
+                plan_digest=plan.plan_digest,
+            )
+        )
+
+    return _write_text(target, buffer.getvalue())
+
+
+def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
+                         database=None) -> dict:
+    """Write both artifacts, or neither.
+
+    Preflight runs over both paths first, so a bad CSV path cannot leave a
+    written JSON envelope behind it.
+    """
+    targets = preflight_output_paths(
+        json_path=json_path, csv_path=csv_path, database=database
+    )
+    written = {}
+
+    if "json" in targets:
+        written["json"] = _write_text(
+            targets["json"],
+            json.dumps(plan.as_dict(), indent=2, sort_keys=True) + "\n",
+        )
+
+    if "csv" in targets:
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS,
+                                extrasaction="raise", restval="")
         writer.writeheader()
         for binding in plan.bindings:
             writer.writerow(
                 binding.as_dict(
                     planner_version=plan.planner_version,
                     snapshot_digest=plan.snapshot_digest,
+                    plan_digest=plan.plan_digest,
                 )
             )
+        written["csv"] = _write_text(targets["csv"], buffer.getvalue())
 
-    return target
+    return written
