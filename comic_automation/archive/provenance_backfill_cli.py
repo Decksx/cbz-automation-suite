@@ -19,9 +19,9 @@ from pathlib import Path
 
 from comic_automation.archive.provenance_backfill_planner import (
     BackfillPlannerError,
-    write_plan_csv,
-    write_plan_json,
     plan_backfill,
+    preflight_output_paths,
+    write_plan_artifacts,
 )
 from comic_automation.database.read_guards import (
     DatabaseChangedError,
@@ -50,6 +50,7 @@ def _render_summary(plan, snapshot) -> str:
         "",
         f"  planner          {plan.planner_version}",
         f"  snapshot digest  {plan.snapshot_digest}",
+        f"  plan digest      {plan.plan_digest}",
         "",
         "  read guarantee",
         f"    quick_check          {snapshot.quick_check}",
@@ -58,6 +59,7 @@ def _render_summary(plan, snapshot) -> str:
         f"    unchanged            {snapshot.data_version_unchanged}",
         "",
         f"  planned rows     {plan.totals['planned_rows']}",
+        f"  planned sides    {plan.totals['planned_sides']}",
         f"    bound          {plan.totals['bound']}",
         f"    unresolved     {plan.totals['unresolved']}",
         "",
@@ -100,6 +102,17 @@ def _render_summary(plan, snapshot) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Both artifact paths are checked BEFORE the database is read, so an
+    # unusable output path costs nothing and cannot leave a half-written pair.
+    try:
+        preflight_output_paths(
+            json_path=args.json_path, csv_path=args.csv_path,
+            database=args.database,
+        )
+    except BackfillPlannerError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 6
+
     try:
         snapshot = plan_backfill(args.database)
     except FileNotFoundError as error:
@@ -121,16 +134,22 @@ def main(argv: list[str] | None = None) -> int:
     print(_render_summary(plan, snapshot))
 
     try:
-        if args.json_path:
-            written = write_plan_json(plan, args.json_path, database=args.database)
-            print(f"\n  wrote {written}")
-
-        if args.csv_path:
-            written = write_plan_csv(plan, args.csv_path, database=args.database)
-            print(f"  wrote {written}")
+        written = write_plan_artifacts(
+            plan,
+            json_path=args.json_path,
+            csv_path=args.csv_path,
+            database=args.database,
+        )
     except BackfillPlannerError as error:
         print(f"error: {error}", file=sys.stderr)
         return 6
+
+    if written:
+        print("")
+
+    for label in ("json", "csv"):
+        if label in written:
+            print(f"  wrote {written[label]}")
 
     # A gate failure is reported in the exit code as well as the text, so a
     # wrapper script cannot mistake a failing plan for a passing one.
