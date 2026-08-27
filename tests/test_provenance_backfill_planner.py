@@ -886,14 +886,15 @@ def test_a_failure_committing_the_envelope_leaves_neither_artifact(
     plan = build_plan(db)
     json_path = tmp_path / "plan.json"
     csv_path = tmp_path / "plan.csv"
-    real_replace = os.replace
+    real_promote = planner._promote
 
-    def failing_replace(source, destination, *args, **kwargs):
-        if str(destination).endswith(".json"):
-            raise OSError("no space left on device")
-        return real_replace(source, destination, *args, **kwargs)
+    def failing_promote(owned, final):
+        """Let the CSV commit for real, then fail the envelope's promotion."""
+        if str(final).endswith(".json"):
+            raise OutputPathError("could not commit the envelope")
+        return real_promote(owned, final)
 
-    monkeypatch.setattr(planner.os, "replace", failing_replace)
+    monkeypatch.setattr(planner, "_promote", failing_promote)
 
     with pytest.raises(OutputPathError, match="could not commit"):
         planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
@@ -1112,14 +1113,14 @@ def test_the_bindings_are_committed_before_the_envelope(db, tmp_path, monkeypatc
     crash cannot be reproduced here, so the sequence is pinned instead.
     """
     plan = build_plan(db)
-    real_replace = os.replace
+    real_promote = planner._promote
     committed = []
 
-    def recording_replace(source, destination, *args, **kwargs):
-        committed.append(Path(destination).suffix)
-        return real_replace(source, destination, *args, **kwargs)
+    def recording_promote(owned, final):
+        committed.append(Path(final).suffix)
+        return real_promote(owned, final)
 
-    monkeypatch.setattr(planner.os, "replace", recording_replace)
+    monkeypatch.setattr(planner, "_promote", recording_promote)
     planner.write_plan_artifacts(
         plan, json_path=tmp_path / "plan.json", csv_path=tmp_path / "plan.csv"
     )
@@ -1236,3 +1237,120 @@ def test_a_staging_name_taken_after_preflight_is_neither_written_nor_removed(
 
     assert victim.read_text(encoding="utf-8") == "not ours"
     assert created == []
+
+
+# --- review round 4: exclusive ownership past the staging files -----------
+
+
+def test_a_destination_that_appears_after_preflight_is_not_overwritten(
+    db, tmp_path, monkeypatch
+):
+    """`os.replace` overwrites by design, which is why it was the wrong call.
+
+    Preflight runs before the payload is even rendered, so it cannot see a
+    file that appears afterwards. Promotion used `os.replace`, which destroyed
+    that file and reported success naming both artifacts. Measured on this
+    runtime: `os.link` and `os.rename` refuse an existing destination,
+    `os.replace` does not.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+    real_create = planner._create_and_write
+    staged = []
+
+    def create_then_squat(path, payload, created):
+        """A foreign file appears at the CSV's final name after preflight."""
+        result = real_create(path, payload, created)
+        staged.append(path)
+
+        if len(staged) == 1:
+            csv_path.write_text("SOMEONE ELSE'S FILE", encoding="utf-8")
+
+        return result
+
+    monkeypatch.setattr(planner, "_create_and_write", create_then_squat)
+
+    with pytest.raises(OutputPathError, match="refusing to overwrite"):
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    # Preserved, not destroyed -- and the plan's own artifacts are gone.
+    assert csv_path.read_text(encoding="utf-8") == "SOMEONE ELSE'S FILE"
+    assert not json_path.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["plan.csv"]
+
+
+def test_a_committed_artifact_replaced_before_rollback_is_left_alone(
+    db, tmp_path, monkeypatch
+):
+    """The rollback's half of the same defect.
+
+    The cleanup set held bare pathnames, so when another writer replaced the
+    committed CSV between the commit and the envelope's failure, the rollback
+    deleted the REPLACEMENT -- contradicting the stated invariant that every
+    file it removes belongs to this invocation. Ownership is now the
+    device/inode pair captured at exclusive creation.
+    """
+    plan = build_plan(db)
+    json_path = tmp_path / "plan.json"
+    csv_path = tmp_path / "plan.csv"
+    real_promote = planner._promote
+
+    def promote_then_fail(owned, final):
+        if str(final).endswith(".json"):
+            csv_path.unlink()
+            csv_path.write_text("REPLACEMENT BY ANOTHER PROCESS", encoding="utf-8")
+            raise OutputPathError("could not commit the envelope")
+        return real_promote(owned, final)
+
+    monkeypatch.setattr(planner, "_promote", promote_then_fail)
+
+    with pytest.raises(OutputPathError, match="replaced by another writer") as raised:
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    assert csv_path.read_text(encoding="utf-8") == "REPLACEMENT BY ANOTHER PROCESS"
+    # The operator is told, rather than the file vanishing or being kept quiet.
+    assert str(csv_path) in str(raised.value)
+
+
+def test_promotion_preserves_the_identity_captured_at_creation(tmp_path):
+    """What makes the ownership check work across the commit.
+
+    The rollback compares against the device/inode captured when the staging
+    file was exclusively created, so promotion has to carry that identity to
+    the final name. `os.link` does; this pins it, because a promotion that
+    silently produced a new inode would make every post-commit ownership
+    check fail closed and leave residue on every rollback.
+    """
+    created = []
+    staging = tmp_path / "plan.csv.partial"
+    owned = planner._create_and_write(staging, "payload", created)
+    final = tmp_path / "plan.csv"
+
+    promoted, staging_gone = planner._promote(owned, final)
+
+    assert staging_gone
+    assert not staging.exists()
+    assert (promoted.device, promoted.inode) == (owned.device, owned.inode)
+    assert promoted.identifies(os.stat(final))
+
+
+def test_a_file_whose_identity_cannot_be_established_is_never_removed(tmp_path):
+    """Fail-closed, for the volumes that report no usable file id.
+
+    FAT and exFAT report inode 0, and exFAT has been measured on this
+    repository's library volume before. Identity cannot be established there,
+    so the file is left alone: residue is recoverable and reportable,
+    deleting somebody else's file is neither.
+    """
+    victim = tmp_path / "artifact.csv"
+    victim.write_text("not ours", encoding="utf-8")
+    unidentifiable = planner._OwnedFile(victim, device=0, inode=0)
+
+    assert not unidentifiable.identifies(os.stat(victim))
+
+    survived, foreign = planner._discard([unidentifiable])
+
+    assert victim.read_text(encoding="utf-8") == "not ours"
+    assert foreign == [victim]
+    assert survived == []
