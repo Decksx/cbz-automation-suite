@@ -347,7 +347,7 @@ CREATE TABLE page_inventory(
     CHECK (extracted_at_basis IN ('first_page_persistence',
                                   'signature_calculated_at')),
   sealed_at TEXT,
-  created_at TEXT NOT NULL DEFAULT '2026-01-01',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   superseded_at TEXT, superseded_by_id INTEGER,
   superseded_reason TEXT CHECK (superseded_reason IS NULL OR length(
       trim(superseded_reason, char(32) || char(9) || char(10) || char(13))) > 0),
@@ -743,7 +743,9 @@ digest, committing.
 
 The migration carries the same obligation over the backfill: it recomputes all
 58,437 digests from the children it attached and compares out of band in
-Python (`PI-54`), and §11's reconciliation carries that comparison as a gate.
+Python (`PI-54`). §11's reconciliation names that comparison explicitly — an
+earlier draft claimed it did while the gate itself omitted it, which is the
+kind of promise that reads as satisfied and is not.
 
 **On the alternative.** A user-defined `sha256` registered on every connection
 would move the guarantee into the schema. An earlier draft declined it on the
@@ -857,21 +859,67 @@ generation of evidence, not an edit to an old one.
 
 A census of every SQL reference to `archive_pages` in the package:
 
+Each group is assigned a target scope, not merely marked "rescope". An
+earlier draft stopped at the label, which left four materially different
+consumers — classification, live perceptual work, historical coverage and
+source-drift recovery — without a decided answer:
+
 ```text
-site                                            scoping        4p action
-perceptual_hashing.py:584   page lookup          archive_id    rescope
-perceptual_hashing.py:623   enrichment UPDATE    page id       unchanged
-perceptual_hashing.py:770   enqueue predicate    archive_id    rescope
-perceptual_hashing.py:1029  batch selection      archive_id    rescope
-perceptual_hash_cli.py:137  CLI selection        archive_id    rescope
-near_duplicate.py:286       candidate loading    archive_id    rescope
-classification.py:511       per-archive counts   archive_id    rescope
-perceptual_coverage_audit.py:358   denominator   archive_id    rescope
-perceptual_reuse_analysis.py:37,83,118           archive_id    rescope
-source_drift_recovery.py:175,672,685             archive_id    rescope
-page_hashing.py:173         DELETE by archive    archive_id    cut over (§10.3)
-page_hashing.py:180         INSERT               archive_id    cut over (§10.3)
+group / sites                     purpose            target scope
+--------------------------------------------------------------------------
+perceptual_hashing.py:584         page lookup for    current_revision
+                                  the file it just
+                                  opened
+perceptual_hashing.py:770         enqueue predicate  current_revision
+perceptual_hashing.py:1029        batch selection    current_revision
+perceptual_hash_cli.py:137        CLI selection      current_revision
+classification.py:511             per-archive page   current_revision
+                                  counts
+
+near_duplicate.py:286             candidate loading  explicit_revision
+                                                     /inventory
+
+perceptual_coverage_audit.py:358  coverage           all_generations_grouped
+perceptual_reuse_analysis.py      reuse analysis     all_generations_grouped
+    :37, :83, :118
+source_drift_recovery.py          drift detection    all_generations_grouped
+    :175, :672, :685              and recovery
+
+perceptual_hashing.py:623         enrichment UPDATE  none needed -- already
+                                                     keyed by page id
+page_hashing.py:173, :180         the producer       cut over to
+                                                     build/fill/seal (§10.3)
 ```
+
+**`current_revision`** — the caller is working on the file as it is now.
+Join `page_inventory` to `archive_files` on
+`i.source_revision_id = a.current_revision_id` and require
+`i.superseded_at IS NULL` (`PI-76`). With two active revisions each of these
+must return only the current generation's pages: `perceptual_hashing.py:584`
+in particular compares its result against the archive it opened, so anything
+wider makes the comparison fail permanently (`PI-69`).
+
+**`explicit_revision/inventory`** — the caller must be *told* which
+generation, because there is no defensible default. A near-duplicate
+comparison is between two specific page sets, and slice 1 §10 already has
+candidates becoming revision-pair-scoped; the loader takes the revision or
+inventory id as an argument rather than inferring one. With two active
+revisions it returns exactly the pair it was asked for (`PI-08`).
+
+**`all_generations_grouped`** — the caller means every generation, and must
+`GROUP BY page_inventory.id` so the generations stay distinguishable rather
+than summed (`PI-77`). Coverage denominators and reuse analysis are about
+what was ever computed, not about what is current.
+
+**`source_drift_recovery` belongs here, and cannot be mechanically treated as
+a current-revision reader.** Its whole purpose is to inspect evidence that
+does *not* agree with the current file — the 16 drift archives of slice 1
+§4.2 are exactly rows whose signature describes an earlier byte generation.
+Scoping it to the current revision would hide the population it exists to
+find. It reads all generations and distinguishes them by inventory.
+
+`perceptual_hashing.py:623` needs no scope: it updates by `archive_pages.id`,
+which already names one row of one generation.
 
 Every one of them means "this archive's pages" and gets the right answer only
 while an archive has one generation. With two active inventories they combine
@@ -957,7 +1005,19 @@ lifecycle_mutable    updated_at
 ```
 
 **Both this block and the `CREATE TABLE` in §6.1 are generated from the same
-registry the prototype executes**, which is the only reason they agree. An
+structural definition the prototype executes**, which is the only reason they
+agree. The one thing that legitimately differs is the clock: production
+defaults `created_at` and `updated_at` to `CURRENT_TIMESTAMP`, while the
+prototype substitutes a fixed date so its cases are deterministic. That
+substitution is a single marker in the shared text, resolved per renderer.
+
+An earlier round generated the published DDL straight from the prototype and
+shipped `DEFAULT '2026-01-01'` into the production schema — a test fixture
+presented as the migration's own convention, and a contradiction of §10.1's
+"the migration's own clock" three sections away. Generation removed
+transcription drift and introduced a different failure: generating faithfully
+from the wrong source. The renderers are split for that reason, and the
+production one is asserted to contain no fixed date. An
 earlier draft maintained them by hand and they diverged in three ways at once:
 `extracted_at_basis` was required by §4.2 and absent from the displayed table,
 `superseded_reason`'s non-blank CHECK lived only in prose, and the headers
@@ -1054,12 +1114,12 @@ PI-49  zero-page inventory on the signature timestamp          ACCEPTED
 PI-50  a populated inventory claiming the signature timestamp  ACCEPTED
 
 producer order
-PI-51  build a candidate before deciding, same revision                   REJECTED
-PI-52  decide first, then supersede/build/fill/seal atomically            ACCEPTED
-PI-53  seal accepts a content_digest that does not describe the children  ACCEPTED
-PI-54  the producer-level digest check catches what seal cannot           ACCEPTED
-PI-74  digest mismatch rolls back inventory, children and hashes          ACCEPTED
-PI-75  matching digest commits the whole replacement                      ACCEPTED
+PI-51  build a candidate before deciding, same revision                    REJECTED
+PI-52  decide first, then supersede/build/fill/seal atomically             ACCEPTED
+PI-53  seal accepts a content_digest that does not describe the children   ACCEPTED
+PI-54  the migration's out-of-band recomputation catches what seal cannot  ACCEPTED
+PI-74  digest mismatch rolls back inventory, children and hashes           ACCEPTED
+PI-75  matching digest commits the whole replacement                       ACCEPTED
 
 reason and context
 PI-59  empty superseded_reason                 REJECTED
@@ -1226,8 +1286,8 @@ slice 4p  page tables        ONE migration and its own PR: create
                              page_inventory, mint 58,437 rows, rebuild
                              archive_pages into its final shape, populate
                              inventory_id, cut the producer over to
-                             build/fill/seal, and rescope or disable every
-                             consumer of §8.6.2
+                             build/fill/seal, and atomically rescope every
+                             consumer of §8.6.2 to its assigned target scope
 slice 5   other four tables  exactly as slice 1 §11 specifies; page tables
                              have nothing left to do here
 ```
@@ -1261,7 +1321,9 @@ after       reconciliation: every page row has exactly one inventory_id;
             every inventory is sealed; every inventory's page_count equals
             its child count and its max(page_index)+1; every child's
             archive_id equals its parent's; hash values and row counts
-            byte-identical in all three tables
+            byte-identical in all three tables;
+            EVERY inventory.content_digest equals the digest recomputed
+            from its children's ordered sha256 rows
 failure     restore from the protected pre-migration backup
 ```
 
