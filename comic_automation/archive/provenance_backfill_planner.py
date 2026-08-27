@@ -1588,11 +1588,17 @@ class _StagedFile:
     which is why they are Optional rather than assumed present.
     """
 
+    # `path` is always the STAGING name and never changes. An earlier
+    # revision overwrote it with the final name on promotion, which lost the
+    # staging file's identity entirely -- so a staging name that could not be
+    # removed became residue nothing could report.
     path: Path
     descriptor: int | None
+    final: Path | None = None
     device: int | None = None
     inode: int | None = None
     promoted: bool = False
+    staging_removed: bool = False
     identity_unverified: bool = False
 
     def close(self) -> None:
@@ -1680,15 +1686,35 @@ def _create_and_write(path: Path, payload: str,
 
     record.device, record.inode = status.st_dev, status.st_ino
 
-    try:
-        os.write(descriptor, payload.encode("utf-8"))
-    except OSError as error:
-        raise OutputPathError(f"could not write {path}: {error}") from error
+    # os.write is permitted to accept fewer bytes than it is given, without
+    # raising. Calling it once and discarding the count produced a truncated
+    # artifact that the call still reported as complete -- and whose SHA-256
+    # then disagreed with the digest the envelope had already recorded for
+    # it, so the pair was internally inconsistent as well as short.
+    data = payload.encode("utf-8")
+    written = 0
+
+    while written < len(data):
+        try:
+            accepted = os.write(descriptor, data[written:])
+        except OSError as error:
+            raise OutputPathError(f"could not write {path}: {error}") from error
+
+        if accepted <= 0:
+            # Zero is not progress, and looping on it would spin forever
+            # rather than fail. Treated as the refusal it is.
+            raise OutputPathError(
+                f"could not write {path}: the filesystem accepted "
+                f"{accepted} of {len(data) - written} remaining byte(s), so "
+                "the artifact would be truncated"
+            )
+
+        written += accepted
 
     return record
 
 
-def _discard(staged: Iterable["_StagedFile"]) -> tuple[list[Path], list[Path]]:
+def _discard(staged: Iterable["_StagedFile"]) -> dict[str, list[Path]]:
     """Remove the staging files this call created, and nothing else.
 
     Three rules, the first two of which are one rule applied twice: this
@@ -1701,7 +1727,8 @@ def _discard(staged: Iterable["_StagedFile"]) -> tuple[list[Path], list[Path]]:
        final path is still ours, and the previous attempt to prove it with a
        device/inode comparison deleted another writer's replacement instead.
        Leaving a committed artifact in place is the honest alternative, and
-       the caller reports it.
+       the caller reports it. A staging name that survived its promotion is
+       reported alongside it, for the same reason and by the same rule.
     2. a staging file whose identity was never established -- `os.fstat`
        failed on the fresh descriptor -- is likewise left in place and
        reported, for exactly the same reason.
@@ -1716,21 +1743,30 @@ def _discard(staged: Iterable["_StagedFile"]) -> tuple[list[Path], list[Path]]:
     holds open, so the descriptor is released first; up to that instant no
     other process could have touched it.
     """
-    survived: list[Path] = []
-    foreign: list[Path] = []
-    unverified: list[Path] = []
+    report: dict[str, list[Path]] = {
+        "survived": [],
+        "foreign": [],
+        "unverified": [],
+        "staging_residue": [],
+    }
 
     for record in staged:
         if record.promoted:
-            # Rule 1. Not ours to delete any more; the caller names it.
+            # Rule 1. Not ours to delete any more; the caller names it -- and
+            # names any staging link that outlived the promotion, which is
+            # equally unprovable and equally not ours to remove.
             record.close()
+
+            if not record.staging_removed:
+                report["staging_residue"].append(record.path)
+
             continue
 
         if record.identity_unverified:
             # Created, but its identity was never established, so the same
             # rule applies: unprovable ownership means no deletion.
             record.close()
-            unverified.append(record.path)
+            report["unverified"].append(record.path)
             continue
 
         try:
@@ -1742,7 +1778,7 @@ def _discard(staged: Iterable["_StagedFile"]) -> tuple[list[Path], list[Path]]:
             continue
         except OSError:
             record.close()
-            survived.append(record.path)
+            report["survived"].append(record.path)
             continue
 
         # Every record reaching here has a verified identity, because the
@@ -1750,7 +1786,7 @@ def _discard(staged: Iterable["_StagedFile"]) -> tuple[list[Path], list[Path]]:
         # ownership and this is the second opinion on it.
         if not record.identifies(status):
             record.close()
-            foreign.append(record.path)
+            report["foreign"].append(record.path)
             continue
 
         if os.name == "nt":
@@ -1758,12 +1794,13 @@ def _discard(staged: Iterable["_StagedFile"]) -> tuple[list[Path], list[Path]]:
 
         try:
             os.unlink(record.path)
+            record.staging_removed = True
         except OSError:
-            survived.append(record.path)
+            report["survived"].append(record.path)
         finally:
             record.close()
 
-    return survived, foreign, unverified
+    return report
 
 
 def _promote(record: "_StagedFile", final: Path) -> None:
@@ -1821,21 +1858,38 @@ def _promote(record: "_StagedFile", final: Path) -> None:
                 f"could not commit {final}: {rename_error}"
             ) from rename_error
 
-        record.path = final
+        # rename moves the file, so there is no staging name left behind.
+        record.final = final
         record.promoted = True
+        record.staging_removed = True
         return
+
+    # Marked committed the instant the link exists, BEFORE the staging name
+    # is dealt with. From here the final name is never a deletion candidate,
+    # whatever happens next -- which is what stops a failure below from
+    # putting a committed artifact back into the rollback's reach.
+    record.final = final
+    record.promoted = True
 
     try:
         os.unlink(record.path)
-    except OSError:
-        # The staging name survives as a second link to the same bytes. The
-        # artifact is committed and correct; the leftover is reported rather
-        # than treated as a failed commit, and it is NOT removed -- the
-        # anchor is gone, so it can no longer be proven ours.
-        pass
+    except OSError as error:
+        # The staging name survives as a second link to the same bytes. An
+        # earlier revision swallowed this and returned success, so the call
+        # reported a clean pair while a `.partial` sat beside it -- and
+        # because the record's path had been overwritten with the final name,
+        # nothing could even say which file was left.
+        #
+        # It is not removed here: the anchor was released before the link, so
+        # this name can no longer be proven ours. It is reported instead, and
+        # the commit fails, because a successful return has to mean there is
+        # no residue.
+        raise OutputPathError(
+            f"committed {final}, but could not remove its staging file "
+            f"{record.path}: {error}"
+        ) from error
 
-    record.path = final
-    record.promoted = True
+    record.staging_removed = True
 
 
 def render_plan_csv(plan: "BackfillPlan") -> str:
@@ -1888,6 +1942,12 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
       artifact is named in the error.
     * an **interruption the process does not survive** leaves the same state
       for the same reason.
+
+    A **successful return means no staging file is left anywhere.** If a
+    `.partial` survives its own promotion -- the hard link succeeded and the
+    staging name could not be unlinked -- the call fails and names both the
+    committed artifact and the surviving staging path, rather than returning
+    success beside a file it did not mention.
 
     All three failure modes therefore produce one of two dispositions:
     nothing, or bindings with no envelope. The second is recognisably
@@ -1951,37 +2011,53 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                 _promote(staged[label], targets[label])
                 committed[label] = targets[label]
     except BaseException as error:
-        survived, foreign, unverified = _discard(created)
+        report = _discard(created)
         problems: list[str] = []
 
-        if committed:
+        # Derived from the records, not from `committed`: a promotion that
+        # linked successfully and then failed to clear its staging name never
+        # reached the assignment below, yet its final artifact is committed
+        # and must still be named.
+        promoted_finals = [
+            record.final for record in created
+            if record.promoted and record.final is not None
+        ]
+
+        if promoted_finals:
             problems.append(
                 "were already committed and are deliberately NOT removed, "
                 "because a final name can be taken by another writer and this "
                 "call can no longer prove the file there is its own: "
-                + ", ".join(str(path) for path in committed.values())
+                + ", ".join(str(path) for path in promoted_finals)
                 + " -- the plan on disk is incomplete and should be removed "
                 "by hand once checked"
             )
 
-        if survived:
+        if report["staging_residue"]:
             problems.append(
-                "could not be removed: "
-                + ", ".join(str(path) for path in survived)
+                "are staging files that outlived their own promotion and can "
+                "no longer be proven to belong to this call: "
+                + ", ".join(str(path) for path in report["staging_residue"])
             )
 
-        if foreign:
+        if report["survived"]:
+            problems.append(
+                "could not be removed: "
+                + ", ".join(str(path) for path in report["survived"])
+            )
+
+        if report["foreign"]:
             problems.append(
                 "were replaced by another writer before the rollback and were "
                 "left untouched: "
-                + ", ".join(str(path) for path in foreign)
+                + ", ".join(str(path) for path in report["foreign"])
             )
 
-        if unverified:
+        if report["unverified"]:
             problems.append(
                 "were created but their identity could never be established, "
                 "so they are left in place rather than deleted unprovably: "
-                + ", ".join(str(path) for path in unverified)
+                + ", ".join(str(path) for path in report["unverified"])
             )
 
         if problems:
