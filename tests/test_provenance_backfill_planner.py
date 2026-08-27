@@ -647,10 +647,13 @@ def test_neither_artifact_is_written_when_one_path_is_bad(db, tmp_path):
 
 
 def test_the_two_artifacts_must_be_different_files(db, tmp_path):
+    """The simplest case of the pairwise name check: both finals identical."""
     plan = build_plan(db)
     same = tmp_path / "both"
-    with pytest.raises(OutputPathError, match="different files"):
+    with pytest.raises(OutputPathError, match="are the same file"):
         planner.write_plan_artifacts(plan, json_path=same, csv_path=same)
+
+    assert sorted(q.name for q in tmp_path.iterdir()) == []
 
 
 def test_a_missing_output_directory_is_a_planner_refusal(db, tmp_path):
@@ -786,9 +789,12 @@ def test_a_broken_symlink_cannot_escape_into_the_database_directory(db, tmp_path
 
     A link inside an allowed directory targeting a nonexistent file beside the
     database passed preflight, because `Path.parent` answered `allowed/`
-    regardless of where the link pointed -- and `Path.resolve(strict=False)`
-    would not have helped, since on a dangling link it returns the link
-    itself. The write then created the target next to production.
+    regardless of where the link pointed, and the check resolved that. The
+    write then created the target next to production.
+
+    The defect was the order, not the resolver: resolving the PATH and then
+    taking its directory is correct whichever resolver does it, and resolving
+    the lexical parent is wrong however carefully it is done.
     """
     plan = build_plan(db)
     database_directory = tmp_path / "prod"
@@ -812,10 +818,12 @@ def test_a_broken_symlink_cannot_escape_into_the_database_directory(db, tmp_path
 def test_the_resolved_parent_of_a_dangling_link_is_its_target_directory(tmp_path):
     """The property the guard rests on, pinned directly.
 
-    `Path.resolve(strict=False)` returns the link for a dangling link, which
-    is why the guard uses `os.path.realpath` instead. Asserting that here
-    means a future simplification back to `resolve()` fails a test rather than
-    silently reopening the escape.
+    Both resolvers agree here, and that is worth recording because an earlier
+    version of this docstring claimed they did not -- it said
+    `Path.resolve(strict=False)` returned the link itself for a dangling
+    link. It returns the target, on this runtime and in this test. What the
+    guard actually depends on is resolving the path BEFORE taking its
+    directory, and the final assertion below is the one that pins it.
     """
     target_directory = tmp_path / "elsewhere"
     target_directory.mkdir()
@@ -827,8 +835,13 @@ def test_the_resolved_parent_of_a_dangling_link_is_its_target_directory(tmp_path
     assert output_guards.resolved_parent(link) == output_guards.path_identity(
         target_directory
     )
-    # The reading the old guard used, kept here to show they differ.
-    assert Path(link).parent != target_directory
+    # Both resolvers reach the target; the claim that they differ was wrong.
+    assert Path(link).resolve(strict=False) == Path(
+        os.path.realpath(target_directory / "missing.json")
+    )
+    # The reading the old guard used, and the one that actually differs:
+    # taking the parent first answers a question about the name.
+    assert Path(link).parent.resolve() != Path(os.path.realpath(target_directory))
 
 
 def test_an_output_path_that_is_the_database_is_refused(db, tmp_path):
@@ -1112,3 +1125,114 @@ def test_the_bindings_are_committed_before_the_envelope(db, tmp_path, monkeypatc
     )
 
     assert committed == [".csv", ".json"]
+
+
+# --- review round 3: the staging blockers ---------------------------------
+
+
+def test_an_artifact_path_that_is_another_artifacts_staging_path_is_refused(
+    db, tmp_path
+):
+    """The four-name collision, reproduced from the review.
+
+    With JSON=`plan` and CSV=`plan.partial`, the envelope's staging path IS
+    the CSV's final path. Comparing only the two finals let it through:
+    staging wrote the envelope to `plan.partial`, committing the CSV renamed
+    its own staging file over it, and committing the envelope then renamed the
+    CSV's bytes to `plan`. The call reported success naming both artifacts,
+    while on disk the CSV was gone and the envelope held CSV content -- worse
+    than the half-pair the staging protocol was added to prevent.
+    """
+    plan = build_plan(db)
+
+    with pytest.raises(OutputPathError, match="staging file"):
+        planner.write_plan_artifacts(
+            plan, json_path=tmp_path / "plan", csv_path=tmp_path / "plan.partial"
+        )
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_the_collision_check_covers_the_reverse_pairing_too(db, tmp_path):
+    """The same collision with the roles swapped.
+
+    Testing the whole class rather than the reported instance: here the CSV's
+    staging path is the envelope's final path, which a check written against
+    only the reported ordering would miss.
+    """
+    plan = build_plan(db)
+
+    with pytest.raises(OutputPathError, match="staging file"):
+        planner.write_plan_artifacts(
+            plan, json_path=tmp_path / "plan.partial", csv_path=tmp_path / "plan"
+        )
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_a_staging_write_that_fails_after_creating_the_file_leaves_nothing(
+    db, tmp_path, monkeypatch
+):
+    """The residue case: created, partially written, then failed.
+
+    The cleanup set was populated only after the write RETURNED, so a write
+    that created the file and then failed -- a full disk is the ordinary way
+    -- left a `.partial` nothing knew about. The failure is injected at the
+    stream rather than at the path, because the file must genuinely exist by
+    the time the error is raised for the test to mean anything.
+    """
+    plan = build_plan(db)
+    real_fdopen = os.fdopen
+    calls = []
+
+    def failing_fdopen(descriptor, *args, **kwargs):
+        stream = real_fdopen(descriptor, *args, **kwargs)
+        calls.append(descriptor)
+
+        if len(calls) > 1:
+            return stream
+
+        class PartialThenFails:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                stream.close()
+                return False
+
+            def write(self, payload):
+                stream.write(payload[:50])
+                raise OSError("no space left on device")
+
+        return PartialThenFails()
+
+    monkeypatch.setattr(planner.os, "fdopen", failing_fdopen)
+
+    with pytest.raises(OutputPathError, match="could not write"):
+        planner.write_plan_artifacts(
+            plan, json_path=tmp_path / "plan.json", csv_path=tmp_path / "plan.csv"
+        )
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_a_staging_name_taken_after_preflight_is_neither_written_nor_removed(
+    tmp_path
+):
+    """What O_EXCL buys, tested at the writer rather than through preflight.
+
+    Preflight refuses a staging path that already exists, but it cannot cover
+    the window between that check and the write. Exclusive creation closes it,
+    and the property that matters is twofold: the existing file is not
+    overwritten, and it does not enter the cleanup set -- otherwise the
+    rollback would delete a file this call never created.
+    """
+    victim = tmp_path / "someone_elses.partial"
+    victim.write_text("not ours", encoding="utf-8")
+    created = []
+
+    with pytest.raises(OutputPathError, match="existing staging file"):
+        planner._create_and_write(victim, "our payload", created)
+
+    assert victim.read_text(encoding="utf-8") == "not ours"
+    assert created == []
