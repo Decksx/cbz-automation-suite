@@ -428,11 +428,20 @@ read the type and reported a failed write.
 
 The rule that resolves it: **the writer substitutes its own error type
 only when it has something to tell the caller that the original error
-does not.** A plan that committed cleanly leaves nothing to report -- the
-artifacts are exactly what was asked for and every staging name is gone
--- so the original exception propagates unchanged, and a
-`KeyboardInterrupt` stays a `KeyboardInterrupt` rather than being
-downgraded into something `except Exception` can swallow. When the CSV
+does not.** Stated exactly, because a narrower version of it was written
+here first: the original interruption propagates unchanged when the
+writer has nothing additional to report -- either **every requested
+artifact committed cleanly**, or **nothing committed and all staging
+files were removed**. So a `KeyboardInterrupt` stays a
+`KeyboardInterrupt` rather than being downgraded into something
+`except Exception` can swallow.
+
+Neither half may be narrowed to the pair. A CSV-only or envelope-only
+write that promotes its single artifact and clears its staging name
+qualifies for the first. And the cleanup clause in the second is
+load-bearing: an interrupt arriving before any promotion whose staging
+cleanup then fails leaves a file that must be named, so it is converted
+to `OutputPathError` and does not propagate unchanged. When the CSV
 committed and the envelope did not, there *is* something to say, so the
 substitution happens; that asymmetry is the rule working, not an
 exception to it.
@@ -444,9 +453,11 @@ interrupt case would have required converting an interrupt.
 
 The operator CLI's exit codes follow the state the writer left behind, not
 the cause. An interrupt is not tied to one code: it exits 130 when it
-arrives unconverted, which happens when there was nothing to report --
-either the pair committed cleanly or nothing was promoted at all -- and
-the message tells those apart by the envelope. It exits 6 when the writer
+arrives unconverted, which happens when there was nothing additional to
+report -- every requested artifact committed cleanly, or nothing
+committed and all staging files were removed -- and the message, not the
+code, tells those apart, by the envelope where one was requested. It
+exits 6 when the writer
 substituted an `OutputPathError` because a committed CSV was being left
 behind with no envelope, which is correct, since that plan did not
 commit. It exits 7 when everything requested committed and staging
