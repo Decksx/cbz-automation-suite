@@ -18,6 +18,7 @@ import pytest
 from pathlib import Path
 
 from comic_automation.archive import output_guards
+from comic_automation.archive import provenance_backfill_cli as cli
 from comic_automation.archive import provenance_backfill_planner as planner
 from comic_automation.archive.provenance_backfill_planner import (
     SideAttribution,
@@ -27,6 +28,7 @@ from comic_automation.archive.provenance_backfill_planner import (
     PlannedBinding,
     PlannerInvariantError,
     OutputPathError,
+    StagingResidueError,
     SIGNATURE_CALCULATED_AT,
     SINGLE_REVISION_INHERITED,
     UNRESOLVED_DRIFT,
@@ -1703,3 +1705,228 @@ def test_a_promotion_is_recorded_before_its_staging_name_is_cleared(tmp_path):
     assert staging.exists()
     # ...and the surviving staging name is reported rather than lost.
     assert report["staging_residue"] == [staging]
+
+
+def _fail_unlink_of(monkeypatch, doomed):
+    """Make the first os.unlink of `doomed` fail, and record that it did.
+
+    The staging file survives as a real second link to the committed bytes,
+    which is the state being reproduced: not a simulated flag, an actual
+    residue on disk.
+    """
+    real_unlink = os.unlink
+    injected = []
+
+    def failing_unlink(path):
+        if Path(path) == doomed and not injected:
+            injected.append(path)
+            raise OSError("injected staging-name removal failure")
+        return real_unlink(path)
+
+    monkeypatch.setattr(planner.os, "unlink", failing_unlink)
+    return injected
+
+
+def test_envelope_side_residue_is_a_committed_plan_not_an_incomplete_one(
+    db, tmp_path, monkeypatch
+):
+    """Both artifacts committed, so the failure must not call the plan incomplete.
+
+    The CSV promotes, the envelope promotes, and only the envelope's staging
+    name resists removal. Every byte the caller asked for is on disk and the
+    envelope's digest matches the bindings beside it -- yet this was reported
+    with the same "the plan on disk is incomplete and should be removed by
+    hand" text as a genuinely half-written plan. An operator following that
+    text would have deleted a valid committed plan, and a consumer reading the
+    envelope would have kept it: opposite conclusions from one directory.
+    """
+    plan = build_plan(db)
+    csv_path = tmp_path / "plan.csv"
+    json_path = tmp_path / "plan.json"
+    json_staging = tmp_path / "plan.json.partial"
+    _fail_unlink_of(monkeypatch, json_staging)
+
+    with pytest.raises(StagingResidueError) as raised:
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    error = raised.value
+
+    # The pair is genuinely complete: the envelope attests to the bytes that
+    # are actually on disk, which is the property that makes it committed.
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    assert digest == envelope["artifacts"]["csv_sha256"]
+
+    assert csv_path.exists() and json_path.exists()
+    assert json_staging.exists()
+
+    # Structured, so the caller never has to parse prose to learn this.
+    assert error.committed == {"csv": csv_path, "json": json_path}
+    assert error.residue == [json_staging]
+
+    message = str(error)
+    assert str(json_staging) in message
+    # The false claim that cost a plan: it must not reappear in any wording.
+    assert "incomplete" not in message
+    assert "should be removed by hand" not in message
+    assert "must NOT be removed" in message
+
+
+def test_csv_side_residue_is_still_an_incomplete_plan(db, tmp_path, monkeypatch):
+    """The contrast that keeps the new class from swallowing the real failure.
+
+    The CSV's staging name is the one that resists removal, so the call raises
+    before the envelope is ever promoted. No envelope means no commit marker,
+    so this plan did NOT commit and must keep the incomplete classification --
+    and must not be reported as a committed pair.
+    """
+    plan = build_plan(db)
+    csv_path = tmp_path / "plan.csv"
+    json_path = tmp_path / "plan.json"
+    csv_staging = tmp_path / "plan.csv.partial"
+    _fail_unlink_of(monkeypatch, csv_staging)
+
+    with pytest.raises(OutputPathError) as raised:
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    # Specifically NOT the committed class, which is a subclass of this one.
+    assert not isinstance(raised.value, StagingResidueError)
+    assert not json_path.exists()
+    assert csv_path.exists()
+    assert "incomplete" in str(raised.value)
+
+
+def test_the_committed_class_and_the_envelope_marker_cannot_disagree(
+    db, tmp_path, monkeypatch
+):
+    """The equivalence the whole ruling rests on, asserted both ways.
+
+    A consumer decides on the envelope; this writer decides on whether every
+    requested artifact promoted. If those two tests could ever disagree the
+    ruling would be worthless, so both residue cases are run and the envelope's
+    presence is checked against the exception class each time.
+    """
+    for doomed_label, expect_committed in (("json", True), ("csv", False)):
+        directory = tmp_path / doomed_label
+        directory.mkdir()
+        csv_path = directory / "plan.csv"
+        json_path = directory / "plan.json"
+        staging = directory / f"plan.{doomed_label}.partial"
+        _fail_unlink_of(monkeypatch, staging)
+
+        with pytest.raises(OutputPathError) as raised:
+            planner.write_plan_artifacts(
+                build_plan(db), json_path=json_path, csv_path=csv_path
+            )
+
+        # Envelope present exactly when the writer says the plan committed.
+        assert json_path.exists() is expect_committed
+        assert isinstance(raised.value, StagingResidueError) is expect_committed
+
+
+def test_a_csv_only_residue_never_claims_an_envelope_it_was_not_asked_for(
+    db, tmp_path, monkeypatch
+):
+    """A CSV-only write commits, but has no commit marker to cite.
+
+    The first wording of the committed message asserted "the envelope is
+    present" for every committed case, which is false here -- no envelope was
+    ever requested. Claiming a marker that does not exist is the same class of
+    false statement as calling a complete plan incomplete, in the other
+    direction.
+    """
+    csv_path = tmp_path / "plan.csv"
+    staging = tmp_path / "plan.csv.partial"
+    _fail_unlink_of(monkeypatch, staging)
+
+    with pytest.raises(StagingResidueError) as raised:
+        write_plan_csv(build_plan(db), csv_path)
+
+    message = str(raised.value)
+    assert "the envelope is present" not in message
+    assert "no envelope was requested" in message
+    assert raised.value.committed == {"csv": csv_path}
+
+
+def _file_database(path):
+    """The `db` fixture's shape, on disk, because the CLI opens by path.
+
+    The CLI is the caller whose conclusion has to match the consumer's, so it
+    is exercised through `main` rather than by asserting on the exception it
+    would have seen.
+    """
+    connection = sqlite3.connect(path)
+    connection.executescript(SCHEMA)
+    _archive(connection, 1, pages=2)
+    _archive(connection, 2, pages=3)
+    connection.commit()
+    connection.close()
+
+
+def test_the_cli_reports_envelope_residue_as_written_not_as_a_failed_write(
+    tmp_path, monkeypatch, capsys
+):
+    """The caller must agree with the consumer about the same directory.
+
+    Before the split, the CLI caught one error class and exited 6 -- a failed
+    write -- for a plan whose envelope was on disk and which slice 4 would read
+    as committed. It now reports the artifacts as written, names the residue
+    for the human who has to clear it, and exits 7, which is neither success
+    nor a failed write.
+    """
+    # Separate directories: the writer refuses to place plan artifacts beside
+    # the database, which is a guard in its own right and not what this tests.
+    database = tmp_path / "db" / "inspection.db"
+    database.parent.mkdir()
+    _file_database(database)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    csv_path = plans / "plan.csv"
+    json_path = plans / "plan.json"
+    json_staging = plans / "plan.json.partial"
+    _fail_unlink_of(monkeypatch, json_staging)
+
+    code = cli.main([
+        "--database", str(database),
+        "--json", str(json_path),
+        "--csv", str(csv_path),
+    ])
+
+    assert code == 7
+    captured = capsys.readouterr()
+    # Reported as written, and the residue named where an operator will see it.
+    assert f"wrote {json_path}" in captured.out
+    assert f"wrote {csv_path}" in captured.out
+    assert str(json_staging) in captured.out
+    assert "remove by hand" in captured.out
+    # A warning, not an error: the plan committed.
+    assert "warning:" in captured.err
+
+    # And the plan it reported really is the committed, consistent pair.
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    assert digest == envelope["artifacts"]["csv_sha256"]
+
+
+def test_the_cli_still_fails_when_the_plan_did_not_commit(
+    tmp_path, monkeypatch, capsys
+):
+    """The CSV-side contrast at the CLI, so exit 7 cannot absorb a real failure."""
+    database = tmp_path / "db" / "inspection.db"
+    database.parent.mkdir()
+    _file_database(database)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    csv_path = plans / "plan.csv"
+    json_path = plans / "plan.json"
+    _fail_unlink_of(monkeypatch, plans / "plan.csv.partial")
+
+    code = cli.main([
+        "--database", str(database),
+        "--json", str(json_path),
+        "--csv", str(csv_path),
+    ])
+
+    assert code == 6
+    assert "error:" in capsys.readouterr().err
+    assert not json_path.exists()
