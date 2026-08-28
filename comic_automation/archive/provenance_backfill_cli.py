@@ -182,11 +182,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     except StagingResidueError as error:
         # Caught BEFORE its parent, because the two mean opposite things. The
-        # plan committed -- every artifact asked for reached its final name
-        # and the envelope attests to the bindings -- and only a `.partial`
-        # could not be cleared. Reporting it as a failed write would have this
-        # command call incomplete the very plan that slice 4, reading the
-        # envelope, will correctly treat as committed.
+        # plan committed -- every artifact *asked for* reached its final name
+        # -- and only a `.partial` could not be cleared. That condition is the
+        # requested set, not the envelope: this handler also takes the residue
+        # of a CSV-only run, where no envelope was requested and none attests
+        # to anything. Where one was requested it attests to the bindings, and
+        # reporting this as a failed write would have had this command call
+        # incomplete the very plan slice 4 will read as committed.
         print(f"warning: {error}", file=sys.stderr)
         written = error.committed
         residue = error.residue
