@@ -165,9 +165,16 @@ class StagingResidueError(OutputPathError):
 
     Separate from its parent because the two say opposite things about the
     plan on disk. A plain `OutputPathError` from the writer means the plan did
-    NOT commit; this means it did -- every artifact requested reached its
-    final name and the envelope, the commit marker, is present -- and only the
-    cleanup of a `.partial` name failed.
+    NOT commit; this means it did -- every artifact *requested* reached its
+    final name -- and only the cleanup of a `.partial` name failed.
+
+    The condition is "every requested artifact", NOT "the envelope is
+    present". The two coincide for a pair write, where the envelope is
+    promoted last and is exactly the commit marker a consumer reads. They do
+    not coincide for a CSV-only write, which commits without an envelope ever
+    being created, and this class is raised there too. So the type does not
+    imply an envelope: `committed` names what actually reached its final name,
+    and an envelope appears in it only when one was requested.
 
     The distinction is not cosmetic. It was raised as one error, whose message
     told the operator the plan was "incomplete" and "should be removed by hand"
@@ -1993,6 +2000,14 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     * the residue is the envelope's, so both artifacts already reached their
       final names: the plan **committed**, is complete, and must not be
       removed -- `StagingResidueError`, carrying `committed` and `residue`.
+
+    Those two describe a pair write. The dividing line is not the envelope but
+    whether every artifact *requested* reached its final name, so a CSV-only
+    or envelope-only write that promotes its single artifact and then fails to
+    clear the staging name raises `StagingResidueError` as well. An envelope
+    is present only when one was asked for; it is the commit marker for the
+    pair, and a CSV-only write deliberately has no marker for a consumer to
+    read.
 
     A failure arriving **after the pair committed cleanly** -- in practice an
     interrupt between the envelope's promotion and this call's return -- is
