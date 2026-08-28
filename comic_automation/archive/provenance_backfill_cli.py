@@ -8,6 +8,22 @@ existing file.
         --database G:\\ComicAutomation\\TestDatabase\\inspection-working.db \\
         --json  plans/backfill.json \\
         --csv   plans/backfill.csv
+
+Exit codes, because a wrapper script decides on these rather than on the text:
+
+    0  plan written, gates passed
+    1  plan written, one or more gates failed
+    2  usage or output-path refusal
+    3  database integrity failure
+    4  the database changed under the read, so no plan was emitted
+    5  planning failed
+    6  writing failed; the plan did NOT commit
+    7  the plan COMMITTED and is complete, but a staging `.partial` survived
+       and needs clearing by hand
+
+6 and 7 are deliberately different. 7 is not a failed write: the envelope is
+present, so slice 4 will read the plan as committed, and this command says the
+same thing rather than the opposite.
 """
 
 from __future__ import annotations
@@ -19,6 +35,7 @@ from pathlib import Path
 
 from comic_automation.archive.provenance_backfill_planner import (
     BackfillPlannerError,
+    StagingResidueError,
     plan_backfill,
     preflight_output_paths,
     write_plan_artifacts,
@@ -133,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     plan = snapshot.result
     print(_render_summary(plan, snapshot))
 
+    residue: list[Path] = []
+
     try:
         written = write_plan_artifacts(
             plan,
@@ -140,6 +159,16 @@ def main(argv: list[str] | None = None) -> int:
             csv_path=args.csv_path,
             database=args.database,
         )
+    except StagingResidueError as error:
+        # Caught BEFORE its parent, because the two mean opposite things. The
+        # plan committed -- every artifact asked for reached its final name
+        # and the envelope attests to the bindings -- and only a `.partial`
+        # could not be cleared. Reporting it as a failed write would have this
+        # command call incomplete the very plan that slice 4, reading the
+        # envelope, will correctly treat as committed.
+        print(f"warning: {error}", file=sys.stderr)
+        written = error.committed
+        residue = error.residue
     except BackfillPlannerError as error:
         print(f"error: {error}", file=sys.stderr)
         return 6
@@ -150,6 +179,18 @@ def main(argv: list[str] | None = None) -> int:
     for label in ("json", "csv"):
         if label in written:
             print(f"  wrote {written[label]}")
+
+    if residue:
+        for path in residue:
+            print(f"  staging file left behind, remove by hand: {path}")
+
+        # Distinct from success and from a failed write alike: the artifacts
+        # are committed and usable, and a human still has to clear the
+        # residue. It takes precedence over the gate code deliberately -- a
+        # gate failure is a property of the plan's contents, readable in the
+        # summary above, while residue is filesystem state nothing else will
+        # clean up.
+        return 7
 
     # A gate failure is reported in the exit code as well as the text, so a
     # wrapper script cannot mistake a failing plan for a passing one.
