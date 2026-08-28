@@ -1968,20 +1968,25 @@ def render_plan_json(plan: "BackfillPlan", *, csv_sha256: str | None = None) -> 
 
 def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                          database=None) -> dict:
-    """Write both artifacts, or leave a recognisably incomplete plan.
+    """Write every requested artifact, or leave a recognisably incomplete plan.
+
+    Writes the pair, or a CSV alone, or an envelope alone, according to which
+    paths are given. "Both" is the common case and not the contract: what this
+    call promises is stated over the requested set throughout.
 
     The contract stated exactly, because two earlier versions of it promised
     more than any code can deliver:
 
-    * a failure **before anything is promoted** leaves neither artifact. The
+    * a failure **before anything is promoted** leaves no artifact at all. The
       staging files are removed on the strength of a descriptor held since
       their exclusive creation.
-    * a failure **after the CSV is promoted** leaves the CSV and no envelope.
-      It is not removed, and that is deliberate: a final name is exposed to
-      every other writer by definition, the ownership anchor cannot survive
-      promotion, and the previous attempt to prove ownership by device and
-      inode deleted another writer's replacement instead. The committed
-      artifact is named in the error.
+    * a failure **after part of the set is promoted** -- for a pair, after the
+      CSV and before the envelope -- leaves what was promoted and nothing
+      after it. It is not removed, and that is deliberate: a final name is
+      exposed to every other writer by definition, the ownership anchor
+      cannot survive promotion, and the previous attempt to prove ownership
+      by device and inode deleted another writer's replacement instead. The
+      committed artifact is named in the error.
     * an **interruption the process does not survive** leaves the same state
       for the same reason.
 
@@ -2030,19 +2035,27 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     exit code a consumer sees therefore describes the state left behind, not
     what went wrong.
 
-    The failure modes therefore produce one of four dispositions: nothing,
-    bindings with no envelope, a complete committed pair beside a staging
-    file that needs clearing by hand, or a complete committed pair and the
-    original failure. Only the second is incomplete, which is what the commit
-    order buys -- an envelope with no bindings would read as a finished plan.
+    The dispositions are stated over the **requested artifact set**, since
+    this call also writes a CSV alone or an envelope alone. They are:
+    nothing; part of the set committed and the rest not; the whole set
+    committed beside a staging file that needs clearing by hand; or the whole
+    set committed and the original failure.
+
+    Only the second is incomplete. For a pair it takes exactly one shape,
+    bindings with no envelope, which is what the commit order buys -- an
+    envelope with no bindings would read as a finished plan. A single-artifact
+    write has no partial shape at all: its one artifact either reached its
+    final name or did not.
 
     The sequence:
 
-    1. both payloads are rendered in memory, so a rendering failure happens
-       before the filesystem is touched at all;
+    1. every requested payload is rendered in memory, so a rendering failure
+       happens before the filesystem is touched at all;
     2. each is written to a sibling `.partial` file, created with `O_EXCL`
        and held open;
-    3. the CSV is promoted first, the envelope second, neither clobbering.
+    3. they are promoted in a fixed order, neither clobbering. When both are
+       requested that order is the CSV first and the envelope second, which
+       is what makes the envelope the pair's commit marker.
 
     The envelope is the commit marker, and it stays the commit marker even
     when this call fails. It carries the CSV's SHA-256, so its presence
@@ -2050,12 +2063,17 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     bindings this envelope approved -- something migration 015 can verify
     rather than infer from two files sharing a directory.
 
-    **A consumer decides on the envelope alone, never on the absence of a
-    `.partial`.** Residue is a cleanup outcome, not a commit outcome: an
-    operator clearing a leftover staging file does not change whether the
-    plan committed, so a rule keyed on residue would give two answers for one
-    plan. `StagingResidueError` exists so this call agrees with that rule
-    instead of contradicting it.
+    **A consumer of a pair decides on the envelope alone, never on the absence
+    of a `.partial`.** Residue is a cleanup outcome, not a commit outcome: an
+    operator clearing a leftover staging file does not change whether the plan
+    committed, so a rule keyed on residue would give two answers for one plan.
+    `StagingResidueError` exists so this call agrees with that rule instead of
+    contradicting it.
+
+    A CSV-only write has no envelope and therefore no commit marker for a
+    consumer to read, which is why slice 4 consumes pairs. That is a property
+    of the requested set, not a gap: nothing attests to a CSV written alone,
+    and this call does not pretend otherwise.
     """
     targets = preflight_output_paths(
         json_path=json_path, csv_path=csv_path, database=database
