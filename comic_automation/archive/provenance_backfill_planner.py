@@ -1994,11 +1994,22 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
       final names: the plan **committed**, is complete, and must not be
       removed -- `StagingResidueError`, carrying `committed` and `residue`.
 
-    The four failure modes therefore produce one of three dispositions:
-    nothing, bindings with no envelope, or a complete committed pair beside a
-    staging file that needs clearing by hand. Only the second is incomplete,
-    which is what the commit order buys -- an envelope with no bindings would
-    read as a finished plan.
+    A failure arriving **after the pair committed cleanly** -- in practice an
+    interrupt between the envelope's promotion and this call's return -- is
+    neither. The plan is complete, no staging file is left, and there is
+    nothing this call can tell the caller that the original exception does
+    not: so the original propagates **unchanged**, and a `KeyboardInterrupt`
+    stays a `KeyboardInterrupt`. It is never rewrapped as `OutputPathError`,
+    whose whole meaning is that the plan did not commit.
+
+    That is the general rule this call follows: it substitutes its own error
+    type only when it has something to say that the original does not.
+
+    The failure modes therefore produce one of four dispositions: nothing,
+    bindings with no envelope, a complete committed pair beside a staging
+    file that needs clearing by hand, or a complete committed pair and the
+    original failure. Only the second is incomplete, which is what the commit
+    order buys -- an envelope with no bindings would read as a finished plan.
 
     The sequence:
 
@@ -2092,7 +2103,22 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
             if record.promoted and record.final is not None
         }
 
-        if promoted_finals and plan_committed:
+        # Nothing is reported for a plan that committed cleanly, and that is
+        # the point rather than an omission. This block builds warnings about
+        # files the caller must deal with; a complete plan with every staging
+        # name already gone gives the caller nothing to deal with. Building a
+        # warning anyway is what turned a post-commit interrupt into an
+        # OutputPathError -- a type meaning "did NOT commit" -- wrapped around
+        # prose correctly saying the pair was complete. With `problems` empty
+        # the original failure propagates unchanged at the end of this block,
+        # which is also what keeps a KeyboardInterrupt a KeyboardInterrupt
+        # instead of downgrading it into an error `except Exception` can
+        # swallow.
+        #
+        # The asymmetry is deliberate: this call converts a failure into its
+        # own error type only when it has something to tell the caller that
+        # the original error does not say.
+        if promoted_finals and plan_committed and report["staging_residue"]:
             # Complete. Saying "incomplete" here told an operator to delete a
             # valid plan. The envelope clause is conditional because a
             # CSV-only write never creates one, and claiming a commit marker
@@ -2110,7 +2136,7 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                 + marker + ": "
                 + ", ".join(str(path) for path in promoted_finals)
             )
-        elif promoted_finals:
+        elif promoted_finals and not plan_committed:
             problems.append(
                 "were already committed and are deliberately NOT removed, "
                 "because a final name can be taken by another writer and this "
