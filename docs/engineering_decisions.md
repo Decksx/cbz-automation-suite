@@ -375,3 +375,133 @@ be used to say the other's thing.
 exact-duplicate groups were measured on 2026-08-21, and byte-identical
 archives must stay separately addressable. Canonical-copy selection is a
 later guarded resolution action, not a schema constraint.
+
+## The envelope is the plan's commit marker, including when the writer fails
+
+The backfill planner writes two artifacts through a staged commit: bindings
+to `plan.csv`, then the envelope to `plan.json`. The envelope is promoted
+last and carries the CSV's SHA-256, so its presence attests that the bindings
+finished writing and proves they are the bindings it approved.
+
+**A consumer decides whether a plan committed on the envelope alone.** It
+never decides on the absence of a `.partial` staging file. Residue is a
+cleanup outcome, not a commit outcome: an operator clearing a leftover
+staging file does not change whether the plan committed, so a rule keyed on
+residue returns two different answers for one unchanged plan. Migration 015
+and slice 4 consume on this rule.
+
+The decision was forced by a defect found in review on 2026-08-28. When the
+CSV promoted, the envelope promoted, and only the envelope's staging name
+could not be unlinked, the writer raised and called the plan "incomplete...
+should be removed by hand" -- while both artifacts were complete and the
+envelope's digest matched the CSV beside it. An operator following that text
+would have deleted a valid committed plan, and a consumer reading the
+envelope would have kept it. One state, opposite conclusions.
+
+The alternative was considered and rejected: treating such a pair as
+uncommitted would have required every consumer to check both staging paths
+before trusting an envelope, which is the weaker predicate above and
+contradicts the commit ordering the writer already pays for.
+
+So the writer classifies instead. `StagingResidueError` (a subclass of
+`OutputPathError`) means the plan committed and only cleanup failed; a plain
+`OutputPathError` means it did not commit. The classification is "every
+requested artifact reached its final name", which in pair mode is
+*equivalent* to the envelope existing -- a CSV-side residue failure raises
+before the envelope is promoted -- so the writer and its consumer cannot
+disagree. That equivalence is asserted in both directions by
+`test_the_committed_class_and_the_envelope_marker_cannot_disagree`.
+
+It remains a raise rather than a successful return, because a successful
+return has to keep meaning that no staging file is left anywhere. Callers
+separate the cases on the exception type and its `committed` / `residue`
+attributes, never by parsing the message. The operator CLI exits 7 for this
+case: not 0, because a human must still clear the residue, and not 6, which
+means the plan did not commit.
+
+A second round found the same contradiction on a path with no residue at
+all. An interrupt arriving between the envelope's promotion and the
+writer's return left a complete, committed pair -- and was rewrapped as
+`OutputPathError`, the type whose meaning is that the plan did not
+commit, around prose that correctly called the pair complete. The CLI
+read the type and reported a failed write.
+
+The rule that resolves it: **the writer substitutes its own error type
+only when it has something to tell the caller that the original error
+does not.** Stated exactly, because a narrower version of it was written
+here first: the original interruption propagates unchanged when the
+writer has nothing additional to report -- either **every requested
+artifact committed cleanly**, or **nothing committed and all staging
+files were removed**. So a `KeyboardInterrupt` stays a
+`KeyboardInterrupt` rather than being downgraded into something
+`except Exception` can swallow.
+
+Neither half may be narrowed to the pair. A CSV-only or envelope-only
+write that promotes its single artifact and clears its staging name
+qualifies for the first. And the cleanup clause in the second is
+load-bearing: an interrupt arriving before any promotion whose staging
+cleanup then fails leaves a file that must be named, so it is converted
+to `OutputPathError` and does not propagate unchanged. When the CSV
+committed and the envelope did not, there *is* something to say, so the
+substitution happens; that asymmetry is the rule working, not an
+exception to it.
+
+A general committed-plan exception was considered and rejected. After the
+final promotion the only remaining statement is the return, so its
+non-interrupt case would have been unreachable defensive code, and its
+interrupt case would have required converting an interrupt.
+
+The operator CLI's exit codes follow the state the writer left behind, not
+the cause. An interrupt is not tied to one code: it exits 130 when it
+arrives unconverted, which happens when there was nothing additional to
+report -- every requested artifact committed cleanly, or nothing
+committed and all staging files were removed -- and the message, not the
+code, tells those apart, by the envelope where one was requested. It
+exits 6 when the writer
+substituted an `OutputPathError` because a committed CSV was being left
+behind with no envelope, which is correct, since that plan did not
+commit. It exits 7 when everything requested committed and staging
+residue survived. 130 is separate from 1, which already means the gates
+failed.
+
+One consequence is worth stating plainly, because two contracts stated it
+wrongly before it was noticed: **an envelope is present only when one was
+requested.** The condition for a committed plan is that every *requested*
+artifact reached its final name. For a pair that is equivalent to the
+envelope existing, which is why the envelope is the marker a consumer
+reads. A CSV-only write commits with no envelope at all, and raises the
+same `StagingResidueError` and exits the same 7, so neither the exception
+type nor the exit code may be read as evidence that an envelope exists.
+
+The rollback's ownership proof has a stated limit, recorded here because a
+limit that lives only at the call site is invisible to anyone deciding
+whether to rely on it. `_discard` holds the descriptor it created the
+staging file with, which keeps POSIX from recycling the inode, so a
+device/inode match cannot be satisfied by a later file that inherited the
+id. That is the accident this rollback actually hit and it is closed.
+
+It does **not** make the check and the removal atomic. `os.lstat` and
+`os.unlink` are two calls against a pathname, and a process coordinating
+with this one could re-point that name in between, in which case the
+unlink removes the replacement. The descriptor protects the inode, not
+the name.
+
+The reason no mechanism is planned is an **operational assumption, not a
+property of the paths**: artifact generation requires one cooperating
+writer per requested final and staging namespace. The implementation
+refuses concurrent *creation* with `O_EXCL`, and that is all it does. It
+does not defend against another process deliberately removing or
+replacing a staging pathname during rollback.
+
+The staging names give no help here and it is worth being exact about
+why, because the first version of this entry claimed they did. They are
+deterministic siblings -- `plan.csv` stages through `plan.csv.partial` --
+so two processes aimed at the same output compute the same staging path,
+and `O_EXCL` makes the second one lose the create rather than making the
+name unguessable. Anyone relying on this rollback under concurrency needs
+the assumption above to hold, or needs a coordination mechanism that does
+not exist yet.
+
+The docstring claimed protection outright until 2026-08-28 -- that "the
+name cannot be swapped" -- which is the kind of claim that stops someone
+adding the mechanism that would.
