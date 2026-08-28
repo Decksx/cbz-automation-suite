@@ -472,3 +472,20 @@ envelope existing, which is why the envelope is the marker a consumer
 reads. A CSV-only write commits with no envelope at all, and raises the
 same `StagingResidueError` and exits the same 7, so neither the exception
 type nor the exit code may be read as evidence that an envelope exists.
+
+The rollback's ownership proof has a stated limit, recorded here because a
+limit that lives only at the call site is invisible to anyone deciding
+whether to rely on it. `_discard` holds the descriptor it created the
+staging file with, which keeps POSIX from recycling the inode, so a
+device/inode match cannot be satisfied by a later file that inherited the
+id. That is the accident this rollback actually hit and it is closed.
+
+It does **not** make the check and the removal atomic. `os.lstat` and
+`os.unlink` are two calls against a pathname, and a process coordinating
+with this one could re-point that name in between, in which case the
+unlink removes the replacement. The descriptor protects the inode, not
+the name. No mechanism here defends against a cooperating adversary, and
+none is planned: the staging names are process-unique paths beside the
+operator's own output, not a shared location. The docstring claimed
+otherwise until 2026-08-28 -- that "the name cannot be swapped" -- which
+is the kind of claim that stops someone adding the mechanism that would.
