@@ -418,3 +418,31 @@ separate the cases on the exception type and its `committed` / `residue`
 attributes, never by parsing the message. The operator CLI exits 7 for this
 case: not 0, because a human must still clear the residue, and not 6, which
 means the plan did not commit.
+
+A second round found the same contradiction on a path with no residue at
+all. An interrupt arriving between the envelope's promotion and the
+writer's return left a complete, committed pair -- and was rewrapped as
+`OutputPathError`, the type whose meaning is that the plan did not
+commit, around prose that correctly called the pair complete. The CLI
+read the type and reported a failed write.
+
+The rule that resolves it: **the writer substitutes its own error type
+only when it has something to tell the caller that the original error
+does not.** A plan that committed cleanly leaves nothing to report -- the
+artifacts are exactly what was asked for and every staging name is gone
+-- so the original exception propagates unchanged, and a
+`KeyboardInterrupt` stays a `KeyboardInterrupt` rather than being
+downgraded into something `except Exception` can swallow. When the CSV
+committed and the envelope did not, there *is* something to say, so the
+substitution happens; that asymmetry is the rule working, not an
+exception to it.
+
+A general committed-plan exception was considered and rejected. After the
+final promotion the only remaining statement is the return, so its
+non-interrupt case would have been unreachable defensive code, and its
+interrupt case would have required converting an interrupt.
+
+The CLI exits 130 on interrupt -- not 6, which would claim a failed write
+for a plan that may be complete, and not 1, which already means the gates
+failed -- and it decides what to report the same way a consumer does, by
+looking for the envelope.
