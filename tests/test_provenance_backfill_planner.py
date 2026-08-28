@@ -1930,3 +1930,137 @@ def test_the_cli_still_fails_when_the_plan_did_not_commit(
     assert code == 6
     assert "error:" in capsys.readouterr().err
     assert not json_path.exists()
+
+
+def _interrupt_after_promoting(monkeypatch, final_path):
+    """Raise KeyboardInterrupt the instant the real promotion of `final_path`
+    returns.
+
+    The real `_promote` runs first and is allowed to finish, so the artifact is
+    genuinely committed on disk before the interrupt lands. Injecting in place
+    of the promotion would prove nothing: the point is the window between a
+    promotion completing and the writer returning.
+    """
+    real_promote = planner._promote
+
+    def promote_then_interrupt(record, final):
+        real_promote(record, final)
+        if Path(final) == final_path:
+            raise KeyboardInterrupt("injected after promotion")
+
+    monkeypatch.setattr(planner, "_promote", promote_then_interrupt)
+
+
+def test_an_interrupt_after_the_pair_commits_stays_an_interrupt(
+    db, tmp_path, monkeypatch
+):
+    """A committed plan must never surface as the type meaning "did not commit".
+
+    The interrupt arrives after the envelope promotion has returned, so both
+    artifacts are complete and no staging file is left. This was rewrapped as
+    OutputPathError -- whose whole meaning is that the plan did not commit --
+    around prose that correctly called the pair complete, and the CLI then
+    reported a failed write for a plan slice 4 would read as committed.
+
+    Re-raising unchanged also keeps a Ctrl-C out of `except Exception`, which
+    is why the writer substitutes its own type only when it has something to
+    say that the original does not.
+    """
+    plan = build_plan(db)
+    csv_path = tmp_path / "plan.csv"
+    json_path = tmp_path / "plan.json"
+    _interrupt_after_promoting(monkeypatch, json_path)
+
+    with pytest.raises(KeyboardInterrupt):
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    # The pair really did commit, which is what makes the old type a lie.
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    assert digest == envelope["artifacts"]["csv_sha256"]
+    assert csv_path.exists() and json_path.exists()
+    # Committed cleanly: nothing was left to report in the first place.
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_an_interrupt_before_the_envelope_still_reports_the_committed_csv(
+    db, tmp_path, monkeypatch
+):
+    """The contrast: an interrupt with something to report is still converted.
+
+    Here the CSV committed and the envelope never did, so the plan did NOT
+    commit and a committed artifact is being left behind. That is something the
+    original KeyboardInterrupt cannot say, so the writer substitutes its own
+    error -- which is the rule, not an exception to it.
+    """
+    plan = build_plan(db)
+    csv_path = tmp_path / "plan.csv"
+    json_path = tmp_path / "plan.json"
+    _interrupt_after_promoting(monkeypatch, csv_path)
+
+    with pytest.raises(OutputPathError) as raised:
+        planner.write_plan_artifacts(plan, json_path=json_path, csv_path=csv_path)
+
+    assert not isinstance(raised.value, StagingResidueError)
+    assert not json_path.exists()
+    assert csv_path.exists()
+    assert "incomplete" in str(raised.value)
+
+
+def test_the_cli_never_calls_a_post_commit_interrupt_a_failed_write(
+    tmp_path, monkeypatch, capsys
+):
+    """Exit 130, and never 6, for an interrupt that arrived after the commit.
+
+    The CLI half of the same finding: a plan whose envelope is on disk, and
+    which slice 4 will treat as committed, must not be reported here as a
+    failed write.
+    """
+    database = tmp_path / "db" / "inspection.db"
+    database.parent.mkdir()
+    _file_database(database)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    csv_path = plans / "plan.csv"
+    json_path = plans / "plan.json"
+    _interrupt_after_promoting(monkeypatch, json_path)
+
+    code = cli.main([
+        "--database", str(database),
+        "--json", str(json_path),
+        "--csv", str(csv_path),
+    ])
+
+    assert code == 130
+    assert code != 6
+    message = capsys.readouterr().err
+    # It reports committed-ness by the envelope, the consumer's own rule.
+    assert str(json_path) in message
+    assert "COMMITTED" in message
+    assert "must NOT be removed" in message
+    assert json_path.exists()
+
+
+def test_the_cli_reports_an_interrupt_before_the_envelope_as_uncommitted(
+    tmp_path, monkeypatch, capsys
+):
+    """The same interrupt path, decided the other way by the same rule."""
+    database = tmp_path / "db" / "inspection.db"
+    database.parent.mkdir()
+    _file_database(database)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    csv_path = plans / "plan.csv"
+    json_path = plans / "plan.json"
+    _interrupt_after_promoting(monkeypatch, csv_path)
+
+    code = cli.main([
+        "--database", str(database),
+        "--json", str(json_path),
+        "--csv", str(csv_path),
+    ])
+
+    # The plan did not commit, so this is a write failure and reported as one.
+    assert code == 6
+    assert not json_path.exists()
+    assert "error:" in capsys.readouterr().err
