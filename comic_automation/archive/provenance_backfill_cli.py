@@ -21,15 +21,18 @@ Exit codes, because a wrapper script decides on these rather than on the text:
        plan did NOT commit
     7  every requested artifact COMMITTED and is complete, but a staging
        `.partial` survived and needs clearing by hand
-  130  the writer left nothing for a caller to act on, so the original
-       interrupt arrived unchanged; the message says whether it committed
+  130  the writer had nothing additional to report, so the original interrupt
+       arrived unchanged; the message, not the code, says whether it
+       committed
 
 These are chosen by the state the writer left behind, never by what went
 wrong, and an interrupt is not tied to any one of them:
 
-  * an interrupt that leaves nothing to act on -- the pair committed
-    cleanly, or nothing was promoted at all -- arrives unconverted and exits
-    130, and the message distinguishes those two by the envelope;
+  * an interrupt that leaves nothing to act on arrives unconverted and exits
+    130. That is either every requested artifact committing cleanly -- a
+    CSV-only or envelope-only write as much as a pair -- or nothing
+    committing and every staging file being removed. The message, not the
+    code, says which, and for a pair it says so by the envelope;
   * an interrupt after the CSV committed but before the envelope did leaves a
     committed artifact that will not be removed, which the interrupt itself
     cannot say, so the writer substitutes an `OutputPathError` and this exits
@@ -193,10 +196,15 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         # The writer substitutes its own error only when it has something to
         # report, so an interrupt arriving here unconverted means it had
-        # nothing: either the pair committed cleanly or nothing was promoted
-        # at all. Both are possible here, and they are told apart the way
-        # slice 4 tells them apart -- on the envelope -- so this command
-        # cannot contradict its own consumer on this path either.
+        # nothing additional: either every requested artifact committed
+        # cleanly -- which includes a CSV-only write, not just a pair -- or
+        # nothing committed and every staging file was removed. An interrupt
+        # before promotion whose cleanup then FAILED does not reach here; it
+        # is converted, because the surviving staging file must be named.
+        #
+        # Those states are told apart the way slice 4 tells them apart -- on
+        # the envelope, where one was requested -- so this command cannot
+        # contradict its own consumer on this path either.
         if args.json_path is None:
             print(
                 "interrupted; no envelope was requested, so there is no "
