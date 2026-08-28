@@ -375,3 +375,46 @@ be used to say the other's thing.
 exact-duplicate groups were measured on 2026-08-21, and byte-identical
 archives must stay separately addressable. Canonical-copy selection is a
 later guarded resolution action, not a schema constraint.
+
+## The envelope is the plan's commit marker, including when the writer fails
+
+The backfill planner writes two artifacts through a staged commit: bindings
+to `plan.csv`, then the envelope to `plan.json`. The envelope is promoted
+last and carries the CSV's SHA-256, so its presence attests that the bindings
+finished writing and proves they are the bindings it approved.
+
+**A consumer decides whether a plan committed on the envelope alone.** It
+never decides on the absence of a `.partial` staging file. Residue is a
+cleanup outcome, not a commit outcome: an operator clearing a leftover
+staging file does not change whether the plan committed, so a rule keyed on
+residue returns two different answers for one unchanged plan. Migration 015
+and slice 4 consume on this rule.
+
+The decision was forced by a defect found in review on 2026-08-28. When the
+CSV promoted, the envelope promoted, and only the envelope's staging name
+could not be unlinked, the writer raised and called the plan "incomplete...
+should be removed by hand" -- while both artifacts were complete and the
+envelope's digest matched the CSV beside it. An operator following that text
+would have deleted a valid committed plan, and a consumer reading the
+envelope would have kept it. One state, opposite conclusions.
+
+The alternative was considered and rejected: treating such a pair as
+uncommitted would have required every consumer to check both staging paths
+before trusting an envelope, which is the weaker predicate above and
+contradicts the commit ordering the writer already pays for.
+
+So the writer classifies instead. `StagingResidueError` (a subclass of
+`OutputPathError`) means the plan committed and only cleanup failed; a plain
+`OutputPathError` means it did not commit. The classification is "every
+requested artifact reached its final name", which in pair mode is
+*equivalent* to the envelope existing -- a CSV-side residue failure raises
+before the envelope is promoted -- so the writer and its consumer cannot
+disagree. That equivalence is asserted in both directions by
+`test_the_committed_class_and_the_envelope_marker_cannot_disagree`.
+
+It remains a raise rather than a successful return, because a successful
+return has to keep meaning that no staging file is left anywhere. Callers
+separate the cases on the exception type and its `committed` / `residue`
+attributes, never by parsing the message. The operator CLI exits 7 for this
+case: not 0, because a human must still clear the residue, and not 6, which
+means the plan did not commit.
