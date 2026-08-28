@@ -1619,8 +1619,10 @@ class _StagedFile:
     A held descriptor is sound on both platforms, by different mechanisms:
 
     * POSIX keeps the inode allocated while any descriptor refers to it, so
-      the id cannot be recycled underneath us and a matching stat really does
-      mean the name still refers to our file;
+      the id cannot be recycled underneath us and a matching stat means the
+      name referred to our file **at the instant of that check** -- see
+      `_discard` for why that instant is not the same as the instant of the
+      unlink;
     * Windows opens without delete-sharing, so while this descriptor is held
       no other process can delete or rename the file at all. Measured: an
       unlink attempt by another opener fails with PermissionError.
@@ -1779,11 +1781,26 @@ def _discard(staged: Iterable["_StagedFile"]) -> dict[str, list[Path]]:
        ever since. The device/inode comparison is a second opinion for the
        window between closing and unlinking, not the proof.
 
-    POSIX unlinks while the descriptor is still held, which closes that
-    window entirely -- the inode cannot be recycled and the name cannot be
-    swapped for a file we would then delete. Windows cannot unlink a file it
-    holds open, so the descriptor is released first; up to that instant no
-    other process could have touched it.
+    POSIX unlinks while the descriptor is still held, which narrows that
+    window: the inode stays allocated, so it cannot be recycled and a matching
+    stat cannot be satisfied by some later file that inherited the id.
+
+    It does **not** make the check and the unlink atomic. `os.lstat` and
+    `os.unlink` are two calls against a pathname, and a process coordinating
+    with this one could re-point that name in between, in which case the
+    unlink removes the replacement. The descriptor protects the *inode*, not
+    the *name*. Nothing here defends against that, and this docstring used to
+    claim otherwise -- that "the name cannot be swapped" -- which is the kind
+    of claim that stops someone adding the mechanism that would.
+
+    What it does defend against is the accident this rollback actually hit: a
+    recycled file id making a foreign file look like ours. That is a race
+    against the filesystem's allocator rather than against a cooperating
+    writer, and pinning the inode removes it.
+
+    Windows cannot unlink a file it holds open, so the descriptor is released
+    first; up to that instant no other process could have deleted or renamed
+    it, because the file was opened without delete-sharing.
     """
     report: dict[str, list[Path]] = {
         "survived": [],
@@ -1999,13 +2016,18 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     The contract stated exactly, because two earlier versions of it promised
     more than any code can deliver:
 
-    * a failure **before anything is promoted** leaves no final artifact. Its
-      staging files are removed on the strength of a descriptor held since
-      their exclusive creation -- except one: if `os.fstat` failed on the
-      fresh descriptor, that file's identity was never established, so it is
-      preserved and named rather than deleted unprovably. The rule is the same
-      one that protects a promoted name, applied to a file this call cannot
-      prove it owns.
+    * a failure **before anything is promoted** leaves no final artifact.
+      Verified staging files are removed when the filesystem permits, on the
+      strength of a descriptor held since their exclusive creation. **Any
+      staging name that cannot be removed safely or successfully is preserved
+      and reported by name instead.** A failed `os.fstat` is one example --
+      the identity was never established, so the file cannot be shown to be
+      ours -- and it is not the only one: the `lstat` can fail, the `unlink`
+      can fail, and the name can turn out to hold a file that is no longer
+      ours. `_discard` reports those as `unverified`, `survived` and
+      `foreign`. The rule behind all of them is the one that also protects a
+      promoted name: a file this call cannot prove it owns is not a file it
+      may delete.
     * a failure **after part of the set is promoted** -- for a pair, after the
       CSV and before the envelope -- leaves what was promoted and nothing
       after it. It is not removed, and that is deliberate: a final name is
@@ -2066,8 +2088,9 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     ```text
     finals            staging      meaning
     none              all removed  did not commit, nothing left behind
-    none              residue      did not commit; an unprovable `.partial`
-                                   is named (the `fstat` case)
+    none              residue      did not commit; a `.partial` that could
+                                   not be removed safely or successfully is
+                                   named (a failed `fstat` is one example)
     proper subset     all removed  incomplete; the committed part is named
     proper subset     residue      incomplete, and a `.partial` is named
     every requested   all removed  COMMITTED and complete
