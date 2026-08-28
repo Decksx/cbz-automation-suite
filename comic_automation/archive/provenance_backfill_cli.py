@@ -19,16 +19,29 @@ Exit codes, because a wrapper script decides on these rather than on the text:
     5  planning failed
     6  the output paths were refused, or the write failed; either way the
        plan did NOT commit
-    7  the plan COMMITTED and is complete, but a staging `.partial` survived
-       and needs clearing by hand
-  130  interrupted; the message reports whether the envelope committed, read
-       the same way a consumer reads it
+    7  every requested artifact COMMITTED and is complete, but a staging
+       `.partial` survived and needs clearing by hand
+  130  the writer left nothing for a caller to act on, so the original
+       interrupt arrived unchanged; the message says whether it committed
 
-6 and 7 are deliberately different. 7 is not a failed write: the envelope is
-present, so slice 4 will read the plan as committed, and this command says the
-same thing rather than the opposite. 130 is separate from both because an
-interrupt can arrive after the pair committed, and calling that a failed write
-would be the same contradiction in a third place.
+These are chosen by the state the writer left behind, never by what went
+wrong, and an interrupt is not tied to any one of them:
+
+  * an interrupt that leaves nothing to act on -- the pair committed
+    cleanly, or nothing was promoted at all -- arrives unconverted and exits
+    130, and the message distinguishes those two by the envelope;
+  * an interrupt after the CSV committed but before the envelope did leaves a
+    committed artifact that will not be removed, which the interrupt itself
+    cannot say, so the writer substitutes an `OutputPathError` and this exits
+    6 -- correctly, because that plan did not commit;
+  * an interrupt that leaves staging residue behind a committed plan is a
+    `StagingResidueError` and exits 7.
+
+6, 7 and 130 are therefore distinct states, not three kinds of cause. 7 is not
+a failed write: everything asked for is on disk, so a consumer will read the
+plan as committed and this command says the same thing rather than the
+opposite. For a pair that consumer reads the envelope; a CSV-only write can
+also exit 7, and has no envelope because none was requested.
 """
 
 from __future__ import annotations
@@ -178,10 +191,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 6
     except KeyboardInterrupt:
-        # The writer does not convert interrupts, so reaching here means a
-        # real Ctrl-C rather than a disguised write failure -- and it may have
-        # arrived after the pair had already committed. Whether it did is
-        # decided the way slice 4 decides it, on the envelope, so this command
+        # The writer substitutes its own error only when it has something to
+        # report, so an interrupt arriving here unconverted means it had
+        # nothing: either the pair committed cleanly or nothing was promoted
+        # at all. Both are possible here, and they are told apart the way
+        # slice 4 tells them apart -- on the envelope -- so this command
         # cannot contradict its own consumer on this path either.
         if args.json_path is None:
             print(
