@@ -442,7 +442,22 @@ final promotion the only remaining statement is the return, so its
 non-interrupt case would have been unreachable defensive code, and its
 interrupt case would have required converting an interrupt.
 
-The CLI exits 130 on interrupt -- not 6, which would claim a failed write
-for a plan that may be complete, and not 1, which already means the gates
-failed -- and it decides what to report the same way a consumer does, by
-looking for the envelope.
+The operator CLI's exit codes follow the state the writer left behind, not
+the cause. An interrupt is not tied to one code: it exits 130 when it
+arrives unconverted, which happens when there was nothing to report --
+either the pair committed cleanly or nothing was promoted at all -- and
+the message tells those apart by the envelope. It exits 6 when the writer
+substituted an `OutputPathError` because a committed CSV was being left
+behind with no envelope, which is correct, since that plan did not
+commit. It exits 7 when everything requested committed and staging
+residue survived. 130 is separate from 1, which already means the gates
+failed.
+
+One consequence is worth stating plainly, because two contracts stated it
+wrongly before it was noticed: **an envelope is present only when one was
+requested.** The condition for a committed plan is that every *requested*
+artifact reached its final name. For a pair that is equivalent to the
+envelope existing, which is why the envelope is the marker a consumer
+reads. A CSV-only write commits with no envelope at all, and raises the
+same `StagingResidueError` and exits the same 7, so neither the exception
+type nor the exit code may be read as evidence that an envelope exists.
