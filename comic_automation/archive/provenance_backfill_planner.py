@@ -2009,16 +2009,26 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     pair, and a CSV-only write deliberately has no marker for a consumer to
     read.
 
-    A failure arriving **after the pair committed cleanly** -- in practice an
-    interrupt between the envelope's promotion and this call's return -- is
-    neither. The plan is complete, no staging file is left, and there is
-    nothing this call can tell the caller that the original exception does
-    not: so the original propagates **unchanged**, and a `KeyboardInterrupt`
-    stays a `KeyboardInterrupt`. It is never rewrapped as `OutputPathError`,
-    whose whole meaning is that the plan did not commit.
+    A failure arriving when there is **nothing left to report** is neither,
+    and the original propagates **unchanged** -- a `KeyboardInterrupt` stays a
+    `KeyboardInterrupt`, never rewrapped as `OutputPathError`, whose whole
+    meaning is that the plan did not commit. That covers two states, not one:
+
+    * **every requested artifact committed cleanly** and no staging file is
+      left. Not only a pair: a CSV-only or envelope-only write that promotes
+      its single artifact and clears its staging name qualifies too;
+    * **nothing committed and every staging file was removed**, which is an
+      interrupt arriving before any promotion whose cleanup then succeeded.
+
+    The cleanup half of the second state is load-bearing. If that cleanup
+    fails, a staging file survives that this call must name, so it has
+    something to say after all and substitutes `OutputPathError` -- the same
+    interrupt then does not propagate unchanged.
 
     That is the general rule this call follows: it substitutes its own error
-    type only when it has something to say that the original does not.
+    type only when it has something to say that the original does not. The
+    exit code a consumer sees therefore describes the state left behind, not
+    what went wrong.
 
     The failure modes therefore produce one of four dispositions: nothing,
     bindings with no envelope, a complete committed pair beside a staging
@@ -2118,10 +2128,11 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
             if record.promoted and record.final is not None
         }
 
-        # Nothing is reported for a plan that committed cleanly, and that is
-        # the point rather than an omission. This block builds warnings about
-        # files the caller must deal with; a complete plan with every staging
-        # name already gone gives the caller nothing to deal with. Building a
+        # Nothing is reported when every requested artifact committed cleanly,
+        # and that is the point rather than an omission. This block builds
+        # warnings about files the caller must deal with; a complete plan with
+        # every staging name already gone gives the caller nothing to deal
+        # with -- for a CSV-only write as much as for a pair. Building a
         # warning anyway is what turned a post-commit interrupt into an
         # OutputPathError -- a type meaning "did NOT commit" -- wrapped around
         # prose correctly saying the pair was complete. With `problems` empty
