@@ -484,8 +484,24 @@ It does **not** make the check and the removal atomic. `os.lstat` and
 `os.unlink` are two calls against a pathname, and a process coordinating
 with this one could re-point that name in between, in which case the
 unlink removes the replacement. The descriptor protects the inode, not
-the name. No mechanism here defends against a cooperating adversary, and
-none is planned: the staging names are process-unique paths beside the
-operator's own output, not a shared location. The docstring claimed
-otherwise until 2026-08-28 -- that "the name cannot be swapped" -- which
-is the kind of claim that stops someone adding the mechanism that would.
+the name.
+
+The reason no mechanism is planned is an **operational assumption, not a
+property of the paths**: artifact generation requires one cooperating
+writer per requested final and staging namespace. The implementation
+refuses concurrent *creation* with `O_EXCL`, and that is all it does. It
+does not defend against another process deliberately removing or
+replacing a staging pathname during rollback.
+
+The staging names give no help here and it is worth being exact about
+why, because the first version of this entry claimed they did. They are
+deterministic siblings -- `plan.csv` stages through `plan.csv.partial` --
+so two processes aimed at the same output compute the same staging path,
+and `O_EXCL` makes the second one lose the create rather than making the
+name unguessable. Anyone relying on this rollback under concurrency needs
+the assumption above to hold, or needs a coordination mechanism that does
+not exist yet.
+
+The docstring claimed protection outright until 2026-08-28 -- that "the
+name cannot be swapped" -- which is the kind of claim that stops someone
+adding the mechanism that would.
