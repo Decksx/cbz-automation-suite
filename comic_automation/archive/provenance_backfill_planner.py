@@ -160,6 +160,41 @@ class OutputPathError(BackfillPlannerError):
     """An output path would overwrite something, or sits beside the database."""
 
 
+class StagingResidueError(OutputPathError):
+    """The plan committed, but a staging file could not be removed.
+
+    Separate from its parent because the two say opposite things about the
+    plan on disk. A plain `OutputPathError` from the writer means the plan did
+    NOT commit; this means it did -- every artifact requested reached its
+    final name and the envelope, the commit marker, is present -- and only the
+    cleanup of a `.partial` name failed.
+
+    The distinction is not cosmetic. It was raised as one error, whose message
+    told the operator the plan was "incomplete" and "should be removed by hand"
+    while both artifacts were complete and the envelope's digest matched the
+    bindings beside it. A caller acting on that text would have deleted a valid
+    committed plan, and a caller trusting the envelope (as slice 4 does) would
+    have kept it -- the two reaching opposite conclusions from one state.
+
+    It stays a failure rather than becoming a successful return, because a
+    successful return has to keep meaning that no staging file is left
+    anywhere. Callers that need to tell the cases apart do it on the type and
+    on `committed`/`residue`, not by parsing the message.
+
+    Attributes:
+        committed: label -> final path, for every artifact that reached its
+            final name. Complete and NOT to be removed.
+        residue: staging paths that survived their own promotion and need
+            clearing by hand.
+    """
+
+    def __init__(self, message: str, *, committed: dict[str, Path],
+                 residue: list[Path]) -> None:
+        super().__init__(message)
+        self.committed = committed
+        self.residue = residue
+
+
 def _canonical(value: Any) -> Any:
     """Reduce a value to something JSON renders injectively.
 
@@ -1949,10 +1984,21 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     committed artifact and the surviving staging path, rather than returning
     success beside a file it did not mention.
 
-    All three failure modes therefore produce one of two dispositions:
-    nothing, or bindings with no envelope. The second is recognisably
-    incomplete, which is what the commit order buys -- an envelope with no
-    bindings would read as a finished plan.
+    That failure is **not** always an incomplete plan, and the two cases are
+    different exception types rather than one message a caller would have to
+    parse:
+
+    * the residue is the CSV's, so the failure raises before the envelope is
+      promoted: no envelope, plan not committed, `OutputPathError`;
+    * the residue is the envelope's, so both artifacts already reached their
+      final names: the plan **committed**, is complete, and must not be
+      removed -- `StagingResidueError`, carrying `committed` and `residue`.
+
+    The four failure modes therefore produce one of three dispositions:
+    nothing, bindings with no envelope, or a complete committed pair beside a
+    staging file that needs clearing by hand. Only the second is incomplete,
+    which is what the commit order buys -- an envelope with no bindings would
+    read as a finished plan.
 
     The sequence:
 
@@ -1962,10 +2008,18 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
        and held open;
     3. the CSV is promoted first, the envelope second, neither clobbering.
 
-    The envelope is the commit marker. It carries the CSV's SHA-256, so its
-    presence attests that the bindings finished writing and proves they are
-    the bindings this envelope approved -- something migration 015 can verify
+    The envelope is the commit marker, and it stays the commit marker even
+    when this call fails. It carries the CSV's SHA-256, so its presence
+    attests that the bindings finished writing and proves they are the
+    bindings this envelope approved -- something migration 015 can verify
     rather than infer from two files sharing a directory.
+
+    **A consumer decides on the envelope alone, never on the absence of a
+    `.partial`.** Residue is a cleanup outcome, not a commit outcome: an
+    operator clearing a leftover staging file does not change whether the
+    plan committed, so a rule keyed on residue would give two answers for one
+    plan. `StagingResidueError` exists so this call agrees with that rule
+    instead of contradicting it.
     """
     targets = preflight_output_paths(
         json_path=json_path, csv_path=csv_path, database=database
@@ -2023,7 +2077,40 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
             if record.promoted and record.final is not None
         ]
 
-        if promoted_finals:
+        # The plan committed iff every artifact this call was asked to write
+        # reached its final name. In pair mode that is equivalent to the
+        # envelope being present, because the envelope is promoted last and a
+        # CSV-side residue failure raises before the envelope is promoted --
+        # so this test and slice 4's envelope check cannot disagree about the
+        # same directory. The equivalence is the whole point: it is what stops
+        # a caller and its consumer reaching opposite conclusions.
+        plan_committed = bool(targets) and all(
+            label in staged and staged[label].promoted for label in targets
+        )
+        committed_finals = {
+            label: record.final for label, record in staged.items()
+            if record.promoted and record.final is not None
+        }
+
+        if promoted_finals and plan_committed:
+            # Complete. Saying "incomplete" here told an operator to delete a
+            # valid plan. The envelope clause is conditional because a
+            # CSV-only write never creates one, and claiming a commit marker
+            # that was never requested would be the same kind of false
+            # statement in the other direction.
+            marker = (
+                " -- the envelope is present and its digest attests to the "
+                "bindings"
+                if "json" in committed_finals
+                else " -- no envelope was requested, so this is every "
+                     "artifact this call was asked to write"
+            )
+            problems.append(
+                "are complete and committed, and must NOT be removed"
+                + marker + ": "
+                + ", ".join(str(path) for path in promoted_finals)
+            )
+        elif promoted_finals:
             problems.append(
                 "were already committed and are deliberately NOT removed, "
                 "because a final name can be taken by another writer and this "
@@ -2061,9 +2148,18 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
             )
 
         if problems:
-            raise OutputPathError(
-                f"{error}; and these artifacts " + "; ".join(problems)
-            ) from error
+            detail = f"{error}; and these artifacts " + "; ".join(problems)
+
+            # Typed so the caller does not have to parse prose to learn
+            # whether the plan it asked for is on disk.
+            if plan_committed and report["staging_residue"]:
+                raise StagingResidueError(
+                    detail,
+                    committed=committed_finals,
+                    residue=list(report["staging_residue"]),
+                ) from error
+
+            raise OutputPathError(detail) from error
 
         raise
 
