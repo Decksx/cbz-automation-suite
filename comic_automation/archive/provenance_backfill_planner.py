@@ -1968,18 +1968,44 @@ def render_plan_json(plan: "BackfillPlan", *, csv_sha256: str | None = None) -> 
 
 def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
                          database=None) -> dict:
-    """Write every requested artifact, or leave a recognisably incomplete plan.
+    """Write every requested artifact, or name exactly what is left.
 
     Writes the pair, or a CSV alone, or an envelope alone, according to which
     paths are given. "Both" is the common case and not the contract: what this
     call promises is stated over the requested set throughout.
 
+    The outcome has **two independent axes**, and earlier versions of this
+    contract collapsed them into one -- which is how it came to promise that
+    every failure leaves a "recognisably incomplete plan" when some leave a
+    complete committed one, and that every pre-promotion failure clears its
+    staging files when one deliberately does not.
+
+    **Axis 1, the final artifacts.** Either none of them, a proper subset, or
+    every requested one. Every requested final means the plan **committed**; a
+    proper subset means it is **incomplete**; none means it did not commit.
+    For a pair the proper subset has exactly one shape, bindings with no
+    envelope, which is what the commit order buys. A single-artifact write has
+    no proper subset at all.
+
+    **Axis 2, the staging files.** Either all removed, or residue this call
+    reports by name. Residue is a cleanup outcome and never moves the plan
+    along axis 1: a committed plan with residue is still committed, and an
+    uncommitted one with residue still did not commit.
+
+    The axes are independent, so a state exists at every combination that the
+    code can reach -- including no finals at all *with* reported residue,
+    which is the `fstat` case in the first bullet below.
+
     The contract stated exactly, because two earlier versions of it promised
     more than any code can deliver:
 
-    * a failure **before anything is promoted** leaves no artifact at all. The
+    * a failure **before anything is promoted** leaves no final artifact. Its
       staging files are removed on the strength of a descriptor held since
-      their exclusive creation.
+      their exclusive creation -- except one: if `os.fstat` failed on the
+      fresh descriptor, that file's identity was never established, so it is
+      preserved and named rather than deleted unprovably. The rule is the same
+      one that protects a promoted name, applied to a file this call cannot
+      prove it owns.
     * a failure **after part of the set is promoted** -- for a pair, after the
       CSV and before the envelope -- leaves what was promoted and nothing
       after it. It is not removed, and that is deliberate: a final name is
@@ -2035,17 +2061,27 @@ def write_plan_artifacts(plan: "BackfillPlan", *, json_path=None, csv_path=None,
     exit code a consumer sees therefore describes the state left behind, not
     what went wrong.
 
-    The dispositions are stated over the **requested artifact set**, since
-    this call also writes a CSV alone or an envelope alone. They are:
-    nothing; part of the set committed and the rest not; the whole set
-    committed beside a staging file that needs clearing by hand; or the whole
-    set committed and the original failure.
+    Read off the two axes, the reachable dispositions are:
 
-    Only the second is incomplete. For a pair it takes exactly one shape,
-    bindings with no envelope, which is what the commit order buys -- an
-    envelope with no bindings would read as a finished plan. A single-artifact
-    write has no partial shape at all: its one artifact either reached its
-    final name or did not.
+    ```text
+    finals            staging      meaning
+    none              all removed  did not commit, nothing left behind
+    none              residue      did not commit; an unprovable `.partial`
+                                   is named (the `fstat` case)
+    proper subset     all removed  incomplete; the committed part is named
+    proper subset     residue      incomplete, and a `.partial` is named
+    every requested   all removed  COMMITTED and complete
+    every requested   residue      COMMITTED and complete; a `.partial` is
+                                   named and needs clearing by hand
+    ```
+
+    Only the "proper subset" rows are incomplete, and only they say the plan
+    on disk should be removed by hand. Two rows advise removing something by
+    hand and they mean different things: a proper-subset row means the
+    committed *final* is a fragment to clear, while the `fstat` row means an
+    unprovable *staging* file is. Reading the staging column as though it
+    decided the meaning is the mistake this docstring made -- it does not
+    appear in the meaning column at all.
 
     The sequence:
 
