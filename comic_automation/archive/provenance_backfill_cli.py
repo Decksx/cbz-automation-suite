@@ -13,17 +13,22 @@ Exit codes, because a wrapper script decides on these rather than on the text:
 
     0  plan written, gates passed
     1  plan written, one or more gates failed
-    2  usage or output-path refusal
+    2  argparse usage error, or the database file does not exist
     3  database integrity failure
     4  the database changed under the read, so no plan was emitted
     5  planning failed
-    6  writing failed; the plan did NOT commit
+    6  the output paths were refused, or the write failed; either way the
+       plan did NOT commit
     7  the plan COMMITTED and is complete, but a staging `.partial` survived
        and needs clearing by hand
+  130  interrupted; the message reports whether the envelope committed, read
+       the same way a consumer reads it
 
 6 and 7 are deliberately different. 7 is not a failed write: the envelope is
 present, so slice 4 will read the plan as committed, and this command says the
-same thing rather than the opposite.
+same thing rather than the opposite. 130 is separate from both because an
+interrupt can arrive after the pair committed, and calling that a failed write
+would be the same contradiction in a third place.
 """
 
 from __future__ import annotations
@@ -172,6 +177,35 @@ def main(argv: list[str] | None = None) -> int:
     except BackfillPlannerError as error:
         print(f"error: {error}", file=sys.stderr)
         return 6
+    except KeyboardInterrupt:
+        # The writer does not convert interrupts, so reaching here means a
+        # real Ctrl-C rather than a disguised write failure -- and it may have
+        # arrived after the pair had already committed. Whether it did is
+        # decided the way slice 4 decides it, on the envelope, so this command
+        # cannot contradict its own consumer on this path either.
+        if args.json_path is None:
+            print(
+                "interrupted; no envelope was requested, so there is no "
+                f"commit marker to read -- check {args.csv_path} by hand",
+                file=sys.stderr,
+            )
+        elif Path(args.json_path).exists():
+            print(
+                f"interrupted, but the envelope is present: {args.json_path}"
+                " -- the plan COMMITTED, is complete, and must NOT be removed",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "interrupted before the envelope was committed; no plan was "
+                "written",
+                file=sys.stderr,
+            )
+
+        # 130 is the conventional SIGINT code. Deliberately not 6, which would
+        # claim a failed write for a plan that may be complete, and not 1,
+        # which already means the gates failed.
+        return 130
 
     if written:
         print("")
