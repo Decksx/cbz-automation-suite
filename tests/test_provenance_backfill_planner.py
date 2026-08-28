@@ -2064,3 +2064,70 @@ def test_the_cli_reports_an_interrupt_before_the_envelope_as_uncommitted(
     assert code == 6
     assert not json_path.exists()
     assert "error:" in capsys.readouterr().err
+
+
+def test_the_cli_reports_an_interrupt_with_nothing_promoted_as_no_plan(
+    tmp_path, monkeypatch, capsys
+):
+    """130 also covers an interrupt that committed nothing, not just a clean pair.
+
+    The writer substitutes its own error only when it has something to report,
+    and an interrupt before any promotion leaves nothing at all -- so it too
+    arrives unconverted and exits 130. The exit code therefore does not mean
+    "committed"; the message distinguishes the two, on the envelope. Documented
+    in the CLI's exit-code table, so it is pinned rather than asserted there.
+    """
+    database = tmp_path / "db" / "inspection.db"
+    database.parent.mkdir()
+    _file_database(database)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    csv_path = plans / "plan.csv"
+    json_path = plans / "plan.json"
+
+    def interrupt_before_any_promotion(record, final):
+        raise KeyboardInterrupt("before any promotion")
+
+    monkeypatch.setattr(planner, "_promote", interrupt_before_any_promotion)
+
+    code = cli.main([
+        "--database", str(database),
+        "--json", str(json_path),
+        "--csv", str(csv_path),
+    ])
+
+    assert code == 130
+    assert "no plan was written" in capsys.readouterr().err
+    # Nothing committed and nothing left behind.
+    assert not json_path.exists() and not csv_path.exists()
+    assert list(plans.glob("*.partial")) == []
+
+
+def test_the_cli_never_claims_an_envelope_for_a_csv_only_interrupt(
+    tmp_path, monkeypatch, capsys
+):
+    """An envelope is present only when one was requested.
+
+    A CSV-only run has no commit marker, so the interrupt report must not
+    decide committed-ness by an envelope that was never asked for. It says so
+    and names the CSV instead, which is the honest answer rather than a guess.
+    """
+    database = tmp_path / "db" / "inspection.db"
+    database.parent.mkdir()
+    _file_database(database)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    csv_path = plans / "plan.csv"
+    _interrupt_after_promoting(monkeypatch, csv_path)
+
+    code = cli.main([
+        "--database", str(database),
+        "--csv", str(csv_path),
+    ])
+
+    assert code == 130
+    message = capsys.readouterr().err
+    assert "no envelope was requested" in message
+    assert str(csv_path) in message
+    # The CSV really did commit; there is simply no marker attesting to it.
+    assert csv_path.exists()
