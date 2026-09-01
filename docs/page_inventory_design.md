@@ -1339,6 +1339,109 @@ transaction — which is also what runs the §8.3 child check over all 58,437,
 making the reconciliation above an enforced invariant rather than a
 post-hoc audit.
 
+### 11.1 Candidate attribution: what this slice does and does not enable
+
+Added 2026-09-01, revised twice the same day. Slice 4's design establishes that
+`near_duplicate_candidates` must carry a non-NULL provenance basis from
+migration 015, while the page evidence it inherits from does not gain ownership
+until this slice.
+
+Two different things were conflated in the first two drafts, and the
+distinction is the whole content of this section:
+
+```text
+retrospective repair    binding a candidate created BEFORE this slice, whose
+                        compared evidence is not recorded anywhere.
+                        NOT DONE, here or anywhere.
+contemporaneous         a candidate created AFTER this slice, whose detector
+  attribution           was handed an explicit inventory. ENABLED BY THIS
+                        SLICE, and performed by the detector at INSERT.
+```
+
+**The retrospective pass is withdrawn.** A first draft of this section gave 4p
+a pass that would bind unresolved sides from page evidence. It could bind a
+candidate to evidence it never compared:
+
+```text
+candidate compares page set V1
+page hashing replaces it with V2
+4p mints the inventory for V2
+the pass assigns V2's revision to a candidate that compared V1
+```
+
+`metrics()` (`near_duplicate.py:65-75`) stores distances, ratios and pixel
+areas -- no inventory id, no content signature, no page digest -- so the row
+does not record which generation was compared and no pass can prove its
+binding. Recorded rather than deleted, because the pass is an obvious enough
+idea that it would otherwise be reintroduced as missing work.
+
+**What this slice enables -- and therefore owns.** §8.6.2's
+`explicit_revision/inventory` loader is the mechanism candidate attribution
+needs: after 4p a comparison is between two *named* inventories, so the
+detector can know each side's revision at write time and bind with
+`inherited_from_page_evidence`, which is what slice 1 §8.2 assigns that case.
+
+An earlier draft claimed 4p enables this while "this slice does not change the
+detector". **Those cannot both hold.** Knowing the revision at the loader is
+useless unless it reaches the INSERT, and nothing carries it there today. So
+the change is assigned here, and it is one atomic change rather than three:
+
+```text
+loader              returns each side's inventory WITH its source_revision_id
+                    and provenance state, not only its pages
+comparison result   ArchiveFingerprint / the comparison result carries that
+                    per side, instead of discarding it after the compare
+persistence         the candidate INSERT writes revision_a_id /
+                    provenance_basis_a and the _b pair from it
+```
+
+Split across slices, the middle piece would be dead weight in one and missing
+in the other, and a candidate written between them would silently take the
+wrong basis. They land together, in this slice, or not at all.
+
+**Per side, independently.** `page_inventory.source_revision_id` is nullable
+(§6.1) and an unresolved inventory is a first-class state -- a drift inventory
+is exactly one -- so a side inherits only what its own inventory has:
+
+```text
+that side's inventory HAS a revision  -> revision id + inherited_from_page_evidence
+that side's inventory is unresolved   -> NULL + unresolved_no_identity
+```
+
+A half-bound candidate is a normal outcome, not a defect.
+
+**Obligations this slice takes on:**
+
+```text
+flow            the loader / result / persistence change above, atomically.
+                Inventory minting and sealing are unchanged.
+reconciliation  one added assertion, a NEGATIVE: the count of candidate sides
+                carrying each basis is IDENTICAL before and after the
+                MIGRATION. The migration attributes no candidate; the detector
+                does, afterwards, as it runs.
+tests           a candidate created before this slice is unchanged by the
+                migration; AND a FUNCTIONAL post-4p test: a detection run
+                after the cutover writes a candidate whose sides carry the
+                revisions of the inventories it was given, covering all four
+                bound/unresolved A/B combinations. Asserting only that the
+                migration leaves old rows alone would test the half of this
+                that is trivially true.
+recovery        unchanged for the migration. The detector change ships with
+                it and is covered by the same release rollback, since a
+                detector writing bases against a pre-4p schema is exactly the
+                mismatch the single-release rule exists to prevent.
+```
+
+**An anchor does not change the pre-4p rows.** An inventory id or compared
+content signature written at detection time from slice 6 onward would improve
+future auditability, but it cannot retroactively prove what a row created
+before it compared, so no blind pass over them is defensible. They can still be
+bound by a fresh comparison that recomputes a matching payload, which is a new
+producer action rather than a repair. Quiescence was also
+rejected: it would require no page hashing between 015 and 4p, over an interval
+whose length is a scheduling decision, with no way to verify afterwards that it
+held.
+
 ---
 
 ## 12. Decisions and deliberate non-decisions
