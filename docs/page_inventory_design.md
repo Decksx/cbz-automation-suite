@@ -1339,19 +1339,28 @@ transaction — which is also what runs the §8.3 child check over all 58,437,
 making the reconciliation above an enforced invariant rather than a
 post-hoc audit.
 
-### 11.1 Candidate attribution is explicitly NOT this slice's work
+### 11.1 Candidate attribution: what this slice does and does not enable
 
-Added 2026-09-01, revised the same day. Slice 4's design establishes that
+Added 2026-09-01, revised twice the same day. Slice 4's design establishes that
 `near_duplicate_candidates` must carry a non-NULL provenance basis from
-migration 015, while the page evidence it would inherit from does not gain
-ownership until this slice. A candidate created in the 4 -> 4p window
-therefore writes `unresolved_no_identity` on both sides.
+migration 015, while the page evidence it inherits from does not gain ownership
+until this slice.
 
-The first version of this section gave 4p a pass that would bind those sides
-afterwards. **That pass is withdrawn**, and this section exists to record why,
-so it is not reintroduced as an obvious piece of missing work.
+Two different things were conflated in the first two drafts, and the
+distinction is the whole content of this section:
 
-It could bind a candidate to page evidence it never compared:
+```text
+retrospective repair    binding a candidate created BEFORE this slice, whose
+                        compared evidence is not recorded anywhere.
+                        NOT DONE, here or anywhere.
+contemporaneous         a candidate created AFTER this slice, whose detector
+  attribution           was handed an explicit inventory. ENABLED BY THIS
+                        SLICE, and performed by the detector at INSERT.
+```
+
+**The retrospective pass is withdrawn.** A first draft of this section gave 4p
+a pass that would bind unresolved sides from page evidence. It could bind a
+candidate to evidence it never compared:
 
 ```text
 candidate compares page set V1
@@ -1360,37 +1369,46 @@ page hashing replaces it with V2
 the pass assigns V2's revision to a candidate that compared V1
 ```
 
-Nothing in the row distinguishes the two. `metrics()`
-(`near_duplicate.py:65-75`) stores distances, ratios and pixel areas -- no
-inventory id, no content signature, no page digest. The comparison's evidence
-generation is not recorded anywhere, so no pass can prove the binding it makes.
+`metrics()` (`near_duplicate.py:65-75`) stores distances, ratios and pixel
+areas -- no inventory id, no content signature, no page digest -- so the row
+does not record which generation was compared and no pass can prove its
+binding. Recorded rather than deleted, because the pass is an obvious enough
+idea that it would otherwise be reintroduced as missing work.
 
-**Consequences for this slice**, stated as the obligations 4p does and does
-not take on:
+**What this slice does enable.** §8.6.2's `explicit_revision/inventory` loader
+is exactly the mechanism candidate attribution needs: after 4p a comparison is
+between two *named* inventories, so the detector knows each side's revision at
+write time and binds with `inherited_from_page_evidence`, which is what slice 1
+§8.2 assigns that case. No pass is involved -- the value is in hand when the
+row is written.
+
+That makes 4p the point at which the candidate attribution transition becomes
+reachable at all. Before it, no code path can perform it.
+
+**Obligations this slice takes on:**
 
 ```text
-flow            unchanged. 4p mints, seals and reconciles inventories. It
-                performs no candidate attribution.
-reconciliation  one added assertion, and it is a NEGATIVE: the count of
-                candidate sides carrying each basis is IDENTICAL before and
-                after 4p. If 4p ever changes a candidate side, that is a
-                defect, and this is what detects it.
-tests           a candidate created during the window carries
+flow            unchanged for inventories. The loader's explicit-revision path
+                (PI-08) is what the detector will use afterwards; this slice
+                does not change the detector.
+reconciliation  one added assertion, a NEGATIVE: the count of candidate sides
+                carrying each basis is IDENTICAL before and after 4p. If 4p
+                ever changes a candidate side, that is a defect, and this
+                detects it.
+tests           a candidate created before this slice carries
                 unresolved_no_identity on both sides before 4p and STILL does
                 after it completes.
-recovery        unchanged. 4p adds no candidate obligation, so it adds no
-                candidate recovery step.
+recovery        unchanged. No candidate obligation is added, so no candidate
+                recovery step is either.
 ```
 
-**The real fix belongs to slice 6.** An evidence anchor -- an inventory id or
-the compared content signature, per side, written at detection time -- would
-let a later pass prove what it was binding. Slice 6 already reopens this table
-for parameters and run provenance, which is where such a column belongs. It is
-a new ruling and neither this document nor slice 4's takes it.
-
-Quiescence was also considered and rejected: it would require no page hashing
-between 015 and 4p, over an interval whose length is a scheduling decision,
-with no way to verify afterwards that it held.
+**An anchor does not change the pre-4p rows.** An inventory id or compared
+content signature written at detection time from slice 6 onward would improve
+future auditability, but it cannot retroactively prove what a row created
+before it compared. Those rows stay unresolved permanently. Quiescence was also
+rejected: it would require no page hashing between 015 and 4p, over an interval
+whose length is a scheduling decision, with no way to verify afterwards that it
+held.
 
 ---
 
