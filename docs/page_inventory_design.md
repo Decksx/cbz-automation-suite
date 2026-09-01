@@ -1375,37 +1375,69 @@ does not record which generation was compared and no pass can prove its
 binding. Recorded rather than deleted, because the pass is an obvious enough
 idea that it would otherwise be reintroduced as missing work.
 
-**What this slice does enable.** §8.6.2's `explicit_revision/inventory` loader
-is exactly the mechanism candidate attribution needs: after 4p a comparison is
-between two *named* inventories, so the detector knows each side's revision at
-write time and binds with `inherited_from_page_evidence`, which is what slice 1
-§8.2 assigns that case. No pass is involved -- the value is in hand when the
-row is written.
+**What this slice enables -- and therefore owns.** §8.6.2's
+`explicit_revision/inventory` loader is the mechanism candidate attribution
+needs: after 4p a comparison is between two *named* inventories, so the
+detector can know each side's revision at write time and bind with
+`inherited_from_page_evidence`, which is what slice 1 §8.2 assigns that case.
 
-That makes 4p the point at which the candidate attribution transition becomes
-reachable at all. Before it, no code path can perform it.
+An earlier draft claimed 4p enables this while "this slice does not change the
+detector". **Those cannot both hold.** Knowing the revision at the loader is
+useless unless it reaches the INSERT, and nothing carries it there today. So
+the change is assigned here, and it is one atomic change rather than three:
+
+```text
+loader              returns each side's inventory WITH its source_revision_id
+                    and provenance state, not only its pages
+comparison result   ArchiveFingerprint / the comparison result carries that
+                    per side, instead of discarding it after the compare
+persistence         the candidate INSERT writes revision_a_id /
+                    provenance_basis_a and the _b pair from it
+```
+
+Split across slices, the middle piece would be dead weight in one and missing
+in the other, and a candidate written between them would silently take the
+wrong basis. They land together, in this slice, or not at all.
+
+**Per side, independently.** `page_inventory.source_revision_id` is nullable
+(§6.1) and an unresolved inventory is a first-class state -- a drift inventory
+is exactly one -- so a side inherits only what its own inventory has:
+
+```text
+that side's inventory HAS a revision  -> revision id + inherited_from_page_evidence
+that side's inventory is unresolved   -> NULL + unresolved_no_identity
+```
+
+A half-bound candidate is a normal outcome, not a defect.
 
 **Obligations this slice takes on:**
 
 ```text
-flow            unchanged for inventories. The loader's explicit-revision path
-                (PI-08) is what the detector will use afterwards; this slice
-                does not change the detector.
+flow            the loader / result / persistence change above, atomically.
+                Inventory minting and sealing are unchanged.
 reconciliation  one added assertion, a NEGATIVE: the count of candidate sides
-                carrying each basis is IDENTICAL before and after 4p. If 4p
-                ever changes a candidate side, that is a defect, and this
-                detects it.
-tests           a candidate created before this slice carries
-                unresolved_no_identity on both sides before 4p and STILL does
-                after it completes.
-recovery        unchanged. No candidate obligation is added, so no candidate
-                recovery step is either.
+                carrying each basis is IDENTICAL before and after the
+                MIGRATION. The migration attributes no candidate; the detector
+                does, afterwards, as it runs.
+tests           a candidate created before this slice is unchanged by the
+                migration; AND a FUNCTIONAL post-4p test: a detection run
+                after the cutover writes a candidate whose sides carry the
+                revisions of the inventories it was given, covering all four
+                bound/unresolved A/B combinations. Asserting only that the
+                migration leaves old rows alone would test the half of this
+                that is trivially true.
+recovery        unchanged for the migration. The detector change ships with
+                it and is covered by the same release rollback, since a
+                detector writing bases against a pre-4p schema is exactly the
+                mismatch the single-release rule exists to prevent.
 ```
 
 **An anchor does not change the pre-4p rows.** An inventory id or compared
 content signature written at detection time from slice 6 onward would improve
 future auditability, but it cannot retroactively prove what a row created
-before it compared. Those rows stay unresolved permanently. Quiescence was also
+before it compared, so no blind pass over them is defensible. They can still be
+bound by a fresh comparison that recomputes a matching payload, which is a new
+producer action rather than a repair. Quiescence was also
 rejected: it would require no page hashing between 015 and 4p, over an interval
 whose length is a scheduling decision, with no way to verify afterwards that it
 held.
