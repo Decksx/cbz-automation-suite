@@ -96,16 +96,24 @@ R13  attribution transitions  EXACT PAIRS ONLY, per table (§7.4). The producer
                             code path performs that transition, because there
                             is no explicitly-loaded inventory to inherit from.
                             From 4p to slice 6 it is load-bearing.
-R14  candidate attribution  no RETROSPECTIVE binding, ever: a candidate created
+R14  candidate attribution  No RETROSPECTIVE binding, ever: a candidate created
                             between 015 and 4p is never bound by a pass,
                             because nothing records which page generation it
-                            compared; it can still be bound by a FRESH
-                            comparison whose payload matches (§7.6). CONTEMPORANEOUS binding from 4p onward:
-                            the loader is given an explicit revision/inventory
-                            (slice 2 PI-08), so each side binds at INSERT with
-                            inherited_from_page_evidence. A pending unresolved
-                            row binds only on a fresh comparison whose full
-                            payload matches the stored one (§7.6).
+                            compared. It can still be bound by a FRESH
+                            comparison whose payload matches.
+                            CONTEMPORANEOUS from 4p onward, and CONDITIONAL
+                            PER SIDE -- the loader is given an explicit
+                            revision/inventory (slice 2 PI-08), but that
+                            inventory may itself be unresolved, so each side
+                            takes its own inventory's state -- an inventory
+                            with a revision gives that revision and
+                            inherited_from_page_evidence, an unresolved one
+                            gives NULL and unresolved_no_identity. All four
+                            A/B combinations are legal. A pending
+                            unresolved row binds only on a fresh comparison
+                            whose full payload matches the stored one, and
+                            then only for sides whose inventories are
+                            themselves bound (§7.6).
 R15  ledger precondition    refuse unless the pending protected set is exactly
                             {15} and every discovered version below 15 is
                             recorded (§12.1).
@@ -1170,10 +1178,15 @@ enforce quiescence           REJECTED. It would require no page hashing between
                              operator's scheduling decision, with no way to
                              verify afterwards that it held. An assumption that
                              cannot be checked is not a defence.
-leave them unresolved        TAKEN. Costs attribution on candidates created in
-                             one bounded window; costs no correctness. §10
-                             resolves an unresolved side conservatively, so
-                             this understates rather than overstates.
+leave them unresolved        TAKEN -- by the migration and by any blind pass.
+  BY MIGRATION AND         Not by the producer: a fresh comparison whose
+  BLIND PASSES             payload matches may still bind them, because that
+                           is a new producer action with evidence in hand.
+                           Costs attribution on candidates created in one
+                           bounded window until such a comparison runs; costs
+                           no correctness. §10 resolves an unresolved side
+                           conservatively, so this understates rather than
+                           overstates.
 ```
 
 An evidence anchor written at detection time remains worth having for
@@ -1343,12 +1356,42 @@ NULL-blindness               a protected column going NULL->value and
                              value->NULL is REJECTED (proves IS NOT)
 identity NOT protected here  an algorithm_version rewrite is NOT rejected by
                              the slice-4 guard -- the negative proving R11
-R13 exact pairs              a seed row (migration_014_identity_seed) and a
-                             drift row are NOT relabelled by the attribution
-                             statement; only unresolved_no_identity ->
-                             stat_matched_revision applies. This is the
-                             reproduction of §7.4, asserted as a regression
-R13 hashes                   the hasher issues NO attribution statement
+R13 exact pairs, PER TABLE   The §7.4 reproduction used
+                             migration_014_identity_seed, which is
+                             archive_hashes' vocabulary -- and that table's
+                             producer issues no attribution statement at all,
+                             so the case could not exercise the predicate it
+                             was meant to guard. Each table is tested in its
+                             OWN vocabulary:
+
+                             signatures   unchanged: migration_014_field_seed,
+                                          unresolved_drift, already-bound.
+                                          Only transition:
+                                          unresolved_no_identity ->
+                                          stat_matched_revision
+                             inspections  unchanged: single_revision_inherited,
+                                          already-bound. Only transition:
+                                          unresolved_no_identity ->
+                                          stat_matched_revision, and it is
+                                          stat-gated (§7.5)
+                             candidates   per side, independently. Unchanged:
+                                          single_revision_inherited, already
+                                          inherited. Only transition:
+                                          unresolved_no_identity ->
+                                          inherited_from_page_evidence
+                             hashes       NO attribution statement exists --
+                                          asserted as the absence it is, not
+                                          as a passing predicate
+R13 candidate source guard   BYPASS THE SOURCE-STATE PREDICATE ALONE and
+                             require a NAMED failure. Measured: with the guard,
+                             a pending single_revision_inherited side keeps
+                             (7, 'single_revision_inherited'); with it replaced
+                             by a permissive "any differing attribution" test,
+                             the same side becomes
+                             (99, 'inherited_from_page_evidence') silently.
+                             Every other R13 and R14 test still passes under
+                             that bypass, which is exactly why this one is
+                             required separately
 hasher reordering (§7.1)     the revision exists before archive_hashes is
                              written; save() remains one transaction;
                              metadata_changed still reads file_locations before
