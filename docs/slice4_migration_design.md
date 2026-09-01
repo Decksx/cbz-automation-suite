@@ -88,14 +88,21 @@ R11  trigger scope          slice-4 guard = measurement + lifecycle_immutable.
 R12  basis nullability      moves into slice 4; every basis NOT NULL, and
                             archive_hashes.source_revision_id NOT NULL.
 R13  attribution transitions  EXACT PAIRS ONLY, per table (§7.4). The producer
-                            predicate carries this until slice 5's transition
-                            triggers land, because those triggers reference
-                            supersession columns slice 4 does not have.
+                            predicate carries this until each table's
+                            transition trigger lands: slice 5 for signatures
+                            and inspections, SLICE 6 for candidates
+                            (ND-01..ND-16). So the candidate predicate stays
+                            load-bearing across 4 -> 4p -> 5 -> 6, two slices
+                            longer than the others.
 R14  candidate 4->4p window a candidate created between 015 and 4p writes
                             unresolved_no_identity on BOTH sides, and is bound
-                            after 4p by an explicit binding pass (§7.5).
+                            after 4p by an explicit binding pass (§7.6).
                             Joining the content signature instead would be a
-                            new ruling and is NOT taken here.
+                            new ruling and is NOT taken here. The pass is
+                            4p's work, so it is recorded in
+                            docs/page_inventory_design.md §12 as well as here
+                            -- naming it only in this document would leave the
+                            authoritative 4p design stale.
 R15  ledger precondition    refuse unless the pending protected set is exactly
                             {15} and every discovered version below 15 is
                             recorded (§12.1).
@@ -612,22 +619,39 @@ not obtain a revision until `record_or_reuse()` at **line 233**. Under R12
 that does not yet exist. The cutover is therefore a **reordering**, not an
 added column.
 
-The reorder is safe, and that is a property of the code rather than an
-assumption:
+**The previous revision's safety proof was false.** It claimed
+`record_or_reuse()` touches only `archive_revisions`. It does not:
 
 ```text
-save() already runs entirely inside one transaction (require_transaction at
-the top), so moving statements within it changes no durability boundary.
+current_for()  READS archive_files.current_revision_id   (dal.py:652-661)
+set_current()  WRITES archive_files.current_revision_id  (dal.py:830-833),
+               and record_or_reuse calls it on the provisional path
+```
 
-record_or_reuse() touches ONLY archive_revisions -- revision_with_digest(),
-_append() and current_for() all read or write that table (dal.py:752-790).
-It does not read archive_hashes, file_locations or archive_files, so moving
-it earlier breaks no read-after-write dependency.
+`save()` also writes `archive_files.file_size`, so the two overlap on that
+table. The reorder still holds, but for a reason that has to be stated against
+the real read/write set rather than a wrong one:
+
+```text
+save() runs entirely inside one transaction (require_transaction at the top),
+so moving statements within it changes no durability boundary.
+
+The overlap on archive_files is COLUMN-DISJOINT: record_or_reuse touches only
+current_revision_id, and save() touches only file_size. Neither reads what the
+other writes, so their relative order does not change either result.
+
+record_or_reuse does not read archive_hashes at all, which is the dependency
+that would actually forbid moving it before the archive_hashes write.
 
 The one ordering constraint that must be preserved: `metadata_changed` reads
 file_locations BEFORE the UPDATE that refreshes it. That read is already the
 first statement and stays there.
 ```
+
+Column-disjointness is an argument about the code as it stands today, not an
+invariant the database enforces, so §11 tests it: the reorder is asserted to
+leave `current_revision_id`, `file_size` and the revision lineage identical to
+what the unreordered path produced for the same input.
 
 Required order:
 
@@ -693,9 +717,16 @@ a second boundary:
 ```text
 identical rerun (clock advanced) -> unchanged: True | location repointed: False
 changed payload                  -> REJECTED: measurement results are immutable
-attribution-only update          -> applied; measurements + hashed_at preserved
-attribution rerun                -> rows changed: 0
 ```
+
+The same harness also verified the attribution mechanism -- an attribution-only
+update applies while preserving every measurement and `hashed_at`, and a rerun
+of it changes 0 rows. **That was measured on the generic shape, not on
+`archive_hashes`**, which issues no attribution statement at all (§7.4). The
+previous revision listed those two lines inside this table's transcript, which
+read as though the hasher performed an attribution update it must never
+perform. They belong to §7.5's signature and inspection paths, and are shown
+there.
 
 ### 7.3 Payload and attribution columns, per producer
 
@@ -803,7 +834,103 @@ rather than relabelled.
 `archive_hashes` issues no attribution statement, which is why the reproduction
 above describes a statement that will not exist after this correction.
 
-### 7.5 Candidate attribution in the 4 → 4p window (R14)
+### 7.5 The other three producers, concretely
+
+Slice 1 §8.2 gives the abstract ownership paths; these are the changes to the
+producers as they stand.
+
+**Signatures — `page_hashing.py:229`.** The stat match is the join the file
+already uses for freshness (`page_hashing.py:329`:
+`acs.source_file_size = fl.file_size AND acs.source_modified_time_ns =
+fl.modified_time_ns`), pointed at `archive_hashes` instead:
+
+```sql
+-- The lookup. Binds only on EXACTLY ONE revision-bound match (slice 1 §8.3):
+-- zero leaves it unresolved, and two or more also leaves it unresolved,
+-- because picking either would be a coin flip recorded as a fact.
+SELECT ah.source_revision_id
+  FROM archive_hashes AS ah
+ WHERE ah.archive_id         = :archive_id
+   AND ah.file_size          = :source_file_size
+   AND ah.modified_time_ns   = :source_modified_time_ns
+   AND ah.source_revision_id IS NOT NULL
+ LIMIT 2;                       -- LIMIT 2, so "several" is distinguishable
+                                -- from "one"; LIMIT 1 would hide the case
+                                -- the rule exists to refuse
+```
+
+```text
+exactly one row   -> source_revision_id = it, basis 'stat_matched_revision'
+zero rows         -> source_revision_id NULL, basis 'unresolved_no_identity'
+two or more       -> source_revision_id NULL, basis 'unresolved_no_identity'
+```
+
+**Pre-commit revalidation.** Slice 1 §8.3 requires the location identity and
+the captured stat to be re-checked immediately before COMMIT, exactly as the
+archive hasher does, so a file replaced between the match and the write cannot
+leave evidence bound to a revision it never described:
+
+```sql
+-- Re-run immediately before COMMIT, inside the same transaction. If it
+-- returns no row, the file moved under the read: abort rather than commit a
+-- binding to bytes that are gone.
+SELECT 1 FROM file_locations
+ WHERE id = :location_id AND archive_id = :archive_id
+   AND file_size = :source_file_size
+   AND modified_time_ns = :source_modified_time_ns;
+```
+
+The write itself is §7.2's two statements over the signature payload of §7.3,
+with `provenance_basis` supplied by the lookup above.
+
+**Inspections — `repository.py:76`.** Inspection normally runs *before*
+hashing, so at first write no revision may exist to bind to.
+
+```text
+first write   run the same stat lookup, with inspected_file_size and
+              inspected_modified_time_ns in place of the signature's stat
+              fields. One match -> stat_matched_revision; zero or several ->
+              unresolved_no_identity with a NULL revision.
+              inspector_version_basis = 'known' and inspector_version = the
+              running inspector's version, ALWAYS. Never 'unknown_legacy':
+              that label describes evidence produced before the column
+              existed, and this row is being produced after it.
+later binding an inspection left unresolved is bound by the attribution
+              statement of §7.4 -- the exact pair unresolved_no_identity ->
+              stat_matched_revision -- run after hashing establishes a
+              revision for the same archive. It is the hasher's own
+              transaction that makes a previously-unresolved inspection
+              bindable, so the binding action runs there, after
+              record_or_reuse and against the same archive_id.
+```
+
+The later-binding action is the one place a slice-4 producer performs an
+attribution update on a row it did not just write, which is why §7.4's
+predicate is written as four `AND` clauses rather than a revision comparison.
+
+**Candidates — `near_duplicate.py:505`.** Detection already opens its own
+`BEGIN IMMEDIATE` and upserts each selected comparison.
+
+```text
+INSERT branch  both sides written per §7.6 -- unresolved_no_identity with NULL
+               revisions during the 4 -> 4p window, inherited from bound page
+               evidence afterwards.
+UPDATE branch  keeps its existing WHERE review_status = 'pending_review'
+               guard, AND gains §7.2's payload predicate. Both must hold: a
+               reviewed row is still never touched, and a pending row whose
+               metrics are unchanged is now a no-op rather than a rewrite.
+review status  unchanged in every respect. review_status, reviewed_by and
+               reviewed_at are `review` disposition (§9), mutable by the
+               reviewer workflow, and no slice-4 guard touches them.
+```
+
+**The behaviour change worth stating plainly:** a detection rerun that produces
+*different* metrics on a `pending_review` row now fails the job rather than
+silently overwriting nine computed metrics. That is R4's intent and §11.4's
+"refusal rather than loss" semantics, and it will surface operationally as a
+failed near-duplicate run rather than as silent drift.
+
+### 7.6 Candidate attribution in the 4 → 4p window (R14)
 
 Candidates must write non-NULL bases from 015 (R12), but their authoritative
 source — page evidence — does not gain ownership until 4p. A candidate created
@@ -1029,10 +1156,37 @@ ledger (R15)                 the executor refuses a ledger with a hole below
                              15, refuses when another protected migration is
                              also pending, applies exactly 015, and
                              schema_migrations grows by exactly one
-reconciliation (R16)         planned and reconstructed applied bindings agree
-                             FIELD-FOR-FIELD, including per-side mapping;
-                             a single altered basis, revision, or side label is
-                             detected, each injected separately
+reconciliation (R16)         planned and applied PROJECTIONS agree
+                             field-for-field, including per-side mapping by
+                             label; a single altered basis, revision, or side
+                             label is detected, each injected separately.
+                             The projection's field set is asserted to be
+                             exactly §12.2's, so parameters_basis cannot enter
+                             it -- the field that makes PlannedBinding itself
+                             unusable here
+hasher read/write set        the reorder leaves current_revision_id, file_size
+                             and the revision lineage identical to the
+                             unreordered path for the same input -- the
+                             column-disjointness argument of §7.1 is a claim
+                             about today's code, not an enforced invariant
+signature stat match         exactly one revision-bound match binds
+                             stat_matched_revision; zero and TWO OR MORE both
+                             leave unresolved_no_identity, the second proven
+                             with two rows sharing a stat
+pre-commit revalidation      a location whose stat changed between the match
+                             and COMMIT aborts rather than committing a
+                             binding to bytes that are gone
+inspection first write       inspector_version_basis = 'known' with a non-NULL
+                             version, never 'unknown_legacy'; an unresolved
+                             inspection is bound later by the exact pair after
+                             hashing establishes a revision
+candidate UPDATE branch      a reviewed row is still never touched; a pending
+                             row with unchanged metrics is a no-op; a pending
+                             row with changed metrics FAILS
+R15 ledger set equality      recorded {1..14,16} with discovered {1..15} is
+                             REFUSED -- the reproduction of §12.1, asserted as
+                             a regression; an unknown recorded version is
+                             refused; 015 must be the next applicable
 inspector default            the rebuilt column has NO default
 migration-root disjointness  the two roots are disjoint (§4.1)
 fail-closed (R6)             a newly launched ordinary command ABORTS while 015
@@ -1073,17 +1227,36 @@ ledger row. Inside the same transaction, in this order:
 ```text
 1  discovered = discover_migrations(MIGRATIONS)       -- every numbered file
 2  recorded   = applied_versions(connection)
-3  REFUSE unless {v in discovered : v < 15} is a SUBSET of recorded
-      -- "014 present" is not enough: a ledger holding only 14 passes that
-         test while 003 was never applied
-4  REFUSE unless the pending protected set is exactly {15}
-      -- pending = discovered - recorded. If it holds another protected id,
-         or 015 is absent from it, the executor is being asked for something
-         other than what was approved
-5  apply exactly 015 -- no other pending migration is applied here
-6  INSERT INTO schema_migrations (version, name) VALUES (15, '015_<name>.sql')
-7  verify schema_migrations grew by exactly one row
-8  reconcile (§12.2), then commit
+3  REFUSE unless recorded == {v in discovered : v < 15}, as SET EQUALITY.
+      Three holes close at once, and the previous revision's subset test
+      closed only the first:
+        a ledger holding only 14 fails, because 001..013 are missing
+        an UNKNOWN recorded version fails: recorded - discovered must be
+          empty, so a row for a migration file this tree does not have is
+          refused rather than ignored
+        an ALREADY-APPLIED LATER version fails: 16 in recorded is not in
+          {v < 15}, so it is refused
+4  REFUSE unless 015 is the NEXT APPLICABLE migration: min(discovered -
+      recorded) == 15. Not merely a member of the pending set -- the next one.
+5  REFUSE unless the pending protected set is exactly {15}
+6  apply exactly 015 -- no other pending migration is applied here
+7  INSERT INTO schema_migrations (version, name) VALUES (15, '015_<name>.sql')
+8  verify schema_migrations grew by exactly one row
+9  reconcile (§12.2), then commit
+
+Step 3's set equality is what the subset test missed. Measured against the
+previous revision's two checks:
+
+```text
+discovered = {1..15}, recorded = {1..14, 16}
+  "all below 15 recorded"     -> True   (subset test passes)
+  "pending protected == {15}" -> True   (pending == {15})
+  => 015 would be applied AFTER 016 was already applied
+```
+
+Both documented checks passed on a ledger that had already run a later
+migration. Set equality plus the next-applicable test refuses it twice
+over.
 ```
 
 `migration_version()` parses `015_*.sql` to **15** (`migrations.py:44`) and
@@ -1097,50 +1270,116 @@ two. Inside the transaction, schema change and ledger row commit or roll back
 together, which is the property `apply_migrations()` already relies on
 (`migrations.py:105-107`).
 
-### 12.2 The applied binding digest is the planner's own form (R16)
+### 12.2 The slice-4 applied projection (R16)
 
 A count plus an implementation-chosen digest is not the §11.1 reconciliation
-gate. The applied side reuses the planner's canonical rendering rather than
-inventing a second one:
+gate. But **`PlannedBinding.canonical_line()` cannot be reused directly**, and
+the previous revision was wrong to say it could. Measured:
 
 ```text
-representation   PlannedBinding.canonical_line(), which renders through
-                 _canonical_json -- injective, delimiters escaped inside
-                 strings, sides nested in their own scope rather than
-                 flattened, a missing value rendered null rather than "".
-                 (planner lines 361-392.)
-version marker   PLAN_DIGEST_VERSION = "provenance-backfill-plan/2" and
-                 PLANNER_VERSION = "provenance-backfill-planner/2" travel with
-                 it, so a rendering change cannot silently compare equal.
-fields           table, key_kind, key, archive_id, bound, and per side:
-                 label, archive_id, source_revision_id, provenance_basis;
-                 plus the table-specific frozen `values`.
-side mapping     the candidate table's two sides are the planner's
-                 sides[label='a'] and sides[label='b'], mapped to
-                 (revision_a_id, provenance_basis_a) and
-                 (revision_b_id, provenance_basis_b). The mapping is by LABEL,
-                 never by tuple position.
+PlannedBinding(table="near_duplicate_candidates", ..., values={"parameters_basis": ...})
+    PlannerInvariantError: planned values do not match the table's artifact
+    columns (missing ['archive_b_id'])
+PlannedBinding(..., values={})
+    PlannerInvariantError: ... (missing ['archive_b_id', 'parameters_basis'])
+
+ARTIFACT_COLUMNS["near_duplicate_candidates"] == ('archive_b_id',
+                                                  'parameters_basis')
 ```
+
+`parameters_basis` is required by the planner's own invariant and is
+**deliberately not written by slice 4** — it lands in slice 6 with the fields
+that give it meaning. So a candidate binding reconstructed from post-015 state
+cannot be a `PlannedBinding` at all: the column does not exist to read.
+
+The answer is a projection, defined once and applied to both sides, rather
+than two formats compared:
+
+```text
+name     slice-4 applied projection
+version  "provenance-backfill-applied/1"
+         Its own marker, NOT the planner's. A projection that borrowed
+         PLAN_DIGEST_VERSION would compare equal across a change to either
+         definition, which is the failure the planner's own marker exists to
+         prevent.
+```
+
+**Fields, per binding.** Exactly what 015 writes, and nothing else:
+
+```text
+table         one of the four; page_inventory is excluded by construction
+key_kind      always "row_id" in slice 4 -- the natural-key form is 4p's
+key           the row id
+archive_id    the row's archive_id
+sides         ordered by label; for the three single-sided tables one side
+              with label ""; for candidates two, labels "a" and "b"
+  label
+  archive_id
+  source_revision_id
+  provenance_basis
+values        table-specific, restricted to columns 015 writes:
+                archive_hashes              {}
+                archive_content_signatures  {}
+                archive_inspections         inspector_version,
+                                            inspector_version_basis
+                near_duplicate_candidates   archive_b_id
+              parameters_basis is ABSENT by design, and its absence is
+              asserted rather than assumed: a projection that grew it would
+              mean slice 4 had started writing a slice-6 column.
+```
+
+**Framing, stated exactly**, because "canonical" without framing is not a
+format:
+
+```text
+serialization  the planner's _canonical_json semantics: sorted keys, no
+               inserted whitespace, delimiters escaped inside strings, nesting
+               preserved so sides and values occupy their own scopes rather
+               than flattening into one stream, and a missing value rendered
+               null rather than "". Injective, which is the property that
+               makes two distinct bindings unable to render identically.
+line           one binding per line; the line IS the JSON object, with no
+               surrounding delimiters to escape.
+order          sorted by (table, key). Total, because the staging table's
+               PRIMARY KEY (table_name, row_id) makes the pair unique.
+document       version marker line, then "bindings|count=<n>", then the
+               sorted lines.
+join           "
+" between lines, and a single trailing "
+", so no
+               rendering can be a prefix of another.
+digest         SHA-256 over the UTF-8 encoding of that document, lowercase hex.
+per-table      the same framing restricted to one table's lines, so the
+               postflight artifact carries a digest per table as well as one
+               over all four.
+```
+
+**Both sides use this one function.** The planned side is the projection of
+the approved artifact's bindings; the applied side is the projection of rows
+read back from the rebuilt tables. Neither is the planner's own rendering, so
+the comparison cannot silently succeed because both were produced by the same
+accident.
 
 Reconciliation, after the rebuilds and inside the transaction:
 
 ```text
-1  reconstruct a PlannedBinding for every slice-4 row from the REBUILT tables,
-   using the same key_kind ('row_id') the planner used
-2  render both sides through canonical_line()
-3  compare FIELD-FOR-FIELD, not digest-to-digest: the digests are compared too,
-   but a mismatch must name the table, row id, field and both values, because
-   a digest that differs tells an operator nothing about what moved
-4  assert set equality both ways -- every planned binding applied exactly once,
+1  project every planned slice-4 binding from the artifact
+2  project every slice-4 row read back from the REBUILT tables
+3  compare FIELD-FOR-FIELD, not digest-to-digest. The digests are compared
+   too, but a mismatch must name the table, row id, field and both values --
+   a digest that differs tells an operator nothing about what moved.
+4  assert set equality both ways: every planned binding applied exactly once,
    and no applied binding absent from the plan
-5  the per-table applied digest is SHA-256 over the sorted canonical lines for
-   that table, and goes into the postflight artifact
+5  assert the projections' field sets are identical to the definition above,
+   so a column added later cannot silently enter or leave the comparison
+6  the per-table and whole-run digests go into the postflight artifact
 ```
 
-Sorting is by `(table, key)`, which is total because the staging table's
-primary key made `(table_name, row_id)` unique.
+Candidate sides are mapped **by label**: `sides[label='a']` to
+`(revision_a_id, provenance_basis_a)` and `sides[label='b']` to
+`(revision_b_id, provenance_basis_b)`, never by tuple position.
 
-`page_inventory` bindings are excluded from step 1 by construction — their
+`page_inventory` bindings are excluded at step 1 by construction — their
 `key_kind` is `archive_id` and their table is not among the four — and are
 counted as deliberately unapplied rather than silently missing.
 
