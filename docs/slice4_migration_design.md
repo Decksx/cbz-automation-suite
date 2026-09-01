@@ -94,21 +94,24 @@ R13  attribution transitions  EXACT PAIRS ONLY, per table (§7.4). The producer
                             (ND-01..ND-16). So the candidate predicate stays
                             load-bearing across 4 -> 4p -> 5 -> 6, two slices
                             longer than the others.
-R14  candidate 4->4p window a candidate created between 015 and 4p writes
-                            unresolved_no_identity on BOTH sides, and is bound
-                            after 4p by an explicit binding pass (§7.6).
-                            Joining the content signature instead would be a
-                            new ruling and is NOT taken here. The pass is
-                            4p's work, so it is recorded in
-                            docs/page_inventory_design.md §12 as well as here
-                            -- naming it only in this document would leave the
-                            authoritative 4p design stale.
+R14  unresolved candidates  a candidate created between 015 and 4p writes
+                            unresolved_no_identity on BOTH sides and STAYS
+                            unresolved. The binding pass an earlier revision
+                            put in 4p is withdrawn: nothing in the row records
+                            which page generation the comparison read, so no
+                            pass can prove its binding (§7.6). An evidence
+                            anchor is the real fix and is a new ruling for
+                            slice 6, which already reopens this table.
 R15  ledger precondition    refuse unless the pending protected set is exactly
                             {15} and every discovered version below 15 is
                             recorded (§12.1).
-R16  applied binding digest reuses the planner's canonical binding rendering;
-                            reconciliation is field-for-field over reconstructed
-                            bindings, not a count plus a digest (§12.2).
+R16  applied projection     a SEPARATE slice-4 projection, not the planner's
+                            rendering -- PlannedBinding requires
+                            parameters_basis, which slice 4 does not write, so
+                            its own invariant refuses a candidate reconstructed
+                            from post-015 state. Reconciliation is
+                            field-for-field over projections, not a count plus
+                            a digest (§12.2).
 ```
 
 ## 3. Scope: four tables, 180,519 field projections
@@ -131,7 +134,7 @@ page_inventory bindings, deferred to 4p     58,437
 ```text
 slice 4   ownership keys, basis columns created NOT NULL, inspector version
           pair, results-immutability triggers, four table rebuilds
-slice 4p  page_inventory + archive_pages, then the candidate binding pass (R14)
+slice 4p  page_inventory + archive_pages. NO candidate binding pass (R14).
 slice 5   uniqueness / partial indexes, UPSERT -> append, supersession columns
           and lifecycle, identity immutability, the source_context guard, the
           attribution TRANSITION TRIGGERS (which need supersession columns),
@@ -865,56 +868,115 @@ zero rows         -> source_revision_id NULL, basis 'unresolved_no_identity'
 two or more       -> source_revision_id NULL, basis 'unresolved_no_identity'
 ```
 
-**Pre-commit revalidation.** Slice 1 §8.3 requires the location identity and
-the captured stat to be re-checked immediately before COMMIT, exactly as the
-archive hasher does, so a file replaced between the match and the write cannot
-leave evidence bound to a revision it never described:
+**Pre-commit revalidation — of the FILE, not the row.** The previous revision
+re-read `file_locations` here. That is nearly worthless: `BEGIN IMMEDIATE`
+already excludes every other database writer for the transaction's duration, so
+the row cannot have moved — and a filesystem replacement does not update that
+row at all. The check would have passed over exactly the event it was meant to
+catch.
 
-```sql
--- Re-run immediately before COMMIT, inside the same transaction. If it
--- returns no row, the file moved under the read: abort rather than commit a
--- binding to bytes that are gone.
-SELECT 1 FROM file_locations
- WHERE id = :location_id AND archive_id = :archive_id
-   AND file_size = :source_file_size
-   AND modified_time_ns = :source_modified_time_ns;
+The archive hasher already does this correctly, and is the model: it stats the
+path before and after reading and refuses on a difference
+(`hashing.py:85-93`, `raise OSError("Archive changed while hashing")`).
+
+```text
+1  carry the PATH into the transactional save flow. It is not there today --
+   the signature producer receives ids and a result, not the path it read --
+   so this is a signature change, not just an added statement.
+2  immediately before COMMIT, re-stat that path:
+       after = Path(path).stat()
+3  ABORT unless ALL of:
+       after.st_size     == the captured source_file_size
+       after.st_mtime_ns == the captured source_modified_time_ns
+       the location row still names this archive_id and this path
+4  the database check remains, but as the identity half only: the location
+   must still be the same row for the same archive at the same path. It is
+   not evidence about the file's bytes, and is no longer described as such.
 ```
+
+A missing file raises rather than compares: `stat()` on a deleted path throws,
+and that is the correct outcome — abort, do not commit evidence about bytes
+that are gone.
+
+This closes the window slice 1 §8.3 names, and it is the only form that does:
+the stat that matters is the filesystem's, and only re-reading it can detect a
+replacement.
 
 The write itself is §7.2's two statements over the signature payload of §7.3,
 with `provenance_basis` supplied by the lookup above.
 
-**Inspections — `repository.py:76`.** Inspection normally runs *before*
-hashing, so at first write no revision may exist to bind to.
+**Inspections — `repository.py:76`.** Three separate defects, each verified
+in the tree, and none of them fixable by adding columns to the existing
+statement.
+
+**(a) The stat is not measured.** `InspectArchiveHandler` passes
+`file_size=int(location["file_size"])` from the `file_locations` row it read
+earlier (`handlers.py:85-86`), and `inspect_archive()` never stats the file at
+all — `inspection.py` contains no `.stat()`, `st_size` or `st_mtime_ns`. So
+`inspected_file_size` and `inspected_modified_time_ns` today record what the
+database believed, not what was inspected. Binding on them would stat-match
+against a remembered value.
 
 ```text
-first write   run the same stat lookup, with inspected_file_size and
-              inspected_modified_time_ns in place of the signature's stat
-              fields. One match -> stat_matched_revision; zero or several ->
-              unresolved_no_identity with a NULL revision.
-              inspector_version_basis = 'known' and inspector_version = the
-              running inspector's version, ALWAYS. Never 'unknown_legacy':
-              that label describes evidence produced before the column
-              existed, and this row is being produced after it.
-later binding an inspection left unresolved is bound by the attribution
-              statement of §7.4 -- the exact pair unresolved_no_identity ->
-              stat_matched_revision -- run after hashing establishes a
-              revision for the same archive. It is the hasher's own
-              transaction that makes a previously-unresolved inspection
-              bindable, so the binding action runs there, after
-              record_or_reuse and against the same archive_id.
+required   inspect_archive() captures the path's stat BEFORE and AFTER reading
+           it and refuses on a difference, exactly as the hasher does
+           (hashing.py:85-93), and returns the after-stat as part of its
+           result. The repository stores THAT, not the caller's parameter.
+           The file_size / modified_time_ns parameters of save() go away:
+           keeping them beside a measured value would leave two answers to
+           one question.
 ```
 
-The later-binding action is the one place a slice-4 producer performs an
-attribution update on a row it did not just write, which is why §7.4's
-predicate is written as four `AND` clauses rather than a revision comparison.
+**(b) The write is not atomic.** `ArchiveInspectionRepository.save()` has no
+`require_transaction` and runs in autocommit, so the ownership lookup, the
+measurement UPSERT and any attribution update are three separate transactions.
+A crash between them leaves an inspection whose basis does not describe its
+own row.
+
+```text
+required   save() takes BEGIN IMMEDIATE ownership the way ArchiveHashRepository
+           does -- require_transaction at the top, with the caller owning the
+           transaction and its rollback. Lookup, UPSERT and attribution become
+           one unit or none of them.
+```
+
+**(c) The late-binding predicate is too weak.** §7.4's four clauses match on
+`archive_id` and the unresolved basis. That binds *any* unresolved inspection
+of that archive to the revision the hasher just established — including one
+taken from older bytes, which is precisely the wrong-generation error §7.6
+withdrew the candidate pass over.
+
+```sql
+-- Run inside the hasher's transaction, after record_or_reuse, and ONLY for an
+-- inspection whose own recorded stat equals the stat the hash just measured.
+UPDATE archive_inspections
+   SET source_revision_id = :revision_id,
+       provenance_basis   = 'stat_matched_revision',
+       updated_at         = CURRENT_TIMESTAMP
+ WHERE archive_id                 = :archive_id
+   AND source_revision_id         IS NULL
+   AND provenance_basis           = 'unresolved_no_identity'
+   AND inspected_file_size        = :hash_result_file_size
+   AND inspected_modified_time_ns = :hash_result_modified_time_ns;
+```
+
+The last two clauses are the correction. Without them the statement says "this
+archive has a revision now"; with them it says "this inspection read the same
+bytes that revision describes", which is the only claim
+`stat_matched_revision` is entitled to make. An inspection of older bytes fails
+to match and stays unresolved — the same conservative outcome as §7.6.
+
+This is the one place a slice-4 producer performs an attribution update on a
+row it did not just write, which is why §7.4's predicate is a set of `AND`
+clauses rather than a revision comparison.
 
 **Candidates — `near_duplicate.py:505`.** Detection already opens its own
 `BEGIN IMMEDIATE` and upserts each selected comparison.
 
 ```text
-INSERT branch  both sides written per §7.6 -- unresolved_no_identity with NULL
-               revisions during the 4 -> 4p window, inherited from bound page
-               evidence afterwards.
+INSERT branch  both sides written unresolved_no_identity with NULL revisions,
+               per §7.6, and they STAY that way -- no pass binds them later,
+               because nothing records which page generation was compared.
 UPDATE branch  keeps its existing WHERE review_status = 'pending_review'
                guard, AND gains §7.2's payload predicate. Both must hold: a
                reviewed row is still never touched, and a pending row whose
@@ -930,34 +992,71 @@ silently overwriting nine computed metrics. That is R4's intent and §11.4's
 "refusal rather than loss" semantics, and it will surface operationally as a
 failed near-duplicate run rather than as silent drift.
 
-### 7.6 Candidate attribution in the 4 → 4p window (R14)
+### 7.6 Unresolved candidate sides stay unresolved (R14, revised)
 
-Candidates must write non-NULL bases from 015 (R12), but their authoritative
-source — page evidence — does not gain ownership until 4p. A candidate created
-in that window has nothing to inherit from.
+Candidates must carry a non-NULL basis from 015 (R12), but their authoritative
+source — page evidence — does not gain ownership until 4p. The previous
+revision answered that with a binding pass in 4p. **That pass is withdrawn: it
+could bind a candidate to page evidence it never compared.**
+
+The sequence, which the previous design accepted:
+
+```text
+candidate compares page set V1
+page hashing replaces it with V2
+4p mints the inventory for V2
+the pass assigns V2's revision to a candidate that compared V1
+```
+
+Nothing in the row can distinguish the two. Measured — `metrics()`
+(`near_duplicate.py:65-75`) returns `alignment_offset`,
+`average_dhash_distance`, `average_phash_distance`, `compared_page_count`,
+`dimension_match_ratio`, `median_pixel_area_a`, `median_pixel_area_b` and
+`page_match_ratio`. **No inventory id, no content signature, no page digest.**
+The table stores archive ids and metrics; it does not record which generation
+of page evidence the comparison read. So the pass could not prove the binding
+it was making, and the test the previous revision proposed — "a candidate
+created during the window is bound" — would have certified exactly that unsafe
+behaviour.
+
+The flaw is not confined to the window, either. `_resolve` may return
+`unresolved_no_identity` for a side of a *pre-015* candidate whose archive has
+no single revision (planner lines 1009-1019), and the 3,000 backfilled rows
+were bound "by the one-revision-per-archive census rather than from page
+evidence" (slice 1 §7.4). Any later pass binding those from page evidence would
+assign a provenance the comparison never used.
+
+**Ruling: an unresolved candidate side stays unresolved.** No binding pass
+exists in 4p or anywhere else in this plan.
 
 ```text
 during 4 -> 4p   a newly created candidate writes unresolved_no_identity on
-                 BOTH sides, with both revision ids NULL. That is honest: the
-                 evidence it would inherit from carries no ownership yet.
-after 4p         an explicit binding pass performs the per-side transition
-                 unresolved_no_identity -> inherited_from_page_evidence for
-                 every candidate side whose page evidence has since bound.
-                 It is 4p's responsibility and named in 4p's gate, not left to
-                 be noticed.
+                 BOTH sides, with both revision ids NULL
+after 4p         it stays that way. Nothing binds it, because nothing can
+                 prove which page generation it compared.
 ```
 
-**Deliberately not taken:** binding the candidate by joining
-`archive_content_signatures` instead of page evidence. That would give the side
-a different provenance than slice 1 §8.2 assigns it — signatures are
-stat-matched, page evidence is what the comparison actually read — and it would
-need `stat_matched_revision` in a vocabulary that does not contain it. It is a
-**new ruling**, not an implementation detail, and this document does not take
-it.
+This removes work from 4p rather than adding it, and §10 resolves an
+unresolved side conservatively, so the cost is understated attribution rather
+than a wrong binding.
 
-The interim cost, stated: candidates created between 015 and 4p are unresolved
-on both sides until the pass runs. §10 resolves an unresolved side
-conservatively, so this understates attribution rather than overstating it.
+**The three options, and why this one.** The review named them:
+
+```text
+require an evidence anchor   the real fix, and a NEW RULING: it needs a column
+                             this design does not add -- an inventory id or the
+                             compared content signature, per side, written at
+                             detection time. Slice 6 already reopens this table
+                             for parameters and run provenance, which is where
+                             an anchor belongs. Not taken here.
+enforce quiescence           rejected. It would require no page hashing between
+                             015 and 4p, across an interval whose length is an
+                             operator's scheduling decision, and nothing could
+                             enforce or verify it afterwards. An assumption
+                             that cannot be checked is not a defence.
+leave them unresolved        TAKEN. Costs attribution on candidates created in
+                             the window; costs no correctness.
+```
 
 ## 8. Concurrency protocol
 
@@ -1133,9 +1232,10 @@ hasher reordering (§7.1)     the revision exists before archive_hashes is
                              metadata_changed still reads file_locations before
                              the refresh
 R14 window                   a candidate created before 4p carries
-                             unresolved_no_identity on both sides; after the 4p
-                             pass its bound sides carry
-                             inherited_from_page_evidence
+                             unresolved_no_identity on both sides, and STILL
+                             does after 4p completes. The negative is the
+                             point: no pass binds it, because none can prove
+                             which page generation it compared
 R12 basis NOT NULL           an omitted basis is rejected on INSERT, on both
                              shapes, before the conflict branch, leaving the
                              evidence row unchanged
@@ -1176,10 +1276,25 @@ signature stat match         exactly one revision-bound match binds
 pre-commit revalidation      a location whose stat changed between the match
                              and COMMIT aborts rather than committing a
                              binding to bytes that are gone
+inspection stat measured     inspect_archive captures the path's real stat
+                             before and after, refuses on a difference, and the
+                             stored inspected_file_size /
+                             inspected_modified_time_ns come from THAT, not
+                             from the caller's file_locations parameter
+inspection atomicity         save() refuses outside a transaction; lookup,
+                             UPSERT and attribution commit together or not at
+                             all
 inspection first write       inspector_version_basis = 'known' with a non-NULL
-                             version, never 'unknown_legacy'; an unresolved
-                             inspection is bound later by the exact pair after
-                             hashing establishes a revision
+                             version, never 'unknown_legacy'
+late binding is stat-gated   an unresolved inspection whose recorded stat
+                             EQUALS the hash result's stat is bound; one whose
+                             stat DIFFERS stays unresolved even though the same
+                             archive now has a revision -- the negative that
+                             proves the two added clauses are load-bearing
+signature re-stat            a file replaced on disk between the match and
+                             COMMIT ABORTS; re-reading file_locations alone
+                             does not detect it, which is why the check is a
+                             filesystem stat
 candidate UPDATE branch      a reviewed row is still never touched; a pending
                              row with unchanged metrics is a no-op; a pending
                              row with changed metrics FAILS
@@ -1344,21 +1459,29 @@ order          sorted by (table, key). Total, because the staging table's
                PRIMARY KEY (table_name, row_id) makes the pair unique.
 document       version marker line, then "bindings|count=<n>", then the
                sorted lines.
-join           "
-" between lines, and a single trailing "
-", so no
-               rendering can be a prefix of another.
+join           one LF byte (0x0A) between lines, and one trailing LF byte,
+               so no rendering can be a prefix of another. No CR: the
+               document is joined as bytes, not written through a
+               text-mode writer that might translate them. Specified as a
+               byte value rather than as a backslash escape because the
+               escape did not survive this document's own authoring -- it
+               was emitted as a real line break, splitting the
+               specification of the separator across the lines it was
+               specifying.
 digest         SHA-256 over the UTF-8 encoding of that document, lowercase hex.
 per-table      the same framing restricted to one table's lines, so the
                postflight artifact carries a digest per table as well as one
                over all four.
 ```
 
-**Both sides use this one function.** The planned side is the projection of
-the approved artifact's bindings; the applied side is the projection of rows
-read back from the rebuilt tables. Neither is the planner's own rendering, so
-the comparison cannot silently succeed because both were produced by the same
-accident.
+**Both sides use this one function** -- the planned side projects the approved
+artifact's bindings, the applied side projects rows read back from the rebuilt
+tables. That gives a comparison of like with like, and it is explicitly **not**
+a protection against a shared omission: one projector applied twice will drop
+the same field from both sides and compare equal. What protects against that is
+the independently asserted field registry of step 5 -- written out here, not
+derived from the projector -- and the fault-injection tests of §11, which alter
+one field at a time and require the mismatch to be reported.
 
 Reconciliation, after the rebuilds and inside the transaction:
 
@@ -1414,7 +1537,7 @@ write would still pass while guarding nothing.
 **Single-writer threat model.** Recorded at `c666014`: one cooperating writer
 per namespace is an operational assumption, not a property of any path. §8.1 is
 that gate applied here — three defences with different reach, none a substitute
-for another. §10's frozen-producer-version window and §7.5's interim unresolved
+for another. §10's frozen-producer-version window and §7.6's permanently unresolved
 candidates are assumptions of the same kind, recorded the same way.
 
 ---
