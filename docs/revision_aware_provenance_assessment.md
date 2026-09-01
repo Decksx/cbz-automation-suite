@@ -815,9 +815,21 @@ evidence that describes it — the same argument 014 made for lineage.
 
 Nullable, and never nullable *silently*:
 
+**[SUPERSEDED 2026-09-01 — see §0.** The snippet below is the shape as
+originally ruled and is preserved as that record. The shape slice 4 builds
+differs in two lines, marked inline within it: `provenance_basis` is
+`TEXT NOT NULL`, and `source_revision_id` stays `INTEGER` — nullable —
+everywhere except `archive_hashes`, where the vocabulary makes it NOT NULL
+(§9.3, §9.4.2). Everything else here, including both CHECKs, is unchanged.**]
+
 ```text
 source_revision_id INTEGER          -- NULL = ownership not established
+                                    -- [SUPERSEDED: nullable as written EXCEPT
+                                    --  on archive_hashes, where slice 4 makes
+                                    --  it NOT NULL]
 provenance_basis   TEXT
+                                    -- [SUPERSEDED: slice 4 creates this
+                                    --  TEXT NOT NULL]
     CHECK (provenance_basis IN (
         'measured',
         'stat_matched_revision',
@@ -960,7 +972,11 @@ because it gains no ownership column (§5.1).
 `unresolved_no_identity` from its vocabulary — the hasher computes a digest
 and binds inside the same transaction, so an unresolved hash row is
 unreachable — which is what makes `source_revision_id` NOT NULL at the slice-5
-rebuild. An unresolved partial index on a NOT NULL column is dead on arrival:
+rebuild. [**SUPERSEDED 2026-09-01 — see §0:** at the **slice-4** rebuild. The
+vocabulary argument and every consequence below are unchanged; only the slice
+that performs the rebuild moved, so the dead-index reasoning applies from
+slice 4 onward rather than from slice 5.]
+An unresolved partial index on a NOT NULL column is dead on arrival:
 its `WHERE source_revision_id IS NULL` can never match a row. An earlier draft
 listed the pair here anyway, having been written before the vocabulary was
 tightened. Nothing would have failed — which is the problem, since a dead
