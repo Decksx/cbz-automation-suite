@@ -1339,66 +1339,58 @@ transaction — which is also what runs the §8.3 child check over all 58,437,
 making the reconciliation above an enforced invariant rather than a
 post-hoc audit.
 
-## 11.1 The candidate binding pass (slice 4 R14)
+### 11.1 Candidate attribution is explicitly NOT this slice's work
 
-Added 2026-09-01, when slice 4's design established that
+Added 2026-09-01, revised the same day. Slice 4's design establishes that
 `near_duplicate_candidates` must carry a non-NULL provenance basis from
-migration 015 while its authoritative source -- page evidence -- does not gain
+migration 015, while the page evidence it would inherit from does not gain
 ownership until this slice. A candidate created in the 4 -> 4p window
-therefore writes `unresolved_no_identity` on both sides, and **binding it is
-4p's work**. Recording that only in the slice-4 document would leave this one,
-the authoritative 4p design, stale.
+therefore writes `unresolved_no_identity` on both sides.
 
-**Flow**, in the same transaction as the rest of 4p, after every inventory is
-minted, sealed and reconciled:
+The first version of this section gave 4p a pass that would bind those sides
+afterwards. **That pass is withdrawn**, and this section exists to record why,
+so it is not reintroduced as an obvious piece of missing work.
 
-```text
-for each candidate side (a, b) whose page evidence has since bound:
-    unresolved_no_identity -> inherited_from_page_evidence
-```
-
-The transition is per side, and it is the exact pair slice 1 §9.4.2 names --
-no other source state transitions, so a `single_revision_inherited` side
-backfilled by 015 is left alone rather than relabelled. Until slice 6's
-`ND-01..ND-16` triggers land, this pair is enforced by the pass's own
-predicate, which is therefore load-bearing rather than defensive.
-
-**Reconciliation**, added to §11's `after` list:
+It could bind a candidate to page evidence it never compared:
 
 ```text
-every candidate side whose page evidence is bound carries
-  inherited_from_page_evidence and a non-NULL revision id
-every candidate side whose page evidence is NOT bound still carries
-  unresolved_no_identity and a NULL revision id
-no side moved from any other basis -- the count of sides carrying
-  single_revision_inherited is unchanged across the pass
-both sides' revision ids reference a revision of THAT side's archive,
-  which the composite foreign keys already enforce structurally
+candidate compares page set V1
+page hashing replaces it with V2
+4p mints the inventory for V2
+the pass assigns V2's revision to a candidate that compared V1
 ```
 
-**Tests**, added to §9's set:
+Nothing in the row distinguishes the two. `metrics()`
+(`near_duplicate.py:65-75`) stores distances, ratios and pixel areas -- no
+inventory id, no content signature, no page digest. The comparison's evidence
+generation is not recorded anywhere, so no pass can prove the binding it makes.
+
+**Consequences for this slice**, stated as the obligations 4p does and does
+not take on:
 
 ```text
-a candidate side bound by the pass carries inherited_from_page_evidence
-a candidate side whose page evidence is still unresolved is untouched
-a single_revision_inherited side is NOT relabelled by the pass
-the pass is idempotent: a second run changes zero rows
-a candidate created DURING the window carries unresolved_no_identity on
-  both sides before the pass, and is bound by it
+flow            unchanged. 4p mints, seals and reconciles inventories. It
+                performs no candidate attribution.
+reconciliation  one added assertion, and it is a NEGATIVE: the count of
+                candidate sides carrying each basis is IDENTICAL before and
+                after 4p. If 4p ever changes a candidate side, that is a
+                defect, and this is what detects it.
+tests           a candidate created during the window carries
+                unresolved_no_identity on both sides before 4p and STILL does
+                after it completes.
+recovery        unchanged. 4p adds no candidate obligation, so it adds no
+                candidate recovery step.
 ```
 
-**Recovery** is unchanged in kind: the pass runs inside 4p's single
-transaction, so a failure rolls back with the rest, and the fallback is
-restoration from the protected pre-migration backup. It adds no new recovery
-obligation, which is worth stating because a pass that ran outside the
-transaction would have added one.
+**The real fix belongs to slice 6.** An evidence anchor -- an inventory id or
+the compared content signature, per side, written at detection time -- would
+let a later pass prove what it was binding. Slice 6 already reopens this table
+for parameters and run provenance, which is where such a column belongs. It is
+a new ruling and neither this document nor slice 4's takes it.
 
-**Not taken here:** binding a candidate side by joining
-`archive_content_signatures` instead of page evidence. That would give the side
-a different provenance than slice 1 §8.2 assigns it -- signatures are
-stat-matched, page evidence is what the comparison actually read -- and would
-need `stat_matched_revision` in a vocabulary that does not contain it. It is a
-new ruling, and neither this document nor slice 4's takes it.
+Quiescence was also considered and rejected: it would require no page hashing
+between 015 and 4p, over an interval whose length is a scheduling decision,
+with no way to verify afterwards that it held.
 
 ---
 
