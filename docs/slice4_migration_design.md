@@ -97,9 +97,10 @@ R13  attribution transitions  EXACT PAIRS ONLY, per table (§7.4). The producer
                             is no explicitly-loaded inventory to inherit from.
                             From 4p to slice 6 it is load-bearing.
 R14  candidate attribution  no RETROSPECTIVE binding, ever: a candidate created
-                            between 015 and 4p stays unresolved permanently,
+                            between 015 and 4p is never bound by a pass,
                             because nothing records which page generation it
-                            compared. CONTEMPORANEOUS binding from 4p onward:
+                            compared; it can still be bound by a FRESH
+                            comparison whose payload matches (§7.6). CONTEMPORANEOUS binding from 4p onward:
                             the loader is given an explicit revision/inventory
                             (slice 2 PI-08), so each side binds at INSERT with
                             inherited_from_page_evidence. A pending unresolved
@@ -137,8 +138,9 @@ page_inventory bindings, deferred to 4p     58,437
 ```text
 slice 4   ownership keys, basis columns created NOT NULL, inspector version
           pair, results-immutability triggers, four table rebuilds
-slice 4p  page_inventory + archive_pages. No retrospective candidate pass;
-          contemporaneous candidate binding becomes possible here (R14).
+slice 4p  page_inventory + archive_pages, AND the detector change that
+          threads each inventory's revision into candidate persistence
+          (slice 2 §11.1). No retrospective pass (R14).
 slice 5   uniqueness / partial indexes, UPSERT -> append, supersession columns
           and lifecycle, identity immutability, the source_context guard, the
           attribution TRANSITION TRIGGERS (which need supersession columns),
@@ -957,12 +959,16 @@ inspection flow mirrors it statement for statement:
 3  revalidate the location: same location id, same archive_id, same path
    -- the hasher's _assert_still_current (hashing.py:468)
 4  re-stat the path and compare to the captured stat -- fail-fast, and
-   deliberately redundant: the hasher records that removing this one alone
-   fails no test, because step 6 subsumes it, and keeps it so a replacement
-   noticed early does not first write rows and enqueue work it must undo
-   (hashing.py:443-452). The same reasoning applies here, and is recorded
-   for the same reason: an overlap nobody wrote down gets deleted later as
-   dead weight.
+   deliberately redundant for correctness: step 6 subsumes it. It is kept
+   so a replacement noticed early does not first perform the ownership
+   lookup and the UPSERT and then roll them back. The hasher's own
+   version of this note says "enqueue work it must undo"
+   (hashing.py:443-452) because the hasher also enqueues a reinspection;
+   INSPECTION ENQUEUES NOTHING, so that clause does not carry over and
+   the saving here is only the wasted lookup, write and rollback. The
+   overlap is recorded rather than left implicit, for the reason the
+   hasher records its own: an overlap nobody wrote down gets deleted
+   later as dead weight.
 5  the ownership lookup and the measurement UPSERT
 6  RE-STAT THE PATH AFTER ALL WRITES AND IMMEDIATELY BEFORE COMMIT --
    the hasher's second _assert_file_matches (hashing.py:460-464). This is
@@ -1038,13 +1044,15 @@ clauses rather than a revision comparison.
 
 ```text
 INSERT branch  BEFORE 4p: both sides unresolved_no_identity with NULL
-               revisions, permanently (§7.6).
-               FROM 4p: each side binds to the revision of the inventory the
-               detector was explicitly given, basis
-               inherited_from_page_evidence. The detector must therefore carry
-               that revision/inventory id from the loader call into the write
-               -- it has the value already (slice 2 PI-08) but does not thread
-               it to the insert today, so this is a data-flow change.
+               revisions, and no pass ever binds them (§7.6). A fresh
+               matching comparison still can.
+               FROM 4p: each side takes its OWN inventory's state -- bound
+               -> inherited_from_page_evidence, unresolved ->
+               unresolved_no_identity -- so all four A/B combinations are
+               legal. The loader, the comparison result and the INSERT change
+               together to carry that per side; slice 2 §11.1 owns that
+               change, because enabling it there while disclaiming the
+               detector would leave the value known and unreachable.
 UPDATE branch  keeps its existing WHERE review_status = 'pending_review'
                guard, AND gains §7.2's payload predicate. Both must hold: a
                reviewed row is still never touched, and a pending row whose
@@ -1110,28 +1118,46 @@ page evidence it compared".
 
 ```text
 created 015 -> 4p    unresolved_no_identity on both sides, NULL revisions.
-                     Never retrospectively bound: the row does not record
-                     which generation it compared, and nothing later can
-                     supply that.
-created after 4p     each side binds AT INSERT to the revision of the
-                     inventory the detector was explicitly given, basis
-                     inherited_from_page_evidence. The evidence is in hand at
-                     write time, which is the whole difference.
-pending unresolved   may bind ONLY during a fresh comparison of those same
-  historical row      explicit inventories, and only when the complete
-                     recomputed payload matches the stored payload. Then the
-                     binding is contemporaneous with a comparison that
-                     actually happened, not a guess about an old one.
+                     Never bound by a retrospective pass: the row does not
+                     record which generation it compared.
+created after 4p     each side takes the state of the inventory the detector
+                     was explicitly given, INDEPENDENTLY PER SIDE (below).
+pending unresolved   may bind only during a FRESH comparison, and only when
+  historical row     the complete recomputed payload matches the stored
+                     payload. The binding then describes the inventories that
+                     fresh recomputation used -- not "the same" ones, because
+                     the historical row cannot prove sameness; the matching
+                     payload is what makes the new comparison an acceptable
+                     substitute for it.
 reviewed, or         stay unresolved. A reviewed row is never rewritten
   payload mismatch   (its UPDATE guard), and a payload that no longer matches
                      is evidence the comparison changed.
 ```
 
+**Post-4p does not mean bound.** `page_inventory.source_revision_id` is
+nullable (slice 2 line 338), its CHECK admits an `unresolved%` basis (line
+365), and slice 2 carries a partial index over `source_revision_id IS NULL`
+(line 391) — an unresolved inventory is a first-class state, and a drift
+inventory is exactly one. An explicitly loaded inventory may therefore have no
+revision to inherit, so each side resolves on its own:
+
+```text
+that side's inventory HAS a revision   -> revision_id, inherited_from_page_evidence
+that side's inventory is unresolved    -> NULL,        unresolved_no_identity
+```
+
+Independently per side, so all four A/B combinations are reachable and a
+half-bound candidate is a normal outcome rather than a defect. That is also
+what makes a fresh-comparison transition able to bind one side while leaving
+the other unresolved.
+
 **A slice-6 anchor does not change this.** An anchor written from slice 6
 onward helps future auditability; it cannot retroactively prove which evidence
 a row created before it compared. So it is not a deferred fix for the
-pre-4p rows — those stay unresolved permanently — and the previous revision was
-wrong to present it as one.
+pre-4p rows — no anchor makes a blind pass over them defensible — and the
+previous revision was wrong to present it as one. A fresh comparison remains
+the one path that can bind them, because it is a new producer action with
+evidence in hand.
 
 **The options, for the pre-4p rows specifically:**
 
@@ -1331,24 +1357,43 @@ R14 pre-4p stays unresolved  a candidate created before 4p carries
                              unresolved_no_identity on both sides, and STILL
                              does after 4p completes -- the negative that
                              proves no retrospective pass exists
-R14 post-4p binds at INSERT  a candidate created after 4p carries
-                             inherited_from_page_evidence and the revision of
-                             the inventory the detector was explicitly given,
-                             per side, without any later pass
+R14 post-4p, per side        ALL FOUR A/B combinations, since an explicitly
+                             loaded inventory may itself be unresolved:
+                               both inventories bound   -> both sides
+                                                           inherited_from_page_evidence
+                               A bound, B unresolved    -> mixed, and legal
+                               A unresolved, B bound    -> mixed, and legal
+                               both unresolved          -> both
+                                                           unresolved_no_identity
+                             A half-bound candidate is a normal outcome, so
+                             the mixed cases are asserted rather than assumed
+                             impossible
 R14 fresh-comparison bind    a pending unresolved historical row binds only
-                             when a fresh comparison of the same explicit
-                             inventories reproduces the stored payload
-                             completely; a payload mismatch leaves it
-                             unresolved, and a REVIEWED row is untouched
-                             either way
+                             when a fresh comparison reproduces the stored
+                             payload completely, and then only for the sides
+                             whose inventories are themselves bound -- so a
+                             one-sided transition is covered too. A payload
+                             mismatch leaves it unresolved, and a REVIEWED row
+                             is untouched either way
 inspection ownership         save() refuses outside a transaction; the HANDLER
                              opens and owns it, and a handler-level rollback
                              discards lookup, UPSERT and attribution together
-inspection post-read race    the file is replaced AFTER inspect_archive()
-                             returns but BEFORE commit: the transaction aborts
-                             and the stored inspection is unchanged. Proven by
-                             replacing the file between the two, which is the
-                             window the in-read before/after stat cannot see
+inspection race, EARLY        the file is replaced after inspect_archive()
+                             returns but BEFORE the transaction's first stat
+                             (step 4): the call fails fast, and no repository
+                             write happens at all
+inspection race, LATE         the file is replaced AFTER the UPSERT and before
+                             the final stat (step 6): the final guard aborts
+                             and the transaction rolls back, leaving the
+                             stored inspection unchanged.
+                             TWO TESTS, NOT ONE. A single test that replaces
+                             the file "sometime before commit" is caught by
+                             step 4 and stays green when step 6 is deleted --
+                             the exact injection-site failure this project has
+                             hit before. Bypassing step 6 ALONE must fail the
+                             LATE test by name, and bypassing step 4 alone
+                             must fail the EARLY test by name, with neither
+                             bypass failing the other's test
 R12 basis NOT NULL           an omitted basis is rejected on INSERT, on both
                              shapes, before the conflict branch, leaving the
                              evidence row unchanged
@@ -1647,7 +1692,7 @@ write would still pass while guarding nothing.
 **Single-writer threat model.** Recorded at `c666014`: one cooperating writer
 per namespace is an operational assumption, not a property of any path. §8.1 is
 that gate applied here — three defences with different reach, none a substitute
-for another. §10's frozen-producer-version window and §7.6's permanently unresolved
+for another. §10's frozen-producer-version window and §7.6's unresolved
 candidates are assumptions of the same kind, recorded the same way.
 
 ---
