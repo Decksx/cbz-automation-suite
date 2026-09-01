@@ -91,17 +91,20 @@ R13  attribution transitions  EXACT PAIRS ONLY, per table (§7.4). The producer
                             predicate carries this until each table's
                             transition trigger lands: slice 5 for signatures
                             and inspections, SLICE 6 for candidates
-                            (ND-01..ND-16). So the candidate predicate stays
-                            load-bearing across 4 -> 4p -> 5 -> 6, two slices
-                            longer than the others.
-R14  unresolved candidates  a candidate created between 015 and 4p writes
-                            unresolved_no_identity on BOTH sides and STAYS
-                            unresolved. The binding pass an earlier revision
-                            put in 4p is withdrawn: nothing in the row records
-                            which page generation the comparison read, so no
-                            pass can prove its binding (§7.6). An evidence
-                            anchor is the real fix and is a new ruling for
-                            slice 6, which already reopens this table.
+                            (ND-01..ND-16). The candidate predicate becomes
+                            ACTIVE AT 4p, not during 4 -> 4p: before 4p no
+                            code path performs that transition, because there
+                            is no explicitly-loaded inventory to inherit from.
+                            From 4p to slice 6 it is load-bearing.
+R14  candidate attribution  no RETROSPECTIVE binding, ever: a candidate created
+                            between 015 and 4p stays unresolved permanently,
+                            because nothing records which page generation it
+                            compared. CONTEMPORANEOUS binding from 4p onward:
+                            the loader is given an explicit revision/inventory
+                            (slice 2 PI-08), so each side binds at INSERT with
+                            inherited_from_page_evidence. A pending unresolved
+                            row binds only on a fresh comparison whose full
+                            payload matches the stored one (§7.6).
 R15  ledger precondition    refuse unless the pending protected set is exactly
                             {15} and every discovered version below 15 is
                             recorded (§12.1).
@@ -134,7 +137,8 @@ page_inventory bindings, deferred to 4p     58,437
 ```text
 slice 4   ownership keys, basis columns created NOT NULL, inspector version
           pair, results-immutability triggers, four table rebuilds
-slice 4p  page_inventory + archive_pages. NO candidate binding pass (R14).
+slice 4p  page_inventory + archive_pages. No retrospective candidate pass;
+          contemporaneous candidate binding becomes possible here (R14).
 slice 5   uniqueness / partial indexes, UPSERT -> append, supersession columns
           and lifecycle, identity immutability, the source_context guard, the
           attribution TRANSITION TRIGGERS (which need supersession columns),
@@ -927,17 +931,76 @@ required   inspect_archive() captures the path's stat BEFORE and AFTER reading
            one question.
 ```
 
+**That is necessary and not sufficient.** A before/after stat inside
+`inspect_archive()` proves only that the file held still *during the read*. It
+can be replaced after the function returns and before the commit:
+
+```text
+inspect V1 -> returns stat S
+file replaced with V2
+BEGIN IMMEDIATE
+lookup the hash row matching S
+UPSERT the inspection, bound to that revision
+COMMIT                      <- evidence about V1's bytes, attributed under a
+                               lock that never saw V2 arrive
+```
+
+The database lock cannot detect it: the archive is outside SQLite's
+transaction boundary. The hasher already carries the full discipline, and the
+inspection flow mirrors it statement for statement:
+
+```text
+1  carry the inspected PATH and the captured stat into the handler-owned
+   transaction (the handler has the path already -- handlers.py:43 --
+   but does not pass it onward today)
+2  BEGIN IMMEDIATE (handler)
+3  revalidate the location: same location id, same archive_id, same path
+   -- the hasher's _assert_still_current (hashing.py:468)
+4  re-stat the path and compare to the captured stat -- fail-fast, and
+   deliberately redundant: the hasher records that removing this one alone
+   fails no test, because step 6 subsumes it, and keeps it so a replacement
+   noticed early does not first write rows and enqueue work it must undo
+   (hashing.py:443-452). The same reasoning applies here, and is recorded
+   for the same reason: an overlap nobody wrote down gets deleted later as
+   dead weight.
+5  the ownership lookup and the measurement UPSERT
+6  RE-STAT THE PATH AFTER ALL WRITES AND IMMEDIATELY BEFORE COMMIT --
+   the hasher's second _assert_file_matches (hashing.py:460-464). This is
+   the check that closes the window above.
+7  ABORT and roll back on disappearance or any stat disagreement. A
+   deleted path raises from stat() rather than comparing, which is the
+   correct outcome.
+8  COMMIT
+```
+
 **(b) The write is not atomic.** `ArchiveInspectionRepository.save()` has no
 `require_transaction` and runs in autocommit, so the ownership lookup, the
 measurement UPSERT and any attribution update are three separate transactions.
 A crash between them leaves an inspection whose basis does not describe its
 own row.
 
+The previous revision said `save()` "takes BEGIN IMMEDIATE ownership... with
+the caller owning the transaction". Those cannot both be true, and the hasher
+shows which one is right — the split is unambiguous there:
+
 ```text
-required   save() takes BEGIN IMMEDIATE ownership the way ArchiveHashRepository
-           does -- require_transaction at the top, with the caller owning the
-           transaction and its rollback. Lookup, UPSERT and attribution become
-           one unit or none of them.
+handler      hashing.py:437   with transaction(self.connection):   <- OWNS it
+repository   hashing.py:126   require_transaction(self.connection) <- REFUSES
+                                                                      outside
+```
+
+```text
+required   InspectArchiveHandler opens the transaction and owns commit and
+           rollback. ArchiveInspectionRepository.save() only calls
+           require_transaction() and refuses outside one; it opens nothing.
+
+           This is a concrete interface change, not wording.
+           InspectArchiveHandler.__init__ receives `connection`
+           (handlers.py:29) but stores only
+           self.repository = ArchiveInspectionRepository(connection)
+           (handlers.py:33) -- it keeps no connection of its own and so
+           cannot open a transaction today. It must hold one, as the hash
+           handler does.
 ```
 
 **(c) The late-binding predicate is too weak.** §7.4's four clauses match on
@@ -974,9 +1037,14 @@ clauses rather than a revision comparison.
 `BEGIN IMMEDIATE` and upserts each selected comparison.
 
 ```text
-INSERT branch  both sides written unresolved_no_identity with NULL revisions,
-               per §7.6, and they STAY that way -- no pass binds them later,
-               because nothing records which page generation was compared.
+INSERT branch  BEFORE 4p: both sides unresolved_no_identity with NULL
+               revisions, permanently (§7.6).
+               FROM 4p: each side binds to the revision of the inventory the
+               detector was explicitly given, basis
+               inherited_from_page_evidence. The detector must therefore carry
+               that revision/inventory id from the loader call into the write
+               -- it has the value already (slice 2 PI-08) but does not thread
+               it to the insert today, so this is a data-flow change.
 UPDATE branch  keeps its existing WHERE review_status = 'pending_review'
                guard, AND gains §7.2's payload predicate. Both must hold: a
                reviewed row is still never touched, and a pending row whose
@@ -1026,37 +1094,65 @@ were bound "by the one-revision-per-archive census rather than from page
 evidence" (slice 1 §7.4). Any later pass binding those from page evidence would
 assign a provenance the comparison never used.
 
-**Ruling: an unresolved candidate side stays unresolved.** No binding pass
-exists in 4p or anywhere else in this plan.
+**Ruling: no RETROSPECTIVE binding, ever. Contemporaneous binding from 4p
+onward.** The distinction is between repairing a row whose evidence is
+unrecorded and attributing one whose evidence is in hand.
+
+An earlier draft of this section over-corrected into "every candidate insert is
+unresolved". That is wrong from 4p onward, because 4p changes what the detector
+knows. Slice 2 §8.6.2 gives the page loader an `explicit_revision/inventory`
+access path: "the caller must be *told* which generation, because there is no
+defensible default... the loader takes the revision or inventory id as an
+argument rather than inferring one" (`PI-08`). After 4p a comparison is
+therefore between two *named* inventories, and slice 1 §8.2 assigns exactly
+that case `inherited_from_page_evidence` — "each side takes the revision of the
+page evidence it compared".
 
 ```text
-during 4 -> 4p   a newly created candidate writes unresolved_no_identity on
-                 BOTH sides, with both revision ids NULL
-after 4p         it stays that way. Nothing binds it, because nothing can
-                 prove which page generation it compared.
+created 015 -> 4p    unresolved_no_identity on both sides, NULL revisions.
+                     Never retrospectively bound: the row does not record
+                     which generation it compared, and nothing later can
+                     supply that.
+created after 4p     each side binds AT INSERT to the revision of the
+                     inventory the detector was explicitly given, basis
+                     inherited_from_page_evidence. The evidence is in hand at
+                     write time, which is the whole difference.
+pending unresolved   may bind ONLY during a fresh comparison of those same
+  historical row      explicit inventories, and only when the complete
+                     recomputed payload matches the stored payload. Then the
+                     binding is contemporaneous with a comparison that
+                     actually happened, not a guess about an old one.
+reviewed, or         stay unresolved. A reviewed row is never rewritten
+  payload mismatch   (its UPDATE guard), and a payload that no longer matches
+                     is evidence the comparison changed.
 ```
 
-This removes work from 4p rather than adding it, and §10 resolves an
-unresolved side conservatively, so the cost is understated attribution rather
-than a wrong binding.
+**A slice-6 anchor does not change this.** An anchor written from slice 6
+onward helps future auditability; it cannot retroactively prove which evidence
+a row created before it compared. So it is not a deferred fix for the
+pre-4p rows — those stay unresolved permanently — and the previous revision was
+wrong to present it as one.
 
-**The three options, and why this one.** The review named them:
+**The options, for the pre-4p rows specifically:**
 
 ```text
-require an evidence anchor   the real fix, and a NEW RULING: it needs a column
-                             this design does not add -- an inventory id or the
-                             compared content signature, per side, written at
-                             detection time. Slice 6 already reopens this table
-                             for parameters and run provenance, which is where
-                             an anchor belongs. Not taken here.
-enforce quiescence           rejected. It would require no page hashing between
+retrospective binding        REJECTED. Nothing records which generation was
+                             compared, so any pass would be a guess presented
+                             as a fact.
+enforce quiescence           REJECTED. It would require no page hashing between
                              015 and 4p, across an interval whose length is an
-                             operator's scheduling decision, and nothing could
-                             enforce or verify it afterwards. An assumption
-                             that cannot be checked is not a defence.
+                             operator's scheduling decision, with no way to
+                             verify afterwards that it held. An assumption that
+                             cannot be checked is not a defence.
 leave them unresolved        TAKEN. Costs attribution on candidates created in
-                             the window; costs no correctness.
+                             one bounded window; costs no correctness. §10
+                             resolves an unresolved side conservatively, so
+                             this understates rather than overstates.
 ```
+
+An evidence anchor written at detection time remains worth having for
+auditability, and slice 6 already reopens this table — but as future-facing
+provenance, not as a repair for these rows.
 
 ## 8. Concurrency protocol
 
@@ -1231,11 +1327,28 @@ hasher reordering (§7.1)     the revision exists before archive_hashes is
                              written; save() remains one transaction;
                              metadata_changed still reads file_locations before
                              the refresh
-R14 window                   a candidate created before 4p carries
+R14 pre-4p stays unresolved  a candidate created before 4p carries
                              unresolved_no_identity on both sides, and STILL
-                             does after 4p completes. The negative is the
-                             point: no pass binds it, because none can prove
-                             which page generation it compared
+                             does after 4p completes -- the negative that
+                             proves no retrospective pass exists
+R14 post-4p binds at INSERT  a candidate created after 4p carries
+                             inherited_from_page_evidence and the revision of
+                             the inventory the detector was explicitly given,
+                             per side, without any later pass
+R14 fresh-comparison bind    a pending unresolved historical row binds only
+                             when a fresh comparison of the same explicit
+                             inventories reproduces the stored payload
+                             completely; a payload mismatch leaves it
+                             unresolved, and a REVIEWED row is untouched
+                             either way
+inspection ownership         save() refuses outside a transaction; the HANDLER
+                             opens and owns it, and a handler-level rollback
+                             discards lookup, UPSERT and attribution together
+inspection post-read race    the file is replaced AFTER inspect_archive()
+                             returns but BEFORE commit: the transaction aborts
+                             and the stored inspection is unchanged. Proven by
+                             replacing the file between the two, which is the
+                             window the in-read before/after stat cannot see
 R12 basis NOT NULL           an omitted basis is rejected on INSERT, on both
                              shapes, before the conflict branch, leaving the
                              evidence row unchanged
@@ -1281,9 +1394,6 @@ inspection stat measured     inspect_archive captures the path's real stat
                              stored inspected_file_size /
                              inspected_modified_time_ns come from THAT, not
                              from the caller's file_locations parameter
-inspection atomicity         save() refuses outside a transaction; lookup,
-                             UPSERT and attribution commit together or not at
-                             all
 inspection first write       inspector_version_basis = 'known' with a non-NULL
                              version, never 'unknown_legacy'
 late binding is stat-gated   an unresolved inspection whose recorded stat
