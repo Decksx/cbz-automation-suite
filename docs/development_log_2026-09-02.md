@@ -7,10 +7,15 @@ Scope is section 4 of `docs/slice4_migration_design.md` and its tests only.
 No migration 015, no producer change, no production access.
 `G:\ComicAutomation\` was not opened.
 
-Two review rounds. Round 1 landed the guard; round 2 fixed a **fail-open**
-defect round 1 had shipped, and corrected two durable-evidence claims that
-were wrong. Both rounds are recorded, because a log that only shows the
-final state cannot be told apart from one where nothing went wrong.
+Three review rounds, all recorded. Round 1 landed the guard. Round 2 fixed a
+**fail-open** defect round 1 had shipped and corrected two wrong
+durable-evidence claims. Round 3 showed that round 2's own bypass evidence was
+wrong -- a guard reported as unobservable was observable under a stronger
+scenario -- and that the call-site census was both too narrow and untested.
+
+Each round found the previous round's evidence weaker than it claimed. That is
+the point of writing all three down: a log that shows only the final state
+cannot be told apart from one where nothing went wrong.
 
 ## What landed
 
@@ -22,7 +27,7 @@ comic_automation/database/protected_migrations.py   new    the declaration,
 comic_automation/database/migrations.py             +33    applies from the
                                                            snapshot the guard
                                                            judged
-tests/test_protected_migrations.py                  new    46 tests
+tests/test_protected_migrations.py                  new    54 tests
 tests/test_archive_fault_injection.py               +13    version derivation
                                                            re-pointed
 tests/test_archive_revisions.py                     +26    stale patch target
@@ -57,9 +62,7 @@ takes a connection and a directory and answers a question about them.
 
 ### The snapshot is not the fix by itself
 
-The obvious reading -- "one snapshot closes it" -- is wrong, and the wrong
-reading is the dangerous one, because it invites dropping the other two
-layers. Three independent things stand between a stale plan and protected SQL:
+Three independent things stand between a stale plan and protected SQL:
 
 ```text
 1  the guard        refuses while a protected version is pending
@@ -69,30 +72,58 @@ layers. Three independent things stand between a stale plan and protected SQL:
                     itself, immediately before any SQL runs
 ```
 
-Measured by peeling them apart against the review's own scenario -- 015
-arrives the instant the single reading completes -- through the real
-`apply_migrations()`:
+Measured by peeling them apart against the real `apply_migrations()`, with a
+protected `015` **and** an unprotected `016` arriving the instant the single
+reading completes:
 
 ```text
-layers disabled                          outcome
-none                                     [1]      015 not applied
-re-scan                                  [1]      015 not applied
-plan filter                              [1]      015 not applied
-plan filter + re-scan                    REFUSED  invariant fired
-plan filter + invariant                  [1]      015 not applied
-plan filter + invariant + re-scan        [1, 15]  THE REPORTED DEFECT
+layers disabled                       outcome
+none                                  [1]          015 and 016 excluded
+re-scan                               [1, 16]      R6 VIOLATED
+plan filter                           [1]
+invariant                             [1]
+plan filter + re-scan                 REFUSED      invariant fired
+plan filter + invariant + re-scan     [1, 15, 16]  protected SQL ran
 ```
 
-The review's exact result returns only with all three disabled together, and
-any one of them standing prevents it.
+Every layer is load-bearing on its own. None is sufficient: protected SQL
+actually executing still needs all three gone.
+
+### Round 2 got this table wrong, and how
+
+Round 2 ran the same peeling with **only** `015` arriving, and recorded that
+reintroducing the second scan alone was unobservable -- filing it as defence in
+depth rather than a guard. With only the protected file arriving, the plan
+filter drops it, the invariant finds nothing protected, and the run applies
+`[1]` either way, so the bypass genuinely produced no failure.
+
+Review supplied the stronger scenario. With `016` sitting above the protected
+version, the same bypass gives:
+
+```text
+result [1, 16]
+ledger [(1, ...), (16, '016_after_protected.sql')]
+tables [..., 'ordinary_016_ran', ...]
+```
+
+No protected SQL executed, and R6 was still violated: the run **skipped a
+protected migration and carried on past it**, which design section 4.2 forbids
+in those words.
+
+The generalisable finding, which is the reason this is in the log rather than
+only in the diff: **"no protected SQL ran" is a weaker property than "refuse
+rather than skip and continue", and a test asserting only the weaker one reads
+exactly like a test asserting both.** That is how a real defect spent a review
+round wearing the label "defence in depth". The round-2 docstring that recorded
+the bypass as unobservable was itself the artifact of the too-weak scenario.
 
 ## Test count, reconciled
 
 ```text
 master 4bdc5d9   2065 passed, 2 skipped   (recorded in the slice 4A handoff)
-this branch      2111 passed, 2 skipped
-delta            +46 passed, +0 skipped
-tests added      46, all in tests/test_protected_migrations.py
+this branch      2119 passed, 2 skipped
+delta            +54 passed, +0 skipped
+tests added      54, all in tests/test_protected_migrations.py
 ```
 
 The skip count is unchanged, deliberately. An intermediate round-1 revision
@@ -106,7 +137,7 @@ Python 3.11.3, Windows checkout, `python -m pytest -q`, clean tree.
 ## Guard-bypass evidence
 
 Each guard disabled **alone**, with every other guard in place, full suite run
-against the bypass. Baseline for every row: `2111 passed, 2 skipped`.
+against the bypass. Baseline for every row: `2119 passed, 2 skipped`.
 
 ```text
 B1   apply_migrations() no longer calls the guard          9 failing
@@ -146,40 +177,54 @@ B8   authorization accepts an unnamed operator             1 failing
        test_an_authorization_must_name_its_operator
 
 B9   apply plan stops filtering protected versions         1 failing
-       test_a_recorded_protected_version_stays_out_of_the_apply_plan
+       test_a_pending_protected_version_stays_out_of_the_apply_plan
 
 B10  apply-set invariant removed                           1 failing
        test_a_broken_plan_builder_is_stopped_before_any_sql_runs
 
-B11  snapshot discovery re-scans instead of being reused   0 failing
-       DEFENCE IN DEPTH. Not independently observable. See below.
+B11  snapshot discovery re-scans instead of being reused   1 failing
+       test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan
+       (0 failing in round 2 -- see "Round 2 got this table wrong")
 
 B12  duplicate versions collapse silently again            3 failing
        test_two_files_claiming_one_version_are_refused
        test_a_duplicated_protected_version_is_refused_as_ambiguous
        test_apply_migrations_refuses_a_duplicate_version_directory
+
+B13  census source discovery replaced by a fixed answer    9 failing
+       test_the_census_recognizes_every_import_form
+       test_the_census_scans_every_production_directory
+       test_the_census_skips_the_tests_tree
+       test_the_census_ignores_an_independent_implementation
+       test_the_census_ignores_strings_and_comments
+       test_the_census_rejects_a_form_it_cannot_classify
+       test_the_census_rejects_a_bare_call_it_cannot_source
+       test_the_census_refuses_a_file_it_cannot_parse
+       test_the_census_detects_a_caller_the_root_map_does_not_list
 ```
 
-B8 in round 1 was the seam's missing-file check, which was unreachable and has
+Round 1's B8 was the seam's missing-file check, which was unreachable and has
 since been **deleted** rather than kept -- with the snapshot, every pending
 version comes out of `snapshot.discovered` by construction, so nothing is left
-for it to catch. B8 is now the non-empty-operator refusal, which review
-correctly pointed out was a guard with no bypass row at all.
+for it to catch. B8 is now the non-empty-operator refusal, which round 2
+review correctly pointed out was a guard with no bypass row at all.
 
-### B11 fails nothing, and that is reported rather than fixed up
+**Every guard now fails at least one named test when disabled alone.** No row
+is filed as unreachable or as defence in depth; the two that were, in rounds 1
+and 2, are recorded below as the mistakes they were.
 
-Re-introducing the second scan on its own applies no protected migration,
-because layers 2 and 3 above still hold. It was tempting to write a test that
-reaches it by disabling something else at the same time; that would be a
-bypass of two guards reported as one, which is the thing the injection-site
-gate exists to stop. The peeling table above is the honest form of the same
-evidence.
+### Round 3's finding: B11 was a real guard reported as a cushion
 
-An earlier draft of
-`test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan`'s docstring
-claimed the bypass would fail it. It does not. The docstring now says so
-outright -- a comment asserting a bypass result that was never measured is
-worse than no comment, because it is read as evidence.
+Covered above under "Round 2 got this table wrong". Recorded here as well
+because it belongs in the bypass record and not only in the design narrative:
+B11 moved from `0 failing` to `1 failing` with no change to the guard at all.
+Only the test's scenario changed, from planting `015` alone to planting `015`
+and an unprotected `016`.
+
+A bypass row of `0 failing` means one of two things, and they are not
+distinguishable by looking at the number: the guard is genuinely unreachable,
+or the tests are too weak to reach it. Round 2 assumed the first and wrote it
+down. The second was true.
 
 ### Round 1's two zero-failure findings
 
@@ -232,11 +277,12 @@ this change.
 ## Platform-specific measurements
 
 None. The guard is set arithmetic over migration filenames plus a
-`sqlite_master` lookup. The suite counts above are from a Windows checkout on
-Python 3.11.3, and CI runs the same suite on `windows-latest` / 3.11, so they
-are not a cross-platform claim either way. Review's paired Linux / Python 3.12
-run confirmed the same `+46` delta against a baseline carrying 198
-platform-dependent failures on both sides.
+`sqlite_master` lookup, and an AST walk over source files. The suite counts
+above are from a Windows checkout on Python 3.11.3, and CI runs the same suite
+on `windows-latest` / 3.11, so they are not a cross-platform claim either way.
+Review's paired Linux / Python 3.12 runs confirmed the branch delta on that
+platform too, against a baseline carrying 198 platform-dependent failures on
+both sides.
 
 ## Line endings
 
@@ -252,13 +298,17 @@ Every changed blob is `i/lf`. Measured with `git show <rev>:<path>`:
 ```text
 file                                                  LF lines      CR bytes
 comic_automation/database/migrations.py               125 -> 158     0 -> 0
-comic_automation/database/protected_migrations.py     new, 494       0
-tests/test_protected_migrations.py                    new, 1548      0
+comic_automation/database/protected_migrations.py     new, 506       0
+tests/test_protected_migrations.py                    new, 1934      0
 tests/test_archive_fault_injection.py                 765 -> 778     0 -> 0
 tests/test_archive_revisions.py                      1479 -> 1505    0 -> 0
-docs/engineering_decisions.md                         507 -> 635     0 -> 0
+docs/engineering_decisions.md                         507 -> 662     0 -> 0
 docs/development_log_2026-09-02.md                    new            0
 ```
+
+(This file's own LF count is not listed: it is the file being written, so
+any figure here would be measuring a draft. Its CR count is 0, which is the
+part that is checkable and the part that matters.)
 
 **CR bytes `0 -> 0` is the claim that matters**: no edit introduced a carriage
 return into an LF blob, so nothing was normalized and no file moved toward
@@ -268,25 +318,79 @@ is entirely `i/lf`, and `tests/` is 77 `i/lf` to 3 `i/crlf`.
 
 `git diff --check` with the git-derived exclusions (45 files) exits 0.
 
-## A claim that was removed rather than repaired
+## The call-site census, corrected twice
 
-`test_every_entry_point_points_at_the_protected_root()` said in round 1 that a
-twelfth `apply_migrations()` call site would fail its count assertion. It would
-not have: the assertion counted a dictionary written by hand in the test, which
-is length 11 whatever the source tree does. The claim was future-detection
+Round 1 claimed that a twelfth `apply_migrations()` call site would fail
+`test_every_entry_point_points_at_the_protected_root`'s count assertion. It
+would not have: the assertion counted a dictionary written by hand in the
+test, which is length 11 whatever the source tree does. Future-detection
 theatre.
 
-It is now backed by `_apply_migrations_call_sites()`, an AST census of
-`comic_automation/` and `scripts/` that counts calls in modules importing
-`apply_migrations` from `comic_automation.database.migrations` -- which is what
-separates them from `scripts/db.py`'s independent implementation of the same
-name, and from the definition itself. The census is compared against the
-hand-written root map, so a new caller makes the two sets differ. It has its
-own fault-injection test rather than being trusted.
+Round 2 replaced it with an AST census. Round 3 found that census had three
+defects, all of the same kind -- it answered a narrower question than its
+callers believed, and its own test could not tell.
 
-Parsed rather than grepped, so a call inside a string or comment cannot
-inflate the count and a line-wrapped call cannot escape it. Measured: 11
-modules, 11 calls, matching design section 4's list exactly.
+**Scope.** It walked `comic_automation/` and `scripts/` only. `apps/` exists
+in this repository and was outside the scan entirely, so an entry point there
+was invisible. It now walks the repository and removes only a skip list
+(`tests/`, caches, vendored trees), so a caller added under a directory
+invented later is inside the census by default rather than by amendment.
+
+**Import forms.** Only the bare call was counted. Measured by review:
+
+```text
+aliased direct import   imports_it=True    counted_calls=0
+module import           imports_it=False   counted_calls=0
+```
+
+All six forms that reach this function are now recognized -- bare, aliased,
+`from ...database import migrations`, that with an alias, `import ... as`, and
+the fully dotted call. A module defining its own `apply_migrations` and calling
+it bare still counts zero: that is `scripts/db.py`, out of scope by design
+section 4.1.
+
+Anything else naming `apply_migrations` in call position now raises
+`CensusError`, as does a file that cannot be read or parsed. Counting zero is
+the dangerous answer for a census whose entire job is to notice a caller
+nobody told it about, and an unparseable file is not a file with no callers.
+
+**The test.** `test_the_call_site_census_detects_a_new_caller` re-implemented
+the parsing predicates inline instead of calling the helper, so it passed while
+exercising none of the helper's code. Review proved it by replacing the helper
+with a fixed eleven-entry dictionary:
+
+```text
+2 passed
+```
+
+`_apply_migrations_call_sites()` now takes a root, and all eight census tests
+point the **real** function at an injected temporary source tree. The same
+fixed-dictionary substitution is bypass row B13 above and fails nine tests by
+name.
+
+Measured against the tree: 11 modules, 11 calls, matching design section 4's
+list exactly.
+
+## A docstring that described a state its own fixture ruled out
+
+`ordinary_apply_plan()` said its protected filter covered an "already
+recorded" protected version. It cannot: `pending()` subtracts the recorded set
+before the filter runs, so everything reaching it is pending and the guard
+would have refused the whole run over it.
+
+`test_a_recorded_protected_version_stays_out_of_the_apply_plan` was named for
+the same impossible state while its fixture set `recorded=frozenset()` --
+both versions pending. The test was always constructing the pending case; only
+its name and its explanation described the other one. Renamed to
+`test_a_pending_protected_version_stays_out_of_the_apply_plan`, and the source
+docstring now says what the filter actually is: a layer behind the guard for
+when the plan is not built from the snapshot the guard judged, which is
+necessary and not sufficient.
+
+Worth recording as a pattern rather than a typo. A comment describing a
+fixture state the code makes unreachable is not caught by any test, because
+the test passes for the real reason while its name advertises the imaginary
+one.
 
 ## Deliberately not done
 
