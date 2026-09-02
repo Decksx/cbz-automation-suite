@@ -570,13 +570,40 @@ are independent:
                     plan itself, immediately before any SQL runs
 ```
 
-Measured by peeling them apart against the original reproduction: the
-defect returns only with **all three** disabled together, and any one of
-them standing prevents it. With the filter gone and a second scan
-reintroduced, the invariant converts the silent application into a
-refusal. This means re-introducing the second scan on its own fails no
-test -- recorded as defence in depth rather than as a proven guard, the
-same way B8 was in the first round.
+Measured by peeling them apart. The first measurement used a scenario
+where only a protected `015` arrives after the guarded snapshot, and it
+produced a **wrong conclusion** that was written down here: that
+reintroducing the second scan on its own was unobservable, and therefore
+defence in depth rather than a guard in its own right.
+
+It is observable, and the scenario was too weak to see it. Adding an
+unprotected `016` above the protected version:
+
+```text
+layers disabled                       outcome
+none                                  [1]          015 and 016 excluded
+re-scan                               [1, 16]      R6 VIOLATED
+plan filter                           [1]
+invariant                             [1]
+plan filter + re-scan                 REFUSED      invariant fired
+plan filter + invariant + re-scan     [1, 15, 16]  protected SQL ran
+```
+
+With only the second scan reintroduced, the fresh scan sees
+`{1, 15, 16}`, the plan filter silently drops `015`, the invariant finds
+nothing protected, and `016` runs. No protected SQL executed and R6 was
+still violated: the run **skipped a protected migration and carried on
+past it**, which section 4.2 forbids in those words.
+
+The lesson is not about this guard. "No protected SQL ran" is a weaker
+property than "refuse rather than skip", and a test asserting only the
+weaker one reads exactly like a test asserting both. That is what made a
+real defect look like defence in depth for a whole review round.
+
+So all three layers are load-bearing, each failing a named test when
+disabled alone. What remains true is that no single one of them is
+sufficient: the deepest failure -- protected SQL actually executing --
+still needs all three gone.
 
 The invariant is deliberately not inside `ordinary_apply_plan()`. An
 invariant enforced only by the function that establishes it is that
