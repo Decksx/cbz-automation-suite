@@ -541,6 +541,68 @@ table as a side effect of asking a question.
 operator facing a pending 015 can still read the database -- which is most
 of what they will want to do. The refusal message names that path.
 
+### One reading, and three layers over it
+
+The first implementation asked twice. The guard scanned the migrations
+directory, returned, and `apply_migrations()` scanned again to build its
+apply list; a `015_*.sql` created between the two was invisible to the
+first and visible to the second, so an ordinary command applied a
+protected migration and wrote its ledger row. The protected-execution
+seam had the same shape, comparing a pending set from one scan against
+paths from another.
+
+`MigrationSnapshot` is one frozen reading of the directory and the
+ledger, and the guard, the apply plan and the seam all derive from it.
+The incoherent shape is unrepresentable rather than merely discouraged:
+no function here takes a connection and a directory and answers a
+question about them.
+
+Coherence is **not** the only thing standing between a stale plan and
+protected SQL, and it is worth being exact about that, because the
+obvious reading -- "the snapshot is the fix" -- is wrong. Three layers
+are independent:
+
+```text
+1  the guard        refuses while a protected version is pending
+2  the plan filter  ordinary_apply_plan() excludes protected versions
+                    however the snapshot it was built from was obtained
+3  the invariant    assert_no_protected_in_apply_set() re-checks the
+                    plan itself, immediately before any SQL runs
+```
+
+Measured by peeling them apart against the original reproduction: the
+defect returns only with **all three** disabled together, and any one of
+them standing prevents it. With the filter gone and a second scan
+reintroduced, the invariant converts the silent application into a
+refusal. This means re-introducing the second scan on its own fails no
+test -- recorded as defence in depth rather than as a proven guard, the
+same way B8 was in the first round.
+
+The invariant is deliberately not inside `ordinary_apply_plan()`. An
+invariant enforced only by the function that establishes it is that
+function checking its own output, and a rewrite of the builder carries
+the check away with it.
+
+### Two files may not claim one version
+
+`schema_migrations.version` is an INTEGER PRIMARY KEY, so `015_a.sql`
+and `015_b.sql` describe a state the ledger cannot represent: one of the
+two could never be recorded. The version-to-path mapping used to be a
+dictionary comprehension, which kept whichever file sorted last and
+dropped the other in silence -- so which of two migrations ran was
+decided by filename order, and the loser was left permanently unapplied
+*and* unrecorded.
+
+`take_migration_snapshot()` refuses instead, with `AmbiguousMigrationError`.
+This does change ordinary behaviour: a duplicate-version directory used
+to half-apply and now refuses outright. That is a fix, not a regression,
+and it is written down here because "ordinary migrations are unaffected"
+is otherwise a claim with a quiet exception. The error is a separate type
+from `ProtectedMigrationError` because a malformed directory is a
+different condition, and a duplicated *protected* id must not be reported
+as "a protected migration is pending" -- that would send an operator to
+the protected executor to run a file that cannot be identified.
+
 ### The limits, which are the part worth writing down
 
 `resolve_protected_execution()` is a seam, not an executor. It resolves
@@ -564,8 +626,10 @@ The two roots are disjoint today and that is asserted by tests rather than
 assumed -- including that all eleven call sites resolve to the guarded root
 and that no protected id sits under the unguarded one.
 
-The `missing`-file check inside `resolve_protected_execution()` is
-**unreachable** given the set equality above it, and bypassing it alone
-fails nothing. It is kept as an assertion against a future pending-set
-computation that stops deriving from the files on disk, and is recorded as
-unreachable rather than counted as a proven guard.
+The `missing`-file check that used to sit inside
+`resolve_protected_execution()` is **gone**. It was unreachable given the
+set equality above it, and bypassing it alone failed nothing. Once the
+seam took a snapshot, every pending version came out of
+`snapshot.discovered` by construction, so there was no longer even a
+hypothetical path for it to catch -- and unreachable code kept "just in
+case" reads to the next person as a guard that works.
