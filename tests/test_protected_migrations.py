@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from comic_automation.database import protected_migrations
 from comic_automation.database import read_guards
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import (
@@ -397,6 +398,41 @@ def test_a_refusal_mutates_neither_schema_nor_ledger(
             apply_migrations(connection, protected_root)
 
     assert _schema_and_ledger(database_path) == before
+
+
+def test_a_refusal_on_a_fresh_database_creates_no_ledger(
+    tmp_path: Path,
+) -> None:
+    """The refusal path of `apply_migrations()` itself creates nothing.
+
+    Distinct from
+    `test_asking_the_question_does_not_create_the_ledger`, which calls the
+    guard directly, and from
+    `test_a_refusal_mutates_neither_schema_nor_ledger`, whose database
+    already has a ledger so `ensure_migration_table()` is a no-op there.
+    Neither of those notices where the guard sits relative to
+    `ensure_migration_table()`, and moving it after that call failed no
+    test until this one existed -- found by bypassing the ordering and
+    watching nothing break.
+
+    A fresh database is the only state that can tell the two orderings
+    apart: refusing *after* ensure_migration_table() leaves behind a
+    schema_migrations table created by a run that applied nothing.
+    """
+    protected = _protected_version()
+    database_path = tmp_path / "comics.db"
+    root = _migration_root(tmp_path, (1, protected))
+
+    with database_connection(database_path) as connection:
+        assert "schema_migrations" not in _table_names(connection)
+
+        with pytest.raises(ProtectedMigrationError):
+            apply_migrations(connection, root)
+
+        assert _table_names(connection) == set(), (
+            "a refusing run created schema objects; the guard must be "
+            "checked before ensure_migration_table()"
+        )
 
 
 def test_apply_migrations_resumes_once_the_protected_version_is_recorded(
@@ -906,28 +942,43 @@ def test_the_seam_refuses_an_authorization_that_is_not_pending(
 
 def test_the_seam_refuses_when_a_pending_version_is_unauthorized(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The other direction: something is pending that nobody approved.
 
-    A subset test would pass here, which is why the comparison is set
-    equality. Needs two protected versions to express, so this test skips
-    itself rather than silently asserting nothing while only one is
-    declared.
-    """
-    if len(PROTECTED_MIGRATIONS) < 2:
-        pytest.skip(
-            "needs two declared protected versions to express an "
-            "unauthorized-but-pending set"
-        )
+    A subset test passes the not-pending case above, so only this
+    direction can prove the comparison is set *equality* -- and it was
+    unproven until this test stopped skipping: replacing the equality with
+    `authorization.versions <= pending` failed no test at all.
 
-    versions = sorted(PROTECTED_MIGRATIONS)[:2]
+    Expressing it needs two pending protected versions, which today's
+    declaration cannot supply. The *declaration* is therefore what gets
+    patched, not the mechanism: `is_protected` reads the module global at
+    call time, so both the pending-set computation and the
+    authorization's own validation see the extended policy, and the code
+    under test is the shipped code.
+    """
+    protected = _protected_version()
+    second = max(PROTECTED_MIGRATIONS) + 1
+    monkeypatch.setattr(
+        protected_migrations,
+        "PROTECTED_MIGRATIONS",
+        frozenset(PROTECTED_MIGRATIONS | {second}),
+    )
+
     database_path = tmp_path / "comics.db"
-    root = _migration_root(tmp_path, tuple(versions))
+    root = _migration_root(tmp_path, (protected, second))
 
     with database_connection(database_path) as connection:
+        # Both are pending; the authorization names only one of them.
+        assert pending_protected_versions(connection, root) == [
+            protected,
+            second,
+        ]
+
         with pytest.raises(ProtectedMigrationError):
             resolve_protected_execution(
-                connection, root, _authorization(versions={versions[0]})
+                connection, root, _authorization(versions={protected})
             )
 
 
