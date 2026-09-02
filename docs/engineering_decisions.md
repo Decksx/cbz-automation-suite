@@ -505,3 +505,67 @@ not exist yet.
 The docstring claimed protection outright until 2026-08-28 -- that "the
 name cannot be swapped" -- which is the kind of claim that stops someone
 adding the mechanism that would.
+
+## A migration too dangerous to run automatically is refused, not skipped
+
+Every migration under `comic_automation/database/migrations/` is applied
+on startup by `apply_migrations()`, which eleven CLI and service entry
+points call and which has no notion of approval, backup or postflight.
+That is right for a migration that adds a column and wrong for migration
+015, which rebuilds four evidence tables, binds 180,519 field projections
+from an approved plan artifact, cannot be re-run, and leaves no state any
+code here can read if it lands partially
+(`docs/slice4_migration_design.md` sections 5 and 8).
+
+`comic_automation/database/protected_migrations.py` declares such versions
+in `PROTECTED_MIGRATIONS`, and `apply_migrations()` **aborts** while any of
+them is pending. Three parts of that are decisions rather than mechanics.
+
+**Protection is a version number in source, not a filename convention and
+not a marker inside the .sql file.** A content marker fails in the
+dangerous direction: a file that omits it reads as unprotected and is
+applied silently. A missing entry in a frozenset is a diff.
+
+**It aborts the whole run rather than skipping the protected file.**
+Skipping and continuing would apply the unprotected migrations queued
+around it and report success, leaving the schema between two releases with
+no ledger row saying so, and leaving every entry point running producer
+code against a schema the operator believes is still pending. Refusal is
+also inert: the guard reads the ledger through its own
+`recorded_versions()` rather than `applied_versions()`, because the latter
+calls `ensure_migration_table()` and would make a refusing run create a
+table as a side effect of asking a question.
+
+**Failing closed is not failing blind.** The strictly read-only path
+(`database/read_guards.py`) is unaffected and never migrates, so an
+operator facing a pending 015 can still read the database -- which is most
+of what they will want to do. The refusal message names that path.
+
+### The limits, which are the part worth writing down
+
+`resolve_protected_execution()` is a seam, not an executor. It resolves
+which files an authorization covers and refuses unless the pending
+protected set equals the authorized set exactly. It enforces **none** of
+the rest of design sections 8 and 12: writer quiescence, the protected
+backup, plan-digest and expected-count revalidation, the ledger
+preconditions of section 12.1 steps 3-4, statement-by-statement
+application, the in-transaction ledger row, or the section 12.2
+reconciliation. A caller holding the resolved paths has been authorized and
+has satisfied none of those obligations. Recorded here, and not only in the
+docstring, because a limit visible only at the call site is invisible to
+anyone deciding whether to rely on the capability.
+
+The guard protects **one root**. It computes its pending set from the
+directory it is handed, so an entry point aimed at a different migrations
+directory would find no protected file, see an empty pending set and fail
+*open*, in silence. `scripts/db.py` has exactly such an independent root
+(`<repo root>/migrations`, applied with `executescript()` and no guard).
+The two roots are disjoint today and that is asserted by tests rather than
+assumed -- including that all eleven call sites resolve to the guarded root
+and that no protected id sits under the unguarded one.
+
+The `missing`-file check inside `resolve_protected_execution()` is
+**unreachable** given the set equality above it, and bypassing it alone
+fails nothing. It is kept as an assertion against a future pending-set
+computation that stops deriving from the files on disk, and is recorded as
+unreachable rather than counted as a proven guard.
