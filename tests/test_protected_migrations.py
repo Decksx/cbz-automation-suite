@@ -1104,53 +1104,207 @@ def _protected_files_under(root: Path) -> list[Path]:
     ]
 
 
-def _apply_migrations_call_sites() -> dict[str, int]:
-    """Census of every call to the package's `apply_migrations`.
+class CensusError(RuntimeError):
+    """The census met an `apply_migrations` reference it cannot classify.
 
-    Parsed rather than grepped, so a call inside a string or a comment
-    cannot inflate the count and a line-wrapped call cannot escape it.
-
-    A module qualifies only if it *imports* `apply_migrations` from
-    `comic_automation.database.migrations`, which is what separates the
-    guarded implementation from `scripts/db.py`'s independent one of the
-    same name (design section 4.1) and from the definition itself.
+    Raised rather than counted-as-zero. An unrecognized form is exactly
+    the case where a silent answer is dangerous: the census exists to
+    notice a caller nobody told it about, and quietly returning 0 for a
+    shape it does not understand would make it report "no new callers"
+    for the one situation it was written to catch.
     """
-    roots = (
-        REPOSITORY_ROOT / "comic_automation",
-        REPOSITORY_ROOT / "scripts",
-    )
+
+
+MIGRATIONS_MODULE = "comic_automation.database.migrations"
+MIGRATIONS_PARENT = "comic_automation.database"
+
+# Directories the census does not walk. `tests` is excluded because test
+# modules call `apply_migrations()` constantly and none of them is an
+# entry point; the rest are caches and vendored trees. Everything else in
+# the repository IS scanned -- `apps/`, `integrations/`, `tools/`,
+# `archive/` and any directory added later -- because "production source"
+# is not a synonym for "comic_automation and scripts", and an entry point
+# added under a new top-level directory is precisely the one that would
+# be missed.
+CENSUS_SKIP_DIRECTORIES = frozenset(
+    {
+        "tests",
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".tox",
+        ".eggs",
+        "node_modules",
+        "build",
+        "dist",
+    }
+)
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    """Render `a.b.c` from an attribute chain, or None if it is not one."""
+    parts: list[str] = []
+
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    return None
+
+
+def _count_apply_migrations_calls(label: str, tree: ast.Module) -> int:
+    """Calls to *this* `apply_migrations` in one parsed module.
+
+    Six import forms reach the same function and all six are recognized,
+    because counting only the one this repository happens to use today
+    would make the census agree with itself rather than with the tree:
+
+        from ...migrations import apply_migrations        -> bare call
+        from ...migrations import apply_migrations as run -> run(...)
+        from comic_automation.database import migrations   -> migrations.apply_migrations(...)
+        from comic_automation.database import migrations as m -> m.apply_migrations(...)
+        import comic_automation.database.migrations as mm  -> mm.apply_migrations(...)
+        import comic_automation.database.migrations        -> fully dotted call
+
+    A module defining its own `apply_migrations` and calling it bare is
+    counted as zero: that is `scripts/db.py`, whose independent
+    implementation over its own root is out of scope by design section
+    4.1 and must not be swept in.
+
+    Anything else naming `apply_migrations` in call position raises
+    `CensusError`.
+    """
+    function_aliases: set[str] = set()
+    module_aliases: set[str] = set()
+    dotted_module_imported = False
+    defines_its_own = False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == MIGRATIONS_MODULE:
+                for alias in node.names:
+                    if alias.name == "*":
+                        raise CensusError(
+                            f"{label}:{node.lineno} star-imports "
+                            f"{MIGRATIONS_MODULE}; the census cannot tell "
+                            "what that binds"
+                        )
+                    if alias.name == "apply_migrations":
+                        function_aliases.add(alias.asname or alias.name)
+            elif node.module == MIGRATIONS_PARENT:
+                for alias in node.names:
+                    if alias.name == "migrations":
+                        module_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == MIGRATIONS_MODULE:
+                    if alias.asname:
+                        module_aliases.add(alias.asname)
+                    else:
+                        dotted_module_imported = True
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "apply_migrations":
+                defines_its_own = True
+
+    calls = 0
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func = node.func
+
+        if isinstance(func, ast.Name):
+            if func.id in function_aliases:
+                calls += 1
+            elif func.id == "apply_migrations" and not defines_its_own:
+                raise CensusError(
+                    f"{label}:{node.lineno} calls apply_migrations() with "
+                    "no recognized import of it and no local definition"
+                )
+        elif isinstance(func, ast.Attribute) and (
+            func.attr == "apply_migrations"
+        ):
+            base = _dotted_name(func.value)
+
+            if isinstance(func.value, ast.Name) and (
+                func.value.id in module_aliases
+            ):
+                calls += 1
+            elif base == MIGRATIONS_MODULE and dotted_module_imported:
+                calls += 1
+            else:
+                raise CensusError(
+                    f"{label}:{node.lineno} calls "
+                    f"{base}.apply_migrations(), which the census cannot "
+                    "resolve to this module"
+                )
+
+    return calls
+
+
+def _apply_migrations_call_sites(
+    root: Path | None = None,
+) -> dict[str, int]:
+    """Census of every production call to the package's `apply_migrations`.
+
+    Walks `root` (the repository by default) and returns
+    ``{repo-relative posix path: call count}`` for modules that call this
+    `apply_migrations`.
+
+    `root` is a parameter so the fault-injection tests below can point the
+    **real** helper at a temporary source tree. An earlier version took no
+    argument and its "injection" test re-implemented the parsing predicates
+    inline, which meant the test passed while exercising none of the
+    helper's code -- review demonstrated it by replacing the helper with a
+    fixed eleven-entry dictionary and watching both census tests still
+    pass. Every census test below now calls this function.
+
+    Parsed rather than grepped, so a call inside a string or comment cannot
+    inflate the count and a line-wrapped call cannot escape it.
+    """
+    base = REPOSITORY_ROOT if root is None else root
     census: dict[str, int] = {}
 
-    for directory in roots:
-        for path in sorted(directory.rglob("*.py")):
-            tree = ast.parse(
-                path.read_text(encoding="utf-8"), filename=str(path)
-            )
+    for path in sorted(base.rglob("*.py")):
+        relative = path.relative_to(base)
 
-            imports_it = any(
-                isinstance(node, ast.ImportFrom)
-                and node.module == "comic_automation.database.migrations"
-                and any(
-                    alias.name == "apply_migrations" for alias in node.names
-                )
-                for node in ast.walk(tree)
-            )
+        if CENSUS_SKIP_DIRECTORIES & set(relative.parts):
+            continue
 
-            if not imports_it:
-                continue
+        label = relative.as_posix()
 
-            calls = sum(
-                1
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "apply_migrations"
-            )
+        # The definition itself, which is not a call site.
+        if label == "comic_automation/database/migrations.py":
+            continue
 
-            if calls:
-                census[
-                    path.relative_to(REPOSITORY_ROOT).as_posix()
-                ] = calls
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CensusError(
+                f"{label} could not be read as UTF-8 source ({exc}); the "
+                "census cannot certify a file it cannot parse"
+            ) from exc
+
+        try:
+            tree = ast.parse(source, filename=str(path))
+        except SyntaxError as exc:
+            raise CensusError(
+                f"{label}:{exc.lineno} failed to parse; the census cannot "
+                "certify a file it cannot parse"
+            ) from exc
+
+        calls = _count_apply_migrations_calls(label, tree)
+
+        if calls:
+            census[label] = calls
 
     return census
 
@@ -1228,9 +1382,17 @@ def test_every_entry_point_points_at_the_protected_root() -> None:
     The list below is written by hand, and an earlier revision claimed a
     twelfth call site would fail its count. It would not have: a
     hand-written dictionary is length 11 whatever the source tree does.
-    `_apply_migrations_call_sites()` is a real AST census of the tree, and
-    comparing the two is what actually detects a new caller -- the census
-    grows, the hand-written map does not, and the sets differ.
+    `_apply_migrations_call_sites()` is what supplies the other side of
+    the comparison -- the census grows when a caller is added, the
+    hand-written map does not, and the two sets differ.
+
+    That census walks the whole repository except the skip list, not
+    `comic_automation/` and `scripts/` as an earlier version did, and it
+    recognizes all six import forms rather than the single one this tree
+    happens to use. Both narrowings were real blind spots: an entry point
+    under `apps/` was outside the scan entirely, and an aliased or
+    module-qualified call counted zero. Its own behaviour is covered by
+    the census tests below, every one of which calls this same function.
     """
     from comic_automation.archive import cli as archive_cli
     from comic_automation.archive import duplicate_resolution_cli
@@ -1304,53 +1466,237 @@ def test_every_entry_point_points_at_the_protected_root() -> None:
     )
 
 
-def test_the_call_site_census_detects_a_new_caller(tmp_path: Path) -> None:
-    """Fault injection for the census, so it is not trusted on faith.
+def _write_source(root: Path, relative: str, source: str) -> Path:
+    """Write one module into an injected source tree."""
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    return path
 
-    The census is what makes the test above future-detecting rather than
-    decorative, so it needs its own proof that it sees a caller it has
-    not seen before. Parsed here from source text rather than by writing
-    a file into the package, which would pollute the tree the census
-    scans.
+
+def test_the_census_recognizes_every_import_form(tmp_path: Path) -> None:
+    """Six ways to reach the same function, all counted.
+
+    Run against the real `_apply_migrations_call_sites()` over an injected
+    tree, not against a re-implementation of its predicates. Review showed
+    why that matters: with the predicates duplicated in the test, the
+    helper could be replaced by a fixed dictionary and the census tests
+    still passed.
+
+    Two of these forms were measured as MISSED by the earlier census --
+    an aliased direct import counted 0 calls, and a module-qualified call
+    was not even recognized as importing anything.
     """
-    module = (
+    forms = {
+        "pkg/plain.py": (
+            "from comic_automation.database.migrations import "
+            "apply_migrations\n"
+            "def go(c, d):\n"
+            "    return apply_migrations(c, d)\n"
+        ),
+        "pkg/aliased.py": (
+            "from comic_automation.database.migrations import "
+            "apply_migrations as run\n"
+            "def go(c, d):\n"
+            "    return run(c, d)\n"
+        ),
+        "pkg/module_from.py": (
+            "from comic_automation.database import migrations\n"
+            "def go(c, d):\n"
+            "    return migrations.apply_migrations(c, d)\n"
+        ),
+        "pkg/module_alias.py": (
+            "from comic_automation.database import migrations as m\n"
+            "def go(c, d):\n"
+            "    return m.apply_migrations(c, d)\n"
+        ),
+        "pkg/import_as.py": (
+            "import comic_automation.database.migrations as mm\n"
+            "def go(c, d):\n"
+            "    return mm.apply_migrations(c, d)\n"
+        ),
+        "pkg/import_dotted.py": (
+            "import comic_automation.database.migrations\n"
+            "def go(c, d):\n"
+            "    return comic_automation.database.migrations."
+            "apply_migrations(c, d)\n"
+        ),
+    }
+
+    for relative, source in forms.items():
+        _write_source(tmp_path, relative, source)
+
+    census = _apply_migrations_call_sites(tmp_path)
+
+    assert census == {relative: 1 for relative in forms}
+
+
+def test_the_census_scans_every_production_directory(tmp_path: Path) -> None:
+    """Not just comic_automation/ and scripts/.
+
+    The earlier census hard-coded those two roots, so an entry point under
+    `apps/` -- which exists in this repository -- would have been invisible
+    to it. Scanning is directory-agnostic now, and the skip list is the
+    only thing that removes anything.
+    """
+    call = (
         "from comic_automation.database.migrations import apply_migrations\n"
-        "\n"
-        "def go(connection, directory):\n"
-        "    return apply_migrations(connection, directory)\n"
-    )
-    tree = ast.parse(module)
-
-    imports_it = any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "comic_automation.database.migrations"
-        and any(alias.name == "apply_migrations" for alias in node.names)
-        for node in ast.walk(tree)
-    )
-    calls = sum(
-        1
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "apply_migrations"
+        "def go(c, d):\n"
+        "    return apply_migrations(c, d)\n"
     )
 
-    assert imports_it and calls == 1
+    for relative in (
+        "apps/gui_launcher.py",
+        "integrations/sync.py",
+        "tools/oneoff.py",
+        "a_directory_invented_later/entry.py",
+    ):
+        _write_source(tmp_path, relative, call)
 
-    # And the shape the census must NOT count: scripts/db.py's own
-    # implementation, which is called without importing the package's.
-    other = ast.parse(
-        "def apply_migrations(conn, d):\n"
+    census = _apply_migrations_call_sites(tmp_path)
+
+    assert set(census) == {
+        "apps/gui_launcher.py",
+        "integrations/sync.py",
+        "tools/oneoff.py",
+        "a_directory_invented_later/entry.py",
+    }
+
+    # And the real repository's own extra directories are inside the scan,
+    # so this is not only true of the injected tree.
+    assert (REPOSITORY_ROOT / "apps").is_dir()
+    assert "apps" not in CENSUS_SKIP_DIRECTORIES
+
+
+def test_the_census_skips_the_tests_tree(tmp_path: Path) -> None:
+    """Test modules call apply_migrations constantly and are not callers."""
+    call = (
+        "from comic_automation.database.migrations import apply_migrations\n"
+        "def go(c, d):\n"
+        "    return apply_migrations(c, d)\n"
+    )
+    _write_source(tmp_path, "tests/test_something.py", call)
+    _write_source(tmp_path, "pkg/real.py", call)
+
+    assert _apply_migrations_call_sites(tmp_path) == {"pkg/real.py": 1}
+
+
+def test_the_census_ignores_an_independent_implementation(
+    tmp_path: Path,
+) -> None:
+    """`scripts/db.py`'s shape: its own function, its own root, no import.
+
+    Design section 4.1 settles that it is out of scope. If the census
+    counted it, the root map would have to list a twelfth entry pointing
+    at a directory the guard deliberately does not cover.
+    """
+    _write_source(
+        tmp_path,
+        "scripts/db.py",
+        "def apply_migrations(conn, migrations_dir):\n"
         "    return []\n"
         "\n"
-        "def go(conn, d):\n"
-        "    return apply_migrations(conn, d)\n"
+        "def initialize(conn, migrations_dir):\n"
+        "    return apply_migrations(conn, migrations_dir)\n",
     )
-    assert not any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "comic_automation.database.migrations"
-        for node in ast.walk(other)
+
+    assert _apply_migrations_call_sites(tmp_path) == {}
+
+
+def test_the_census_ignores_strings_and_comments(tmp_path: Path) -> None:
+    """Parsed, not grepped."""
+    _write_source(
+        tmp_path,
+        "pkg/prose.py",
+        "from comic_automation.database.migrations import apply_migrations\n"
+        "USAGE = 'call apply_migrations(connection, directory)'\n"
+        "# apply_migrations(connection, directory)\n"
+        "def go():\n"
+        '    """Docstring mentioning apply_migrations(c, d)."""\n'
+        "    return None\n",
     )
+
+    assert _apply_migrations_call_sites(tmp_path) == {}
+
+
+def test_the_census_rejects_a_form_it_cannot_classify(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized shape raises instead of counting zero.
+
+    Counting zero is the dangerous answer. The census exists to notice a
+    caller nobody told it about, so returning "no callers here" for a
+    shape it does not understand would make it silent in exactly the case
+    it was written for.
+    """
+    _write_source(
+        tmp_path,
+        "pkg/qualified.py",
+        "class Runner:\n"
+        "    def go(self, c, d):\n"
+        "        return self.apply_migrations(c, d)\n",
+    )
+
+    with pytest.raises(CensusError) as caught:
+        _apply_migrations_call_sites(tmp_path)
+
+    assert "self.apply_migrations()" in str(caught.value)
+
+
+def test_the_census_rejects_a_bare_call_it_cannot_source(
+    tmp_path: Path,
+) -> None:
+    """A bare call with neither an import nor a local definition."""
+    _write_source(
+        tmp_path,
+        "pkg/mystery.py",
+        "def go(c, d):\n"
+        "    return apply_migrations(c, d)\n",
+    )
+
+    with pytest.raises(CensusError):
+        _apply_migrations_call_sites(tmp_path)
+
+
+def test_the_census_refuses_a_file_it_cannot_parse(tmp_path: Path) -> None:
+    """Unparseable is not the same as callerless.
+
+    A file the census cannot read is a file it cannot certify, and
+    treating it as "no calls found" would let a syntax error hide an entry
+    point.
+    """
+    _write_source(tmp_path, "pkg/broken.py", "def go(:\n")
+
+    with pytest.raises(CensusError):
+        _apply_migrations_call_sites(tmp_path)
+
+
+def test_the_census_detects_a_caller_the_root_map_does_not_list(
+    tmp_path: Path,
+) -> None:
+    """The property `test_every_entry_point_points_at_the_protected_root`
+    depends on: a new caller makes the census and the hand-written map
+    disagree.
+
+    Asserted against the real helper on an injected tree, so replacing the
+    helper's body with a fixed answer fails this test rather than passing
+    it.
+    """
+    call = (
+        "from comic_automation.database.migrations import apply_migrations\n"
+        "def go(c, d):\n"
+        "    return apply_migrations(c, d)\n"
+    )
+    _write_source(tmp_path, "comic_automation/service.py", call)
+
+    before = _apply_migrations_call_sites(tmp_path)
+    assert set(before) == {"comic_automation/service.py"}
+
+    _write_source(tmp_path, "apps/newly_added_entry_point.py", call)
+
+    after = _apply_migrations_call_sites(tmp_path)
+
+    assert set(after) - set(before) == {"apps/newly_added_entry_point.py"}
 
 
 def test_the_protected_root_is_where_protected_ids_belong(
