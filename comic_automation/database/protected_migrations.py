@@ -254,11 +254,23 @@ class MigrationSnapshot:
     def ordinary_apply_plan(self) -> tuple[tuple[int, Path], ...]:
         """What an ordinary `apply_migrations()` run may apply, in order.
 
-        Protected versions are excluded here as well as refused by
-        `assert_no_pending_protected()`, because the two exclusions cover
-        different cases: the guard covers a *pending* protected version,
-        and this filter covers an *already recorded* one, which is not
-        pending and must still never be applied by this path.
+        The protected filter here is **not** covering a case the guard
+        misses, and an earlier version of this docstring claimed it was
+        -- it said the filter caught an already-recorded protected
+        version. It cannot: `pending()` has already dropped every
+        recorded version, so everything reaching this filter is pending,
+        and `assert_no_pending_protected()` would have refused the whole
+        run over it.
+
+        What it actually is, is a layer behind the guard for the case
+        where the plan is not built from the snapshot the guard judged.
+        Measured, not reasoned about: with a second directory scan
+        reintroduced at the plan and this filter removed, a protected
+        version reaches `assert_no_protected_in_apply_set()`; with the
+        invariant gone as well it reaches the database. With the filter
+        alone the same scan silently drops the protected version and
+        applies whatever sits above it, which is R6's 'skip and continue'
+        -- so this filter is necessary and is not sufficient.
         """
         return tuple(
             (version, self.discovered[version])
