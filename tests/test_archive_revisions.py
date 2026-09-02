@@ -32,6 +32,9 @@ import pytest
 
 from comic_automation.database import dal
 from comic_automation.database import migrations as migration_module
+from comic_automation.database import (
+    protected_migrations as protected_module,
+)
 from comic_automation.database.connection import connect_database
 from comic_automation.database.migrations import apply_migrations
 
@@ -55,17 +58,40 @@ def _apply_through(connection: sqlite3.Connection, version: int) -> None:
     as an upgrade. Applying every migration to an empty file exercises table
     creation but never the backfill, which is the part that touches existing
     rows and therefore the part that can lose them.
+
+    The patch targets `protected_module.discover_migrations`, not
+    `migration_module`'s. Discovery moved when the protected-migration
+    guard was made coherent: `apply_migrations` no longer scans the
+    directory itself, it asks `take_migration_snapshot()` for one reading,
+    and that function binds `discover_migrations` into
+    `protected_migrations`' namespace at import time. Patching the module
+    that *defines* the name therefore no longer reaches the call, and the
+    silent result was that this helper applied every migration instead of
+    stopping at `version`.
+
+    Which is why the outcome is asserted rather than assumed. The next time
+    that call site moves, this fails here with a message naming the helper
+    instead of surfacing as six unrelated backfill failures downstream.
     """
-    real = migration_module.discover_migrations
+    real = protected_module.discover_migrations
     try:
-        migration_module.discover_migrations = lambda directory: [
+        protected_module.discover_migrations = lambda directory: [
             path
             for path in real(directory)
             if migration_module.migration_version(path) <= version
         ]
         apply_migrations(connection, MIGRATIONS)
     finally:
-        migration_module.discover_migrations = real
+        protected_module.discover_migrations = real
+
+    highest = connection.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+    ).fetchone()[0]
+
+    assert highest == version, (
+        f"_apply_through({version}) left the schema at {highest}; the patch "
+        "no longer reaches the discovery call apply_migrations() uses"
+    )
 
 
 def _seed_schema_13(connection: sqlite3.Connection) -> None:
