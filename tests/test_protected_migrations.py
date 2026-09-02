@@ -649,6 +649,75 @@ def test_a_protected_file_arriving_after_the_guard_is_not_applied(
             apply_migrations(connection, root)
 
 
+def test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window the review's reproduction actually used.
+
+    `test_a_protected_file_arriving_after_the_guard_is_not_applied`
+    plants its file at `ensure_migration_table()`, which runs after the
+    plan has already been built. That proves the apply loop is coherent
+    with the plan; it says nothing about whether the PLAN is coherent
+    with the guard, and the gap between those two is where the original
+    defect lived. Injection here is at `take_migration_snapshot()`
+    itself, so the file lands the instant the single reading completes:
+    anything reading the directory again sees it, anything deriving from
+    the snapshot does not.
+
+    **This test does not prove snapshot coherence on its own, and saying
+    otherwise would be false.** Re-introducing the second scan fails no
+    test, because two further layers stand between a stale plan and any
+    protected SQL: `ordinary_apply_plan()` filters protected versions out
+    whatever it was built from, and `assert_no_protected_in_apply_set()`
+    re-checks the plan. Measured by peeling them one at a time -- the
+    review's exact result (``[1, 15]`` applied and ledgered) comes back
+    only with all three disabled together, and any one of them standing
+    prevents it. The table is in docs/development_log_2026-09-02.md.
+
+    What this test does pin is the outcome an operator sees: a protected
+    file appearing beside a running command neither gets applied nor
+    turns a legitimate run into a refusal. The second of those is why it
+    asserts success rather than merely the absence of migration 015.
+    """
+    protected = _protected_version()
+    database_path = tmp_path / "comics.db"
+    root = _migration_root(tmp_path, (1,))
+
+    real_take = protected_migrations.take_migration_snapshot
+    planted: list[Path] = []
+
+    def plant_after_the_single_reading(
+        connection: sqlite3.Connection,
+        directory: Path,
+    ) -> MigrationSnapshot:
+        snapshot = real_take(connection, directory)
+
+        if not planted:
+            planted.append(
+                _write_migration(root, protected, suffix="arrived_late")
+            )
+
+        return snapshot
+
+    monkeypatch.setattr(
+        protected_migrations,
+        "take_migration_snapshot",
+        plant_after_the_single_reading,
+    )
+
+    with database_connection(database_path) as connection:
+        applied = apply_migrations(connection, root)
+
+        assert planted and planted[0].is_file()
+        assert applied == [1]
+        assert set(applied_versions(connection)) == {1}
+        assert (
+            f"synthetic_{protected:03d}_arrived_late"
+            not in _table_names(connection)
+        )
+
+
 def test_a_refusal_mutates_neither_schema_nor_ledger(
     tmp_path: Path,
 ) -> None:
