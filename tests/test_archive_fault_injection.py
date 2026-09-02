@@ -36,6 +36,7 @@ from comic_automation.database.migrations import (
     discover_migrations,
     migration_version,
 )
+from comic_automation.database.protected_migrations import is_protected
 from scripts import cbz_library_maintenance
 from scripts.cbz_library_maintenance import write_comicinfo
 from tests import fault_injection as fi
@@ -624,6 +625,15 @@ def test_a_commit_failure_inside_a_migration_restores_the_tables(
     # migration claims that number -- which is exactly what happened when
     # 014 landed: the injected file was skipped, nothing raised, and the
     # test reported that no InjectedFailure occurred.
+    #
+    # Protected versions are then skipped over. The fixture below is a
+    # rollback probe that has to travel through apply_migrations() to
+    # reach the COMMIT this test injects at; landing on a protected
+    # version would make the protected-migration guard refuse the call
+    # before BEGIN IMMEDIATE, so the injected failure would never fire
+    # and the test would fail for a reason unrelated to rollback. That
+    # is not hypothetical -- deriving max+1 produced exactly 15, the
+    # first declared protected version, the moment the guard landed.
     injected_version = (
         max(
             migration_version(path)
@@ -631,6 +641,9 @@ def test_a_commit_failure_inside_a_migration_restores_the_tables(
         )
         + 1
     )
+
+    while is_protected(injected_version):
+        injected_version += 1
     _write_migration(
         directory,
         injected_version,
