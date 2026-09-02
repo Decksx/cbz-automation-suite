@@ -275,15 +275,23 @@ def test_a_recorded_protected_migration_is_no_longer_pending(
     assert_no_pending_protected(snapshot)
 
 
-def test_a_recorded_protected_version_stays_out_of_the_apply_plan(
+def test_a_pending_protected_version_stays_out_of_the_apply_plan(
     tmp_path: Path,
 ) -> None:
-    """The plan's protected filter covers the case the guard cannot.
+    """The plan's protected filter, on the state it actually sees.
 
-    A recorded protected version is not *pending*, so the guard has
-    nothing to say about it -- and it must still never be re-applied by
-    the ordinary path. The filter in `ordinary_apply_plan()` is what
-    covers that, and this is the only test that can see it.
+    An earlier name and docstring said this covered an *already
+    recorded* protected version. It cannot: `pending()` subtracts the
+    recorded set before the filter runs, and this fixture's
+    `recorded=frozenset()` says so -- both versions here are pending.
+    The test was always constructing the pending case; only its name
+    and its explanation described the other one.
+
+    What it proves is the filter's real job: a pending protected version
+    is kept out of the plan even though the guard would have refused the
+    run over it anyway. That redundancy is the point, because the plan
+    is not always built from the snapshot the guard judged -- see
+    `test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan`.
     """
     protected = _protected_version()
     root = _migration_root(tmp_path, (1, protected))
@@ -293,9 +301,8 @@ def test_a_recorded_protected_version_stays_out_of_the_apply_plan(
             1: root / "001_synthetic.sql",
             protected: root / f"{protected:03d}_synthetic.sql",
         },
-        # Neither is recorded, so both are pending; only the protected
-        # one may be filtered out.
         recorded=frozenset(),
+
     )
 
     assert snapshot.pending() == [1, protected]
@@ -653,34 +660,43 @@ def test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The window the review's reproduction actually used.
+    """A second scan is observable, and this is what observes it.
 
     `test_a_protected_file_arriving_after_the_guard_is_not_applied`
-    plants its file at `ensure_migration_table()`, which runs after the
-    plan has already been built. That proves the apply loop is coherent
-    with the plan; it says nothing about whether the PLAN is coherent
-    with the guard, and the gap between those two is where the original
-    defect lived. Injection here is at `take_migration_snapshot()`
-    itself, so the file lands the instant the single reading completes:
-    anything reading the directory again sees it, anything deriving from
-    the snapshot does not.
+    plants its file at `ensure_migration_table()`, after the plan is
+    built, so it covers the plan-to-loop window. This one injects at
+    `take_migration_snapshot()` itself, covering the guard-to-plan
+    window -- where the reported defect lived.
 
-    **This test does not prove snapshot coherence on its own, and saying
-    otherwise would be false.** Re-introducing the second scan fails no
-    test, because two further layers stand between a stale plan and any
-    protected SQL: `ordinary_apply_plan()` filters protected versions out
-    whatever it was built from, and `assert_no_protected_in_apply_set()`
-    re-checks the plan. Measured by peeling them one at a time -- the
-    review's exact result (``[1, 15]`` applied and ledgered) comes back
-    only with all three disabled together, and any one of them standing
-    prevents it. The table is in docs/development_log_2026-09-02.md.
+    **Two files are planted, and the second one is the whole point.**
+    With only 015 arriving, reintroducing the second scan changes
+    nothing observable: the plan filter drops 015, the invariant sees no
+    protected version, and the run applies [1] either way. An earlier
+    revision of this test planted only 015 and therefore passed under
+    that bypass, and its docstring went as far as recording the bypass
+    as unobservable. It is observable. Adding an UNPROTECTED 016 above
+    the protected version is what shows it:
 
-    What this test does pin is the outcome an operator sees: a protected
-    file appearing beside a running command neither gets applied nor
-    turns a legitimate run into a refusal. The second of those is why it
-    asserts success rather than merely the absence of migration 015.
+        with the second scan reintroduced, the fresh scan sees
+        {1, 15, 16}, the filter silently drops 015, the invariant finds
+        nothing protected, and 016 runs --
+
+            result [1, 16]
+            ledger [(1, ...), (16, '016_after_protected.sql')]
+
+    No protected SQL executed, and R6 was still violated: the run
+    skipped a protected migration and carried on past it, which is the
+    behaviour section 4.2 names explicitly. 'No protected SQL ran' is a
+    weaker property than the one required, and testing only the weaker
+    one is how the bypass came back clean.
     """
     protected = _protected_version()
+    above = protected + 1
+    assert not is_protected(above), (
+        "this test needs an UNPROTECTED migration above the protected "
+        "one -- it is the one whose arrival a stale plan would apply"
+    )
+
     database_path = tmp_path / "comics.db"
     root = _migration_root(tmp_path, (1,))
 
@@ -693,9 +709,15 @@ def test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan(
     ) -> MigrationSnapshot:
         snapshot = real_take(connection, directory)
 
+        # Only on the first call, so a reintroduced second scan reads a
+        # directory that has changed rather than one that keeps
+        # changing under it.
         if not planted:
             planted.append(
                 _write_migration(root, protected, suffix="arrived_late")
+            )
+            planted.append(
+                _write_migration(root, above, suffix="after_protected")
             )
 
         return snapshot
@@ -709,14 +731,32 @@ def test_the_plan_comes_from_the_guarded_snapshot_not_a_fresh_scan(
     with database_connection(database_path) as connection:
         applied = apply_migrations(connection, root)
 
-        assert planted and planted[0].is_file()
+        assert planted and all(path.is_file() for path in planted)
+
+        tables = _table_names(connection)
+
+        # The run applied exactly the plan the guard judged.
         assert applied == [1]
         assert set(applied_versions(connection)) == {1}
+
+        # The protected migration did not run ...
         assert (
-            f"synthetic_{protected:03d}_arrived_late"
-            not in _table_names(connection)
+            f"synthetic_{protected:03d}_arrived_late" not in tables
         )
 
+        # ... and neither did the ordinary migration sitting above it,
+        # which is the assertion a stale plan fails. Skipping the
+        # protected version and carrying on is a refusal R6 requires,
+        # not an outcome it tolerates.
+        assert f"synthetic_{above:03d}_after_protected" not in tables
+        assert above not in applied_versions(connection)
+
+    # And the planted files really are discoverable: a second run refuses
+    # because of them. Their exclusion above was the fixed plan, not
+    # blindness.
+    with database_connection(database_path) as connection:
+        with pytest.raises(ProtectedMigrationError):
+            apply_migrations(connection, root)
 
 def test_a_refusal_mutates_neither_schema_nor_ledger(
     tmp_path: Path,
