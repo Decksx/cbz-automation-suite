@@ -77,6 +77,26 @@ def apply_migrations(
     connection: sqlite3.Connection,
     directory: str | Path,
 ) -> list[int]:
+    # Checked before ensure_migration_table(), and before any
+    # migration is applied, so a refusal creates no ledger row, no
+    # ledger table and no schema change -- and applies nothing at
+    # all, not even the unprotected migrations queued below the
+    # protected one. Applying those and stopping would leave the
+    # schema between two releases with no ledger row saying so.
+    #
+    # Imported inside the function rather than at module scope:
+    # protected_migrations reuses this module's discovery and
+    # version-parsing primitives, so importing it from here at
+    # module scope is a cycle. The reuse is deliberate -- a guard
+    # carrying its own copy of the filename parser could disagree
+    # with the applier about which version a file declares, and a
+    # disagreement in the 'not protected' direction is silent.
+    from comic_automation.database.protected_migrations import (
+        assert_no_pending_protected,
+    )
+
+    assert_no_pending_protected(connection, directory)
+
     ensure_migration_table(connection)
     already_applied = applied_versions(connection)
     newly_applied: list[int] = []
