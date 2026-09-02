@@ -35,10 +35,49 @@ producer code against schema 014 while the operator believes the
 migration is merely queued -- the exact split brain section 12.1
 describes.
 
-Refusal is also required to be *inert*. `assert_no_pending_protected()`
-reads the ledger without creating it (see `recorded_versions`), so a
-refusal leaves no schema and no ledger row behind, on a fresh database
-as much as on a populated one.
+Refusal is also required to be *inert*. Taking a snapshot reads the
+ledger without creating it (see `recorded_versions`), so a refusal leaves
+no schema and no ledger row behind, on a fresh database as much as on a
+populated one.
+
+One snapshot, or the guard is decorative
+----------------------------------------
+
+`MigrationSnapshot` exists because the first version of this module did
+not have it, and was **fail-open** as a result. The guard scanned the
+migrations directory, and then `apply_migrations()` scanned it again to
+build its apply list. Those are two readings of a mutable directory, and
+the window between them is enough:
+
+```text
+guard scans      {1}            -> nothing protected, proceed
+015 arrives on disk
+applier scans    {1, 15}        -> applies 1 AND 15
+result           [1, 15]
+ledger           [(1, ...), (15, '015_arrived_late.sql')]
+```
+
+Migration 015's schema objects were created by an ordinary command. The
+guard had already returned, and nothing downstream re-asked the question.
+Found in review by injecting the file between the two scans.
+
+So discovery and the ledger are read **once**, into a frozen snapshot,
+and the guard, the apply plan and the protected-execution seam are all
+derived from that one reading. The incoherent shape is not merely
+discouraged: there is no longer any function taking a connection and a
+directory that answers a question about them, so a caller cannot express
+it. `assert_no_protected_in_apply_set()` then re-checks the plan itself
+immediately before any SQL runs, so the exclusion does not rest on
+having built the plan correctly.
+
+Two files may not claim one version
+-----------------------------------
+
+`015_a.sql` and `015_b.sql` are an ambiguity the ledger cannot represent:
+``schema_migrations.version`` is an INTEGER PRIMARY KEY, so one of the
+two could never be recorded. The old dictionary comprehension silently
+kept whichever sorted last. `take_migration_snapshot()` refuses instead
+-- see `AmbiguousMigrationError`.
 
 What this module is not
 -----------------------
@@ -66,7 +105,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
 from comic_automation.database.migrations import (
     discover_migrations,
@@ -116,8 +155,18 @@ class ProtectedMigrationError(RuntimeError):
 
     Raised on the ordinary path when a protected migration has not been
     applied yet, and by the protected-execution seam when the
-    authorization it was given does not match the database's actual
+    authorization it was given does not match the snapshot's actual
     state. Both are refusals; neither leaves the database changed.
+    """
+
+
+class AmbiguousMigrationError(RuntimeError):
+    """Two migration files claim the same version number.
+
+    A distinct type from `ProtectedMigrationError` because it is a
+    distinct condition -- the directory is malformed, whether or not any
+    protected version is involved -- and whoever is diagnosing one should
+    not have to read the message to tell them apart.
     """
 
 
@@ -162,39 +211,112 @@ def recorded_versions(connection: sqlite3.Connection) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
-def discovered_versions(directory: str | Path) -> dict[int, Path]:
-    """Every numbered migration file under `directory`, keyed by version.
+@dataclass(frozen=True)
+class MigrationSnapshot:
+    """One coherent reading of a migrations directory and the ledger.
 
-    A mapping rather than a list because both callers below need to go
-    from a version number back to the file that declares it.
+    Every question this module answers -- what is pending, what is
+    protected, what an ordinary run may apply, what an authorization
+    covers -- is answered from a single snapshot, because asking twice is
+    how the guard was fail-open before this type existed (see the module
+    docstring).
+
+    Take one with `take_migration_snapshot()`. The duplicate-version
+    refusal lives there and not in `__post_init__`, because a snapshot
+    assembled by hand in a test is a legitimate way to construct a state
+    the filesystem cannot easily be made to hold.
     """
-    return {
-        migration_version(path): path
-        for path in discover_migrations(directory)
-    }
+
+    directory: Path
+    discovered: Mapping[int, Path]
+    recorded: frozenset[int]
+
+    def pending(self) -> list[int]:
+        """Discovered versions with no ledger row, in version order."""
+        return sorted(
+            version
+            for version in self.discovered
+            if version not in self.recorded
+        )
+
+    def pending_protected(self) -> list[int]:
+        """Pending versions only the protected executor may apply.
+
+        A protected version with no file is *not* pending: there is
+        nothing to apply. That is the state this repository is in today
+        -- 015 is declared protected and does not exist -- and it is why
+        wiring the guard in changed no existing behaviour.
+        """
+        return [
+            version for version in self.pending() if is_protected(version)
+        ]
+
+    def ordinary_apply_plan(self) -> tuple[tuple[int, Path], ...]:
+        """What an ordinary `apply_migrations()` run may apply, in order.
+
+        Protected versions are excluded here as well as refused by
+        `assert_no_pending_protected()`, because the two exclusions cover
+        different cases: the guard covers a *pending* protected version,
+        and this filter covers an *already recorded* one, which is not
+        pending and must still never be applied by this path.
+        """
+        return tuple(
+            (version, self.discovered[version])
+            for version in self.pending()
+            if not is_protected(version)
+        )
 
 
-def pending_protected_versions(
+def take_migration_snapshot(
     connection: sqlite3.Connection,
     directory: str | Path,
-) -> list[int]:
-    """Protected migrations that exist on disk and are not yet recorded.
+) -> MigrationSnapshot:
+    """Read the directory and the ledger once, into a frozen snapshot.
 
-    Sorted, so a refusal message and a set comparison both read the same
-    way every time.
+    The only place either is read. Everything downstream derives from the
+    result, so no two answers in one run can disagree about what is on
+    disk or what has been applied.
 
-    A protected version with no file is *not* pending: there is nothing
-    to apply. That is the state this repository is in today -- 015 is
-    declared protected and does not exist -- and it is why wiring the
-    guard in changes no existing behaviour.
+    Refuses an ambiguous directory (`AmbiguousMigrationError`): two files
+    claiming one version cannot both be recorded, since
+    ``schema_migrations.version`` is an INTEGER PRIMARY KEY. Collapsing
+    them -- which a dictionary comprehension does silently, keeping
+    whichever sorts last -- picks one of two migrations by accident and
+    leaves the other permanently unapplied and unrecorded.
+
+    Reads only, and creates nothing (`recorded_versions`).
     """
-    discovered = discovered_versions(directory)
-    recorded = recorded_versions(connection)
+    by_version: dict[int, list[Path]] = {}
 
-    return sorted(
-        version
-        for version in discovered
-        if is_protected(version) and version not in recorded
+    for path in discover_migrations(directory):
+        by_version.setdefault(migration_version(path), []).append(path)
+
+    duplicates = {
+        version: sorted(path.name for path in paths)
+        for version, paths in by_version.items()
+        if len(paths) > 1
+    }
+
+    if duplicates:
+        detail = "; ".join(
+            f"{version:03d}: {', '.join(names)}"
+            for version, names in sorted(duplicates.items())
+        )
+        raise AmbiguousMigrationError(
+            "Refusing to read the migrations directory: more than one "
+            f"file claims the same version ({detail}) under "
+            f"{Path(directory)}. schema_migrations.version is an INTEGER "
+            "PRIMARY KEY, so only one of them could ever be recorded, and "
+            "which one got applied would be decided by filename sort "
+            "order. Rename or remove the duplicate."
+        )
+
+    return MigrationSnapshot(
+        directory=Path(directory),
+        discovered=MappingProxyType(
+            {version: paths[0] for version, paths in by_version.items()}
+        ),
+        recorded=frozenset(recorded_versions(connection)),
     )
 
 
@@ -221,25 +343,54 @@ def describe_pending_protected(versions: Iterable[int]) -> str:
     return "\n".join(lines)
 
 
-def assert_no_pending_protected(
-    connection: sqlite3.Connection,
-    directory: str | Path,
-) -> None:
+def assert_no_pending_protected(snapshot: MigrationSnapshot) -> None:
     """The central guard. Raise if any protected migration is pending.
+
+    Takes a snapshot rather than a connection and a directory, so the
+    state it judges is the same state the caller goes on to act on. The
+    earlier signature took the pair and scanned for itself, which let
+    `apply_migrations()` scan again and apply a protected file that
+    arrived in between.
 
     Called by `apply_migrations()` before it applies anything at all, so
     a pending protected migration aborts the whole run rather than
-    letting the unprotected migrations below it land first. Applying
-    those and stopping would leave the schema somewhere between two
-    releases with no ledger row saying so.
-
-    Reads only, and creates nothing (`recorded_versions`), so the refusal
-    path is inert.
+    letting the unprotected migrations queued below it land first.
+    Applying those and stopping would leave the schema somewhere between
+    two releases with no ledger row saying so.
     """
-    pending = pending_protected_versions(connection, directory)
+    pending = snapshot.pending_protected()
 
     if pending:
         raise ProtectedMigrationError(describe_pending_protected(pending))
+
+
+def assert_no_protected_in_apply_set(
+    plan: Sequence[tuple[int, Path]],
+) -> None:
+    """Raise if an ordinary apply plan contains a protected version.
+
+    The invariant, checked immediately before any migration SQL runs.
+    `ordinary_apply_plan()` already filters protected versions out, so
+    reaching this with one means that filter is broken -- which is
+    exactly the case worth stopping, because by then the guard has
+    already returned and nothing else is looking.
+
+    Kept out of the plan builder on purpose: an invariant enforced only
+    inside the function that establishes it is that function verifying
+    its own output, and a rewrite of the builder takes the check with it.
+    """
+    protected = sorted(
+        version for version, _ in plan if is_protected(version)
+    )
+
+    if protected:
+        raise ProtectedMigrationError(
+            "Refusing to apply migrations: the ordinary apply plan "
+            f"contains protected {protected}. A protected migration may "
+            "only be applied through the protected executor. This is an "
+            "invariant violation rather than a pending-migration "
+            "refusal: the plan builder let a protected version through."
+        )
 
 
 @dataclass(frozen=True)
@@ -292,8 +443,7 @@ class ProtectedExecutionAuthorization:
 
 
 def resolve_protected_execution(
-    connection: sqlite3.Connection,
-    directory: str | Path,
+    snapshot: MigrationSnapshot,
     authorization: ProtectedExecutionAuthorization,
 ) -> tuple[Path, ...]:
     """Resolve the migration files an authorized protected run covers.
@@ -301,7 +451,7 @@ def resolve_protected_execution(
     **This is the seam, not the executor.** It opens no transaction,
     executes no migration statement, writes no ledger row and changes
     nothing. It answers one question -- "which files does this
-    authorization entitle the caller to apply, and does the database
+    authorization entitle the caller to apply, and does the snapshot
     agree that is exactly what is pending?" -- and hands back the paths
     in version order.
 
@@ -309,6 +459,15 @@ def resolve_protected_execution(
     set. Both directions matter: an authorization naming a version that
     is not pending is stale or wrong, and a pending version the
     authorization does not name is a migration nobody approved.
+
+    Takes a snapshot rather than a connection and a directory. The
+    earlier signature scanned twice -- once to compute the pending set,
+    once to map versions back to paths -- so a protected file arriving in
+    between let an authorization for ``{15}`` succeed while the real
+    pending set was ``{15, 16}``. With one snapshot the comparison and
+    the returned paths cannot disagree, and no missing-path check is
+    needed because every pending version was read out of
+    `snapshot.discovered` in the first place.
 
     Deliberately **not** implemented here, and therefore not enforced by
     anything yet (design sections 8 and 12): verified writer quiescence,
@@ -320,7 +479,7 @@ def resolve_protected_execution(
     been authorized and has satisfied none of those obligations. They
     belong to the executor that is built in a later slice.
     """
-    pending = set(pending_protected_versions(connection, directory))
+    pending = set(snapshot.pending_protected())
 
     if pending != authorization.versions:
         raise ProtectedMigrationError(
@@ -329,24 +488,7 @@ def resolve_protected_execution(
             f"set is {sorted(pending)}. These must match exactly."
         )
 
-    discovered = discovered_versions(directory)
-
-    # Cannot fire given the equality above -- every pending version came
-    # from `discovered` -- and asserted anyway, because it is the check
-    # that would catch a future pending-set computation that stopped
-    # deriving from the files on disk.
-    missing = sorted(
-        version
-        for version in authorization.versions
-        if version not in discovered
-    )
-
-    if missing:
-        raise ProtectedMigrationError(
-            "Protected execution refused: no migration file found for "
-            f"{missing} under {Path(directory)}."
-        )
-
     return tuple(
-        discovered[version] for version in sorted(authorization.versions)
+        snapshot.discovered[version]
+        for version in sorted(authorization.versions)
     )
