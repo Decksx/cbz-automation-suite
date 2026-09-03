@@ -77,16 +77,50 @@ def apply_migrations(
     connection: sqlite3.Connection,
     directory: str | Path,
 ) -> list[int]:
+    # ONE reading of the directory and the ledger, and everything
+    # below derives from it.
+    #
+    # This function used to let the guard scan the directory and then
+    # scan it again itself to build the apply list. A 015_*.sql file
+    # created between those two scans was invisible to the guard and
+    # visible to the applier, so an ordinary command applied a
+    # protected migration and wrote its ledger row -- fail-OPEN, found
+    # in review. A snapshot cannot disagree with itself.
+    #
+    # The snapshot is also taken before ensure_migration_table(), so a
+    # refusal creates no ledger row, no ledger table and no schema
+    # change -- and applies nothing at all, not even the unprotected
+    # migrations queued below the protected one. Applying those and
+    # stopping would leave the schema between two releases with no
+    # ledger row saying so.
+    #
+    # Imported inside the function because protected_migrations reuses
+    # discover_migrations() and migration_version() from this module,
+    # so a module-level import in both directions is a cycle. Sharing
+    # the parser is the point: a guard with its own copy could
+    # disagree with the applier about which version a file declares,
+    # and disagreement in the 'not protected' direction is silent.
+    from comic_automation.database.protected_migrations import (
+        assert_no_pending_protected,
+        assert_no_protected_in_apply_set,
+        take_migration_snapshot,
+    )
+
+    snapshot = take_migration_snapshot(connection, directory)
+    assert_no_pending_protected(snapshot)
+
+    plan = snapshot.ordinary_apply_plan()
+
+    # Belt and braces on the plan itself rather than on the state it
+    # was derived from. By this point the guard has returned, so if
+    # the plan builder ever stopped filtering protected versions
+    # nothing else would notice before the SQL ran.
+    assert_no_protected_in_apply_set(plan)
+
     ensure_migration_table(connection)
-    already_applied = applied_versions(connection)
     newly_applied: list[int] = []
 
-    for path in discover_migrations(directory):
-        version = migration_version(path)
-
-        if version in already_applied:
-            continue
-
+    for version, path in plan:
         sql = path.read_text(encoding="utf-8-sig")
         statements = iter_sql_statements(sql)
 
@@ -120,6 +154,5 @@ def apply_migrations(
             raise
 
         newly_applied.append(version)
-        already_applied.add(version)
 
     return newly_applied

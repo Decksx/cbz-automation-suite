@@ -505,3 +505,158 @@ not exist yet.
 The docstring claimed protection outright until 2026-08-28 -- that "the
 name cannot be swapped" -- which is the kind of claim that stops someone
 adding the mechanism that would.
+
+## A migration too dangerous to run automatically is refused, not skipped
+
+Every migration under `comic_automation/database/migrations/` is applied
+on startup by `apply_migrations()`, which eleven CLI and service entry
+points call and which has no notion of approval, backup or postflight.
+That is right for a migration that adds a column and wrong for migration
+015, which rebuilds four evidence tables, binds 180,519 field projections
+from an approved plan artifact, cannot be re-run, and leaves no state any
+code here can read if it lands partially
+(`docs/slice4_migration_design.md` sections 5 and 8).
+
+`comic_automation/database/protected_migrations.py` declares such versions
+in `PROTECTED_MIGRATIONS`, and `apply_migrations()` **aborts** while any of
+them is pending. Three parts of that are decisions rather than mechanics.
+
+**Protection is a version number in source, not a filename convention and
+not a marker inside the .sql file.** A content marker fails in the
+dangerous direction: a file that omits it reads as unprotected and is
+applied silently. A missing entry in a frozenset is a diff.
+
+**It aborts the whole run rather than skipping the protected file.**
+Skipping and continuing would apply the unprotected migrations queued
+around it and report success, leaving the schema between two releases with
+no ledger row saying so, and leaving every entry point running producer
+code against a schema the operator believes is still pending. Refusal is
+also inert: the guard reads the ledger through its own
+`recorded_versions()` rather than `applied_versions()`, because the latter
+calls `ensure_migration_table()` and would make a refusing run create a
+table as a side effect of asking a question.
+
+**Failing closed is not failing blind.** The strictly read-only path
+(`database/read_guards.py`) is unaffected and never migrates, so an
+operator facing a pending 015 can still read the database -- which is most
+of what they will want to do. The refusal message names that path.
+
+### One reading, and three layers over it
+
+The first implementation asked twice. The guard scanned the migrations
+directory, returned, and `apply_migrations()` scanned again to build its
+apply list; a `015_*.sql` created between the two was invisible to the
+first and visible to the second, so an ordinary command applied a
+protected migration and wrote its ledger row. The protected-execution
+seam had the same shape, comparing a pending set from one scan against
+paths from another.
+
+`MigrationSnapshot` is one frozen reading of the directory and the
+ledger, and the guard, the apply plan and the seam all derive from it.
+The incoherent shape is unrepresentable rather than merely discouraged:
+no function here takes a connection and a directory and answers a
+question about them.
+
+Coherence is **not** the only thing standing between a stale plan and
+protected SQL, and it is worth being exact about that, because the
+obvious reading -- "the snapshot is the fix" -- is wrong. Three layers
+are independent:
+
+```text
+1  the guard        refuses while a protected version is pending
+2  the plan filter  ordinary_apply_plan() excludes protected versions
+                    however the snapshot it was built from was obtained
+3  the invariant    assert_no_protected_in_apply_set() re-checks the
+                    plan itself, immediately before any SQL runs
+```
+
+Measured by peeling them apart. The first measurement used a scenario
+where only a protected `015` arrives after the guarded snapshot, and it
+produced a **wrong conclusion** that was written down here: that
+reintroducing the second scan on its own was unobservable, and therefore
+defence in depth rather than a guard in its own right.
+
+It is observable, and the scenario was too weak to see it. Adding an
+unprotected `016` above the protected version:
+
+```text
+layers disabled                       outcome
+none                                  [1]          015 and 016 excluded
+re-scan                               [1, 16]      R6 VIOLATED
+plan filter                           [1]
+invariant                             [1]
+plan filter + re-scan                 REFUSED      invariant fired
+plan filter + invariant + re-scan     [1, 15, 16]  protected SQL ran
+```
+
+With only the second scan reintroduced, the fresh scan sees
+`{1, 15, 16}`, the plan filter silently drops `015`, the invariant finds
+nothing protected, and `016` runs. No protected SQL executed and R6 was
+still violated: the run **skipped a protected migration and carried on
+past it**, which section 4.2 forbids in those words.
+
+The lesson is not about this guard. "No protected SQL ran" is a weaker
+property than "refuse rather than skip", and a test asserting only the
+weaker one reads exactly like a test asserting both. That is what made a
+real defect look like defence in depth for a whole review round.
+
+So all three layers are load-bearing, each failing a named test when
+disabled alone. What remains true is that no single one of them is
+sufficient: the deepest failure -- protected SQL actually executing --
+still needs all three gone.
+
+The invariant is deliberately not inside `ordinary_apply_plan()`. An
+invariant enforced only by the function that establishes it is that
+function checking its own output, and a rewrite of the builder carries
+the check away with it.
+
+### Two files may not claim one version
+
+`schema_migrations.version` is an INTEGER PRIMARY KEY, so `015_a.sql`
+and `015_b.sql` describe a state the ledger cannot represent: one of the
+two could never be recorded. The version-to-path mapping used to be a
+dictionary comprehension, which kept whichever file sorted last and
+dropped the other in silence -- so which of two migrations ran was
+decided by filename order, and the loser was left permanently unapplied
+*and* unrecorded.
+
+`take_migration_snapshot()` refuses instead, with `AmbiguousMigrationError`.
+This does change ordinary behaviour: a duplicate-version directory used
+to half-apply and now refuses outright. That is a fix, not a regression,
+and it is written down here because "ordinary migrations are unaffected"
+is otherwise a claim with a quiet exception. The error is a separate type
+from `ProtectedMigrationError` because a malformed directory is a
+different condition, and a duplicated *protected* id must not be reported
+as "a protected migration is pending" -- that would send an operator to
+the protected executor to run a file that cannot be identified.
+
+### The limits, which are the part worth writing down
+
+`resolve_protected_execution()` is a seam, not an executor. It resolves
+which files an authorization covers and refuses unless the pending
+protected set equals the authorized set exactly. It enforces **none** of
+the rest of design sections 8 and 12: writer quiescence, the protected
+backup, plan-digest and expected-count revalidation, the ledger
+preconditions of section 12.1 steps 3-4, statement-by-statement
+application, the in-transaction ledger row, or the section 12.2
+reconciliation. A caller holding the resolved paths has been authorized and
+has satisfied none of those obligations. Recorded here, and not only in the
+docstring, because a limit visible only at the call site is invisible to
+anyone deciding whether to rely on the capability.
+
+The guard protects **one root**. It computes its pending set from the
+directory it is handed, so an entry point aimed at a different migrations
+directory would find no protected file, see an empty pending set and fail
+*open*, in silence. `scripts/db.py` has exactly such an independent root
+(`<repo root>/migrations`, applied with `executescript()` and no guard).
+The two roots are disjoint today and that is asserted by tests rather than
+assumed -- including that all eleven call sites resolve to the guarded root
+and that no protected id sits under the unguarded one.
+
+The `missing`-file check that used to sit inside
+`resolve_protected_execution()` is **gone**. It was unreachable given the
+set equality above it, and bypassing it alone failed nothing. Once the
+seam took a snapshot, every pending version came out of
+`snapshot.discovered` by construction, so there was no longer even a
+hypothetical path for it to catch -- and unreachable code kept "just in
+case" reads to the next person as a guard that works.
