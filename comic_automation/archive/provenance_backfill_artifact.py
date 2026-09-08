@@ -15,8 +15,7 @@ boolean learns nothing about which check fired:
 
 ```text
 envelope   parseable JSON object, no duplicate keys, required fields
-           present and correctly typed, planner and digest versions
-           supported
+           present and correctly typed, planner version supported
 csv        raw SHA-256 equals the envelope's artifacts.csv_sha256; header
            exactly CSV_COLUMNS, in order, no duplicates; every row the same
            width
@@ -53,8 +52,9 @@ archive_inspections
 ```
 
 Measured, not reasoned about: `_classify()` plans every inspection row with
-`inspector_version=None` (planner line 951), so the second case is not
-hypothetical -- it is every inspection row in the real plan.
+`inspector_version=None` (`provenance_backfill_planner.py:954`, in the
+`archive_inspections` loop), so the second case is not hypothetical -- it
+is every inspection row in the real plan.
 
 The two are indistinguishable *at the cell*. They are distinguishable by
 **table**, which is what this reader uses: `ARTIFACT_COLUMNS[table]` says
