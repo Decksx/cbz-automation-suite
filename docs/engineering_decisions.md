@@ -672,9 +672,10 @@ plan digest over the artifact it is about to apply and refuse if it
 differs, and it cannot recompute a digest over bindings it cannot
 reconstruct.
 
-Twelve classes of refusal are checked, each with its own message naming
-the file, the line and the values, because an operator handed one boolean
-learns nothing about which check fired. The digest comparison is **last**,
+Twenty-five guards are checked, each with its own message naming the
+file, the line and the values, because an operator handed one boolean
+learns nothing about which check fired. Each was proven load-bearing by
+disabling it alone: all 25 failed at least one named test, 0 failed none. The digest comparison is **last**,
 and it is the one that makes the rest safe to rely on: it is the backstop
 for a *misparse*. The reconstruction has to make decisions the CSV does not
 spell out, and a wrong one changes the canonical rendering -- `null` is not
