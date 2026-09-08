@@ -672,10 +672,14 @@ plan digest over the artifact it is about to apply and refuse if it
 differs, and it cannot recompute a digest over bindings it cannot
 reconstruct.
 
-Twenty-five guards are checked, each with its own message naming the
-file, the line and the values, because an operator handed one boolean
-learns nothing about which check fired. Each was proven load-bearing by
-disabling it alone: all 25 failed at least one named test, 0 failed none. The digest comparison is **last**,
+Forty guards are checked, each with its own message naming the file, the
+line and the values, because an operator handed one boolean learns nothing
+about which check fired. Each was proven load-bearing by disabling it
+alone: all 40 failed at least one named test, 0 failed none.
+
+That count was 25 at first review, and three of the fifteen added since
+closed defects a reviewer reproduced rather than gaps that were reasoned
+about. The digest comparison is **last**,
 and it is the one that makes the rest safe to rely on: it is the backstop
 for a *misparse*. The reconstruction has to make decisions the CSV does not
 spell out, and a wrong one changes the canonical rendering -- `null` is not
@@ -739,6 +743,87 @@ They are slice 4p's and migration 015 does not apply them, but they are in
 the plan and therefore in the plan digest. Dropping them at read time would
 make every recomputed digest wrong on every real plan. The exclusion
 belongs at projection time, where it is counted -- see below.
+
+
+### What the reader verifies, and the two things it cannot
+
+An earlier revision validated five envelope fields and returned the rest of
+the object as though it had been verified. Reproduced in review:
+`execution_status`, `target_states`, `gate_failures`, `archive_gates` and an
+invented `unexpected_top_level` were all forged while the bindings, totals,
+CSV digest and plan digest stayed valid, and the reader reported success.
+
+The top-level field set is now checked as an **equality**, so an unexamined
+key cannot be added either -- an approval record with somewhere to put
+unread data is a place a later consumer might read from. Five fields are
+rendered straight out of planner constants and are compared against them, so
+an envelope disagreeing was not written by this planner against this tree
+whatever its `planner_version` claims. `gate_failures` is **reconstructed**
+from the recounted totals and the envelope's own `archive_gates`: it is the
+field that says whether a plan should be applied at all, and a forged empty
+list would otherwise present a plan carrying producer-only bases as clean.
+
+**Two values cannot be reconstructed and are therefore not verified.**
+`archive_gates` and `quarantine_rows_excluded` are archive-level census
+figures counted against a database this reader never opens, and an archive
+that produced no binding is precisely what they report -- so there is no
+second source to compare them against. They are shape-checked and returned
+on `LoadedPlan.unverified`, **separate** from the verified
+`LoadedPlan.envelope`. Segregated rather than merged because the 4B-2
+executor must not be able to ask for "the envelope" and receive proven and
+merely-parsed values with nothing marking which is which. The trust boundary
+is in the type rather than in a naming convention.
+
+`archives_without_revision` is an interesting case: unverifiable on its own,
+yet still constrained, because `gate_failures` is reconstructed from it. A
+raised count with an empty failure list is refused even though the count
+itself could never have been checked.
+
+### A verified result that can be edited afterwards is not one
+
+Frozen dataclasses freeze **field bindings, not the objects behind them**.
+Both `LoadedPlan` and `AppliedBinding` were frozen and both were mutable
+where it counted. Reproduced in review:
+
+```text
+VERIFIED digest=960463
+mutate loaded.bindings[0].values["inspector_version"]
+mutate loaded.envelope["totals"]["planned_rows"]
+LoadedPlan still carries digest=960463
+recomputed digest=63407e
+```
+
+`AppliedBinding` had the same defect on the side that feeds 015's
+reconciliation, and worse: it retained the caller's dict, so the digest of an
+already-validated binding moved with no call made on the binding at all.
+
+Both now copy before freezing, and the copy matters as much as the freeze --
+a `MappingProxyType` wrapping a dict the caller still holds is a read-only
+*view* of mutable state, which moves the mutation one reference away instead
+of preventing it. `AppliedBinding` copies at the top of `__post_init__`,
+before validation, so what is checked is what is rendered; normalizing
+afterwards would validate one shape and render another.
+
+### The CSV must be the writer's canonical form, not merely parseable
+
+`csv.reader` silently repairs malformed quoting. Reproduced: a field written
+`"x"junk` decoded to `xjunk`, and the raw CSV hash, the reconstructed
+binding, the totals and the plan digest all verified -- because the repaired
+value was exactly what the plan expected. Nothing downstream could catch it,
+since by then the damage was a correctly-shaped binding.
+
+Two checks, doing different jobs. `strict=True` makes malformed quoting a
+parse error. Then the parsed rows are re-rendered through the writer's own
+dialect and the bytes must come back, which rejects everything that is
+merely **not what `render_plan_csv()` would have produced**: needless
+quoting, a lone LF terminator, a stray space after a delimiter.
+
+Measured before relying on it, because a canonical-form check that is too
+strict rejects valid plans rather than forged ones: values containing
+commas, double quotes, embedded LF, embedded CRLF, tabs and surrounding
+whitespace each round-trip byte-exactly through the writer and back. The
+check refuses non-canonical files without refusing awkward values, and that
+negative is a test rather than a claim.
 
 ## The slice-4 applied projection is its own format, with its own marker
 
