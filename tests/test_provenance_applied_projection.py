@@ -620,6 +620,75 @@ def test_a_non_string_basis_is_refused() -> None:
         )
 
 
+# --- the projected binding is immutable, input included -------------------
+
+
+def test_mutating_the_constructor_input_does_not_change_the_projection(
+) -> None:
+    """The reproduction from review, asserted as a regression.
+
+    The reviewed revision stored the caller's own dict, so a dict the
+    caller retained could be edited after construction and the digest of
+    an already-validated binding moved with it. `dict()` in `__post_init__`
+    breaks the alias.
+    """
+    values = {
+        "inspector_version": None,
+        "inspector_version_basis": "unknown_legacy",
+    }
+    binding = AppliedBinding(
+        table="archive_inspections", key=3, archive_id=10,
+        sides=(_side("", 10, None, planner.UNRESOLVED_NO_IDENTITY),),
+        values=values,
+    )
+    before = projection_digest([binding])
+
+    values["inspector_version"] = "FORGED"
+
+    assert binding.values["inspector_version"] is None
+    assert projection_digest([binding]) == before
+
+
+def test_a_projected_bindings_values_cannot_be_mutated() -> None:
+    """And not through the object either -- the copy is proxied, not bare."""
+    binding = _inspection()
+
+    with pytest.raises(TypeError):
+        binding.values["inspector_version"] = "FORGED"
+
+
+def test_mutating_a_retained_sides_list_does_not_change_the_projection(
+) -> None:
+    """`sides` is normalized to a tuple, so a caller's list cannot be a
+    live reference into a validated binding."""
+    sides = [_side("", 10, 7, planner.IDENTITY_SEED)]
+    binding = AppliedBinding(
+        table="archive_hashes", key=1, archive_id=10, sides=sides, values={},
+    )
+    before = projection_digest([binding])
+
+    sides.append(_side("", 11, 8, planner.IDENTITY_SEED))
+
+    assert isinstance(binding.sides, tuple)
+    assert len(binding.sides) == 1
+    assert projection_digest([binding]) == before
+
+
+def test_normalization_happens_before_validation() -> None:
+    """A list of sides is validated as the tuple it becomes.
+
+    If `__post_init__` validated first and normalized after, a caller
+    passing a list would be checked against one shape and rendered from
+    another.
+    """
+    with pytest.raises(ProjectionError, match="side labels"):
+        AppliedBinding(
+            table="near_duplicate_candidates", key=5, archive_id=10,
+            sides=[_side("a", 10, 7, planner.SINGLE_REVISION_INHERITED)],
+            values={"archive_b_id": 11},
+        )
+
+
 # --- what the projector deliberately does NOT judge -----------------------
 
 
