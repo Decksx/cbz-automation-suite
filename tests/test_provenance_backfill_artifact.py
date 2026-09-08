@@ -12,13 +12,17 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
 from comic_automation.archive import provenance_backfill_planner as planner
 from comic_automation.archive.provenance_backfill_artifact import (
+    EXPECTED_ENVELOPE_FIELDS,
     PlanArtifactError,
+    UNVERIFIED_ENVELOPE_FIELDS,
     read_plan_artifacts,
+    reconstruct_gate_failures,
 )
 
 
@@ -329,14 +333,16 @@ def test_a_duplicate_envelope_key_is_refused(tmp_path: Path) -> None:
         read_plan_artifacts(json_path, csv_path)
 
 
-@pytest.mark.parametrize(
-    "field",
-    ["planner_version", "snapshot_digest", "plan_digest", "totals",
-     "artifacts"],
-)
+@pytest.mark.parametrize("field", sorted(EXPECTED_ENVELOPE_FIELDS))
 def test_a_missing_envelope_field_is_refused(
     tmp_path: Path, field: str
 ) -> None:
+    """Every one of the thirteen, not the five the first revision checked.
+
+    The earlier subset let `execution_status`, `target_states`,
+    `gate_failures` and `archive_gates` be removed or forged while the
+    bindings, totals and both digests stayed valid.
+    """
     plan = _plan()
     csv_text = planner.render_plan_csv(plan)
     envelope = _envelope_of(plan, csv_text)
@@ -346,7 +352,194 @@ def test_a_missing_envelope_field_is_refused(
         tmp_path, plan, csv_text=csv_text, envelope=envelope
     )
 
-    with pytest.raises(PlanArtifactError, match="is missing"):
+    with pytest.raises(
+        PlanArtifactError, match="does not carry exactly the expected fields"
+    ):
+        read_plan_artifacts(json_path, csv_path)
+
+
+def test_an_unexpected_envelope_field_is_refused(tmp_path: Path) -> None:
+    """An unexamined key in an approval record is a place to hide something.
+
+    Nothing in this reader would look at it, and a later consumer might.
+    """
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["unexpected_top_level"] = "ignored"
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(
+        PlanArtifactError, match=r"unexpected \['unexpected_top_level'\]"
+    ):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "field, forged",
+    [
+        ("execution_status", "EXECUTE_NOW"),
+        ("target_states", ["forged"]),
+        ("receiving_tables", ["archive_hashes"]),
+        ("natural_key_tables", []),
+        ("table_vocabulary", {"archive_hashes": ["forged"]}),
+    ],
+)
+def test_a_forged_envelope_constant_is_refused(
+    tmp_path: Path, field: str, forged: object
+) -> None:
+    """These are constants of this tree, not opinions the plan may hold.
+
+    Each is rendered straight out of a planner module constant, so an
+    envelope disagreeing with one was not written by this planner against
+    this tree whatever its planner_version claims. `execution_status` is
+    the one that matters most: it is the field that would be moved to make
+    an unexecuted plan look like something else.
+    """
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope[field] = forged
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match="this tree defines"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "gates",
+    [
+        {"forged": "accepted"},
+        {"provisional_archives": 0, "archives_without_revision": 0,
+         "drift_archives": 0},
+        "not an object",
+        # Non-iterables, and they are the reason the `isinstance(gates,
+        # dict)` check exists at all. Every iterable value above is already
+        # caught by the field-set comparison below it -- `set("not an
+        # object")` is a set of characters, which is not the expected field
+        # set -- so with only those cases the type check could be deleted
+        # and nothing would fail. These two reach `set()` on an int and on
+        # None, which raises TypeError: a crash escaping as the wrong
+        # exception type rather than a refusal an operator can act on.
+        5,
+        None,
+    ],
+)
+def test_a_malformed_archive_gates_object_is_refused(
+    tmp_path: Path, gates: object
+) -> None:
+    """Its values are unverifiable, so its shape is the only thing checked.
+
+    That makes the shape check load-bearing rather than cosmetic: a
+    consumer reading `LoadedPlan.unverified` is entitled to the declared
+    fields with the declared types, since nothing downstream will catch a
+    surprise there.
+    """
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["archive_gates"] = gates
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match="archive_gates"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("provisional_archives", "many"),
+        ("provisional_archives", True),
+        ("drift_archive_ids", "1,2"),
+        ("drift_archive_ids", [1, "2"]),
+        ("drift_archive_ids", [True]),
+    ],
+)
+def test_a_mistyped_archive_gate_value_is_refused(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """`True` is refused where a count belongs: bool subclasses int."""
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["archive_gates"][field] = value
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match=f"archive_gates.{field}"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize("value", ["many", None, 1.5, True])
+def test_a_mistyped_quarantine_count_is_refused(
+    tmp_path: Path, value: object
+) -> None:
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["quarantine_rows_excluded"] = value
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(
+        PlanArtifactError, match="quarantine_rows_excluded"
+    ):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize("value", ["a failure", [1], {"a": 1}, None])
+def test_a_mistyped_gate_failures_field_is_refused(
+    tmp_path: Path, value: object
+) -> None:
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["gate_failures"] = value
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(
+        PlanArtifactError, match="expected a list of strings"
+    ):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "artifacts",
+    [
+        {"csv_sha256": "0" * 64, "extra": 1},
+        {},
+        {"sha256": "0" * 64},
+    ],
+)
+def test_a_malformed_artifacts_object_is_refused(
+    tmp_path: Path, artifacts: dict
+) -> None:
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["artifacts"] = artifacts
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match="artifacts carries"):
         read_plan_artifacts(json_path, csv_path)
 
 
@@ -896,6 +1089,364 @@ def test_a_genuinely_empty_text_value_fails_the_digest(
 
     with pytest.raises(PlanArtifactError, match="not the same plan"):
         read_plan_artifacts(json_path, csv_path)
+
+
+# --- gate failures, reconstructed ----------------------------------------
+
+
+def _measured_plan() -> planner.BackfillPlan:
+    """A plan whose classifier reached a producer-only basis.
+
+    `measured` is in `archive_hashes`' vocabulary but the backfill re-reads
+    nothing, so a row planned that way means the classifier took a path it
+    should not have -- exactly the condition `gate_failures` reports.
+    """
+    rows = [
+        planner.PlannedBinding(
+            table="archive_hashes",
+            key=1,
+            key_kind="row_id",
+            archive_id=10,
+            sides=(_side("", 10, 7, planner.MEASURED),),
+            values={},
+        )
+    ]
+
+    return _plan(rows)
+
+
+def test_a_plan_with_a_producer_basis_reports_a_gate_failure(
+    tmp_path: Path,
+) -> None:
+    """The precondition for the forgery test below: the failure is real."""
+    plan = _measured_plan()
+
+    assert plan.gate_failures == (
+        "1 row(s) planned as measured, which only a producer can establish",
+    )
+
+    json_path, csv_path = _write(tmp_path, plan)
+    loaded = read_plan_artifacts(json_path, csv_path)
+
+    # A tuple, not a list: the verified envelope is deeply frozen, so every
+    # sequence in it comes back immutable.
+    assert loaded.envelope["gate_failures"] == tuple(plan.gate_failures)
+
+
+def test_gate_failures_forged_empty_are_refused(tmp_path: Path) -> None:
+    """The field that says whether a plan should be applied at all.
+
+    Emptying it presents a plan carrying producer-only bases as clean, and
+    every other check still passes: the bindings, the totals, the CSV
+    digest and the plan digest are all untouched.
+    """
+    plan = _measured_plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["gate_failures"] = []
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match="do not imply"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+def test_gate_failures_forged_nonempty_are_refused(tmp_path: Path) -> None:
+    """Both directions: an invented failure is a claim too."""
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["gate_failures"] = ["forged failure"]
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match="do not imply"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+def test_a_hidden_unclassifiable_archive_is_refused(tmp_path: Path) -> None:
+    """The archive-count arm of the reconstruction, driven alone.
+
+    `archives_without_revision` is itself unverifiable, but it still
+    constrains `gate_failures` -- so raising the count while leaving the
+    failure list empty is caught even though the count could not have been
+    checked on its own.
+    """
+    plan = _plan()
+    csv_text = planner.render_plan_csv(plan)
+    envelope = _envelope_of(plan, csv_text)
+    envelope["archive_gates"]["archives_without_revision"] = 3
+
+    json_path, csv_path = _write(
+        tmp_path, plan, csv_text=csv_text, envelope=envelope
+    )
+
+    with pytest.raises(PlanArtifactError, match="do not imply"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "bases, without_revision",
+    [
+        ((), 0),
+        ((planner.MEASURED,), 0),
+        ((planner.MEASURED, planner.MEASURED), 0),
+        ((), 4),
+        ((planner.MEASURED,), 2),
+    ],
+)
+def test_the_gate_failure_reconstruction_matches_the_planner(
+    bases: tuple, without_revision: int
+) -> None:
+    """Pins the duplicated logic to the definition it duplicates.
+
+    `reconstruct_gate_failures()` reimplements `BackfillPlan.gate_failures`
+    rather than calling it, because reaching that property needs a
+    `BackfillPlan` and the envelope carries only a COUNT of archives
+    without a revision, not their ids -- so calling it would mean
+    fabricating ids to make a check pass. This test is what keeps the two
+    from drifting: both run over the same plans and must agree exactly.
+    """
+    rows = [
+        planner.PlannedBinding(
+            table="archive_hashes",
+            key=index + 1,
+            key_kind="row_id",
+            archive_id=10 + index,
+            sides=(_side("", 10 + index, 7, basis),),
+            values={},
+        )
+        for index, basis in enumerate(bases)
+    ]
+
+    plan = planner.BackfillPlan(
+        planner_version=planner.PLANNER_VERSION,
+        snapshot_digest=SNAPSHOT_DIGEST,
+        plan_digest=planner.compute_plan_digest(rows, SNAPSHOT_DIGEST),
+        bindings=tuple(rows),
+        totals=planner.plan_totals(rows),
+        gates=planner.ArchiveGate(
+            (), tuple(range(900, 900 + without_revision)), ()
+        ),
+        quarantine_rows=0,
+    )
+
+    assert list(plan.gate_failures) == reconstruct_gate_failures(
+        plan.totals, without_revision
+    )
+
+
+# --- the verified result is deeply immutable -----------------------------
+
+
+def test_the_verified_envelope_cannot_be_mutated(tmp_path: Path) -> None:
+    """A frozen dataclass freezes field bindings, not the objects behind them.
+
+    The reviewed revision returned a plain dict, so an envelope value could
+    be rewritten after verification while `plan_digest` went on reporting
+    the digest of what had been checked.
+    """
+    json_path, csv_path = _write(tmp_path)
+    loaded = read_plan_artifacts(json_path, csv_path)
+
+    with pytest.raises(TypeError):
+        loaded.envelope["plan_digest"] = "0" * 64
+
+    with pytest.raises(TypeError):
+        loaded.envelope["totals"]["planned_rows"] = 999
+
+    with pytest.raises(TypeError):
+        loaded.unverified["archive_gates"]["drift_archives"] = 99
+
+
+def test_a_verified_bindings_values_cannot_be_mutated(
+    tmp_path: Path,
+) -> None:
+    """The reproduction from review, asserted as a regression.
+
+    Previously: mutate `values["inspector_version"]`, and the LoadedPlan
+    kept reporting the old digest while a recomputation produced a
+    different one.
+    """
+    json_path, csv_path = _write(tmp_path)
+    loaded = read_plan_artifacts(json_path, csv_path)
+    inspection = next(
+        b for b in loaded.bindings if b.table == "archive_inspections"
+    )
+
+    with pytest.raises(TypeError):
+        inspection.values["inspector_version"] = "FORGED"
+
+    # And the digest the result carries still describes the bindings it
+    # carries -- which is the property the mutation broke.
+    assert planner.compute_plan_digest(
+        list(loaded.bindings), loaded.snapshot_digest
+    ) == loaded.plan_digest
+
+
+def test_nested_envelope_sequences_are_frozen(tmp_path: Path) -> None:
+    """Lists become tuples all the way down, not just at the top level."""
+    json_path, csv_path = _write(tmp_path)
+    loaded = read_plan_artifacts(json_path, csv_path)
+
+    assert isinstance(loaded.envelope["target_states"], tuple)
+    assert isinstance(loaded.unverified["archive_gates"], Mapping)
+    assert isinstance(
+        loaded.unverified["archive_gates"]["drift_archive_ids"], tuple
+    )
+
+    with pytest.raises(TypeError):
+        loaded.envelope["table_vocabulary"]["archive_hashes"] = ()
+
+
+def test_the_unverified_fields_are_segregated(tmp_path: Path) -> None:
+    """4B-2 must not be able to reach for "the envelope" and get both.
+
+    The two census figures cannot be reconstructed from the bindings -- an
+    archive that produced no binding is exactly what they report -- so they
+    are handed over separately and labelled rather than mixed in.
+    """
+    json_path, csv_path = _write(tmp_path)
+    loaded = read_plan_artifacts(json_path, csv_path)
+
+    assert set(loaded.unverified) == UNVERIFIED_ENVELOPE_FIELDS
+    assert not (set(loaded.envelope) & UNVERIFIED_ENVELOPE_FIELDS)
+    assert (
+        set(loaded.envelope) | set(loaded.unverified)
+        == EXPECTED_ENVELOPE_FIELDS
+    )
+
+
+# --- the CSV must be the writer's canonical form -------------------------
+
+
+def test_malformed_quoting_fails_at_parse(tmp_path: Path) -> None:
+    """`"x"junk` decoded as `xjunk` with every later check still passing.
+
+    The raw CSV hash, the reconstructed binding, the totals and the plan
+    digest were all valid, because the malformed field decoded to the exact
+    value the plan expected. `strict=True` makes it a parse error instead.
+    """
+    rows = [
+        binding for binding in _bindings()
+        if binding.table != "archive_inspections"
+    ]
+    rows.append(
+        planner.PlannedBinding(
+            table="archive_inspections",
+            key=3,
+            key_kind="row_id",
+            archive_id=10,
+            sides=(_side("", 10, None, planner.UNRESOLVED_NO_IDENTITY),),
+            values={
+                "inspector_version": "xjunk",
+                "inspector_version_basis": "unknown_legacy",
+            },
+        )
+    )
+
+    plan = _plan(rows)
+    csv_text = planner.render_plan_csv(plan)
+    malformed = csv_text.replace(",xjunk,", ',"x"junk,')
+    assert malformed != csv_text
+
+    json_path, csv_path = _write(tmp_path, plan, csv_text=malformed)
+
+    with pytest.raises(PlanArtifactError, match="not valid CSV"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "label, old, new",
+    [
+        ("needless quoting", ",xjunk,", ',"xjunk",'),
+        ("lf terminators", "\r\n", "\n"),
+    ],
+)
+def test_a_non_canonical_csv_is_refused(
+    tmp_path: Path, label: str, old: str, new: str
+) -> None:
+    """Parses cleanly, decodes to the right values, is still not the file.
+
+    `strict=True` catches malformed syntax; this catches everything that is
+    merely not what `render_plan_csv()` would have produced. The digest is
+    recomputed over the altered text on purpose, so the raw-hash check
+    cannot fire and only the canonical-form check can.
+    """
+    rows = [
+        binding for binding in _bindings()
+        if binding.table != "archive_inspections"
+    ]
+    rows.append(
+        planner.PlannedBinding(
+            table="archive_inspections",
+            key=3,
+            key_kind="row_id",
+            archive_id=10,
+            sides=(_side("", 10, None, planner.UNRESOLVED_NO_IDENTITY),),
+            values={
+                "inspector_version": "xjunk",
+                "inspector_version_basis": "unknown_legacy",
+            },
+        )
+    )
+
+    plan = _plan(rows)
+    altered = planner.render_plan_csv(plan).replace(old, new)
+
+    json_path, csv_path = _write(tmp_path, plan, csv_text=altered)
+
+    with pytest.raises(PlanArtifactError, match="canonical CSV form"):
+        read_plan_artifacts(json_path, csv_path)
+
+
+@pytest.mark.parametrize(
+    "awkward",
+    ["has,comma", 'has"quote', "has\nnewline", "has\r\ncrlf",
+     "  padded  ", "semi;colon\ttab"],
+)
+def test_the_canonical_check_does_not_reject_awkward_values(
+    tmp_path: Path, awkward: str
+) -> None:
+    """The canonical check must refuse non-canonical FILES, not odd VALUES.
+
+    A value carrying a delimiter, a quote or an embedded newline is quoted
+    by the writer and re-quoted identically on the round trip, so each of
+    these must still verify. Without this, the check could pass its own
+    negative tests while rejecting a legitimate plan.
+    """
+    rows = [
+        binding for binding in _bindings()
+        if binding.table != "archive_inspections"
+    ]
+    rows.append(
+        planner.PlannedBinding(
+            table="archive_inspections",
+            key=3,
+            key_kind="row_id",
+            archive_id=10,
+            sides=(_side("", 10, None, planner.UNRESOLVED_NO_IDENTITY),),
+            values={
+                "inspector_version": awkward,
+                "inspector_version_basis": "unknown_legacy",
+            },
+        )
+    )
+
+    plan = _plan(rows)
+    json_path, csv_path = _write(tmp_path, plan)
+
+    loaded = read_plan_artifacts(json_path, csv_path)
+    inspection = next(
+        b for b in loaded.bindings if b.table == "archive_inspections"
+    )
+
+    assert inspection.values["inspector_version"] == awkward
+    assert loaded.plan_digest == plan.plan_digest
 
 
 # --- IO ------------------------------------------------------------------
