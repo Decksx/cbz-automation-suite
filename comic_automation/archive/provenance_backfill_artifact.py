@@ -14,11 +14,16 @@ a separate refusal with its own message, because an operator handed one
 boolean learns nothing about which check fired:
 
 ```text
-envelope   parseable JSON object, no duplicate keys, required fields
-           present and correctly typed, planner version supported
-csv        raw SHA-256 equals the envelope's artifacts.csv_sha256; header
-           exactly CSV_COLUMNS, in order, no duplicates; every row the same
-           width
+envelope   parseable JSON object, no duplicate keys, EXACTLY the expected
+           top-level field set, each correctly typed, planner version
+           supported
+constants  execution_status, target_states, receiving_tables,
+           natural_key_tables and table_vocabulary equal this tree's own
+           definitions
+csv        raw SHA-256 equals the envelope's artifacts.csv_sha256; parses
+           under csv strict mode; re-rendering what it parsed to reproduces
+           the file byte for byte; header exactly CSV_COLUMNS, in order, no
+           duplicates; every row the same width
 rows       table, key_kind, side labels and table-specific values all legal;
            no column populated that the row's table does not use; no
            duplicate (table, key)
@@ -26,9 +31,22 @@ cross      every row's planner_version, snapshot_digest and plan_digest
            equal the envelope's
 totals     plan_totals() over the reconstructed bindings equals the
            envelope's totals, field for field
+gates      gate_failures equals what the recounted totals and the envelope's
+           own archive_gates imply
 digest     compute_plan_digest(reconstructed, snapshot_digest) equals the
            envelope's plan_digest
 ```
+
+Two envelope values are **not** verified, because nothing here can
+reconstruct them: `archive_gates` and `quarantine_rows_excluded` are
+archive-level census figures counted against a database this reader never
+sees, and an archive that produced no binding is exactly what they report.
+They are shape-checked and returned on `LoadedPlan.unverified`, separate
+from the verified `LoadedPlan.envelope`, so a consumer cannot take "the
+envelope" and get a mix with nothing marking which half is which.
+
+The result is deeply immutable -- see `_deep_freeze` for why a frozen
+dataclass is not enough on its own.
 
 The digest check is last and is the one that makes the rest safe to rely
 on, for a reason worth stating: it is the backstop for a *misparse*. The
@@ -100,18 +118,25 @@ import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from comic_automation.archive.provenance_backfill_planner import (
     ARTIFACT_COLUMNS,
     CSV_COLUMNS,
+    EXECUTION_STATUS,
+    INHERITED_FROM_PAGE_EVIDENCE,
+    MEASURED,
     NATURAL_KEY_TABLES,
     PLAN_DIGEST_VERSION,
     PLANNER_VERSION,
     PlannedBinding,
     PlannerInvariantError,
     RECEIVING_TABLES,
+    STAT_MATCHED,
     SideAttribution,
+    TABLE_VOCABULARY,
+    TARGET_STATES,
     compute_plan_digest,
     plan_totals,
 )
@@ -125,15 +150,64 @@ from comic_automation.archive.provenance_backfill_planner import (
 SUPPORTED_PLANNER_VERSIONS: frozenset[str] = frozenset({PLANNER_VERSION})
 
 
-# Envelope fields required to be present. Their absence is a refusal rather
-# than a default, because every one of them participates in a check and a
-# defaulted value would make that check compare something against itself.
-REQUIRED_ENVELOPE_FIELDS: tuple[str, ...] = (
-    "planner_version",
-    "snapshot_digest",
-    "plan_digest",
-    "totals",
-    "artifacts",
+# The envelope's exact top-level field set -- every key `BackfillPlan.
+# as_dict()` writes, and no other. Checked as an EQUALITY rather than as a
+# "these are present" subset, which is what an earlier revision did: it
+# validated five fields and returned the rest of the object as though
+# verified, so `execution_status`, `target_states`, `gate_failures`,
+# `archive_gates` and an entirely invented `unexpected_top_level` could all
+# be forged while the bindings, totals and both digests stayed valid, and
+# the reader reported success.
+EXPECTED_ENVELOPE_FIELDS: frozenset[str] = frozenset(
+    {
+        "planner_version",
+        "execution_status",
+        "artifacts",
+        "snapshot_digest",
+        "plan_digest",
+        "target_states",
+        "receiving_tables",
+        "natural_key_tables",
+        "table_vocabulary",
+        "totals",
+        "archive_gates",
+        "quarantine_rows_excluded",
+        "gate_failures",
+    }
+)
+
+
+# The envelope's `artifacts` sub-object, exactly.
+EXPECTED_ARTIFACT_FIELDS: frozenset[str] = frozenset({"csv_sha256"})
+
+
+# The envelope's `archive_gates` sub-object, exactly, with each value's type.
+EXPECTED_GATE_FIELDS: Mapping[str, type] = MappingProxyType(
+    {
+        "provisional_archives": int,
+        "archives_without_revision": int,
+        "drift_archives": int,
+        "drift_archive_ids": list,
+    }
+)
+
+
+# The two envelope values this reader CANNOT reconstruct, and therefore does
+# not verify.
+#
+# Both are archive-level census figures the planner counted while reading a
+# database this reader never sees: how many archives were provisional, how
+# many held no revision, how many drifted, and the quarantine rows the plan
+# excluded. Nothing in the bindings implies them -- an archive that produced
+# no binding is exactly the case they exist to report -- so there is no
+# second source to compare against.
+#
+# They are shape-checked and then segregated onto `LoadedPlan.unverified`
+# rather than returned beside the verified fields, because the executor
+# built in 4B-2 must not be able to reach for "the envelope" and get a mix
+# of proven and merely-parsed values with nothing marking which is which.
+UNVERIFIED_ENVELOPE_FIELDS: frozenset[str] = frozenset(
+    {"archive_gates", "quarantine_rows_excluded"}
 )
 
 
@@ -176,6 +250,36 @@ _INT_COLUMNS: frozenset[str] = frozenset(
 )
 
 
+def _deep_freeze(value: Any) -> Any:
+    """Recursively convert parsed JSON into something that cannot be edited.
+
+    Mappings become `MappingProxyType` over a **freshly built** dict and
+    sequences become tuples, all the way down. The freshness matters as much
+    as the proxy: a `MappingProxyType` wrapping a dict the caller still holds
+    is a read-only *view* of mutable state, not immutable state, so wrapping
+    the object `json.loads` returned without copying it would only move the
+    mutation one reference away.
+
+    Why this exists at all: `LoadedPlan` is a frozen dataclass, and freezing
+    a dataclass freezes the *bindings of its fields*, not the objects behind
+    them. The reviewed revision returned verified bindings whose `values`
+    dict and an `envelope` dict were both ordinary mutable objects, so
+    `loaded.bindings[0].values["inspector_version"] = "FORGED"` succeeded
+    while `loaded.plan_digest` went on reporting the digest of the
+    unmodified plan -- a verification result that no longer described the
+    data it was handed out with.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(name): _deep_freeze(item) for name, item in value.items()}
+        )
+
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+
+    return value
+
+
 class PlanArtifactError(RuntimeError):
     """A written plan could not be read back, or does not verify.
 
@@ -193,6 +297,21 @@ class LoadedPlan:
     Carries the reconstructed bindings together with the envelope they were
     checked against, so a caller never has to re-open either file to learn
     what it just verified.
+
+    **Deeply immutable.** Every field is a scalar, a tuple, or a
+    `MappingProxyType` over a dict built here and never exposed -- because a
+    frozen dataclass freezes its field bindings, not the objects behind
+    them, and a verification result that can be edited afterwards is not a
+    verification result. `bindings[i].values` and `envelope` both refused
+    mutation in the tests that accompany this type.
+
+    **`envelope` and `unverified` are separate on purpose.** `envelope`
+    carries only fields whose values this reader reconstructed and compared
+    -- the constants, the recounted totals, the reconstructed gate failures,
+    the digests. `unverified` carries the two it cannot reconstruct
+    (`UNVERIFIED_ENVELOPE_FIELDS`): they were shape-checked and nothing more.
+    They are not merged, so the 4B-2 executor cannot take "the envelope" and
+    treat a parsed census figure as a proven one.
     """
 
     planner_version: str
@@ -201,6 +320,7 @@ class LoadedPlan:
     csv_sha256: str
     bindings: tuple[PlannedBinding, ...]
     envelope: Mapping[str, Any]
+    unverified: Mapping[str, Any]
     json_path: Path
     csv_path: Path
 
@@ -255,13 +375,18 @@ def _load_envelope(path: Path) -> dict[str, Any]:
             f"{type(envelope).__name__}, not an object"
         )
 
-    missing = [
-        name for name in REQUIRED_ENVELOPE_FIELDS if name not in envelope
-    ]
+    present = set(envelope)
 
-    if missing:
+    # Equality, both directions. Missing names a field the plan cannot be
+    # verified without; unexpected names one nothing in this reader would
+    # ever look at -- and an unexamined key in an approval record is a place
+    # to put something a later consumer might read.
+    if present != EXPECTED_ENVELOPE_FIELDS:
+        missing = sorted(EXPECTED_ENVELOPE_FIELDS - present)
+        unexpected = sorted(present - EXPECTED_ENVELOPE_FIELDS)
         raise PlanArtifactError(
-            f"the plan envelope {path} is missing {missing}"
+            f"the plan envelope {path} does not carry exactly the expected "
+            f"fields (missing {missing}, unexpected {unexpected})"
         )
 
     for name in ("planner_version", "snapshot_digest", "plan_digest"):
@@ -294,7 +419,13 @@ def _load_envelope(path: Path) -> dict[str, Any]:
             f"{type(artifacts).__name__}, not an object"
         )
 
-    csv_sha256 = artifacts.get("csv_sha256")
+    if set(artifacts) != EXPECTED_ARTIFACT_FIELDS:
+        raise PlanArtifactError(
+            f"the plan envelope {path}: artifacts carries {sorted(artifacts)}, "
+            f"expected exactly {sorted(EXPECTED_ARTIFACT_FIELDS)}"
+        )
+
+    csv_sha256 = artifacts["csv_sha256"]
 
     if not isinstance(csv_sha256, str) or not csv_sha256:
         # `None` is what the writer records for an envelope written without
@@ -308,7 +439,105 @@ def _load_envelope(path: Path) -> dict[str, Any]:
             "approved."
         )
 
+    _check_envelope_constants(path, envelope)
+    _check_gate_shape(path, envelope["archive_gates"])
+
+    if (isinstance(envelope["quarantine_rows_excluded"], bool)
+            or not isinstance(envelope["quarantine_rows_excluded"], int)):
+        raise PlanArtifactError(
+            f"the plan envelope {path}: quarantine_rows_excluded is "
+            f"{envelope['quarantine_rows_excluded']!r}, expected an integer"
+        )
+
+    if not isinstance(envelope["gate_failures"], list) or not all(
+        isinstance(entry, str) for entry in envelope["gate_failures"]
+    ):
+        raise PlanArtifactError(
+            f"the plan envelope {path}: gate_failures is "
+            f"{envelope['gate_failures']!r}, expected a list of strings"
+        )
+
     return envelope
+
+
+def _check_envelope_constants(path: Path, envelope: Mapping[str, Any]) -> None:
+    """Compare every envelope field that is a constant of this tree.
+
+    These are not opinions the plan is entitled to hold. `target_states`,
+    `receiving_tables`, `natural_key_tables` and `table_vocabulary` are
+    rendered straight out of planner module constants, and
+    `execution_status` is the literal `"not_performed"`. An envelope
+    disagreeing with any of them was not written by this planner against
+    this tree, whatever its `planner_version` says -- and
+    `execution_status` in particular is the field an attacker would move to
+    make an unexecuted plan look like something else.
+    """
+    expected: Mapping[str, Any] = {
+        "execution_status": EXECUTION_STATUS,
+        "target_states": list(TARGET_STATES),
+        "receiving_tables": list(RECEIVING_TABLES),
+        "natural_key_tables": sorted(NATURAL_KEY_TABLES),
+        "table_vocabulary": {
+            table: sorted(bases)
+            for table, bases in TABLE_VOCABULARY.items()
+        },
+    }
+
+    for name, value in expected.items():
+        if envelope[name] != value:
+            raise PlanArtifactError(
+                f"the plan envelope {path}: {name} is {envelope[name]!r}, "
+                f"but this tree defines {value!r}. The envelope was not "
+                "written by this planner against this tree."
+            )
+
+
+def _check_gate_shape(path: Path, gates: Any) -> None:
+    """Shape-check `archive_gates`; its values are not verifiable here.
+
+    The counts describe archives that produced no binding at all -- which is
+    precisely why nothing in the bindings can confirm them. The shape is
+    still checked, so a consumer reading `LoadedPlan.unverified` gets the
+    fields it expects with the types it expects, and the values are handed
+    over labelled rather than mixed in with the verified ones.
+    """
+    if not isinstance(gates, dict):
+        raise PlanArtifactError(
+            f"the plan envelope {path}: archive_gates is a "
+            f"{type(gates).__name__}, not an object"
+        )
+
+    if set(gates) != set(EXPECTED_GATE_FIELDS):
+        raise PlanArtifactError(
+            f"the plan envelope {path}: archive_gates carries "
+            f"{sorted(gates)}, expected exactly "
+            f"{sorted(EXPECTED_GATE_FIELDS)}"
+        )
+
+    for name, kind in EXPECTED_GATE_FIELDS.items():
+        value = gates[name]
+
+        # `bool` is excluded from the integer fields for the same reason it
+        # is everywhere else here: it satisfies `isinstance(x, int)` and
+        # would render as `true` rather than a count.
+        if kind is int and (isinstance(value, bool)
+                            or not isinstance(value, int)):
+            raise PlanArtifactError(
+                f"the plan envelope {path}: archive_gates.{name} is "
+                f"{value!r}, expected an integer"
+            )
+
+        if kind is list and (
+            not isinstance(value, list)
+            or not all(
+                isinstance(entry, int) and not isinstance(entry, bool)
+                for entry in value
+            )
+        ):
+            raise PlanArtifactError(
+                f"the plan envelope {path}: archive_gates.{name} is "
+                f"{value!r}, expected a list of integers"
+            )
 
 
 def _load_csv_rows(path: Path, expected_sha256: str) -> list[list[str]]:
@@ -346,12 +575,35 @@ def _load_csv_rows(path: Path, expected_sha256: str) -> list[list[str]]:
             f"the plan bindings {path} are not valid UTF-8: {error}"
         ) from error
 
+    # `strict=True`, because the default silently repairs malformed quoting:
+    # `"x"junk` parses as `xjunk` without complaint, which is syntax the
+    # writer never emits and which reconstructed a binding whose digest and
+    # totals all verified. Strict makes it a parse error.
     try:
-        rows = list(csv.reader(io.StringIO(text, newline="")))
+        rows = list(csv.reader(io.StringIO(text, newline=""), strict=True))
     except csv.Error as error:
         raise PlanArtifactError(
             f"the plan bindings {path} are not valid CSV: {error}"
         ) from error
+
+    # And then the stronger check: re-render the parsed rows through the
+    # writer's own dialect and require the bytes back. `strict=True` rejects
+    # syntax that is malformed; this rejects everything that is merely NOT
+    # WHAT THE WRITER WOULD HAVE PRODUCED -- unnecessary quoting, a lone LF
+    # terminator, a stray space after a delimiter. Verified against values
+    # containing commas, quotes, embedded LF and CRLF, tabs and surrounding
+    # whitespace: the writer's rendering of each round-trips byte-exactly,
+    # so this refuses non-canonical files without refusing awkward values.
+    rendered = io.StringIO()
+    csv.writer(rendered).writerows(rows)
+
+    if rendered.getvalue() != text:
+        raise PlanArtifactError(
+            f"the plan bindings {path} are not in the writer's canonical CSV "
+            "form. The file parses, but re-rendering what it parsed to does "
+            "not reproduce it, so it was not produced by render_plan_csv() "
+            "and its fields do not necessarily mean what they appear to."
+        )
 
     if not rows:
         raise PlanArtifactError(
@@ -572,7 +824,14 @@ def _binding_from_row(
             key_kind=cells["key_kind"],
             archive_id=archive_id,
             sides=tuple(sides),
-            values=values,
+            # Frozen before it is handed over. `PlannedBinding` is a frozen
+            # dataclass, which freezes the field binding and not the dict
+            # behind it, so a verified binding used to accept
+            # `values["inspector_version"] = "FORGED"` while the plan digest
+            # beside it went on describing the unmodified row. The dict is
+            # built here and wrapped without ever escaping, so the proxy is
+            # over state nothing else can reach.
+            values=MappingProxyType(values),
         )
     except PlannerInvariantError as error:
         # The planner's own invariants, applied to a file rather than to a
@@ -642,6 +901,69 @@ def _check_totals(
             f"match the bindings beside it.\n  envelope:  "
             f"{json.dumps(recorded, sort_keys=True)}\n  recounted: "
             f"{json.dumps(recounted, sort_keys=True)}"
+        )
+
+    _check_gate_failures(envelope, recounted, json_path)
+
+
+def reconstruct_gate_failures(
+    totals: Mapping[str, Any],
+    archives_without_revision: int,
+) -> list[str]:
+    """Rebuild `BackfillPlan.gate_failures` from figures already verified.
+
+    Every input is derivable: the producer-basis counts come from the totals
+    this reader recounted from the bindings, and the archive count comes
+    from the envelope's own `archive_gates`. So the plan's stated gate
+    failures are a claim that can be checked rather than one that has to be
+    taken -- and it needs checking, because it is the field that says
+    whether a plan should be applied at all. A forged empty list would
+    otherwise present a plan carrying producer-only bases as clean.
+
+    Deliberately a reimplementation of the planner's property rather than a
+    call to it, because reaching that property needs a `BackfillPlan`, and
+    building one here would mean inventing an `archives_without_revision`
+    tuple of the right length out of ids the envelope does not carry --
+    fabricated data shaped to make a check pass. The duplication is pinned
+    instead by `test_the_gate_failure_reconstruction_matches_the_planner`,
+    which runs both over the same plans and requires identical output.
+    """
+    failures: list[str] = []
+
+    for basis in (MEASURED, STAT_MATCHED, INHERITED_FROM_PAGE_EVIDENCE):
+        count = totals["per_basis"].get(basis, 0)
+
+        if count:
+            failures.append(
+                f"{count} row(s) planned as {basis}, which only a producer "
+                "can establish"
+            )
+
+    if archives_without_revision:
+        failures.append(
+            f"{archives_without_revision} archive(s) hold no revision row "
+            "and could not be classified at all"
+        )
+
+    return failures
+
+
+def _check_gate_failures(
+    envelope: Mapping[str, Any],
+    recounted: Mapping[str, Any],
+    json_path: Path,
+) -> None:
+    """The envelope's `gate_failures` must be the ones its own data implies."""
+    expected = reconstruct_gate_failures(
+        recounted, envelope["archive_gates"]["archives_without_revision"]
+    )
+
+    if list(envelope["gate_failures"]) != expected:
+        raise PlanArtifactError(
+            f"the plan envelope {json_path} records gate_failures that its "
+            f"own totals and archive_gates do not imply.\n  envelope:    "
+            f"{list(envelope['gate_failures'])!r}\n  reconstructed: "
+            f"{expected!r}"
         )
 
 
@@ -722,7 +1044,18 @@ def read_plan_artifacts(
         plan_digest=envelope["plan_digest"],
         csv_sha256=envelope["artifacts"]["csv_sha256"],
         bindings=tuple(ordered),
-        envelope=envelope,
+        envelope=_deep_freeze(
+            {
+                name: value for name, value in envelope.items()
+                if name not in UNVERIFIED_ENVELOPE_FIELDS
+            }
+        ),
+        unverified=_deep_freeze(
+            {
+                name: value for name, value in envelope.items()
+                if name in UNVERIFIED_ENVELOPE_FIELDS
+            }
+        ),
         json_path=json_path,
         csv_path=csv_path,
     )
