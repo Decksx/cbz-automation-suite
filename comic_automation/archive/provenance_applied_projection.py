@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from comic_automation.archive.provenance_backfill_planner import (
@@ -192,6 +193,18 @@ class AppliedBinding:
     key_kind: str = PROJECTION_KEY_KIND
 
     def __post_init__(self) -> None:
+        # Copied and frozen BEFORE anything is validated, so what gets
+        # checked is what gets rendered. A frozen dataclass freezes its
+        # field bindings, not the objects behind them: the reviewed
+        # revision kept the caller's own dict, so mutating that dict after
+        # construction changed the projection -- and therefore the digest
+        # -- of an object that had already been validated. `dict()` breaks
+        # the alias; the proxy stops the copy being edited through this
+        # object. `sides` is normalized to a tuple for the same reason, in
+        # case a caller passed a list.
+        object.__setattr__(self, "sides", tuple(self.sides))
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+
         if self.table not in PROJECTION_TABLES:
             raise ProjectionError(
                 f"{self.table!r} is not a slice-4 receiving table; the "
