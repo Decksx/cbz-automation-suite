@@ -660,3 +660,245 @@ seam took a snapshot, every pending version came out of
 `snapshot.discovered` by construction, so there was no longer even a
 hypothetical path for it to catch -- and unreachable code kept "just in
 case" reads to the next person as a guard that works.
+
+
+## A written plan is read back by recomputing its digest, not by trusting it
+
+`comic_automation/archive/provenance_backfill_artifact.py` reads an
+approved plan pair -- the JSON envelope and the CSV of bindings -- back
+into `PlannedBinding`s. Until slice 4B-1 nothing read either back; the
+planner only wrote them. Migration 015's executor has to recompute the
+plan digest over the artifact it is about to apply and refuse if it
+differs, and it cannot recompute a digest over bindings it cannot
+reconstruct.
+
+Forty guards are checked, each with its own message naming the file, the
+line and the values, because an operator handed one boolean learns nothing
+about which check fired. Each was proven load-bearing by disabling it
+alone: all 40 failed at least one named test, 0 failed none.
+
+That count was 25 at first review, and three of the fifteen added since
+closed defects a reviewer reproduced rather than gaps that were reasoned
+about. The digest comparison is **last**,
+and it is the one that makes the rest safe to rely on: it is the backstop
+for a *misparse*. The reconstruction has to make decisions the CSV does not
+spell out, and a wrong one changes the canonical rendering -- `null` is not
+`""`, `7` is not `"7"` -- so the recomputed digest stops matching. A reader
+that only validated fields could misread a plan consistently and
+confidently.
+
+### The empty cell is ambiguous, and that is a property of the artifact
+
+Measured on the writer, not reasoned about.
+`csv.DictWriter(restval="")` (`provenance_backfill_planner.py:1964`) fills
+every column a binding does not carry with the empty string, and renders a
+`None` value identically. `_classify()` plans every `archive_inspections`
+row with `inspector_version=None`
+(`provenance_backfill_planner.py:954`), so in the written CSV:
+
+```text
+archive_hashes       inspector_version = ""   the column does not apply
+archive_inspections  inspector_version = ""   the planned value IS None
+```
+
+The second case is not hypothetical -- it is every inspection row in the
+real plan. The two are indistinguishable *at the cell* and distinguishable
+by **table**, which is what the reader uses: `ARTIFACT_COLUMNS[table]` says
+which columns that table's bindings carry, a cell outside that set must be
+empty and is refused if it is not, and a cell inside it decodes with `""`
+meaning `None`.
+
+**The residual limitation, recorded as a gap rather than repaired.** A plan
+whose text-typed artifact column genuinely held the empty string would be
+read back as `None`. No planner path emits one today: every text artifact
+column is either `None` or a non-empty literal. If one ever did, the
+recomputed plan digest would **not** match, because `_canonical_json`
+renders `""` and `null` differently -- so the ambiguity fails closed rather
+than silently, which is what makes it safe to live with. It is not repaired
+because repairing it means changing the artifact format, and that would
+invalidate every plan already approved under the current one.
+
+### The CSV is read as bytes, because its digest covers CRLF
+
+`render_plan_csv()` goes through `csv.DictWriter`, whose default line
+terminator is CRLF, and `_create_and_write()` writes
+`payload.encode("utf-8")` through `os.write` in binary. So the bytes the
+envelope's `artifacts.csv_sha256` covers contain CRLF. Reading that file in
+text mode on Windows translates the terminators, changes the digest, and
+rejects every valid plan -- a failure that would present as corruption
+rather than as a mode bug. The read is binary and the parse takes an
+explicit `newline=""` stream.
+
+### `bound` is recomputed, never trusted
+
+The CSV carries a `bound` column and `PlannedBinding.bound` derives the
+same fact from the sides. The reader parses the column, reconstructs the
+binding, and refuses if the two disagree. The derived value is the one the
+plan digest was computed over, so accepting the column would let a file
+pass whose own envelope contradicts it.
+
+### `page_inventory` rows are read, not skipped
+
+They are slice 4p's and migration 015 does not apply them, but they are in
+the plan and therefore in the plan digest. Dropping them at read time would
+make every recomputed digest wrong on every real plan. The exclusion
+belongs at projection time, where it is counted -- see below.
+
+
+### What the reader verifies, and the two things it cannot
+
+An earlier revision validated five envelope fields and returned the rest of
+the object as though it had been verified. Reproduced in review:
+`execution_status`, `target_states`, `gate_failures`, `archive_gates` and an
+invented `unexpected_top_level` were all forged while the bindings, totals,
+CSV digest and plan digest stayed valid, and the reader reported success.
+
+The top-level field set is now checked as an **equality**, so an unexamined
+key cannot be added either -- an approval record with somewhere to put
+unread data is a place a later consumer might read from. Five fields are
+rendered straight out of planner constants and are compared against them, so
+an envelope disagreeing was not written by this planner against this tree
+whatever its `planner_version` claims. `gate_failures` is **reconstructed**
+from the recounted totals and the envelope's own `archive_gates`: it is the
+field that says whether a plan should be applied at all, and a forged empty
+list would otherwise present a plan carrying producer-only bases as clean.
+
+**Two values cannot be reconstructed and are therefore not verified.**
+`archive_gates` and `quarantine_rows_excluded` are archive-level census
+figures counted against a database this reader never opens, and an archive
+that produced no binding is precisely what they report -- so there is no
+second source to compare them against. They are shape-checked and returned
+on `LoadedPlan.unverified`, **separate** from the verified
+`LoadedPlan.envelope`. Segregated rather than merged because the 4B-2
+executor must not be able to ask for "the envelope" and receive proven and
+merely-parsed values with nothing marking which is which. The trust boundary
+is in the type rather than in a naming convention.
+
+`archives_without_revision` is an interesting case: unverifiable on its own,
+yet still constrained, because `gate_failures` is reconstructed from it. A
+raised count with an empty failure list is refused even though the count
+itself could never have been checked.
+
+### A verified result that can be edited afterwards is not one
+
+Frozen dataclasses freeze **field bindings, not the objects behind them**.
+Both `LoadedPlan` and `AppliedBinding` were frozen and both were mutable
+where it counted. Reproduced in review:
+
+```text
+VERIFIED digest=960463
+mutate loaded.bindings[0].values["inspector_version"]
+mutate loaded.envelope["totals"]["planned_rows"]
+LoadedPlan still carries digest=960463
+recomputed digest=63407e
+```
+
+`AppliedBinding` had the same defect on the side that feeds 015's
+reconciliation, and worse: it retained the caller's dict, so the digest of an
+already-validated binding moved with no call made on the binding at all.
+
+Both now copy before freezing, and the copy matters as much as the freeze --
+a `MappingProxyType` wrapping a dict the caller still holds is a read-only
+*view* of mutable state, which moves the mutation one reference away instead
+of preventing it. `AppliedBinding` copies at the top of `__post_init__`,
+before validation, so what is checked is what is rendered; normalizing
+afterwards would validate one shape and render another.
+
+### The CSV must be the writer's canonical form, not merely parseable
+
+`csv.reader` silently repairs malformed quoting. Reproduced: a field written
+`"x"junk` decoded to `xjunk`, and the raw CSV hash, the reconstructed
+binding, the totals and the plan digest all verified -- because the repaired
+value was exactly what the plan expected. Nothing downstream could catch it,
+since by then the damage was a correctly-shaped binding.
+
+Two checks, doing different jobs. `strict=True` makes malformed quoting a
+parse error. Then the parsed rows are re-rendered through the writer's own
+dialect and the bytes must come back, which rejects everything that is
+merely **not what `render_plan_csv()` would have produced**: needless
+quoting, a lone LF terminator, a stray space after a delimiter.
+
+Measured before relying on it, because a canonical-form check that is too
+strict rejects valid plans rather than forged ones: values containing
+commas, double quotes, embedded LF, embedded CRLF, tabs and surrounding
+whitespace each round-trip byte-exactly through the writer and back. The
+check refuses non-canonical files without refusing awkward values, and that
+negative is a test rather than a claim.
+
+## The slice-4 applied projection is its own format, with its own marker
+
+Design section 12.2. The reconciliation compares the plan an operator
+approved against the rows migration 015 actually wrote, and that comparison
+only means something if both sides are reduced to the same shape by the
+same code. `provenance_applied_projection.py` is that shape and that code.
+
+**`PlannedBinding` cannot be the comparison format**, and it was the
+obvious candidate. Measured:
+
+```text
+PlannedBinding(table="near_duplicate_candidates", ..., values={})
+    PlannerInvariantError: planned values do not match the table's artifact
+    columns (missing ['archive_b_id', 'parameters_basis'])
+```
+
+`parameters_basis` is required by the planner's own invariant and is
+deliberately not written by slice 4 -- it lands in slice 6 with the fields
+that give it meaning -- so a candidate reconstructed from post-015 state
+cannot be a `PlannedBinding` at all: the column does not exist in the
+database to read.
+
+`APPLIED_PROJECTION_VERSION` is `"provenance-backfill-applied/1"` and
+deliberately **not** `PLAN_DIGEST_VERSION`. A projection borrowing the
+planner's marker would keep comparing equal across a change to either
+definition, which is the failure the planner's own marker exists to
+prevent.
+
+### One projector applied twice is not a cross-check
+
+Stated because it is easy to believe otherwise. Projecting both sides
+through one function gives a comparison of like with like; it gives **no**
+protection against a shared omission, because one projector applied twice
+drops the same field from both sides and the two compare equal. Two things
+protect against that, and neither is the projector:
+
+- `PROJECTION_BINDING_FIELDS`, `PROJECTION_SIDE_FIELDS` and
+  `PROJECTION_VALUE_FIELDS` are written out as data, transcribed from
+  section 12.2 by hand, and the tests assert against a second hand
+  transcription rather than against the module -- deriving either would
+  make the assertion the projector agreeing with itself;
+- the fault-injection tests, which alter one field at a time and require
+  the digest to move.
+
+### The projector renders; it does not judge evidence
+
+It validates the shape it is handed -- table, key kind, side labels, field
+names, scalar types -- because a shape error means the caller constructed
+the wrong object and no comparison it produced would mean anything.
+
+It deliberately does **not** validate values: not the basis vocabulary, and
+not the bound-basis-implies-a-revision pairing that `PlannedBinding`
+enforces. Those are the disagreements reconciliation exists to *report*.
+A projector that raised on them would convert a reportable finding into an
+aborted transaction carrying no diagnosis -- an operator would learn that
+015 failed but not which row, field or value moved. This is a deliberate
+asymmetry with `PlannedBinding`, which refuses the same states, and it is
+recorded here because the two types looking alike makes the difference easy
+to read as an oversight.
+
+### `archive_b_id` is preserved payload, not staged attribution
+
+It appears in the candidate projection so the reconciliation verifies the
+rebuild preserved it, and it is read from the planned binding on the
+planned side and from the rebuilt target row on the applied side. It is
+**not** added to `temp_slice4_plan`: it is existing candidate payload
+carried through the rebuild, not backfill attribution, and staging it would
+misdescribe what 015 is binding.
+
+### The `page_inventory` exclusion is counted, not silent
+
+`select_slice4_bindings()` returns both the projected bindings and the
+excluded ones, so the postflight artifact can carry the deliberately
+unapplied count as a measured figure. `project_planned_binding()` refuses a
+`page_inventory` binding outright rather than returning `None`, so a caller
+that bypassed the selection cannot leave that count quietly disagreeing
+with reality.
