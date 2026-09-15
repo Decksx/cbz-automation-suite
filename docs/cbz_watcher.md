@@ -28,9 +28,40 @@ The immediate comic directory is the batch:
 5. Parse each filename with `cbz_core.parse_comic_name()`.
 6. Rename archives when needed.
 7. Create or update `ComicInfo.xml`.
-8. Resolve the destination through `routing.json`.
-9. Move the directory.
-10. Merge file-by-file if the destination exists.
+8. Optionally AI-decensor each archive with Camelia, one book at a time.
+9. Resolve the destination through `routing.json`.
+10. Move the directory.
+11. Merge file-by-file if the destination exists.
+
+## Optional Camelia stage
+
+The CBZ Automation GUI exposes **AI decensor each CBZ before import** on the
+CBZ Watcher screen. It is off by default. When enabled, choose one to three
+Camelia stages in order. Stage 1 defaults to `black_bars`; stages 2 and 3
+default to `None`, preserving the previous single-stage behavior. Each later
+stage consumes the images produced by the preceding stage.
+
+The watcher invokes Camelia's standalone `scripts/process_cbz.py` interface;
+the Camelia web server does not need to be running. Each successfully rebuilt
+archive keeps its watcher-normalized filename and internal archive structure.
+Before replacement, the untouched source is retained below
+`data/ai-decensor-originals/<job-id>/`.
+
+This stage fails closed. If Camelia fails on any book, the directory is not
+routed. Any earlier AI replacements from that directory pass are restored from
+their quarantined originals, preventing partially decensored imports.
+
+Equivalent command-line use:
+
+```powershell
+python -m scripts.cbz_watcher --ai-decensor --ai-decensor-model black_bars --ai-decensor-model transparent_black
+```
+
+The default installation paths are `C:\git\camelia` and
+`C:\ProgramData\miniconda3\envs\camelia_env\python.exe`. Override them with
+`CBZ_CAMELIA_ROOT` and `CBZ_CAMELIA_PYTHON`, or with `--camelia-root` and
+`--camelia-python`. Use `--ai-decensor-backup-dir` to select a different local
+quarantine root.
 
 ## File stability
 
@@ -85,7 +116,7 @@ Rules are ordered; first match wins. Unmatched directories use the default desti
 ## Running
 
 ```powershell
-python scripts\cbz_watcher.py
+python -m scripts.cbz_watcher
 ```
 
 Use the watcher for incoming day-to-day processing. Use unified workflows for retrospective library-wide cleanup.
