@@ -150,3 +150,67 @@ def test_the_gui_runs_tools_from_the_repository_root():
     assert "cwd=str(REPO_ROOT)" in source, (
         "the GUI no longer launches tools with cwd set to the repository root"
     )
+
+
+class _OptionValue:
+    """Minimal Tk-variable stand-in for command construction tests."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+
+def test_watcher_ai_decensor_option_builds_ordered_cli_flags():
+    """The opt-in GUI controls must reach the watcher in the selected order."""
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "ai_decensor": _OptionValue(True),
+        "ai_decensor_stage_1": _OptionValue("black_bars"),
+        "ai_decensor_stage_2": _OptionValue("transparent_black"),
+        "ai_decensor_stage_3": _OptionValue("white_bars"),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert command[-7:] == [
+        "--ai-decensor",
+        "--ai-decensor-model", "black_bars",
+        "--ai-decensor-model", "transparent_black",
+        "--ai-decensor-model", "white_bars",
+    ]
+
+
+def test_watcher_ai_decensor_is_disabled_by_default():
+    """Existing watcher launches must not unexpectedly mutate image content."""
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "ai_decensor": _OptionValue(False),
+        "ai_decensor_stage_1": _OptionValue("black_bars"),
+        "ai_decensor_stage_2": _OptionValue("None"),
+        "ai_decensor_stage_3": _OptionValue("None"),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert "--ai-decensor" not in command
+    assert "--ai-decensor-model" not in command
+
+
+def test_watcher_ai_decensor_enabled_default_is_one_black_bar_stage():
+    """Enabling Camelia without extra choices retains the former single mode."""
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "ai_decensor": _OptionValue(True),
+        "ai_decensor_stage_1": _OptionValue("black_bars"),
+        "ai_decensor_stage_2": _OptionValue("None"),
+        "ai_decensor_stage_3": _OptionValue("white_bars"),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert command[-3:] == ["--ai-decensor", "--ai-decensor-model", "black_bars"]

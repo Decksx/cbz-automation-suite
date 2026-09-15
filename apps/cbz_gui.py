@@ -96,8 +96,69 @@ TOOLS = [
         "category": "core",
         "icon": "\u25ce",
         "color": "#2196F3",
-        "options": [],
-        "note": "Runs as a background service — click Stop to shut it down. Set up your incoming folder in the watcher config.",
+        "options": [
+            {
+                "type": "checkbox",
+                "key": "ai_decensor",
+                "label": "AI decensor each CBZ before import",
+                "default": False,
+                "note": "Processes books one at a time with Camelia. A failed book stops that directory from being routed.",
+                "description": "Run Camelia before the watcher routes each incoming archive.",
+                "example": "Enable for a folder of censored CBZ files.",
+                "expected_result": "Verified decensored archives continue through normal metadata and routing; originals are quarantined.",
+            },
+            {
+                "type": "select",
+                "key": "ai_decensor_stage_1",
+                "label": "Camelia stage 1",
+                "choices": ["black_bars", "transparent_black", "white_bars"],
+                "default": "black_bars",
+                "description": "Choose the first censorship-mask model Camelia runs.",
+                "example": "black_bars for opaque black censor bars.",
+                "expected_result": "Every archive starts with this Camelia stage.",
+
+            },
+
+            {
+
+                "type": "select",
+
+                "key": "ai_decensor_stage_2",
+
+                "label": "Camelia stage 2 (optional)",
+
+                "choices": ["None", "black_bars", "transparent_black", "white_bars"],
+
+                "default": "None",
+
+                "description": "Optionally run a second model on the first stage's output.",
+
+                "example": "transparent_black after black_bars.",
+
+                "expected_result": "The selected model consumes stage 1 output; None stops after stage 1.",
+
+            },
+
+            {
+
+                "type": "select",
+
+                "key": "ai_decensor_stage_3",
+
+                "label": "Camelia stage 3 (optional)",
+
+                "choices": ["None", "black_bars", "transparent_black", "white_bars"],
+
+                "default": "None",
+
+                "description": "Optionally run a third model on the second stage's output.",
+
+                "example": "white_bars as the final stage when all three models are needed.",
+
+                "expected_result": "The selected model consumes the prior stage output; None ends the sequence.",
+            },
+        ],
+        "note": "Runs as a background service — click Stop to shut it down. Set up your incoming folder in the watcher config. Camelia originals are retained in data\\ai-decensor-originals.",
     },
     {
         "id": "library_archive_clean",
@@ -1334,6 +1395,28 @@ class CBZLauncherApp(tk.Tk):
             cmd.append("--restart")
         if opts.get("full_rescan") and opts["full_rescan"].get():
             cmd.append("--full")
+
+        if opts.get("ai_decensor") and opts["ai_decensor"].get():
+            cmd.append("--ai-decensor")
+            stage_vars = [
+                opts.get("ai_decensor_stage_1"),
+                opts.get("ai_decensor_stage_2"),
+                opts.get("ai_decensor_stage_3"),
+            ]
+            selected_stages = []
+            for stage_var in stage_vars:
+                if stage_var is None:
+                    continue
+                stage = stage_var.get()
+                if stage == "None":
+                    break
+                if stage not in selected_stages:
+                    selected_stages.append(stage)
+            # Retain support for launcher state created by the former single-model UI.
+            if not selected_stages and opts.get("ai_decensor_model"):
+                selected_stages = [opts["ai_decensor_model"].get()]
+            for stage in selected_stages or ["black_bars"]:
+                cmd.extend(["--ai-decensor-model", stage])
 
         sort_var = opts.get("sort")
         if sort_var:
