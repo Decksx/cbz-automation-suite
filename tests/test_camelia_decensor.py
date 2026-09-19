@@ -108,6 +108,64 @@ def test_verified_existing_output_is_skipped_and_scan_continues(tmp_path, capsys
     assert source.is_file()
 
 
+def test_existing_output_with_different_method_runs_only_missing_stage_and_continues(
+    tmp_path, capsys
+):
+    source_root = tmp_path / "input"
+    source = _valid_book(source_root / "A.cbz", title="A")
+    later = _valid_book(source_root / "B.cbz", title="B")
+    output = tmp_path / "Comix"
+    existing = _valid_book(
+        output / "A.cbz", tagged=True, title="A", methods=("white_bars",),
+    )
+    args = _args(source_root, output, tmp_path, dry_run=True)
+    args.model_type = ["black_bars", "white_bars"]
+
+    assert camelia_decensor.run_batch(args, _metadata_inspector) == 0
+
+    printed = capsys.readouterr().out
+    assert "already recorded: white_bars; remaining: black_bars" in printed
+    assert (
+        f"DRY RUN {existing} -> "
+        f"{output / '_additional_methods' / 'black_bars' / 'A.cbz'}"
+    ) in printed
+    assert f"DRY RUN {later} -> {output / 'B.cbz'}" in printed
+    assert source.is_file()
+
+
+def test_existing_partial_output_becomes_input_for_only_the_missing_stage(
+    tmp_path, monkeypatch
+):
+    source = _valid_book(tmp_path / "input" / "A.cbz", title="A")
+    output = tmp_path / "Comix"
+    existing = _valid_book(
+        output / "A.cbz", tagged=True, title="A", methods=("white_bars",),
+    )
+    expected = output / "_additional_methods" / "black_bars" / "A.cbz"
+    camelia_root = tmp_path / "camelia"
+    (camelia_root / "scripts").mkdir(parents=True)
+    (camelia_root / "scripts" / "process_cbz.py").touch()
+    python = tmp_path / "python.exe"
+    python.touch()
+    args = _args(source, output, tmp_path, dry_run=False)
+    args.model_type = ["black_bars", "white_bars"]
+    calls = []
+
+    def fake_process(archive, destination, sequence, *_rest):
+        calls.append((archive, destination, sequence))
+        _valid_book(
+            destination, tagged=True, title="A",
+            methods=("white_bars", "black_bars"),
+        )
+
+    monkeypatch.setattr(camelia_decensor, "run_camelia_book", fake_process)
+
+    assert camelia_decensor.run_batch(args, _metadata_inspector) == 0
+    assert calls == [(existing, expected, ["black_bars"])]
+    assert expected.is_file()
+    assert source.is_file()
+
+
 def test_conflicting_existing_output_still_fails_closed_by_default(tmp_path):
     source = _valid_book(tmp_path / "input" / "Book.cbz", title="Book")
     output = tmp_path / "Comix"

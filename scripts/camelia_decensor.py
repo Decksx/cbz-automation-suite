@@ -136,15 +136,19 @@ def _member_identity(member: zipfile.ZipInfo) -> tuple:
 
 def verify_completed_output(
     archive: Path, destination: Path, sequence: list[str], inspector: Callable[[str], dict],
-) -> None:
-    """Accept an existing copy only when its tags and source manifest agree."""
+    *, allow_missing_methods: bool = False,
+) -> tuple[str, ...]:
+    """Verify an existing copy and return requested methods it does not record."""
+    missing: tuple[str, ...] = ()
     try:
         inspection = inspector(str(destination))
         if not inspection.get("already_processed"):
             raise ValueError("uncensored marker is missing")
-        missing = set(sequence) - set(inspection.get("applied_methods") or ())
-        if missing:
-            raise ValueError(f"method tags are missing: {', '.join(sorted(missing))}")
+        missing = tuple(sorted(
+            set(sequence) - set(inspection.get("applied_methods") or ())
+        ))
+        if missing and not allow_missing_methods:
+            raise ValueError(f"method tags are missing: {', '.join(missing)}")
 
         with zipfile.ZipFile(archive) as source, zipfile.ZipFile(destination) as output:
             if source.testzip() is not None or output.testzip() is not None:
@@ -178,6 +182,20 @@ def verify_completed_output(
         raise FileExistsError(
             f"Refusing to resume existing output {destination}: {type(exc).__name__}: {exc}"
         ) from exc
+    return missing
+
+
+def skip_verified_existing_output(
+    archive: Path, destination: Path, sequence: list[str], inspector: Callable[[str], dict],
+    *, created_during_batch: bool = False,
+) -> None:
+    """Verify a completed destination and leave it untouched."""
+    verify_completed_output(archive, destination, sequence, inspector)
+    label = (
+        "SKIP verified output created during batch"
+        if created_during_batch else "SKIP verified existing output"
+    )
+    print(f"{label}: {destination}", flush=True)
 
 
 def plan_batch(source: Path, output_root: Path, inspector: Callable[[str], dict],
@@ -206,14 +224,37 @@ def plan_batch(source: Path, output_root: Path, inspector: Callable[[str], dict]
         destination = output_root / relative
         if destination.exists():
             if not inspection["already_processed"]:
-                verify_completed_output(archive, destination, pending, inspector)
-                print(f"SKIP verified existing output: {destination}", flush=True)
-                resumed += 1
+                missing = verify_completed_output(
+                    archive, destination, pending, inspector,
+                    allow_missing_methods=True,
+                )
+                if not missing:
+                    print(f"SKIP verified existing output: {destination}", flush=True)
+                    resumed += 1
+                    continue
+                completed = [method for method in pending if method not in missing]
+                remaining = [method for method in pending if method in missing]
+                print(
+                    "CONTINUE from verified existing output; "
+                    f"already recorded: {', '.join(completed) or 'legacy/unknown'}; "
+                    f"remaining: {' -> '.join(remaining)}: {destination}",
+                    flush=True,
+                )
+                archive = destination
+                destination = (
+                    output_root / "_additional_methods" / "+".join(remaining) / relative
+                )
+                if destination.exists():
+                    skip_verified_existing_output(
+                        archive, destination, remaining, inspector,
+                    )
+                    resumed += 1
+                    continue
+                planned.append((archive, destination))
                 continue
             destination = output_root / "_additional_methods" / "+".join(pending) / relative
             if destination.exists():
-                verify_completed_output(archive, destination, pending, inspector)
-                print(f"SKIP verified existing output: {destination}", flush=True)
+                skip_verified_existing_output(archive, destination, pending, inspector)
                 resumed += 1
                 continue
         planned.append((archive, destination))
@@ -312,8 +353,10 @@ def run_batch(args: argparse.Namespace, inspector: Callable[[str], dict] | None 
         # Recheck immediately before each expensive run: another process may
         # have created the target after the batch preflight.
         if destination.exists():
-            verify_completed_output(archive, destination, book_sequence, inspector)
-            print(f"SKIP verified output created during batch: {destination}", flush=True)
+            skip_verified_existing_output(
+                archive, destination, book_sequence, inspector,
+                created_during_batch=True,
+            )
             resumed += 1
             print(f"CBZ_PROGRESS {index}/{len(planned)} {int(index * 100 / len(planned))}% books", flush=True)
             continue

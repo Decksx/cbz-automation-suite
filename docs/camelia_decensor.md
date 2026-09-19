@@ -35,15 +35,20 @@ an `uncensored` marker. Original CBZs are never changed. A pre-existing output
 is verified and skipped, and the crawl continues to later books. When a
 method-tagged source has an existing output name, the next result goes under
 `_additional_methods\<method-name>\` instead, preserving the earlier copy.
-If that alternate name also exists, it is likewise verified and skipped. A
-conflicting, corrupt, incomplete, or incorrectly tagged existing output still
-stops the batch without being overwritten. Copy installation also fails if
+If that alternate name also exists, it is likewise verified and skipped. When
+an existing processed copy records only some of the selected methods, it
+becomes the input for the remaining stages. Already-recorded stages are omitted
+and the combined result is written safely below `_additional_methods\` before
+the crawl continues. A
+conflicting, corrupt, incomplete, or unmarked existing output still stops the
+batch without being overwritten. Copy installation also fails if
 another process creates that filename while a book is being processed.
 
 This is a batch, not a durable queue. Completed copies remain after an
 interrupted run. Existing copies are automatically skipped only after checking
-their ZIP CRC, member manifest, unchanged non-image members, decodable output
-pages, and the selected method tags. The legacy `--resume` option is retained
+their processed marker, ZIP CRC, member manifest, unchanged non-image members,
+and decodable output pages. Selected method-tag differences cause only the
+missing stages to run against the prior output. The legacy `--resume` option is retained
 for command compatibility and cannot be combined with `--reprocess`; use dry
 run first to review the remaining book count. Camelia checks each extracted image before model work and
 reports the source CBZ member if an image is mislabeled or unreadable. Use
