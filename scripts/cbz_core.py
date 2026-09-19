@@ -70,6 +70,7 @@ __all__ = [
     "normalize_stem",
     "parse_comic_name",
     "parse_rules",
+    "preserve_decensor_markers",
     "repair_mojibake",
     "sanitize",
     "series_base_name",
@@ -133,6 +134,7 @@ GIBBERISH_RE = re.compile(
 )
 
 _BRACKET_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+_DECENSOR_MARKER_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
 _STRAY_RE = re.compile(r"[\[\]()]")
 _SPACES_RE = re.compile(r" {2,}")
 _URL_RE = re.compile(
@@ -566,7 +568,25 @@ def _decode_mojibake_run(text: str, i: int) -> tuple[int, str | None]:
     return (j - i), decoded
 
 
+def preserve_decensor_markers(source: str, cleaned: str) -> str:
+    """Keep censorship-status words from bracketed source text after cleanup.
+
+    Scan-group brackets can still be dropped, but an explicit processed-status
+    marker must remain visible to the decensor backlog and import guard.
+    """
+    seen = {_marker.group(0).casefold() for _marker in _DECENSOR_MARKER_RE.finditer(cleaned)}
+    missing = []
+    for bracket in _BRACKET_RE.finditer(source):
+        for marker in _DECENSOR_MARKER_RE.finditer(bracket.group(0)):
+            word = marker.group(0)
+            if word.casefold() not in seen:
+                missing.append(word)
+                seen.add(word.casefold())
+    return _collapse_spaces(" ".join((cleaned, *missing))) if missing else cleaned
+
+
 def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
+    original = text
     text = repair_mojibake(text)
     text = html.unescape(text)
 
@@ -590,7 +610,7 @@ def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
     if "windows_safe" in rules:
         text = _make_windows_safe(text)
 
-    return _collapse_spaces(text)
+    return preserve_decensor_markers(original, _collapse_spaces(text))
 
 
 _FILENAME_EXT_RE = re.compile(r"(\.[a-zA-Z0-9]{2,4})$")
@@ -898,6 +918,9 @@ def parse_comic_name(
                         rebuilt = f"{english_stem} Vol. {volume}"
                     stem = rebuilt.strip() or stem
 
+    stem = preserve_decensor_markers(raw_stem, stem)
+    series = preserve_decensor_markers(raw_series, series)
+
     return ParsedComicName(
         original_path=path,
         filename=stem + ext,
@@ -956,7 +979,7 @@ def _translate_comicinfo_fields(root: ET.Element) -> bool:
         translated, source = translate_metadata_text(original)
         if source is None or translated == original:
             continue
-        element.text = translated
+        element.text = preserve_decensor_markers(original, translated)
         changed = True
         if field != "AlternateSeries":
             changed = _append_original_note(root, field, source) or changed
@@ -1030,6 +1053,7 @@ def update_comicinfo_xml(
     # title is otherwise replaced — a corrupted but "custom" title must not be
     # preserved verbatim.
     raw_title = (title_el.text or "")
+    raw_series = (series_el.text or "")
     repaired_title = repair_mojibake(raw_title)
     if repaired_title != raw_title:
         title_el.text = repaired_title
@@ -1049,6 +1073,7 @@ def update_comicinfo_xml(
         new_title = parsed.stem
         if is_generic_title(new_title) or GIBBERISH_RE.match(new_title):
             new_title = parsed.series
+        new_title = preserve_decensor_markers(raw_title, new_title)
         if (title_el.text or "").strip() != new_title:
             title_el.text = new_title
             changed = True
@@ -1058,6 +1083,7 @@ def update_comicinfo_xml(
     if original_series is not None:
         target_series = translated_series
         changed = _append_original_note(root, "Series", original_series) or changed
+    target_series = preserve_decensor_markers(raw_series, target_series)
 
     if (series_el.text or "").strip() != target_series:
         series_el.text = target_series
@@ -1091,7 +1117,9 @@ def update_comicinfo_xml(
     # filename carry the English rendering; Notes retains an explicit breadcrumb.
     if parsed.translated_title:
         alt_el = _ensure_child(root, "AlternateSeries")
-        alternate = parsed.original_title or parsed.translated_title
+        alternate = preserve_decensor_markers(
+            alt_el.text or "", parsed.original_title or parsed.translated_title
+        )
         if (alt_el.text or "").strip() != alternate:
             alt_el.text = alternate
             changed = True

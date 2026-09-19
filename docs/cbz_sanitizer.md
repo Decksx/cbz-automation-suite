@@ -96,7 +96,7 @@ Omitting `--rules` runs all rules.
 
 | Rule | Purpose |
 |---|---|
-| `brackets` | Remove bracketed and parenthesized source fragments |
+| `brackets` | Remove bracketed and parenthesized source fragments, but retain whole-word `uncensored`/`decensored` markers in filenames, directory names, and ComicInfo fields |
 | `comicinfo` | Update ComicInfo metadata |
 | `leading_nums` | Remove leading source IDs and numeric prefixes |
 | `non_latin` | Apply configured non-Latin cleanup |

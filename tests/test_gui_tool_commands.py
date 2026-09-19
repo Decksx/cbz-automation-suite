@@ -162,6 +162,51 @@ class _OptionValue:
         return self._value
 
 
+def test_standalone_camelia_tool_builds_ordered_copy_command():
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "scan_folder": _OptionValue(r"X:\comix\Book.cbz"),
+        "decensor_output_dir": _OptionValue(r"C:\output\Comix"),
+        "run_mode": _OptionValue("Dry run"),
+        "decensor_models": {
+            "black_bars": _OptionValue(True),
+            "transparent_black": _OptionValue(False),
+            "white_bars": _OptionValue(True),
+            "mosaic": _OptionValue(True),
+        },
+    }
+    tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "camelia_decensor")
+
+    command = launcher._build_command(tool)
+
+    assert command == [
+        *launcher._script_command("camelia_decensor.py"),
+        r"X:\comix\Book.cbz", "--dry-run", "--output-dir", r"C:\output\Comix",
+        "--model-type", "black_bars", "--model-type", "white_bars",
+        "--model-type", "mosaic",
+    ]
+
+
+def test_standalone_camelia_tool_refuses_empty_method_selection():
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._running = False
+    launcher._active_tool = next(
+        tool for tool in cbz_gui.TOOLS if tool["id"] == "camelia_decensor"
+    )
+    launcher._option_vars = {
+        "scan_folder": _OptionValue(r"X:\comix\Book.cbz"),
+        "decensor_output_dir": _OptionValue(r"C:\output\Comix"),
+        "decensor_models": {"mosaic": _OptionValue(False)},
+    }
+    messages = []
+    launcher._log_line = lambda message, level: messages.append((message, level))
+    launcher._launch_command = lambda _command: pytest.fail("must not launch")
+
+    launcher._run_tool()
+
+    assert messages == [("Select at least one decensor method.", "error")]
+
+
 def test_watcher_ai_decensor_option_builds_ordered_cli_flags():
     """The opt-in GUI controls must reach the watcher in the selected order."""
     launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
@@ -181,6 +226,42 @@ def test_watcher_ai_decensor_option_builds_ordered_cli_flags():
         "--ai-decensor-model", "transparent_black",
         "--ai-decensor-model", "white_bars",
     ]
+
+
+def test_watcher_gui_can_append_mosaic_as_fourth_stage():
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "ai_decensor": _OptionValue(True),
+        "ai_decensor_stage_1": _OptionValue("black_bars"),
+        "ai_decensor_stage_2": _OptionValue("transparent_black"),
+        "ai_decensor_stage_3": _OptionValue("white_bars"),
+        "ai_decensor_stage_4": _OptionValue("mosaic"),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert command[-9:] == [
+        "--ai-decensor",
+        "--ai-decensor-model", "black_bars",
+        "--ai-decensor-model", "transparent_black",
+        "--ai-decensor-model", "white_bars",
+        "--ai-decensor-model", "mosaic",
+    ]
+
+
+def test_watcher_gui_passes_series_backup_archive_on_f_drive():
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "ai_decensor": _OptionValue(True),
+        "ai_decensor_stage_1": _OptionValue("black_bars"),
+        "ai_decensor_archive_dir": _OptionValue(r"F:\ai-decensor-originals"),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert command[-2:] == ["--ai-decensor-archive-dir", r"F:\ai-decensor-originals"]
 
 
 def test_watcher_ai_decensor_is_disabled_by_default():
@@ -214,3 +295,22 @@ def test_watcher_ai_decensor_enabled_default_is_one_black_bar_stage():
     command = launcher._build_command(watcher_tool)
 
     assert command[-3:] == ["--ai-decensor", "--ai-decensor-model", "black_bars"]
+
+
+def test_reprocess_gui_options_reach_both_decensor_tools():
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    standalone = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "camelia_decensor")
+    watcher = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+    launcher._option_vars = {
+        "scan_folder": _OptionValue(r"X:\comix\Book.cbz"),
+        "decensor_reprocess": _OptionValue(True),
+        "decensor_models": {"mosaic": _OptionValue(True)},
+    }
+    assert "--reprocess" in launcher._build_command(standalone)
+    launcher._option_vars = {
+        "ai_decensor": _OptionValue(True),
+        "ai_decensor_stage_1": _OptionValue("mosaic"),
+        "ai_decensor_reprocess": _OptionValue(True),
+    }
+    assert "--ai-decensor-reprocess" in launcher._build_command(watcher)
+

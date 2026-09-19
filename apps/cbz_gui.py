@@ -61,7 +61,73 @@ CATEGORIES = [
 # scan_folder_flag: how the folder is passed to each script.
 #   "positional"  — appended as a bare arg (default, works for most tools)
 #   "--scan"      — passed as --scan=<path> (used by cbz_sanitizer.py)
-TOOLS = [
+TOOLS = [
+    {
+        "id": "camelia_decensor",
+        "label": "Camelia Decensor",
+        "script": "camelia_decensor.py",
+        "description": "Run Camelia's four decensor methods on one CBZ or a selected folder, independently of the watcher. Originals stay untouched.",
+        "category": "core",
+        "icon": "\u2727",
+        "color": "#8E6FCB",
+        "options": [
+            {
+                "type": "cbz_source",
+                "key": "scan_folder",
+                "label": "Source CBZ or folder",
+                "default": "",
+                "description": "Choose one archive or a folder; folders are scanned recursively (up to 1,000 books).",
+                "example": r"X:\comix\Sample.cbz or X:\comix",
+                "expected_result": "Only unmarked CBZs are considered for processing.",
+            },
+            {
+                "type": "folder",
+                "key": "decensor_output_dir",
+                "label": "Separate Comix output folder",
+                "default": str(REPO_ROOT / "data" / "decensored" / "Comix"),
+                "description": "Verified CBZs are written here with the source folder structure. Existing output files are never overwritten.",
+                "example": str(REPO_ROOT / "data" / "decensored" / "Comix"),
+                "expected_result": "Processed copies are saved separately; source CBZs remain unchanged.",
+            },
+            {
+                "type": "select",
+                "key": "run_mode",
+                "label": "Run mode",
+                "choices": ["Dry run", "Normal run"],
+                "default": "Dry run",
+                "description": "Preview the selected books and destinations before starting a long model run.",
+                "example": "Dry run",
+                "expected_result": "Dry run writes nothing; Normal run processes selected books.",
+            },
+            {
+                "type": "multi_select",
+                "key": "decensor_models",
+                "label": "Decensor methods (run in the order shown)",
+                "choices": ["black_bars", "transparent_black", "white_bars", "mosaic"],
+                "choice_labels": {
+                    "black_bars": "Black bars",
+                    "transparent_black": "Transparent black bars",
+                    "white_bars": "White bars",
+                    "mosaic": "Mosaic (Aletheia-Lens)",
+                },
+                "default": ["black_bars", "transparent_black", "white_bars", "mosaic"],
+                "note": "Mosaic uses the separately installed Aletheia-Lens backend.",
+                "description": "Select the decensor passes to run on each book, from top to bottom.",
+                "example": "black_bars + transparent_black + white_bars + mosaic",
+                "expected_result": "Every selected pass completes before the tagged output CBZ is installed.",
+            },
+            {
+                "type": "checkbox",
+                "key": "decensor_reprocess",
+                "label": "Reprocess even if selected methods were already applied",
+                "default": False,
+                "description": "Override method tags. Existing outputs still will not be overwritten.",
+                "example": "Enable to repeat the black-bars method on a book already tagged camelia:black_bars.",
+                "expected_result": "Selected methods run again and a new output copy is created safely.",
+            },
+        ],
+        "note": "One-shot CBZ tool, separate from the watcher and resumable backlog. Dry run is the default; verified existing outputs are skipped automatically, completed archives are tagged uncensored, and originals are retained.",
+    },
     {
         "id": "sanitizer",
         "label": "CBZ Sanitizer",
@@ -83,7 +149,7 @@ TOOLS = [
                 "label": "Select cleanup rules to apply",
                 "choices": ["brackets", "comicinfo", "leading_nums", "non_latin", "normalize_stem", "number_tokens", "scan_groups", "trailing_junk", "url"],
                 "default": [],
-                "note": "Leave all unchecked to run every available rule. Brackets = remove [brackets], Leading_nums = strip leading numbers, Non_latin = transliterate non-ASCII, URL = strip URLs from names.",
+                "note": "Leave all unchecked to run every available rule. Brackets = remove bracketed groups but keep uncensored/decensored markers; Leading_nums = strip leading numbers, Non_latin = transliterate non-ASCII, URL = strip URLs from names.",
             },
             {"type": "select", "key": "workers", "label": "Parallel workers", "choices": ["1", "2", "4", "8", "12", "20"], "default": "8", "description": "Higher = faster processing but more CPU usage"},
         ],
@@ -111,7 +177,7 @@ TOOLS = [
                 "type": "select",
                 "key": "ai_decensor_stage_1",
                 "label": "Camelia stage 1",
-                "choices": ["black_bars", "transparent_black", "white_bars"],
+                "choices": ["black_bars", "transparent_black", "white_bars", "mosaic"],
                 "default": "black_bars",
                 "description": "Choose the first censorship-mask model Camelia runs.",
                 "example": "black_bars for opaque black censor bars.",
@@ -127,7 +193,7 @@ TOOLS = [
 
                 "label": "Camelia stage 2 (optional)",
 
-                "choices": ["None", "black_bars", "transparent_black", "white_bars"],
+                "choices": ["None", "black_bars", "transparent_black", "white_bars", "mosaic"],
 
                 "default": "None",
 
@@ -147,7 +213,7 @@ TOOLS = [
 
                 "label": "Camelia stage 3 (optional)",
 
-                "choices": ["None", "black_bars", "transparent_black", "white_bars"],
+                "choices": ["None", "black_bars", "transparent_black", "white_bars", "mosaic"],
 
                 "default": "None",
 
@@ -156,9 +222,38 @@ TOOLS = [
                 "example": "white_bars as the final stage when all three models are needed.",
 
                 "expected_result": "The selected model consumes the prior stage output; None ends the sequence.",
-            },
+            },
+
+            {
+                "type": "select",
+                "key": "ai_decensor_stage_4",
+                "label": "Camelia stage 4 (optional)",
+                "choices": ["None", "black_bars", "transparent_black", "white_bars", "mosaic"],
+                "default": "None",
+                "description": "Optionally run a fourth model on the third stage's output.",
+                "example": "mosaic after the three bar stages.",
+                "expected_result": "The selected model consumes the prior stage output; None ends the sequence.",
+            },
+            {
+                "type": "folder",
+                "key": "ai_decensor_archive_dir",
+                "label": "Keep original CBZ backups on F:",
+                "default": r"F:\ai-decensor-originals",
+                "description": "After a successful import, verified originals move from temporary C: storage to series folders here.",
+                "example": r"F:\ai-decensor-originals",
+                "expected_result": "Backups are grouped by series on F:. If F: is unavailable, originals remain on C: and an error is logged.",
+            },
+            {
+                "type": "checkbox",
+                "key": "ai_decensor_reprocess",
+                "label": "Reprocess even if selected methods were already applied",
+                "default": False,
+                "description": "Override method tags for incoming CBZs; originals are still backed up.",
+                "example": "Enable to repeat a selected method on an already processed import.",
+                "expected_result": "Camelia processes the selected method again before routing the book.",
+            },
         ],
-        "note": "Runs as a background service — click Stop to shut it down. Set up your incoming folder in the watcher config. Camelia originals are retained in data\\ai-decensor-originals.",
+        "note": "Runs as a background service — click Stop to shut it down. Camelia originals stay on C: for rollback, then move to F: after import.",
     },
     {
         "id": "library_archive_clean",
@@ -707,7 +802,9 @@ class CBZLauncherApp(tk.Tk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self._proc = None
+        self._proc = None
+        self._proc_lock = threading.Lock()
+        self._stop_event = None
         self._log_queue = queue.Queue()
         self._active_tool = None
         self._option_vars = {}
@@ -716,8 +813,9 @@ class CBZLauncherApp(tk.Tk):
         self._preview_after = None
         self._progress_seen = 0
         self._progress_mode = "idle"
-        self._running = False
-        self._active_category = CATEGORIES[0][0]
+        self._running = False
+        self._running_tool_id = None
+        self._active_category = CATEGORIES[0][0]
 
         self._build_ui()
         self._select_tool(TOOLS[0])
@@ -1190,7 +1288,7 @@ class CBZLauncherApp(tk.Tk):
                          anchor="w", justify="left", wraplength=520)
         label.grid(row=row_num, column=0, columnspan=3, sticky="ew", pady=(5, 2))
 
-        if opt["type"] == "folder":
+        if opt["type"] in {"folder", "cbz_source"}:
             var = tk.StringVar(value=opt.get("default", ""))
             self._option_vars[opt["key"]] = var
             field = tk.Frame(parent, bg=BG)
@@ -1201,10 +1299,15 @@ class CBZLauncherApp(tk.Tk):
                              relief="flat", highlightbackground="#3a3a6a",
                              highlightthickness=1)
             entry.grid(row=0, column=0, sticky="ew", padx=(0, SMALL_GAP))
-            tk.Button(field, text="Browse\u2026", font=FONT_BODY, bg=CARD, fg=TEXT,
-                      relief="flat", cursor="hand2",
-                      command=lambda v=var: self._browse(v)
-                      ).grid(row=0, column=1, sticky="e")
+            if opt["type"] == "cbz_source":
+                tk.Button(field, text="Choose CBZ\u2026", font=FONT_BODY, bg=CARD, fg=TEXT,
+                          relief="flat", cursor="hand2",
+                          command=lambda v=var: self._browse_cbz(v)
+                          ).grid(row=0, column=1, sticky="e", padx=(0, SMALL_GAP))
+            tk.Button(field, text="Browse folder\u2026" if opt["type"] == "cbz_source" else "Browse\u2026",
+                      font=FONT_BODY, bg=CARD, fg=TEXT, relief="flat", cursor="hand2",
+                      command=lambda v=var: self._browse(v)
+                      ).grid(row=0, column=2 if opt["type"] == "cbz_source" else 1, sticky="e")
 
             self._add_option_guidance(field, opt, 1, columnspan=2, wraplength=760)
             self._trace_option(var)
@@ -1244,7 +1347,7 @@ class CBZLauncherApp(tk.Tk):
             checkbox_widgets = []
             for c in choices:
                 cb = tk.Checkbutton(
-                    cb_frame, text=c, variable=check_vars[c],
+                    cb_frame, text=opt.get("choice_labels", {}).get(c, c), variable=check_vars[c],
                     bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
                     selectcolor=FIELD_BG, relief="flat", font=FONT_BODY,
                     anchor="w"
@@ -1327,10 +1430,18 @@ class CBZLauncherApp(tk.Tk):
         self._tool_name_lbl.configure(wraplength=width)
         self._tool_desc_lbl.configure(wraplength=width)
 
-    def _browse(self, var):
-        path = filedialog.askdirectory(initialdir=var.get() or "C:\\")
-        if path:
-            var.set(path)
+    def _browse(self, var):
+        path = filedialog.askdirectory(initialdir=var.get() or "C:\\")
+        if path:
+            var.set(path)
+
+    def _browse_cbz(self, var):
+        path = filedialog.askopenfilename(
+            initialdir=str(Path(var.get()).parent) if var.get() else "C:\\",
+            filetypes=[("Comic archives", "*.cbz"), ("All files", "*.*")],
+        )
+        if path:
+            var.set(path)
 
     # ── Run / Stop ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -1402,6 +1513,7 @@ class CBZLauncherApp(tk.Tk):
                 opts.get("ai_decensor_stage_1"),
                 opts.get("ai_decensor_stage_2"),
                 opts.get("ai_decensor_stage_3"),
+                opts.get("ai_decensor_stage_4"),
             ]
             selected_stages = []
             for stage_var in stage_vars:
@@ -1417,6 +1529,22 @@ class CBZLauncherApp(tk.Tk):
                 selected_stages = [opts["ai_decensor_model"].get()]
             for stage in selected_stages or ["black_bars"]:
                 cmd.extend(["--ai-decensor-model", stage])
+            archive_dir = opts.get("ai_decensor_archive_dir")
+            if archive_dir and archive_dir.get().strip():
+                cmd.extend(["--ai-decensor-archive-dir", archive_dir.get().strip()])
+            if opts.get("ai_decensor_reprocess") and opts["ai_decensor_reprocess"].get():
+                cmd.append("--ai-decensor-reprocess")
+
+        if tool["id"] == "camelia_decensor":
+            if opts.get("decensor_reprocess") and opts["decensor_reprocess"].get():
+                cmd.append("--reprocess")
+            output_dir = opts.get("decensor_output_dir")
+            if output_dir and output_dir.get().strip():
+                cmd.extend(["--output-dir", output_dir.get().strip()])
+            selected_models = opts.get("decensor_models", {})
+            for model in ("black_bars", "transparent_black", "white_bars", "mosaic"):
+                if model in selected_models and selected_models[model].get():
+                    cmd.extend(["--model-type", model])
 
         sort_var = opts.get("sort")
         if sort_var:
@@ -1498,12 +1626,26 @@ class CBZLauncherApp(tk.Tk):
 
         return cmd
 
-    def _run_tool(self):
+    def _run_tool(self):
         if self._running:
             return
         tool = self._active_tool
-        if not tool:
-            return
+        if not tool:
+            return
+
+        if tool["id"] == "camelia_decensor":
+            source = self._option_vars.get("scan_folder")
+            output = self._option_vars.get("decensor_output_dir")
+            models = self._option_vars.get("decensor_models", {})
+            if not source or not source.get().strip():
+                self._log_line("Choose a source CBZ or folder first.", "error")
+                return
+            if not output or not output.get().strip():
+                self._log_line("Choose a separate Comix output folder first.", "error")
+                return
+            if not any(value.get() for value in models.values()):
+                self._log_line("Select at least one decensor method.", "error")
+                return
 
         script_path = SCRIPT_DIR / tool["script"]
         if not script_path.exists():
@@ -1525,32 +1667,43 @@ class CBZLauncherApp(tk.Tk):
         self._log_line(f"Running: {' '.join(cmd)}", "muted")
         self._log_line("\u2500" * 60, "muted")
 
-        self._running = True
+        self._running = True
+        stop_event = threading.Event()
+        self._stop_event = stop_event
+        self._running_tool_id = self._active_tool["id"] if self._active_tool else None
         self._run_btn.configure(state="disabled", bg="#555", fg=MUTED)
         self._stop_btn.configure(state="normal", bg=ERROR, fg="white")
         self._status_lbl.configure(text="Running\u2026", fg=WARNING)
         if self._active_tool:
             self._start_progress(self._active_tool)
 
-        def target():
-            try:
-                env = os.environ.copy()
-                env["CBZ_PROGRESS"] = "1"
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=str(REPO_ROOT),
-                    env=env,
-                )
-                for line in self._proc.stdout:
-                    self._log_queue.put(line.rstrip())
-                self._proc.wait()
-                rc = self._proc.returncode
-                if rc == 0:
+        def target():
+            try:
+                env = os.environ.copy()
+                env["CBZ_PROGRESS"] = "1"
+                env["PYTHONIOENCODING"] = "UTF-8"
+                env["PYTHONUNBUFFERED"] = "1"
+                with self._proc_lock:
+                    if stop_event.is_set():
+                        return
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        cwd=str(REPO_ROOT),
+                        env=env,
+                    )
+                    self._proc = proc
+                for line in proc.stdout:
+                    self._log_queue.put(line.rstrip())
+                proc.wait()
+                rc = proc.returncode
+                if stop_event.is_set():
+                    return
+                if rc == 0:
                     self._log_queue.put("__DONE_OK__")
                 else:
                     self._log_queue.put(f"__DONE_ERR__{rc}")
@@ -1559,15 +1712,32 @@ class CBZLauncherApp(tk.Tk):
 
         threading.Thread(target=target, daemon=True).start()
 
-    def _stop_tool(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            self._log_line("Process stopped by user.", "warn")
+    def _stop_tool(self):
+        if self._stop_event is not None:
+            self._stop_event.set()
+        with self._proc_lock:
+            proc = self._proc
+        if proc and proc.poll() is None:
+            if os.name == "nt" and self._running_tool_id == "camelia_decensor":
+                # This tool launches Camelia, which in turn launches model workers.
+                # Stopping only the wrapper would leave those workers running.
+                stopped = subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, text=True, check=False,
+                )
+                if stopped.returncode != 0 and proc.poll() is None:
+                    self._stop_event.clear()
+                    self._log_line(f"Could not stop the Camelia process tree: {stopped.stderr.strip()}", "error")
+                    return
+            else:
+                proc.terminate()
+            self._log_line("Process stopped by user.", "warn")
         self._stop_progress("Stopped", WARNING, value=0)
         self._set_idle()
 
-    def _set_idle(self):
-        self._running = False
+    def _set_idle(self):
+        self._running = False
+        self._running_tool_id = None
         self._proc = None
         self._run_btn.configure(state="normal", bg=ACCENT, fg="white")
         self._stop_btn.configure(state="disabled", bg=CARD, fg=MUTED)

@@ -28,6 +28,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from scripts.cbz_routing import series_key
+from scripts.ai_decensor_backups import ARCHIVE_ROOT, archive_backup
 from scripts.cbz_lock_order import (
     SeriesLockRegistry,
     UnstableSeriesIdentityError,
@@ -75,12 +76,14 @@ MIN_AGE       = 300  # seconds a directory must exist before processing
 # --ai-decensor, so existing watcher installations retain their old behavior.
 AI_DECENSOR_ENABLED = False
 AI_DECENSOR_MODELS = ["black_bars"]
+AI_DECENSOR_REPROCESS = False
 CAMELIA_ROOT = Path(os.environ.get("CBZ_CAMELIA_ROOT", r"C:\git\camelia"))
 CAMELIA_PYTHON = Path(os.environ.get(
     "CBZ_CAMELIA_PYTHON",
     r"C:\ProgramData\miniconda3\envs\camelia_env\python.exe",
 ))
 AI_DECENSOR_BACKUP_DIR = REPO_ROOT / "data" / "ai-decensor-originals"
+AI_DECENSOR_ARCHIVE_DIR = Path(os.environ.get("CBZ_AI_DECENSOR_ARCHIVE_DIR", str(ARCHIVE_ROOT)))
 
 ROUTING_FILE  = REPO_ROOT / "routing.json"
 
@@ -846,7 +849,16 @@ class AiDecensorError(RuntimeError):
     """Raised when Camelia cannot safely replace an incoming archive."""
 
 
-def run_ai_decensor(cbz_path: Path) -> Path:
+def destination_is_comix(destination: str | Path) -> bool:
+    """Return whether a resolved watcher destination contains `Comix`."""
+    return any(
+        part.casefold() == "comix"
+        for part in re.split(r"[\\/]+", str(destination))
+        if part
+    )
+
+
+def run_ai_decensor(cbz_path: Path, destination_dir: str | Path) -> Path | None:
     """AI-decensor one archive in place and return its quarantined original.
 
     Camelia verifies the rebuilt archive before replacing ``cbz_path`` and
@@ -869,10 +881,14 @@ def run_ai_decensor(cbz_path: Path) -> Path:
     ]
     for model_type in AI_DECENSOR_MODELS:
         command.extend(["--model-type", model_type])
+    if AI_DECENSOR_REPROCESS:
+        command.append("--reprocess")
     command.extend([
         "--replace",
         "--backup-dir",
         str(AI_DECENSOR_BACKUP_DIR),
+        "--destination-dir",
+        str(destination_dir),
     ])
     completed = subprocess.run(
         command,
@@ -901,6 +917,11 @@ def run_ai_decensor(cbz_path: Path) -> Path:
         raise AiDecensorError("Camelia returned no completion record")
     try:
         result = json.loads(result_line.partition("=")[2])
+        if result.get("status") == "skipped":
+            if Path(result.get("path", "")).resolve() != cbz_path.resolve():
+                raise AiDecensorError("Camelia skipped an unexpected archive")
+            log.info(f"    AI decensor skipped for {cbz_path.name}: selected methods already applied")
+            return None
         result_path = Path(result["path"]).resolve()
         backup_path = Path(result["backup_path"]).resolve()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -932,6 +953,24 @@ def restore_ai_decensor_backups(processed: list[tuple[Path, Path]]) -> None:
                 rollback_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def archive_completed_ai_backups(processed: list[tuple[Path, Path]], landed: Path | None) -> None:
+    """Offload originals only after the whole directory was routed successfully."""
+    if not processed:
+        return
+    if landed is None:
+        log.warning("    AI originals remain on C: because the directory was not routed")
+        return
+    for _processed_path, backup_path in processed:
+        try:
+            archived = archive_backup(backup_path, AI_DECENSOR_ARCHIVE_DIR, landed.name)
+            log.info(f"    AI original archived: {backup_path} -> {archived}")
+        except (OSError, ValueError) as exc:
+            log.error(
+                f"    AI original remains on C: after archive failure: {backup_path} "
+                f"({type(exc).__name__}: {exc})"
+            )
 
 
 # ─────────────────────────────────────────────
@@ -1646,6 +1685,14 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         log.info(f"  Processing directory: {comic_dir.name} ({len(cbz_files)} file(s)) -> {dest_folder}")
         parsed_by_path: dict[Path, ParsedComicName] = {}
         ai_decensor_backups: list[tuple[Path, Path]] = []
+        ai_decensor_this_directory = (
+            AI_DECENSOR_ENABLED and destination_is_comix(dest_folder)
+        )
+        if AI_DECENSOR_ENABLED and not ai_decensor_this_directory:
+            log.info(
+                f"    AI decensor skipped: destination is not under a Comix "
+                f"directory ({dest_folder})"
+            )
         for cbz in cbz_files:
             try:
                 if not cbz.exists():
@@ -1664,9 +1711,10 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 if result_path.name != original_name:
                     total_renamed += 1
                 if parsed is not None:
-                    if AI_DECENSOR_ENABLED:
-                        backup_path = run_ai_decensor(result_path)
-                        ai_decensor_backups.append((result_path, backup_path))
+                    if ai_decensor_this_directory:
+                        backup_path = run_ai_decensor(result_path, dest_folder)
+                        if backup_path is not None:
+                            ai_decensor_backups.append((result_path, backup_path))
                     parsed_by_path[result_path] = parsed
             except AiDecensorError as exc:
                 log.error(f"    AI decensor failed for {cbz.name}: {exc}")
@@ -1733,14 +1781,14 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                                   shadow_results)
                     landed = _move_loose_files(archives, dest_folder, series_name)
                     _note_move(series_name, dest_folder, landed)
-                    continue
-
-                _shadow_route(comic_dir, dest_folder, series_name,
-                              list(parsed_by_path.keys()), shadow_results)
-                landed = _move_cbz_dir(comic_dir, dest_folder,
-                                       target_name=series_name,
-                                       chapter_number=dir_number)
-                _note_move(series_name, dest_folder, landed)
+                else:
+                    _shadow_route(comic_dir, dest_folder, series_name,
+                                  list(parsed_by_path.keys()), shadow_results)
+                    landed = _move_cbz_dir(comic_dir, dest_folder,
+                                           target_name=series_name,
+                                           chapter_number=dir_number)
+                    _note_move(series_name, dest_folder, landed)
+            archive_completed_ai_backups(ai_decensor_backups, landed)
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
             # nothing was mutated, the arrival is still in the watch folder,
@@ -2093,7 +2141,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ai-decensor-model",
-        choices=("black_bars", "white_bars", "transparent_black"),
+        choices=("black_bars", "white_bars", "transparent_black", "mosaic"),
         action="append",
         dest="ai_decensor_models",
         help=(
@@ -2108,21 +2156,33 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         default=AI_DECENSOR_BACKUP_DIR,
     )
+    parser.add_argument(
+        "--ai-decensor-reprocess", action="store_true",
+        help="Run selected Camelia methods even if already recorded in ComicInfo tags.",
+    )
+    parser.add_argument(
+        "--ai-decensor-archive-dir",
+        type=Path,
+        default=AI_DECENSOR_ARCHIVE_DIR,
+        help="Verified long-term original backups, grouped by series (default: F:\\ai-decensor-originals).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None):
     """Start the watcher with command-line-selected optional integrations."""
-    global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS
-    global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR
+    global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
+    global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
     args = build_argument_parser().parse_args(argv)
     AI_DECENSOR_ENABLED = args.ai_decensor
     AI_DECENSOR_MODELS = list(dict.fromkeys(
         args.ai_decensor_models or ["black_bars"]
     ))
+    AI_DECENSOR_REPROCESS = args.ai_decensor_reprocess
     CAMELIA_ROOT = args.camelia_root
     CAMELIA_PYTHON = args.camelia_python
     AI_DECENSOR_BACKUP_DIR = args.ai_decensor_backup_dir
+    AI_DECENSOR_ARCHIVE_DIR = args.ai_decensor_archive_dir
 
     watch_path = Path(WATCH_FOLDER)
     os.makedirs(watch_path, exist_ok=True)
@@ -2149,6 +2209,7 @@ def main(argv: list[str] | None = None):
             f"  Camelia  : {' -> '.join(AI_DECENSOR_MODELS)} ({CAMELIA_ROOT})"
         )
         log.info(f"  AI backup: {AI_DECENSOR_BACKUP_DIR}")
+        log.info(f"  AI archive: {AI_DECENSOR_ARCHIVE_DIR}")
     log.info("=" * 60)
 
     tracker = DirectorySettleTracker()

@@ -36,16 +36,34 @@ The immediate comic directory is the batch:
 ## Optional Camelia stage
 
 The CBZ Automation GUI exposes **AI decensor each CBZ before import** on the
-CBZ Watcher screen. It is off by default. When enabled, choose one to three
-Camelia stages in order. Stage 1 defaults to `black_bars`; stages 2 and 3
+CBZ Watcher screen. It is off by default. When enabled, choose one to four
+Camelia stages in order, including Aletheia-Lens `mosaic`. Stage 1 defaults to
+`black_bars`; stages 2 through 4
 default to `None`, preserving the previous single-stage behavior. Each later
 stage consumes the images produced by the preceding stage.
+
+The `mosaic` stage uses Camelia's separately installed Aletheia-Lens backend.
+Set it up once with `C:\git\camelia\scripts\setup_aletheia.ps1` before enabling
+it in the watcher. A missing backend fails that book before it is routed; the
+watcher's existing directory rollback handling remains in effect.
+
+Camelia runs only when the watcher's resolved destination contains an exact
+`Comix` directory segment. Manga, graphic-novel, and other destinations skip
+the AI stage and continue through the normal import instead of failing it.
 
 The watcher invokes Camelia's standalone `scripts/process_cbz.py` interface;
 the Camelia web server does not need to be running. Each successfully rebuilt
 archive keeps its watcher-normalized filename and internal archive structure.
 Before replacement, the untouched source is retained below
 `data/ai-decensor-originals/<job-id>/`.
+This C: copy remains available throughout the directory import for rollback.
+After the entire directory routes successfully, the watcher copies each
+original to `F:\ai-decensor-originals\<Series>\<Book>.cbz`, verifies its
+SHA-256 digest, and only then removes the C: copy. Same-name backups with
+different contents get a readable timestamp suffix; exact duplicates are
+deduplicated. If F: is unavailable or verification fails, the C: original
+remains and the watcher logs the failed offload. The GUI can choose a different
+archive root, or the CLI can use `--ai-decensor-archive-dir`.
 
 This stage fails closed. If Camelia fails on any book, the directory is not
 routed. Any earlier AI replacements from that directory pass are restored from
@@ -54,7 +72,7 @@ their quarantined originals, preventing partially decensored imports.
 Equivalent command-line use:
 
 ```powershell
-python -m scripts.cbz_watcher --ai-decensor --ai-decensor-model black_bars --ai-decensor-model transparent_black
+python -m scripts.cbz_watcher --ai-decensor --ai-decensor-model black_bars --ai-decensor-model transparent_black --ai-decensor-model white_bars --ai-decensor-model mosaic
 ```
 
 The default installation paths are `C:\git\camelia` and
@@ -62,6 +80,18 @@ The default installation paths are `C:\git\camelia` and
 `CBZ_CAMELIA_ROOT` and `CBZ_CAMELIA_PYTHON`, or with `--camelia-root` and
 `--camelia-python`. Use `--ai-decensor-backup-dir` to select a different local
 quarantine root.
+
+To offload pre-existing UUID-folder backups, preview and then apply:
+
+```powershell
+python -m scripts.ai_decensor_backups
+python -m scripts.ai_decensor_backups --apply
+```
+
+The migration reads `ComicInfo.xml` directly from each CBZ to find its series.
+An archive with missing/ambiguous metadata stays on C: for review. The
+standalone Camelia Decensor is separate: it preserves its source books and
+does not create rollback originals in this C: folder.
 
 ## File stability
 

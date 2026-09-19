@@ -10,6 +10,8 @@ Windows-first automation for monitoring, sanitizing, organizing, reviewing, and 
 - `scripts/cbz_library_maintenance.py` — consolidated cleanup, organization, proposal, plan, and repair operations
 - `scripts/cbz_workflows.py` — preferred orchestration entry point for multi-stage jobs
 - `apps/cbz_gui.py` — graphical launcher and series-review workflow
+- `scripts/camelia_decensor.py` — standalone, non-destructive Camelia CBZ batch command
+- `scripts/ai_decensor_backups.py` — verified offload of watcher originals to series folders on F:
 - `scripts/cbz_compilation_resolver.py` — page-level compilation/individual overlap resolver
 - `scripts/cbz_gap_checker.py` — missing-chapter report generator
 - `comic_automation/` — SQLite-backed discovery, archive inspection,
@@ -40,6 +42,9 @@ python -m pip install -r requirements.txt
 ```powershell
 python apps\cbz_gui.py
 ```
+
+Choose **Camelia Decensor** for a one-shot CBZ or folder run independent of the
+live watcher. It starts in dry-run mode. See [standalone decensor guide](docs/camelia_decensor.md).
 
 ### Unified maintenance workflow
 

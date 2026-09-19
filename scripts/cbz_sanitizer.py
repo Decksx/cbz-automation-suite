@@ -42,6 +42,7 @@ try:
             extract_episode_number as _extract_episode_number,
             extract_part_number as _extract_part_number,
             build_sep_notes as _build_sep_notes,
+            preserve_decensor_markers as _preserve_decensor_markers,
         )
     except ModuleNotFoundError:
         from cbz_core import (  # type: ignore[no-redef]
@@ -54,11 +55,21 @@ try:
             extract_episode_number as _extract_episode_number,
             extract_part_number as _extract_part_number,
             build_sep_notes as _build_sep_notes,
+            preserve_decensor_markers as _preserve_decensor_markers,
         )
 except Exception:
     _CORE_RULES = set()
     _parse_comic_name = None
     _update_comicinfo_xml = None
+
+    def _preserve_decensor_markers(source: str, cleaned: str) -> str:
+        seen = set(re.findall(r"\b(?:uncensored|decensored)\b", cleaned, re.IGNORECASE))
+        for bracket in re.findall(r"\[[^\]]*\]|\([^)]*\)", source):
+            for word in re.findall(r"\b(?:uncensored|decensored)\b", bracket, re.IGNORECASE):
+                if word.casefold() not in {item.casefold() for item in seen}:
+                    cleaned = f"{cleaned} {word}".strip()
+                    seen.add(word)
+        return cleaned
 
     def _is_cjk_only(text: str) -> bool:
         return False
@@ -314,6 +325,7 @@ def parse_rules(raw: str) -> set[str]:
 # SANITIZE HELPERS
 # ─────────────────────────────────────────────
 def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
+    original = text
     text = html.unescape(text)
     if "url"         in rules: text = _URL_RE.sub("", text)
     if "scan_groups" in rules: text = _SCAN_GROUP_RE.sub("", text)
@@ -324,7 +336,7 @@ def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
         text = _BRACKET_RE.sub("", text)
         text = _STRAY_RE.sub("", text)
     text = text.replace("_", " ")             # always — underscores → spaces
-    return _SPACES_RE.sub(" ", text).strip()
+    return _preserve_decensor_markers(original, _SPACES_RE.sub(" ", text).strip())
 
 def clean_filename(name: str, rules: set[str] = ALL_RULES) -> str:
     stem = Path(name).stem
@@ -736,6 +748,7 @@ def process_comicinfo(
                 series_match = re.search(r"<Series>(.*?)</Series>", xml_text, re.IGNORECASE | re.DOTALL)
                 title_value  = clean_xml_field(title_match.group(1).strip())  if title_match  else ""
                 series_value = clean_xml_field(series_match.group(1).strip()) if series_match else ""
+                series_changed = False
 
                 if series_match and series_value != series_match.group(1).strip():
                     xml_text = re.sub(
@@ -744,6 +757,7 @@ def process_comicinfo(
                         xml_text, count=1, flags=re.IGNORECASE | re.DOTALL
                     )
                     log.info(f"    Series cleaned: '{series_match.group(1).strip()}' -> '{series_value}'")
+                    series_changed = True
 
                 if "leading_nums"  in rules: title_value = NUMBER_PREFIX_RE.sub("", title_value).strip()
                 if "trailing_junk" in rules: title_value = TRAILING_JUNK_RE.sub("", title_value).strip()
@@ -763,6 +777,7 @@ def process_comicinfo(
                     log.info(f"    Title='{title_value}' is gibberish/generic and filename is generic - using parent dir.")
 
                 if new_title is not None:
+                    new_title = _preserve_decensor_markers(title_match.group(1) if title_match else "", new_title)
                     xml_text = re.sub(
                         r"<Title>.*?</Title>",
                         f"<Title>{new_title}</Title>",
@@ -812,7 +827,7 @@ def process_comicinfo(
                 if sep_changed:
                     log.info("    Season/Episode/Part recorded in Notes.")
 
-                if title_changed or chapter_num or volume_num or alt_changed or sep_changed:
+                if title_changed or series_changed or chapter_num or volume_num or alt_changed or sep_changed:
                     _rewrite_comicinfo(cbz_path, real_name, xml_text)
                 else:
                     log.info(f"    comicinfo.xml OK - no changes needed.")
@@ -990,6 +1005,11 @@ def process_cbz_file(
                     eng_stem = eng_stem.strip()
                     if eng_stem:
                         new_name = eng_stem + cbz_path.suffix
+
+    new_name = (
+        _preserve_decensor_markers(cbz_path.stem, Path(new_name).stem)
+        + (Path(new_name).suffix or cbz_path.suffix)
+    )
 
     if new_name != cbz_path.name:
         new_path = cbz_path.parent / new_name
