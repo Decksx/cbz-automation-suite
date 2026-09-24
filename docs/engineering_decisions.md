@@ -825,6 +825,35 @@ whitespace each round-trip byte-exactly through the writer and back. The
 check refuses non-canonical files without refusing awkward values, and that
 negative is a test rather than a claim.
 
+## Watcher category routing and canonical series identity stay separate
+
+The watcher's ordered `routing.json` rules remain authoritative for the broad
+Comix/Manga category. Canonical series matching is a second step: the selected
+category chooses one `SeriesResolver`, which then resolves the incoming title
+against that library's aliases. This keeps source-specific category knowledge
+out of the name matcher and keeps the resolver reusable outside the watcher.
+
+The current resolver roots are `Z:\comics\Comix` and `Z:\comics\Manga`.
+They are CLI/GUI configuration, not embedded in the registry format, so the
+planned future X: migration is a path change rather than another resolver
+implementation. Existing `X:\_staging` destinations remain review fallbacks
+for ambiguous exact or fuzzy matches; an ambiguity is never converted into an
+automatic merge.
+
+Resolver-enabled startup builds a missing registry and refuses to start if a
+configured library root is unavailable. Falling back silently would make an
+apparently successful watcher accumulate the same manual staging work this
+mode is intended to remove. Live imports persist their observed aliases after
+the file move. Registry failure after a completed move is logged rather than
+rolling back library data, because registry JSON is rebuildable from the
+library while the imported archive is authoritative content.
+
+Conflict handling in resolver mode is deliberately different from legacy
+staging. Equal-size conflicts are hashed; exact incoming duplicates may be
+removed, while every non-identical loser is quarantined outside Komga and the
+larger file is retained. The legacy replacement threshold remains unchanged
+when the resolver is disabled.
+
 ## The slice-4 applied projection is its own format, with its own marker
 
 Design section 12.2. The reconciliation compares the plan an operator
