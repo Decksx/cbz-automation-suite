@@ -854,6 +854,14 @@ removed, while every non-identical loser is quarantined outside Komga and the
 larger file is retained. The legacy replacement threshold remains unchanged
 when the resolver is disabled.
 
+Measured on 2026-09-24 through both `Z:` and `\\TOWER\media`: the TOWER Samba
+share refuses creation of AppleDouble-style `._*` filenames with
+`FileNotFoundError`, while the same `tempfile.mkstemp` call succeeds with an
+underscore-prefixed name. Registry writes therefore keep their temporary file
+beside the target for atomic replacement but use `_series_registry...tmp`, not
+`._series_registry...tmp`. A disposable create-and-replace probe succeeded
+twice on `Z:\comics\Manga` with zero temporary residue.
+
 ## The slice-4 applied projection is its own format, with its own marker
 
 Design section 12.2. The reconciliation compares the plan an operator
