@@ -177,8 +177,13 @@ def _logged_aliases(root: Path) -> list[tuple[str, str]]:
 
 def _atomic_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # TOWER's Samba configuration vetoes AppleDouble-style ``._*`` names:
+    # mkstemp reports FileNotFoundError even though ordinary files in the same
+    # directory are writable. Keep the temporary adjacent for atomic replace,
+    # but do not prepend another dot to registry names that already start with
+    # an underscore.
     handle, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
     )
     temporary = Path(temporary_name)
     try:
