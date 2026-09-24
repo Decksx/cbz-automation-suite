@@ -162,10 +162,66 @@ TOOLS = [
         "category": "core",
         "icon": "\u25ce",
         "color": "#2196F3",
-        "options": [
-            {
-                "type": "checkbox",
-                "key": "ai_decensor",
+        "options": [
+            {
+                "type": "checkbox",
+                "key": "series_resolver",
+                "label": "Resolve series names and import directly to Z:",
+                "default": True,
+                "note": "Exact and 95%+ title matches use the established series folder. Ambiguous matches remain in X: staging for review.",
+                "description": "Use canonical aliases, translated metadata, and fuzzy matching instead of creating slightly different series folders.",
+                "example": "Martial_Evolution Start-by... joins the established Martial Evolution series.",
+                "expected_result": "Confirmed series import directly to Z:; duplicate conflicts keep the larger file and quarantine the smaller one.",
+            },
+            {
+                "type": "folder",
+                "key": "resolver_comix_root",
+                "label": "Canonical Comix library",
+                "default": r"Z:\comics\Comix",
+                "description": "Primary Comix series folders and registry location.",
+                "example": r"Z:\comics\Comix",
+                "expected_result": "Comix imports resolve against this library.",
+            },
+            {
+                "type": "folder",
+                "key": "resolver_manga_root",
+                "label": "Canonical Manga library",
+                "default": r"Z:\comics\Manga",
+                "description": "Primary Manga series folders and registry location.",
+                "example": r"Z:\comics\Manga",
+                "expected_result": "Manga imports resolve against this library.",
+            },
+            {
+                "type": "folder",
+                "key": "resolver_quarantine_root",
+                "label": "Resolver conflict quarantine",
+                "default": r"Z:\comics\_resolver_quarantine",
+                "description": "Stores the smaller non-identical file outside both Komga library roots.",
+                "example": r"Z:\comics\_resolver_quarantine",
+                "expected_result": "Potentially useful conflict losers remain recoverable and are not indexed by Komga.",
+            },
+            {
+                "type": "select",
+                "key": "resolver_threshold",
+                "label": "Minimum fuzzy title match",
+                "choices": ["0.95", "0.97", "0.99"],
+                "default": "0.95",
+                "description": "95% matches the resolver policy; higher values are more conservative.",
+                "example": "0.95",
+                "expected_result": "Only an unambiguous match at or above this score is merged automatically.",
+            },
+            {
+                "type": "checkbox",
+                "key": "resolver_refresh",
+                "label": "Rebuild series registries before watching",
+                "default": False,
+                "description": "Rescan current series folders and saved aliases before accepting imports.",
+                "example": "Enable after a large manual rename or library reorganization.",
+                "expected_result": "Both Z: registries are atomically refreshed before the watcher starts.",
+            },
+            {
+                "type": "checkbox",
+                "key": "ai_decensor",
                 "label": "AI decensor each CBZ before import",
                 "default": False,
                 "note": "Processes books one at a time with Camelia. A failed book stops that directory from being routed.",
@@ -253,7 +309,7 @@ TOOLS = [
                 "expected_result": "Camelia processes the selected method again before routing the book.",
             },
         ],
-        "note": "Runs as a background service — click Stop to shut it down. Camelia originals stay on C: for rollback, then move to F: after import.",
+        "note": "Runs as a background service — click Stop to shut it down. Resolver mode imports confirmed series to Z: and leaves ambiguous matches in X: staging.",
     },
     {
         "id": "library_archive_clean",
@@ -1504,10 +1560,27 @@ class CBZLauncherApp(tk.Tk):
 
         if opts.get("restart") and opts["restart"].get():
             cmd.append("--restart")
-        if opts.get("full_rescan") and opts["full_rescan"].get():
-            cmd.append("--full")
-
-        if opts.get("ai_decensor") and opts["ai_decensor"].get():
+        if opts.get("full_rescan") and opts["full_rescan"].get():
+            cmd.append("--full")
+
+        if opts.get("series_resolver") and opts["series_resolver"].get():
+            cmd.append("--series-resolver")
+            resolver_paths = (
+                ("resolver_comix_root", "--resolver-comix-root"),
+                ("resolver_manga_root", "--resolver-manga-root"),
+                ("resolver_quarantine_root", "--resolver-quarantine-root"),
+            )
+            for key, flag in resolver_paths:
+                value = opts.get(key)
+                if value and value.get().strip():
+                    cmd.extend([flag, value.get().strip()])
+            threshold = opts.get("resolver_threshold")
+            if threshold and threshold.get().strip():
+                cmd.extend(["--resolver-threshold", threshold.get().strip()])
+            if opts.get("resolver_refresh") and opts["resolver_refresh"].get():
+                cmd.append("--resolver-refresh")
+
+        if opts.get("ai_decensor") and opts["ai_decensor"].get():
             cmd.append("--ai-decensor")
             stage_vars = [
                 opts.get("ai_decensor_stage_1"),
