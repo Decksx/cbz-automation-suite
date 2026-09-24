@@ -1,0 +1,130 @@
+"""Deterministic coverage for canonical series importing."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from comic_automation.series_resolver import (
+    ALIAS_SEED_NAME,
+    REGISTRY_NAME,
+    SeriesResolver,
+    alias_key,
+    build_registry,
+    resolve_from_registry,
+    settle_file_conflict,
+    write_registry,
+)
+
+
+def test_alias_key_ignores_case_accents_hyphens_and_underscores() -> None:
+    assert alias_key("Martíal_Evolution: Start-by...") == alias_key(
+        "martial evolution start by"
+    )
+
+
+def test_registry_learns_translated_and_romanized_metadata_aliases(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Manga"
+    canonical = library / "The Apothecary Diaries"
+    canonical.mkdir(parents=True)
+    (canonical / "series.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "name": "The Apothecary Diaries",
+                    "alternate_titles": [
+                        "Kusuriya no Hitorigoto",
+                        "薬屋のひとりごと",
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = build_registry(library)
+
+    romaji = resolve_from_registry(registry, "Kusuriya-no-Hitorigoto")
+    japanese = resolve_from_registry(registry, "薬屋のひとりごと")
+    assert romaji["relative_path"] == "The Apothecary Diaries"
+    assert japanese["relative_path"] == "The Apothecary Diaries"
+
+
+def test_fuzzy_resolution_requires_95_percent_and_rejects_close_competitors() -> None:
+    registry = {
+        "aliases_by_normalized_key": {
+            alias_key("Martial Evolution Start by Awakening Monsters"): "One",
+            alias_key("Martial Evolution Start by Awakening Monsterz"): "Two",
+        },
+        "ambiguous_aliases": {},
+    }
+
+    result = resolve_from_registry(
+        registry, "Martial Evolution Start by Awakening Monsterx", threshold=0.95
+    )
+
+    assert result["matched"] is False
+    assert result["match_type"] == "ambiguous_fuzzy"
+
+
+def test_live_resolver_builds_then_persists_new_aliases(tmp_path: Path) -> None:
+    library = tmp_path / "Comix"
+    (library / "Primary English Title").mkdir(parents=True)
+    resolver = SeriesResolver(library)
+
+    resolver.register(
+        "Primary English Title",
+        {"Romaji Puraimari Taitoru", "Primary_English-Title"},
+    )
+
+    assert (library / REGISTRY_NAME).is_file()
+    assert (library / ALIAS_SEED_NAME).is_file()
+    reloaded = SeriesResolver(library)
+    result = reloaded.resolve("Romaji-Puraimari_Taitoru")
+    assert result["matched"] is True
+    assert result["relative_path"] == "Primary English Title"
+
+
+def test_exact_duplicate_is_removed_without_quarantine(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming.cbz"
+    existing = tmp_path / "library.cbz"
+    quarantine = tmp_path / "quarantine" / "incoming.cbz"
+    incoming.write_bytes(b"same bytes")
+    existing.write_bytes(b"same bytes")
+
+    outcome = settle_file_conflict(incoming, existing, quarantine)
+
+    assert outcome["action"] == "deleted_exact_duplicate"
+    assert not incoming.exists()
+    assert existing.read_bytes() == b"same bytes"
+    assert not quarantine.exists()
+
+
+def test_larger_file_wins_and_smaller_file_is_quarantined(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming.cbz"
+    existing = tmp_path / "library.cbz"
+    quarantine = tmp_path / "quarantine" / "book.cbz"
+    incoming.write_bytes(b"larger incoming archive")
+    existing.write_bytes(b"small")
+
+    outcome = settle_file_conflict(incoming, existing, quarantine)
+
+    assert outcome["action"] == "kept_larger_incoming"
+    assert existing.read_bytes() == b"larger incoming archive"
+    assert quarantine.read_bytes() == b"small"
+
+
+def test_registry_write_is_loadable_json(tmp_path: Path) -> None:
+    library = tmp_path / "Manga"
+    library.mkdir()
+    registry = {
+        "series": [],
+        "aliases_by_normalized_key": {},
+        "ambiguous_aliases": {},
+    }
+
+    path = write_registry(library, registry)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == registry
