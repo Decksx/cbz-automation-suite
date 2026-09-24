@@ -128,3 +128,26 @@ def test_registry_write_is_loadable_json(tmp_path: Path) -> None:
     path = write_registry(library, registry)
 
     assert json.loads(path.read_text(encoding="utf-8")) == registry
+
+
+def test_atomic_registry_temp_name_avoids_samba_appledouble_veto(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """TOWER refuses ``._*`` names, so atomic writes must not use that prefix."""
+    from comic_automation import series_resolver
+
+    real_mkstemp = series_resolver.tempfile.mkstemp
+    observed: list[str] = []
+
+    def recording_mkstemp(*, prefix: str, suffix: str, dir: Path):
+        observed.append(prefix)
+        return real_mkstemp(prefix=prefix, suffix=suffix, dir=dir)
+
+    monkeypatch.setattr(series_resolver.tempfile, "mkstemp", recording_mkstemp)
+    library = tmp_path / "Manga"
+    library.mkdir()
+
+    series_resolver.write_registry(library, {"version": 1})
+
+    assert observed == ["_series_registry.json."]
+    assert not observed[0].startswith("._")
