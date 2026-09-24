@@ -6,6 +6,7 @@ Windows-first automation for monitoring, sanitizing, organizing, reviewing, and 
 
 - `scripts/cbz_core.py` — shared parsing, normalization, translation, and ComicInfo logic
 - `scripts/cbz_watcher.py` — live incoming-folder processor and router
+- `comic_automation/series_resolver.py` — canonical title/alias registry, fuzzy matching, and conflict quarantine
 - `scripts/cbz_sanitizer.py` — recursive batch sanitizer with persistent progress and incremental scanning
 - `scripts/cbz_library_maintenance.py` — consolidated cleanup, organization, proposal, plan, and repair operations
 - `scripts/cbz_workflows.py` — preferred orchestration entry point for multi-stage jobs
@@ -20,8 +21,9 @@ Windows-first automation for monitoring, sanitizing, organizing, reviewing, and 
 
 > The SQLite operational core and Version 1 exact/perceptual hashing
 > pipeline are implemented. The perceptual-hash library backfill is
-> running in guarded batches; series identity, quality scoring,
-> semantic embeddings, and the review dashboard remain roadmap work.
+> running in guarded batches; canonical watcher import matching is available,
+> while quality scoring, semantic embeddings, and the review dashboard remain
+> roadmap work.
 
 ## Requirements
 
@@ -75,6 +77,17 @@ Copy `config\routing.example.json` to `routing.json`, edit it, then run:
 ```powershell
 python scripts\cbz_watcher.py
 ```
+
+The GUI enables canonical series resolving for the current
+`Z:\comics\Comix` and `Z:\comics\Manga` libraries by default. Equivalent CLI
+use is:
+
+```powershell
+python -m scripts.cbz_watcher --series-resolver
+```
+
+See [the watcher guide](docs/cbz_watcher.md#canonical-series-resolver) for
+registry, ambiguity, quarantine, translation, and future X: migration details.
 
 ## Dry-run action plans
 
