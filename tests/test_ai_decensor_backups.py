@@ -99,6 +99,20 @@ def test_legacy_backup_without_series_stays_on_local_drive(tmp_path):
     assert source.is_file()
 
 
+def test_explicit_fallback_archives_backup_without_comicinfo(tmp_path):
+    local = tmp_path / "local"
+    source = local / str(uuid.uuid4()) / "Book.cbz"
+    source.parent.mkdir(parents=True)
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("001.jpg", b"original")
+
+    assert backups.migrate_existing(
+        local, tmp_path / "archive", apply=True, fallback_series="_Unclassified",
+    ) == (1, 0)
+    assert not source.exists()
+    assert (tmp_path / "archive" / "_Unclassified" / "Book.cbz").is_file()
+
+
 def test_single_backlog_backup_offload_and_scope_guard(tmp_path):
     local = tmp_path / "local"
     source = _legacy(local, "Book.cbz", "My Series")
@@ -114,6 +128,19 @@ def test_single_backlog_backup_offload_and_scope_guard(tmp_path):
     with pytest.raises(ValueError, match="not directly inside"):
         backups.offload_one(outside, local, archive)
     assert outside.is_file()
+
+
+def test_single_offload_uses_explicit_fallback_for_missing_series(tmp_path):
+    local = tmp_path / "local"
+    source = local / str(uuid.uuid4()) / "Book.cbz"
+    source.parent.mkdir(parents=True)
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("001.jpg", b"original")
+
+    target = backups.offload_one(source, local, tmp_path / "archive", "Folder Series")
+
+    assert target == tmp_path / "archive" / "Folder Series" / "Book.cbz"
+    assert target.is_file()
 
 
 def test_single_backup_cli_matches_camelia_callback(tmp_path):
