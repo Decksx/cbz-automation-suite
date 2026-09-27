@@ -240,18 +240,20 @@ def test_watcher_resolver_builds_z_library_cli_flags():
         ),
         "resolver_threshold": _OptionValue("0.95"),
         "resolver_refresh": _OptionValue(True),
+        "resolver_normalize_apostrophes": _OptionValue(True),
     }
     watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
 
     command = launcher._build_command(watcher_tool)
 
-    assert command[-10:] == [
+    assert command[-11:] == [
         "--series-resolver",
         "--resolver-comix-root", r"Z:\comics\Comix",
         "--resolver-manga-root", r"Z:\comics\Manga",
         "--resolver-quarantine-root", r"Z:\comics\_resolver_quarantine",
         "--resolver-threshold", "0.95",
         "--resolver-refresh",
+        "--resolver-normalize-apostrophes",
     ]
 
 
@@ -262,6 +264,7 @@ def test_watcher_gui_enables_z_resolver_by_default() -> None:
     assert options["series_resolver"]["default"] is True
     assert options["resolver_comix_root"]["default"] == r"Z:\comics\Comix"
     assert options["resolver_manga_root"]["default"] == r"Z:\comics\Manga"
+    assert options["resolver_normalize_apostrophes"]["default"] is False
 
 
 def test_watcher_gui_can_append_mosaic_as_fourth_stage():
