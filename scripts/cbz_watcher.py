@@ -27,7 +27,12 @@ from collections.abc import Iterable
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
-from comic_automation.series_resolver import SeriesResolver, settle_file_conflict
+from comic_automation.series_resolver import (
+    SeriesResolver,
+    normalize_apostrophes,
+    safe_name,
+    settle_file_conflict,
+)
 from comic_automation.library.exclusions import (
     DEFAULT_EXCLUDED_DIRECTORIES,
     iter_files_excluding_directories,
@@ -102,6 +107,7 @@ SERIES_RESOLVER_ROOTS = {
 SERIES_RESOLVER_QUARANTINE_ROOT = Path(r"Z:\comics\_resolver_quarantine")
 SERIES_RESOLVER_THRESHOLD = 0.95
 SERIES_RESOLVER_REFRESH = False
+SERIES_RESOLVER_NORMALIZE_APOSTROPHES = False
 
 ROUTING_FILE  = REPO_ROOT / "routing.json"
 
@@ -851,7 +857,9 @@ def process_cbz_file(
     #   sanitize → strip leading nums → normalize_stem → normalise_number_tokens
     # This is the single authoritative source for filename and ComicInfo fields.
     parsed   = parse_comic_name(cbz_path)
-    new_name = override_name if override_name is not None else parsed.filename
+    new_name = normalize_apostrophes(
+        override_name if override_name is not None else parsed.filename
+    )
 
     if new_name != cbz_path.name:
         new_path = cbz_path.parent / new_name
@@ -1247,6 +1255,7 @@ def _load_series_resolvers() -> None:
             threshold=SERIES_RESOLVER_THRESHOLD,
             quarantine_root=SERIES_RESOLVER_QUARANTINE_ROOT / root.name,
             refresh=SERIES_RESOLVER_REFRESH,
+            repair_apostrophes=SERIES_RESOLVER_NORMALIZE_APOSTROPHES,
         )
         _series_resolvers[category] = resolver
         log.info(
@@ -1254,6 +1263,13 @@ def _load_series_resolvers() -> None:
             f"({resolver.registry.get('series_count', 0)} series, "
             f"{resolver.registry.get('alias_count', 0)} aliases)"
         )
+        normalization = resolver.apostrophe_normalization
+        if normalization is not None:
+            log.info(
+                f"  Apostrophe normalization: {category} repaired "
+                f"{len(normalization.get('actions', []))} item(s); "
+                f"{len(normalization.get('errors', []))} error(s)"
+            )
 
 
 def _load_routing_v2() -> None:
@@ -1370,24 +1386,193 @@ def _resolve_dest(comic_dir: Path) -> str:
 def _resolve_import_target(
     category: str, title: str, legacy_dest: str
 ) -> tuple[str, str, dict[str, object], SeriesResolver | None]:
-    """Resolve a title to its canonical folder or an ambiguity review path.
+    """Resolve a title across every configured library.
 
-    New and confidently matched titles go directly to the configured Z library.
-    Ambiguous exact or fuzzy results retain the legacy staging destination so a
-    human can review them without a speculative library merge.
+    Existing series identity is stronger evidence than the download source.
+    The source category is used only when no live library folder matches. A
+    stale registry path is ignored, except when the same folder can be found
+    under another configured root after a manual move.
     """
-    resolver = _series_resolvers.get(category)
-    if resolver is None:
+    source_resolver = _series_resolvers.get(category)
+    if not _series_resolvers:
         return title, legacy_dest, {"match_type": "resolver_disabled"}, None
-    result = resolver.resolve(title)
-    if str(result.get("match_type", "")).startswith("ambiguous_"):
-        return title, legacy_dest, result, resolver
-    target_name = str(
-        result.get("relative_path") or result.get("suggested_name") or title
+
+    resolved = {
+        candidate_category: resolver.resolve(title)
+        for candidate_category, resolver in _series_resolvers.items()
+    }
+    candidates: dict[tuple[str, str], dict[str, object]] = {}
+
+    def _add_candidate(
+        evidence_category: str,
+        relative_path: object,
+        evidence_match_type: str,
+        confidence: object,
+    ) -> None:
+        relative = str(relative_path)
+        if Path(relative).name != relative:
+            raise ValueError(
+                f"Resolver returned a non-series path: {relative!r}"
+            )
+        evidence_resolver = _series_resolvers[evidence_category]
+        locations: list[tuple[str, SeriesResolver]] = []
+        if (evidence_resolver.root / relative).is_dir():
+            locations.append((evidence_category, evidence_resolver))
+        else:
+            # A folder manually moved between libraries is useful evidence even
+            # before the next registry refresh, provided its canonical name did
+            # not change during the move.
+            locations.extend(
+                (other_category, other_resolver)
+                for other_category, other_resolver in _series_resolvers.items()
+                if other_category != evidence_category
+                and (other_resolver.root / relative).is_dir()
+            )
+        for selected_category, selected_resolver in locations:
+            relocated = selected_category != evidence_category
+            rank = 2 if evidence_match_type in {
+                "exact_alias", "ambiguous_exact"
+            } else 1
+            try:
+                numeric_confidence = float(confidence)
+            except (TypeError, ValueError):
+                numeric_confidence = 1.0 if rank == 2 else 0.0
+            candidate = {
+                "category": selected_category,
+                "resolver": selected_resolver,
+                "relative_path": relative,
+                "confidence": numeric_confidence,
+                "rank": rank,
+                "match_type": "relocated_series" if relocated else (
+                    "exact_alias" if rank == 2 else "fuzzy_alias"
+                ),
+                "evidence_category": evidence_category,
+                "evidence_match_type": evidence_match_type,
+            }
+            key = (selected_category, relative.casefold())
+            previous = candidates.get(key)
+            if previous is None or (
+                rank,
+                numeric_confidence,
+            ) > (
+                int(previous["rank"]),
+                float(previous["confidence"]),
+            ):
+                candidates[key] = candidate
+
+    for evidence_category, result in resolved.items():
+        match_type = str(result.get("match_type", ""))
+        if result.get("matched"):
+            _add_candidate(
+                evidence_category,
+                result.get("relative_path"),
+                match_type,
+                result.get("confidence"),
+            )
+            continue
+        if match_type not in {"ambiguous_exact", "ambiguous_fuzzy"}:
+            continue
+        for item in result.get("candidates", []):
+            if isinstance(item, dict):
+                relative_path = item.get("relative_path")
+                confidence = item.get("confidence")
+            else:
+                relative_path = item
+                confidence = 1.0
+            if relative_path:
+                _add_candidate(
+                    evidence_category,
+                    relative_path,
+                    match_type,
+                    confidence,
+                )
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: (
+            int(item["rank"]),
+            float(item["confidence"]),
+            str(item["category"]).casefold(),
+            str(item["relative_path"]).casefold(),
+        ),
+        reverse=True,
     )
-    if Path(target_name).name != target_name:
-        raise ValueError(f"Resolver returned a non-series path: {target_name!r}")
-    return target_name, str(resolver.root), result, resolver
+    exact = [candidate for candidate in ranked if candidate["rank"] == 2]
+    selected: dict[str, object] | None = None
+    ambiguous: list[dict[str, object]] = []
+    if len(exact) == 1:
+        selected = exact[0]
+    elif len(exact) > 1:
+        ambiguous = exact
+    elif ranked:
+        if len(ranked) == 1 or (
+            float(ranked[0]["confidence"])
+            - float(ranked[1]["confidence"])
+            >= 0.02
+        ):
+            selected = ranked[0]
+        else:
+            best = float(ranked[0]["confidence"])
+            ambiguous = [
+                candidate
+                for candidate in ranked
+                if best - float(candidate["confidence"]) < 0.02
+            ]
+
+    if ambiguous:
+        candidate_details = [
+            {
+                "category": str(candidate["category"]),
+                "relative_path": str(candidate["relative_path"]),
+                "confidence": round(float(candidate["confidence"]), 4),
+                "match_type": str(candidate["match_type"]),
+            }
+            for candidate in ambiguous[:10]
+        ]
+        categories = {item["category"] for item in candidate_details}
+        ambiguity_type = (
+            "ambiguous_cross_library"
+            if len(categories) > 1
+            else "ambiguous_exact" if exact else "ambiguous_fuzzy"
+        )
+        return title, legacy_dest, {
+            "matched": False,
+            "match_type": ambiguity_type,
+            "title": title,
+            "source_category": category,
+            "candidates": candidate_details,
+        }, None
+
+    if selected is not None:
+        selected_resolver = selected["resolver"]
+        assert isinstance(selected_resolver, SeriesResolver)
+        target_name = str(selected["relative_path"])
+        result = {
+            "matched": True,
+            "match_type": str(selected["match_type"]),
+            "confidence": round(float(selected["confidence"]), 4),
+            "title": title,
+            "relative_path": target_name,
+            "path": str(selected_resolver.root / target_name),
+            "source_category": category,
+            "selected_category": str(selected["category"]),
+            "evidence_category": str(selected["evidence_category"]),
+            "evidence_match_type": str(selected["evidence_match_type"]),
+        }
+        return target_name, str(selected_resolver.root), result, selected_resolver
+
+    if source_resolver is None:
+        return title, legacy_dest, {"match_type": "resolver_disabled"}, None
+    target_name = safe_name(title)
+    return target_name, str(source_resolver.root), {
+        "matched": False,
+        "match_type": "none",
+        "title": title,
+        "suggested_name": target_name,
+        "suggested_path": str(source_resolver.root / target_name),
+        "source_category": category,
+        "selected_category": category,
+    }, source_resolver
 
 
 # The canonical series identity, not a local copy. Three implementations of
@@ -1795,14 +1980,15 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
 
     for comic_dir, cbz_files in sorted(cbz_dirs.items()):
         route_category, legacy_dest = _resolve_route(comic_dir)
-        active_resolver = _series_resolvers.get(route_category)
-        dest_folder = (
-            str(active_resolver.root) if active_resolver is not None else legacy_dest
+        incoming_series_alias = comic_dir.name
+        clean_dir_name = clean_directory_name(comic_dir.name)
+        preliminary_title = clean_dir_name or comic_dir.name
+        _, dest_folder, _, active_resolver = (
+            _resolve_import_target(route_category, preliminary_title, legacy_dest)
         )
         conflict_quarantine_root = (
             active_resolver.quarantine_root if active_resolver is not None else None
         )
-        incoming_series_alias = comic_dir.name
 
         # A directory that has .cbz files sitting directly inside it *and* also
         # contains subdirectories that themselves hold .cbz files (each already
@@ -1817,7 +2003,6 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
             for other in cbz_dirs
         )
 
-        clean_dir_name = clean_directory_name(comic_dir.name)
         if has_nested_comic_dirs:
             # Do not rename/merge the mixed drop-point directory itself here —
             # it still holds subdirectories that belong to other cbz_dirs
@@ -1928,7 +2113,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
             name, number = _resolve_series_dir_name(
                 comic_dir, list(parsed_by_path.keys()), dest_folder
             )
-            if active_resolver is not None:
+            if _series_resolvers:
                 metadata_name = _consistent_comicinfo_series(
                     list(parsed_by_path.keys())
                 )
@@ -1959,6 +2144,11 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 dest_folder = resolution["target_dest"]
                 resolver_result = resolution["resolver_result"]
                 active_resolver = resolution["resolver"]
+                conflict_quarantine_root = (
+                    active_resolver.quarantine_root
+                    if active_resolver is not None
+                    else None
+                )
                 match_type = resolver_result.get("match_type")
                 if str(match_type).startswith("ambiguous_"):
                     log.warning(
@@ -1967,6 +2157,12 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         f"{resolver_result.get('candidates', [])}"
                     )
                 elif active_resolver is not None:
+                    selected_category = resolver_result.get("selected_category")
+                    if selected_category != route_category:
+                        log.info(
+                            f"  Series resolver overrode source category "
+                            f"'{route_category}' -> '{selected_category}'"
+                        )
                     log.info(
                         f"  Series resolver: '{resolution['incoming_name']}' -> "
                         f"'{series_name}' ({match_type}) in {dest_folder}"
@@ -2456,6 +2652,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=AI_DECENSOR_BACKUP_DIR,
     )
     parser.add_argument(
+        "--resolver-normalize-apostrophes",
+        action="store_true",
+        help=(
+            "Normalize apostrophes in library folder/file names before registry "
+            "loading; merge collisions and quarantine smaller non-duplicates."
+        ),
+    )
+    parser.add_argument(
         "--ai-decensor-reprocess", action="store_true",
         help="Run selected Camelia methods even if already recorded in ComicInfo tags.",
     )
@@ -2474,7 +2678,7 @@ def main(argv: list[str] | None = None):
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
-    global SERIES_RESOLVER_REFRESH
+    global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
     args = build_argument_parser().parse_args(argv)
     AI_DECENSOR_ENABLED = args.ai_decensor
     AI_DECENSOR_MODELS = list(dict.fromkeys(
@@ -2493,6 +2697,7 @@ def main(argv: list[str] | None = None):
     SERIES_RESOLVER_QUARANTINE_ROOT = args.resolver_quarantine_root
     SERIES_RESOLVER_THRESHOLD = args.resolver_threshold
     SERIES_RESOLVER_REFRESH = args.resolver_refresh
+    SERIES_RESOLVER_NORMALIZE_APOSTROPHES = args.resolver_normalize_apostrophes
 
     watch_path = Path(WATCH_FOLDER)
     os.makedirs(watch_path, exist_ok=True)
