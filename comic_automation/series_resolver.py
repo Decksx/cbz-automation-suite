@@ -25,12 +25,25 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from comic_automation.library.exclusions import (
+    DEFAULT_EXCLUDED_DIRECTORIES,
     iter_files_excluding_directories,
 )
 
 
 REGISTRY_NAME = "_series_registry.json"
 ALIAS_SEED_NAME = "_series_aliases.json"
+APOSTROPHE_TRANSLATION = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "‛": "'", "′": "'", "‵": "'",
+    "ʻ": "'", "ʼ": "'", "＇": "'", "ꞌ": "'", "՚": "'", "´": "'",
+})
+NORMALIZATION_EXCLUDED_DIRECTORIES = (
+    DEFAULT_EXCLUDED_DIRECTORIES | {"_automation"}
+)
+
+
+def normalize_apostrophes(value: str) -> str:
+    """Return *value* with apostrophe-like Unicode characters made ASCII."""
+    return value.translate(APOSTROPHE_TRANSLATION)
 
 
 def normalized(value: str) -> str:
@@ -53,6 +66,7 @@ def alias_key(value: str) -> str:
 
 def safe_name(value: str) -> str:
     """Make an incoming title safe for use as one Windows directory name."""
+    value = normalize_apostrophes(value)
     value = re.sub(r'[<>:"/\\|?*]', " ", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
     return value or "Untitled Series"
@@ -68,6 +82,127 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         index += 1
+
+
+def _json_safe_action(action: dict[str, object]) -> dict[str, object]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in action.items()
+    }
+
+
+def normalize_apostrophe_names(
+    root: Path,
+    quarantine_root: Path,
+    *,
+    apply: bool = False,
+) -> dict[str, object]:
+    """Normalize apostrophes recursively and merge resulting collisions safely.
+
+    Dry-run mode only inventories affected names. Apply mode works bottom-up so
+    both sides of a directory collision have canonical child names before they
+    are merged. Exact file duplicates are removed; non-identical conflicts keep
+    the larger file and quarantine the smaller one outside the library.
+    """
+    root = root.resolve()
+    quarantine_root = quarantine_root.resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"Library root not found: {root}")
+    try:
+        quarantine_root.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Apostrophe-normalization quarantine must be outside the library root")
+
+    affected: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+
+    def children(directory: Path) -> list[Path]:
+        try:
+            return sorted(directory.iterdir(), key=lambda path: path.name.casefold())
+        except OSError as exc:
+            errors.append({"path": str(directory), "error": f"{type(exc).__name__}: {exc}"})
+            return []
+
+    def inventory(directory: Path) -> None:
+        for child in children(directory):
+            if child.is_dir() and not child.is_symlink() and child.name.casefold() not in NORMALIZATION_EXCLUDED_DIRECTORIES:
+                inventory(child)
+            normalized_name = normalize_apostrophes(child.name)
+            if normalized_name != child.name:
+                target = child.with_name(normalized_name)
+                affected.append({
+                    "action": "would_normalize_name",
+                    "source": str(child),
+                    "target": str(target),
+                    "collision": target.exists(),
+                })
+
+    inventory(root)
+    report: dict[str, object] = {
+        "root": str(root),
+        "quarantine_root": str(quarantine_root),
+        "applied": apply,
+        "affected_count": len(affected),
+        "actions": affected if not apply else [],
+        "errors": errors,
+    }
+    if not apply:
+        return report
+
+    actions: list[dict[str, object]] = []
+    conflict_root = quarantine_root / "_apostrophe_normalization"
+
+    def quarantine_for(path: Path) -> Path:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            relative = Path(path.name)
+        return conflict_root / relative
+
+    def merge_entry(source: Path, target: Path) -> None:
+        if not target.exists():
+            source.rename(target)
+            actions.append({"action": "normalized_name", "source": str(source), "target": str(target)})
+            return
+        if source.is_dir() and target.is_dir():
+            for child in children(source):
+                merge_entry(child, target / child.name)
+            try:
+                source.rmdir()
+            except OSError as exc:
+                errors.append({"path": str(source), "error": f"{type(exc).__name__}: {exc}"})
+            else:
+                actions.append({"action": "merged_apostrophe_directory", "source": str(source), "target": str(target)})
+            return
+        if source.is_file() and target.is_file():
+            outcome = settle_file_conflict(source, target, quarantine_for(target))
+            actions.append(_json_safe_action(outcome))
+            return
+        quarantine = unique_path(quarantine_for(source))
+        quarantine.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(quarantine))
+        actions.append({
+            "action": "quarantined_type_conflict",
+            "source": str(source),
+            "kept": str(target),
+            "quarantined": str(quarantine),
+        })
+
+    def repair(directory: Path) -> None:
+        for child in children(directory):
+            if child.is_dir() and not child.is_symlink() and child.name.casefold() not in NORMALIZATION_EXCLUDED_DIRECTORIES:
+                repair(child)
+        for child in children(directory):
+            normalized_name = normalize_apostrophes(child.name)
+            if normalized_name != child.name:
+                merge_entry(child, child.with_name(normalized_name))
+
+    repair(root)
+    report["actions"] = actions
+    report["changed"] = bool(actions)
+    return report
 
 
 def _read_series_json(folder: Path) -> set[str]:
@@ -223,6 +358,9 @@ def build_registry(root: Path) -> dict[str, object]:
         key=lambda path: path.name.casefold(),
     )
     existing = {folder.name.casefold(): folder.name for folder in folders}
+    existing_by_alias_key: dict[str, set[str]] = {}
+    for folder in folders:
+        existing_by_alias_key.setdefault(alias_key(folder.name), set()).add(folder.name)
     history = _logged_aliases(root)
     redirects = {alias.casefold(): target for alias, target in history}
 
@@ -233,6 +371,9 @@ def build_registry(root: Path) -> dict[str, object]:
             seen.add(current.casefold())
             if current.casefold() in existing:
                 return existing[current.casefold()]
+            normalized_targets = existing_by_alias_key.get(alias_key(current), set())
+            if len(normalized_targets) == 1:
+                return next(iter(normalized_targets))
             next_value = redirects.get(current.casefold())
             if not next_value:
                 return None
@@ -426,6 +567,7 @@ class SeriesResolver:
         threshold: float = 0.95,
         quarantine_root: Path | None = None,
         refresh: bool = False,
+        repair_apostrophes: bool = False,
     ) -> None:
         if not 0.0 < threshold <= 1.0:
             raise ValueError("resolver threshold must be greater than 0 and at most 1")
@@ -439,6 +581,14 @@ class SeriesResolver:
             else self.root.parent / "_resolver_quarantine" / self.root.name
         )
         self._guard = threading.RLock()
+        self.apostrophe_normalization: dict[str, object] | None = None
+        if repair_apostrophes:
+            self.apostrophe_normalization = normalize_apostrophe_names(
+                self.root,
+                self.quarantine_root,
+                apply=True,
+            )
+            refresh = refresh or bool(self.apostrophe_normalization.get("changed"))
         registry_path = self.root / REGISTRY_NAME
         if refresh or not registry_path.is_file():
             self.registry = build_registry(self.root)
