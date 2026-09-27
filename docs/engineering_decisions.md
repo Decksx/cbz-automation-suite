@@ -825,13 +825,20 @@ whitespace each round-trip byte-exactly through the writer and back. The
 check refuses non-canonical files without refusing awkward values, and that
 negative is a test rather than a claim.
 
-## Watcher category routing and canonical series identity stay separate
+## Established series identity outranks watcher source routing
 
-The watcher's ordered `routing.json` rules remain authoritative for the broad
-Comix/Manga category. Canonical series matching is a second step: the selected
-category chooses one `SeriesResolver`, which then resolves the incoming title
-against that library's aliases. This keeps source-specific category knowledge
-out of the name matcher and keeps the resolver reusable outside the watcher.
+The watcher's ordered `routing.json` rules provide a Comix/Manga fallback for
+titles that are new to both libraries. They are not authoritative for existing
+series because download sources can contain mixed material. Canonical matching
+queries every configured `SeriesResolver`, validates each registry match against
+the live filesystem, and follows the single strongest exact or fuzzy match even
+when it is in the category opposite the source rule.
+
+Equal-strength matches in both libraries are staged for review. A stale registry
+entry is not trusted merely because it matches a title; if its folder is absent,
+the watcher ignores it or follows the same canonical folder found under another
+configured root. Rebuilding registries after manual moves or renames records the
+new root durably and clears obsolete location evidence.
 
 The current resolver roots are `Z:\comics\Comix` and `Z:\comics\Manga`.
 They are CLI/GUI configuration, not embedded in the registry format, so the
