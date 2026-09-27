@@ -168,8 +168,8 @@ TOOLS = [
                 "key": "series_resolver",
                 "label": "Resolve series names and import directly to Z:",
                 "default": True,
-                "note": "Exact and 95%+ title matches use the established series folder. Ambiguous matches remain in X: staging for review.",
-                "description": "Use canonical aliases, translated metadata, and fuzzy matching instead of creating slightly different series folders.",
+                "note": "Both libraries are checked first. The download source is only a fallback for new series; ambiguous matches remain in X: staging for review.",
+                "description": "Use canonical aliases, translated metadata, and fuzzy matching to find the established Comix or Manga folder.",
                 "example": "Martial_Evolution Start-by... joins the established Martial Evolution series.",
                 "expected_result": "Confirmed series import directly to Z:; duplicate conflicts keep the larger file and quarantine the smaller one.",
             },
@@ -215,9 +215,18 @@ TOOLS = [
                 "key": "resolver_refresh",
                 "label": "Rebuild series registries before watching",
                 "default": False,
-                "description": "Rescan current series folders and saved aliases before accepting imports.",
-                "example": "Enable after a large manual rename or library reorganization.",
+                "description": "Rescan both libraries so manual moves and renames become the authoritative series locations.",
+                "example": "Enable after moving a series between Comix and Manga or renaming its folder.",
                 "expected_result": "Both Z: registries are atomically refreshed before the watcher starts.",
+            },
+            {
+                "type": "checkbox",
+                "key": "resolver_normalize_apostrophes",
+                "label": "Normalize apostrophes and merge duplicate series names",
+                "default": False,
+                "description": "Convert curly and alternate apostrophes to straight apostrophes across library folder and file names before watching.",
+                "example": "Debra’s Story merges into Debra's Story.",
+                "expected_result": "Exact duplicates are removed; non-identical conflicts keep the larger file and quarantine the smaller one outside Komga.",
             },
             {
                 "type": "checkbox",
@@ -1579,6 +1588,11 @@ class CBZLauncherApp(tk.Tk):
                 cmd.extend(["--resolver-threshold", threshold.get().strip()])
             if opts.get("resolver_refresh") and opts["resolver_refresh"].get():
                 cmd.append("--resolver-refresh")
+            if (
+                opts.get("resolver_normalize_apostrophes")
+                and opts["resolver_normalize_apostrophes"].get()
+            ):
+                cmd.append("--resolver-normalize-apostrophes")
 
         if opts.get("ai_decensor") and opts["ai_decensor"].get():
             cmd.append("--ai-decensor")
