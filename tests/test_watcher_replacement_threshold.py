@@ -132,3 +132,16 @@ def test_a_new_archive_without_a_collision_is_moved(tmp_path: Path) -> None:
 
     assert (destination / "Ch 2.cbz").exists()
     assert (destination / "Ch 1.cbz").stat().st_size == 40_000_000
+
+
+def test_merge_leaves_syncthing_history_untouched(tmp_path: Path) -> None:
+    source = tmp_path / "incoming"
+    destination = tmp_path / "library"
+    active = write(source / "Ch 1.cbz", 500)
+    history = write(source / ".StVersion" / "Ch 1.cbz", 250)
+
+    _merge_directories(source, destination)
+
+    assert (destination / active.name).stat().st_size == 500
+    assert not (destination / ".StVersion").exists()
+    assert history.stat().st_size == 250
