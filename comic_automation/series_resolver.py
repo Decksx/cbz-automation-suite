@@ -24,6 +24,10 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from comic_automation.library.exclusions import (
+    iter_files_excluding_directories,
+)
+
 
 REGISTRY_NAME = "_series_registry.json"
 ALIAS_SEED_NAME = "_series_aliases.json"
@@ -97,7 +101,14 @@ def _read_series_json(folder: Path) -> set[str]:
 
 def _comicinfo_aliases(folder: Path) -> set[str]:
     result: set[str] = set()
-    archives = sorted(folder.rglob("*.cbz"), key=lambda path: path.name.casefold())[:1]
+    archives = sorted(
+        (
+            path
+            for path in iter_files_excluding_directories(folder)
+            if path.suffix.casefold() == ".cbz"
+        ),
+        key=lambda path: path.name.casefold(),
+    )[:1]
     for archive_path in archives:
         try:
             with zipfile.ZipFile(archive_path) as archive:
