@@ -11,7 +11,10 @@ from comic_automation.series_resolver import (
     SeriesResolver,
     alias_key,
     build_registry,
+    normalize_apostrophe_names,
+    normalize_apostrophes,
     resolve_from_registry,
+    safe_name,
     settle_file_conflict,
     write_registry,
 )
@@ -21,6 +24,75 @@ def test_alias_key_ignores_case_accents_hyphens_and_underscores() -> None:
     assert alias_key("Martíal_Evolution: Start-by...") == alias_key(
         "martial evolution start by"
     )
+
+
+def test_apostrophe_variants_normalize_to_ascii_for_new_names() -> None:
+    variants = ("Debra's Story", "Debra’s Story", "Debraʼs Story", "Debra＇s Story")
+    assert {normalize_apostrophes(value) for value in variants} == {"Debra's Story"}
+    assert {safe_name(value) for value in variants} == {"Debra's Story"}
+
+
+def test_apostrophe_repair_merges_directories_and_keeps_larger_file(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Comix"
+    straight = library / "Debra's Story"
+    curly = library / "Debra’s Story"
+    straight.mkdir(parents=True)
+    curly.mkdir(parents=True)
+    (straight / "Debra's Story.cbz").write_bytes(b"small")
+    (curly / "Debra’s Story.cbz").write_bytes(b"larger archive")
+    (straight / "Same.cbz").write_bytes(b"same")
+    (curly / "Same.cbz").write_bytes(b"same")
+    quarantine = tmp_path / "quarantine" / "Comix"
+
+    preview = normalize_apostrophe_names(library, quarantine, apply=False)
+    assert preview["affected_count"] == 2
+    assert straight.is_dir() and curly.is_dir()
+
+    result = normalize_apostrophe_names(library, quarantine, apply=True)
+
+    assert result["changed"] is True
+    assert straight.is_dir()
+    assert not curly.exists()
+    assert (straight / "Debra's Story.cbz").read_bytes() == b"larger archive"
+    assert (straight / "Same.cbz").read_bytes() == b"same"
+    quarantined = list((quarantine / "_apostrophe_normalization").rglob("*.cbz"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"small"
+    assert any(action["action"] == "deleted_exact_duplicate" for action in result["actions"])
+
+
+def test_live_resolver_can_repair_apostrophes_before_building_registry(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Comix"
+    (library / "Debra's Story").mkdir(parents=True)
+    (library / "Debra’s Story").mkdir()
+
+    resolver = SeriesResolver(library, repair_apostrophes=True)
+
+    assert (library / "Debra's Story").is_dir()
+    assert not (library / "Debra’s Story").exists()
+    assert resolver.resolve("Debra’s Story")["relative_path"] == "Debra's Story"
+    assert resolver.registry["ambiguous_aliases"] == {}
+
+
+def test_registry_keeps_seed_aliases_after_canonical_apostrophe_changes(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Comix"
+    (library / "Debra's Story").mkdir(parents=True)
+    (library / ALIAS_SEED_NAME).write_text(
+        json.dumps({"Debra’s Story": ["Debra Story Alternate"]}),
+        encoding="utf-8",
+    )
+
+    registry = build_registry(library)
+
+    result = resolve_from_registry(registry, "Debra Story Alternate")
+    assert result["matched"] is True
+    assert result["relative_path"] == "Debra's Story"
 
 
 def test_registry_learns_translated_and_romanized_metadata_aliases(
