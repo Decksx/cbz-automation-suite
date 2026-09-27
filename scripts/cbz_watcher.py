@@ -28,6 +28,12 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from comic_automation.series_resolver import SeriesResolver, settle_file_conflict
+from comic_automation.library.exclusions import (
+    DEFAULT_EXCLUDED_DIRECTORIES,
+    iter_files_excluding_directories,
+    iter_paths_excluding_directories,
+    path_contains_excluded_directory,
+)
 from scripts.cbz_routing import series_key
 from scripts.ai_decensor_backups import ARCHIVE_ROOT, archive_backup
 from scripts.cbz_lock_order import (
@@ -275,7 +281,9 @@ def _clean_up_stale_rewrite_files(watch_path: Path) -> None:
     operator recovering them by hand.
     """
     leftovers = sorted(
-        list(watch_path.rglob("*.tmp.cbz")) + list(watch_path.rglob("*.bak.cbz"))
+        path
+        for path in iter_files_excluding_directories(watch_path)
+        if path.name.endswith((".tmp.cbz", ".bak.cbz"))
     )
 
     if not leftovers:
@@ -1143,7 +1151,7 @@ def _merge_directories(
     compare exact duplicates and quarantine the smaller non-identical file
     outside the library instead of discarding it.
     """
-    for src_item in src_dir.rglob("*"):
+    for src_item in iter_paths_excluding_directories(src_dir):
         relative  = src_item.relative_to(src_dir)
         dest_item = dest_dir / relative
 
@@ -1766,7 +1774,11 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         return
 
     cbz_dirs: dict[Path, list[Path]] = {}
-    for cbz in sorted(dir_path.rglob("*.cbz")):
+    for cbz in sorted(
+        path
+        for path in iter_files_excluding_directories(dir_path)
+        if path.suffix.casefold() == ".cbz"
+    ):
         cbz_dirs.setdefault(cbz.parent, []).append(cbz)
 
     if not cbz_dirs:
@@ -2120,7 +2132,11 @@ def _process_directory_when_ready(
         )
         return
 
-    cbz_files = sorted(dir_path.rglob("*.cbz"))
+    cbz_files = sorted(
+        path
+        for path in iter_files_excluding_directories(dir_path)
+        if path.suffix.casefold() == ".cbz"
+    )
 
     if not cbz_files:
         log.info(
@@ -2319,6 +2335,12 @@ class CBZHandler(FileSystemEventHandler):
     def _handle(self, path: Path) -> None:
         if path.suffix.lower() != ".cbz":
             return
+        if path_contains_excluded_directory(
+            path,
+            WATCH_FOLDER,
+            excluded_directories=DEFAULT_EXCLUDED_DIRECTORIES,
+        ):
+            return
         parent = path.parent
         with _processing_dirs_lock:
             for proc_dir in _processing_dirs:
@@ -2363,7 +2385,10 @@ def _discover_startup_directories(
     running.
     """
     for subdir in sorted(watch_path.iterdir()):
-        if subdir.is_dir() and any(subdir.rglob("*.cbz")):
+        if subdir.is_dir() and any(
+            path.suffix.casefold() == ".cbz"
+            for path in iter_files_excluding_directories(subdir)
+        ):
             log.info(f"Found existing directory at startup: {subdir.name}")
             _process_directory_when_ready(subdir, tracker)
 
