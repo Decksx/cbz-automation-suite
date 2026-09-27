@@ -19,10 +19,17 @@ from pathlib import Path
 from typing import Callable
 from xml.etree import ElementTree
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from PIL import Image
 
+from comic_automation.library.exclusions import (  # noqa: E402
+    iter_files_excluding_directories,
+)
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_CAMELIA_ROOT = Path(os.environ.get("CBZ_CAMELIA_ROOT", r"C:\git\camelia"))
 DEFAULT_CAMELIA_PYTHON = Path(os.environ.get(
     "CBZ_CAMELIA_PYTHON", r"C:\ProgramData\miniconda3\envs\camelia_env\python.exe"
@@ -62,8 +69,8 @@ def discover_archives(source: Path) -> list[Path]:
         raise ValueError(f"Source is not a CBZ file or folder: {source}")
 
     archives = sorted(
-        (path for path in source.rglob("*") if path.is_file()
-         and not path.is_symlink() and path.suffix.casefold() == ".cbz"),
+        (path for path in iter_files_excluding_directories(source)
+         if not path.is_symlink() and path.suffix.casefold() == ".cbz"),
         key=lambda path: str(path.relative_to(source)).casefold(),
     )
     if not archives:
