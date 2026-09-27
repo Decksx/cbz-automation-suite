@@ -116,6 +116,19 @@ def test_inventory_paths_are_separator_independent(tmp_path):
     assert build_inventory(a).entries[0].relative_path == "sub/deep/file.cbz"
 
 
+def test_inventory_ignores_syncthing_directories(tmp_path):
+    source = _payload(tmp_path / "source", {"issue.cbz": b"active"})
+    history = source / ".STVersions" / "issue.cbz"
+    history.parent.mkdir(parents=True)
+    history.write_bytes(b"old")
+
+    inventory = build_inventory(source)
+
+    assert [entry.relative_path for entry in inventory.entries] == [
+        "issue.cbz"
+    ]
+
+
 def test_inventory_records_size_and_content_digest(tmp_path):
     a = _payload(tmp_path / "a", {"ch01.cbz": b"hello"})
     entry = build_inventory(a).entries[0]
