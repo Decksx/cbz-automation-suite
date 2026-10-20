@@ -155,13 +155,20 @@ deliberate.
 Classification staging (`scripts/cbz_classification_staging.py`) is one
 such deliberate difference (#82). Its every rename goes through one helper,
 `_replace`, with one module-level schedule (`REPLACE_RETRY_DELAYS`, about
-3 s in total, starting at 50 ms). The holder there is a local scanner taking
-a brief handle inside a freshly written tree, which clears in milliseconds,
-not a network-share lock. It retries only `PermissionError` carrying Windows
-code 5 or 32. A failed `os.replace` moves nothing, so a retry cannot
-duplicate a payload. Library-source moves revalidate the source after each
-wait, and exhausting the schedule raises the original error with nothing
-moved.
+3 s in total, starting at 50 ms). The lock it waits out is a brief handle
+inside a freshly written local tree, not a network-share lock. A scanner or
+indexer is the leading hypothesis for the holder; the #82 runs never
+identified it. It retries only `PermissionError` carrying Windows code 5 or
+32. A failed `os.replace` moves nothing, so a retry cannot duplicate a
+payload.
+
+A wait makes earlier checks stale, so nothing irreversible trusts them.
+Library-source moves revalidate the source after each wait. Deleting a
+copied-away source revalidates it immediately before the delete, and refuses
+on drift. Operator moves (promote, reject, rollback) re-run their own
+preconditions before retrying: the frozen record, the staged-payload
+verification and an empty destination. Exhausting the schedule raises the
+original error with nothing moved.
 
 ## Audits record evidence; fixes record resolution
 

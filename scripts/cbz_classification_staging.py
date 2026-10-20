@@ -150,11 +150,12 @@ class SourceChangedError(StagingError):
 
 
 # Windows reports these when another process holds a handle that blocks the
-# rename: ERROR_ACCESS_DENIED (5) for an open handle anywhere inside a
-# directory being renamed, and ERROR_SHARING_VIOLATION (32) for the file
-# itself. Antivirus scanners and indexers take such handles for milliseconds
-# on freshly written trees, which is what made #82's staging tests flaky; the
-# same race can reach real promote/recover/rollback calls.
+# rename: ERROR_ACCESS_DENIED (5) for a handle opened without FILE_SHARE_DELETE
+# anywhere inside a directory being renamed (measured in the #82 tests), and
+# ERROR_SHARING_VIOLATION (32) for the file itself. Which process held the
+# handle in #82's flaky runs was never identified: a scanner or indexer
+# briefly opening fresh files is the leading hypothesis, not a finding. The
+# same race can reach real publish/recover/promote/reject/rollback calls.
 _TRANSIENT_WINERRORS = frozenset({5, 32})
 # Waits between attempts, about 3 s in total. Bounded: a handle held longer
 # than this is not a transient scan, and the caller gets the error.
@@ -186,6 +187,23 @@ def _replace(src: Path, dst: Path, *,
             raise last
         if recheck is not None:
             recheck()
+
+
+def _release_copied_source(source: Path, copied: "PayloadInventory") -> None:
+    """Delete a copied-away source only if it is still exactly what was copied.
+
+    The deletion is the one irreversible step on the copy path, so the source
+    is revalidated against the inventory that was copied and verified
+    immediately before it, however long ago the copy happened. A retried
+    publish or manifest write (`_replace`) waits, and anything that arrived
+    in the source meanwhile (cbz_watcher keeps writing) was never copied.
+    A changed source is a different case by the identity contract:
+    `SourceChangedError` is raised and nothing is deleted. The published
+    copy is the verified earlier inventory, and the source stays
+    authoritative for what changed (#82 review, codex-lead).
+    """
+    revalidate_source(source, copied)
+    shutil.rmtree(source)
 
 
 # ------------------------------------------------------------- inventory
@@ -1290,7 +1308,7 @@ def execute_transfer(plan: StagingPlan, *,
     manifest.write(layout.manifest(case_id))
 
     if manifest.transfer_method == METHOD_COPY_VERIFY and delete_copied_source:
-        shutil.rmtree(source)
+        _release_copied_source(source, plan.inventory)
 
     return manifest
 
@@ -1605,7 +1623,7 @@ def recover_case(layout: StagingLayout, case_id: str, *,
                 f"publication: {why}")
         _publish(layout, manifest)
         if delete_copied_source:
-            shutil.rmtree(source)
+            _release_copied_source(source, expected)
         return RecoveryOutcome(
             True, found.state, case_id, manifest,
             "published the already-verified staged copy without copying "
@@ -1655,7 +1673,7 @@ def recover_case(layout: StagingLayout, case_id: str, *,
     revalidate_source(source, expected)
     _publish(layout, manifest)
     if delete_copied_source:
-        shutil.rmtree(source)
+        _release_copied_source(source, expected)
     return RecoveryOutcome(
         True, found.state, case_id, manifest,
         "discarded the unusable staged copy and recopied, verified, "
@@ -1927,9 +1945,53 @@ def promote_case(layout: StagingLayout, case_id: str, *,
     if refusal is not None:
         return refusal
 
-    _replace(payload_root, destination)
+    refusal = _operator_move(layout, case_id, ACTION_PROMOTE,
+                             expected_record_digest, payload_root, destination,
+                             verify_payload=True)
+    if refusal is not None:
+        return refusal
     return _finish(layout, manifest, STATE_PROMOTED, ACTION_PROMOTE,
                    f"payload verified and promoted to {destination}.")
+
+
+class _OperatorRefusal(Exception):
+    """Carries an operator refusal out of a delayed move's retry (#82 review)."""
+
+    def __init__(self, outcome: "OperatorOutcome"):
+        super().__init__(outcome.detail)
+        self.outcome = outcome
+
+
+def _operator_move(layout: StagingLayout, case_id: str, action: str,
+                   expected_record_digest: str, source: Path, destination: Path,
+                   *, verify_payload: bool) -> "OperatorOutcome | None":
+    """Make an operator's move, rechecking its preconditions after any lock wait.
+
+    `_replace` may wait for a transient lock. The command's preconditions were
+    checked before that wait, so a retry re-runs them first: the frozen record
+    against the digest the operator was shown, the staged payload against its
+    manifest when the command verifies it, and an empty destination. If any no
+    longer holds, nothing moves and the command's own refusal is returned
+    instead of a decision about content nobody reviewed (codex-lead, #94).
+    """
+    def recheck() -> None:
+        manifest, refusal = _ready_for_operator(layout, case_id, action,
+                                                expected_record_digest)
+        if refusal is None and verify_payload:
+            _root, refusal = _verified_staged_payload(layout, manifest, action)
+        if refusal is None and destination.exists():
+            refusal = OperatorOutcome(
+                False, action, case_id, manifest,
+                f"cannot {action}: {destination} appeared while waiting for a "
+                "lock to clear. Refusing to merge into or overwrite it.")
+        if refusal is not None:
+            raise _OperatorRefusal(refusal)
+
+    try:
+        _replace(source, destination, recheck=recheck)
+    except _OperatorRefusal as refused:
+        return refused.outcome
+    return None
 
 
 def reject_case(layout: StagingLayout, case_id: str, *,
@@ -1951,7 +2013,12 @@ def reject_case(layout: StagingLayout, case_id: str, *,
             f"cannot reject: {destination} already exists.")
 
     layout.rejected.mkdir(parents=True, exist_ok=True)
-    _replace(layout.pending_case(case_id), destination)
+    refusal = _operator_move(layout, case_id, ACTION_REJECT,
+                             expected_record_digest,
+                             layout.pending_case(case_id), destination,
+                             verify_payload=False)
+    if refusal is not None:
+        return refusal
     return _finish(layout, manifest, STATE_REJECTED, ACTION_REJECT,
                    f"case moved to {destination}; payload retained.")
 
@@ -2003,6 +2070,10 @@ def rollback_case(layout: StagingLayout, case_id: str, *,
             "capability and is not an implicit extension of rollback.")
 
     original.parent.mkdir(parents=True, exist_ok=True)
-    _replace(payload_root, original)
+    refusal = _operator_move(layout, case_id, ACTION_ROLLBACK,
+                             expected_record_digest, payload_root, original,
+                             verify_payload=True)
+    if refusal is not None:
+        return refusal
     return _finish(layout, manifest, STATE_ROLLED_BACK, ACTION_ROLLBACK,
                    f"payload verified and returned to {original}.")
