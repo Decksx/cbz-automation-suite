@@ -72,8 +72,8 @@ def _router(tmp_path: Path, *, mode=MODE_SHADOW, index=None, **overrides):
     cfg = parse(_raw(tmp_path, **overrides))
     if index is None:
         # Mirror SeriesIndex.build exactly. A bare SeriesIndex() ranks every
-        # destination equally, so ambiguity resolves by write order and any
-        # test asserting priority would be decided by thread scheduling.
+        # destination equally, so a test asserting configured priority would
+        # actually be asserting the fallback tie-breaker's policy.
         index = SeriesIndex(
             priority=cfg.series_index_destinations or tuple(cfg.destinations))
     return WatcherRouter(cfg, index, mode=mode)
@@ -379,8 +379,8 @@ def test_an_update_cannot_interleave_with_a_classification(tmp_path):
 
 def test_a_priorityless_index_is_refused(tmp_path):
     # A bare SeriesIndex ranks every destination equally, so a series in two
-    # libraries keeps whichever entry was written first -- thread scheduling
-    # deciding an adult classification. This caught a test helper that
+    # libraries cannot represent configured precedence (before #60 it kept
+    # whichever entry was written first). This caught a test helper that
     # asserted priority while providing none.
     cfg = parse(_raw(tmp_path))
     with pytest.raises(RoutingConfigError, match="priority"):
