@@ -43,6 +43,8 @@ import json
 import ntpath
 import os
 import shutil
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -142,6 +144,48 @@ class SourceChangedError(StagingError):
     case*. Abandon the transfer, leave the source authoritative, delete
     nothing, and let a retry mint a new case id rather than resuming this one.
     """
+
+
+# ------------------------------------------------------------- replace
+
+
+# Windows reports these when another process holds a handle that blocks the
+# rename: ERROR_ACCESS_DENIED (5) for an open handle anywhere inside a
+# directory being renamed, and ERROR_SHARING_VIOLATION (32) for the file
+# itself. Antivirus scanners and indexers take such handles for milliseconds
+# on freshly written trees, which is what made #82's staging tests flaky; the
+# same race can reach real promote/recover/rollback calls.
+_TRANSIENT_WINERRORS = frozenset({5, 32})
+# Waits between attempts, about 3 s in total. Bounded: a handle held longer
+# than this is not a transient scan, and the caller gets the error.
+REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+
+
+def _replace(src: Path, dst: Path, *,
+             recheck: Callable[[], None] | None = None) -> None:
+    """`os.replace`, retried only while Windows reports a transient lock.
+
+    A failed `os.replace` moves nothing, so another attempt cannot duplicate
+    or half-move a payload. Anything else -- another error, another code, any
+    non-Windows `PermissionError` -- is raised at once, as before. Before each
+    retry the source must still exist, and *recheck* (a caller's revalidation
+    of a library source) runs again, because the wait is time in which the
+    source can change. When the attempts run out the last error is raised
+    with nothing moved, so the caller's existing recovery state still holds.
+    """
+    for delay in (*REPLACE_RETRY_DELAYS, None):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if delay is None or getattr(exc, "winerror", None) not in _TRANSIENT_WINERRORS:
+                raise
+            last = exc
+        time.sleep(delay)
+        if not os.path.lexists(src):
+            raise last
+        if recheck is not None:
+            recheck()
 
 
 # ------------------------------------------------------------- inventory
@@ -824,7 +868,7 @@ class CaseManifest:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(self.to_json(), encoding="utf-8")
-        os.replace(tmp, path)
+        _replace(tmp, path)
 
 
 # ------------------------------------------------------------- inspection
@@ -1235,9 +1279,10 @@ def execute_transfer(plan: StagingPlan, *,
     revalidate_source(source, plan.inventory)                    # gate 2
 
     if manifest.transfer_method == METHOD_RENAME:
-        os.replace(source, staged_payload)
+        _replace(source, staged_payload,
+                 recheck=lambda: revalidate_source(source, plan.inventory))
 
-    os.replace(partial_case, layout.pending_case(case_id))       # publish
+    _replace(partial_case, layout.pending_case(case_id))         # publish
 
     manifest.state = STATE_PENDING_REVIEW
     manifest.staged_path = str(layout.pending_case(case_id))
@@ -1487,8 +1532,8 @@ class RecoveryOutcome:
 
 def _publish(layout: StagingLayout, manifest: CaseManifest) -> None:
     """Rename .partial to pending and record the case as published."""
-    os.replace(layout.partial_case(manifest.case_id),
-               layout.pending_case(manifest.case_id))
+    _replace(layout.partial_case(manifest.case_id),
+             layout.pending_case(manifest.case_id))
     manifest.state = STATE_PENDING_REVIEW
     manifest.staged_path = str(layout.pending_case(manifest.case_id))
     manifest.touch()
@@ -1595,7 +1640,8 @@ def recover_case(layout: StagingLayout, case_id: str, *,
         if partial_case.exists():
             shutil.rmtree(partial_case)
         partial_payload.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, partial_payload)
+        _replace(source, partial_payload,
+                 recheck=lambda: revalidate_source(source, expected))
         _publish(layout, manifest)
         return RecoveryOutcome(
             True, found.state, case_id, manifest,
@@ -1881,7 +1927,7 @@ def promote_case(layout: StagingLayout, case_id: str, *,
     if refusal is not None:
         return refusal
 
-    os.replace(payload_root, destination)
+    _replace(payload_root, destination)
     return _finish(layout, manifest, STATE_PROMOTED, ACTION_PROMOTE,
                    f"payload verified and promoted to {destination}.")
 
@@ -1905,7 +1951,7 @@ def reject_case(layout: StagingLayout, case_id: str, *,
             f"cannot reject: {destination} already exists.")
 
     layout.rejected.mkdir(parents=True, exist_ok=True)
-    os.replace(layout.pending_case(case_id), destination)
+    _replace(layout.pending_case(case_id), destination)
     return _finish(layout, manifest, STATE_REJECTED, ACTION_REJECT,
                    f"case moved to {destination}; payload retained.")
 
@@ -1957,6 +2003,6 @@ def rollback_case(layout: StagingLayout, case_id: str, *,
             "capability and is not an implicit extension of rollback.")
 
     original.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(payload_root, original)
+    _replace(payload_root, original)
     return _finish(layout, manifest, STATE_ROLLED_BACK, ACTION_ROLLBACK,
                    f"payload verified and returned to {original}.")
