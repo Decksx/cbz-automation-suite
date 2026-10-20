@@ -4,7 +4,7 @@ All paths are synthetic. Collisions, non-series input and empty keys have
 different causes, so these tests isolate them instead of testing one count.
 """
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import json
 import os
 from pathlib import Path
@@ -102,13 +102,38 @@ def test_windows_case_aliases_are_one_path(tmp_path):
     index.diagnostics().require_clear()
 
 
-def test_two_destination_labels_for_the_same_path_do_not_invent_a_collision(tmp_path):
+@pytest.mark.parametrize("order", [("manga", "comix"), ("comix", "manga")])
+def test_two_destination_labels_for_the_same_path_do_not_invent_a_collision(tmp_path, order):
     _cfg_value, index = _built(tmp_path)
     path = tmp_path / "same-root" / "Title"
-    index.add("Title", "manga", path)
-    index.add("Title", "comix", path)
+    for dest in order:
+        index.add("Title", dest, path)
     assert index.lookup("Title") == ("comix", path)
     assert not index.is_ambiguous("Title")
+
+
+def test_aliased_roots_and_later_lower_priority_move_keep_configured_label(tmp_path):
+    """load permits root aliases: both the scan and incremental updates must
+    keep the configured winner, even when its observation was not the last."""
+    root = tmp_path / "Shared"
+    path = root / "Title"
+    path.mkdir(parents=True)
+    config = tmp_path / "routing.json"
+    config.write_text(json.dumps({
+        "version": 2, "destinations": {"comix": str(root), "manga": str(root)},
+        "default": "manga", "rules": [],
+        "series_index": {"enabled": True, "destinations": ["comix", "manga"]},
+    }), encoding="utf-8")
+    router = WatcherRouter.load(config, mode=MODE_SHADOW)
+    assert router.index.lookup("Title") == ("comix", path)
+    assert len(router.index.locations("Title")) == 1
+
+    # dest_key_for_path currently chooses the later label for aliased roots,
+    # so this exercises the actual lower-priority update, not a direct add.
+    assert router.dest_key_for_path(str(root)) == "manga"
+    router.note_move("Title", str(root), path)
+    assert router.index.lookup("Title") == ("comix", path)
+    router.index_diagnostics().require_clear()
 
 
 def test_canonical_unicode_names_do_not_collapse_distinct_path_spellings(tmp_path):
@@ -203,6 +228,17 @@ def test_missing_root_is_visible_even_when_no_key_is_ambiguous(tmp_path):
     assert len(report.scan_problems) == 1
     assert cfg.destinations["manga"] in report.scan_problems[0]
     with pytest.raises(routing.RoutingConfigError):
+        report.require_clear()
+
+
+def test_hand_built_config_with_undefined_destination_cannot_pass_the_gate(tmp_path):
+    """parse/load reject this config, but direct RoutingConfig construction is
+    possible: build's defensive branch must not silently certify the scan."""
+    cfg, _index = _built(tmp_path)
+    invalid = replace(cfg, series_index_destinations=("comix", "missing"))
+    report = routing.SeriesIndex.build(invalid).diagnostics()
+    assert report.scan_problems == ("no configured root for missing",)
+    with pytest.raises(routing.RoutingConfigError, match="1 scan problem"):
         report.require_clear()
 
 
