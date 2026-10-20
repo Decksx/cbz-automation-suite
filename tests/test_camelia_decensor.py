@@ -13,13 +13,26 @@ from PIL import Image
 
 from scripts import camelia_decensor
 
+# Zip member timestamps have 2-second resolution, and writestr(name) stamps the
+# current time. Two fixture archives written across a boundary then differ in
+# member date_time, which output verification rightly treats as a changed
+# member; that made test_output_created_during_batch... flaky on loaded
+# runners. Fixtures stamp one fixed time so no test can straddle a boundary.
+FIXED_ZIP_TIME = (2020, 1, 1, 0, 0, 0)
+
+
+def _member(name: str) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, date_time=FIXED_ZIP_TIME)
+    info.external_attr = 0o600 << 16  # what writestr(name) sets for a file
+    return info
+
 
 def _book(path: Path, *, tagged: bool = False) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("001.png", b"fixture")
+        archive.writestr(_member("001.png"), b"fixture")
         tag = "<Tags>uncensored</Tags>" if tagged else ""
-        archive.writestr("ComicInfo.xml", f"<ComicInfo><Title>Book</Title>{tag}</ComicInfo>")
+        archive.writestr(_member("ComicInfo.xml"), f"<ComicInfo><Title>Book</Title>{tag}</ComicInfo>")
     return path
 
 
@@ -33,8 +46,8 @@ def _valid_book(
     method_tags = ", ".join(f"camelia:{method}" for method in methods)
     tags = f"<Tags>uncensored, {method_tags}</Tags>" if tagged else ""
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("001.png", page.getvalue())
-        archive.writestr("ComicInfo.xml", f"<ComicInfo><Title>{title}</Title>{tags}</ComicInfo>")
+        archive.writestr(_member("001.png"), page.getvalue())
+        archive.writestr(_member("ComicInfo.xml"), f"<ComicInfo><Title>{title}</Title>{tags}</ComicInfo>")
     return path
 
 
@@ -278,7 +291,7 @@ def test_resume_accepts_generated_comicinfo_when_source_had_none(tmp_path):
     page = io.BytesIO()
     Image.new("RGB", (8, 8), "red").save(page, format="PNG")
     with zipfile.ZipFile(source, "w") as archive:
-        archive.writestr("001.png", page.getvalue())
+        archive.writestr(_member("001.png"), page.getvalue())
     output = _valid_book(tmp_path / "Comix" / "Book.cbz", tagged=True)
 
     camelia_decensor.verify_completed_output(source, output, ["black_bars"], _metadata_inspector)
@@ -293,7 +306,7 @@ def test_resume_refuses_conflicting_output(tmp_path, conflict):
     elif conflict == "wrong_member":
         _valid_book(output, tagged=True)
         with zipfile.ZipFile(output, "a") as archive:
-            archive.writestr("unexpected.txt", "wrong output")
+            archive.writestr(_member("unexpected.txt"), "wrong output")
     else:
         _valid_book(output)
     args = _args(source, output.parent, tmp_path, dry_run=True)
