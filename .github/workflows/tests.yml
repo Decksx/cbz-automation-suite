@@ -12,10 +12,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            .github/requirements-ci.txt
       - run: python -m pip install -U pip
       - run: python -m pip install -r requirements.txt
       - run: python -m pip install -r .github/requirements-ci.txt
-      - run: python -m pytest -ra --durations=25 --junitxml=test-results/pytest.xml
+      # Keep each module's tests on one worker to preserve module-local state.
+      - run: python -m pytest -n 4 --dist loadfile -ra --durations=25 --junitxml=test-results/pytest.xml
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
