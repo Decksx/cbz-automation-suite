@@ -261,6 +261,55 @@ would encode that disagreement as an authoritative prior decision, and
 the first production index build would make it one — after which the
 evidence that it was ever ambiguous is a log line.
 
+### SeriesIndex diagnostics are the input to that gate (#60)
+
+The index retains every distinct lexical source path for a canonical key,
+including multiple paths inside one destination. Re-observing the same path
+does not manufacture a collision. Path identity uses the host filesystem's
+lexical case policy and an absolute normalized path; it does not resolve
+symlinks, junctions, SMB aliases or Unicode path spellings into physical
+identity. Two distinct Unicode spellings can be separate directories even
+when their canonical series keys agree.
+
+`SeriesIndex.diagnostics()` returns an immutable `SeriesIndexDiagnostics`:
+`collisions` contains each key and all its contributing destination/path
+entries; `empty_keys` contains directories that cannot be indexed;
+`excluded` records the explicit non-series policy; `scan_problems` records an
+unbuilt or disabled index and unavailable configured roots. `to_dict()` is a
+JSON-ready report with the full paths. The watcher exposes the same snapshot
+as `WatcherRouter.index_diagnostics()` under its existing index lock, and
+reports unresolved diagnostics at startup without enabling moves.
+
+The non-series policy names only Syncthing's `.stfolder` and `.stversions`,
+case-insensitively. It does not generalize the old census's four UUID
+exclusions: a UUID-looking title, or another dot-prefixed title such as
+`.hack`, remains a candidate. Any broader exclusion needs its own evidence
+and tests. Files remain outside the default directory lister's input.
+
+The zero-ambiguity branch of the gate is now executable:
+`router.index_diagnostics().require_clear()` (or the equivalent standalone
+index snapshot). It refuses collisions, empty keys, and incomplete scans;
+`is_ambiguous()` alone is never a gate evaluation. A complete scan containing
+only explicitly excluded control directories may pass. An injected lister
+must enumerate the configured root's child directories completely or raise;
+a lister that silently omits input cannot certify a census. Default-lister
+errors propagate, including a root disappearing during enumeration.
+
+The reviewed-exception branch still needs its own manifest identity and
+provenance design. No unchecked key list waives this stricter gate. The gate
+evaluates one in-memory observation; it is not a filesystem transaction, a
+freshness guarantee, a human identity resolution, or permission to activate
+v2. Rebuild and remeasure against the actual target before an authority
+decision. Incremental additions update diagnostics; removals require a
+rebuild rather than silently clearing a prior collision.
+
+Legacy routing continues to choose the configured destination priority so
+archives are not stranded. Within a same-root collision, a deterministic
+path ordering replaces enumeration order. That choice remains explicitly
+reported as an unresolved identity and is not evidence that the authority
+gate passed. Unambiguous routing, adult signals, shadow mode, staging and
+production activation are unchanged by this diagnostic work.
+
 ## Office PC is the worker
 
 CPU-intensive scanning, image decoding, hashing, and GPU embeddings run on the Office PC. The Pi 5 is for dashboards, scheduling, and health checks.
