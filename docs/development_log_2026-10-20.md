@@ -92,3 +92,41 @@ and `issue60-mutations.py` in that folder.
 No production paths or database were opened for this work. The older handoff
 and roadmap describe historical state; this change makes no claim about
 current live ambiguity counts or backfill state.
+
+## Independent review follow-up
+
+Claude reviewed `8ef5ab5d643fd2592cd6121fa5efe39f581867c4` on PR #96
+([comment 6301524878](https://github.com/Decksx/cbz-automation-suite/pull/96#issuecomment-6301524878)).
+It independently found the three defects fixed, reproduced the full-suite
+count, and challenged path identity using real NTFS directories. Its own 19
+mutants killed 16 and left three survivors. No product correctness defect
+was found, but one survivor exposed a missing behavioral test: removing
+`_remember`'s priority comparison made the last destination label win for an
+aliased path. The original test observed the labels only in the order that
+would pass even with that guard removed.
+
+The test now covers both insertion orders. Another regression loads a real
+config with both destination labels pointing at the same synthetic root,
+builds its index, then records a lower-priority watcher `note_move` and
+requires the configured winner to survive. A third covers the defensive
+undefined-destination branch with a directly constructed `RoutingConfig`;
+`parse/load` already reject that config. No production code was changed.
+
+Baseline before these additional mutations: **36 diagnostics tests pass**.
+Last-write-wins now fails **2** cases, named
+`test_two_destination_labels_for_the_same_path_do_not_invent_a_collision[order1]`
+and `test_aliased_roots_and_later_lower_priority_move_keep_configured_label`.
+Silently ignoring the undefined root fails **1** case,
+`test_hand_built_config_with_undefined_destination_cannot_pass_the_gate`.
+Exact source bytes were restored afterward. Raw results are
+`issue60-review-mutation-results.json` in the same local artifact folder.
+These are two additional selected mutations, not a rerun of the earlier 22.
+
+The remaining survivor, removing `_default_lister`'s sort, is deliberately
+accepted: directory enumeration order no longer determines selection or
+diagnostic order. Sorting that input is not a correctness guard.
+
+Full suite after the review additions: **2409 passed, 8 skipped, 66.17 s**.
+The change adds **3** collected passes to the prior 2406, for **36** new cases
+over master, without changing the skipped population. The new exact head
+still needs Claude's re-review and its own CI results before merge.
