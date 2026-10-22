@@ -481,15 +481,15 @@ def resolve_protected_execution(
     needed because every pending version was read out of
     `snapshot.discovered` in the first place.
 
-    Deliberately **not** implemented here, and therefore not enforced by
-    anything yet (design sections 8 and 12): verified writer quiescence,
-    the protected backup, plan-digest and expected-count revalidation,
-    the ledger preconditions of section 12.1 steps 3-4 (recorded against
-    discovered set equality, and the next-applicable test),
-    statement-by-statement application, the in-transaction ledger row,
-    and the section 12.2 reconciliation. A caller holding these paths has
-    been authorized and has satisfied none of those obligations. They
-    belong to the executor that is built in a later slice.
+    This seam still does NOT enforce the executor's other obligations
+    (design sections 8 and 12): verified writer quiescence, protected
+    backup, plan-digest and expected-count revalidation, the next-applicable
+    test, statement-by-statement application, the in-transaction ledger
+    row, and section 12.2 reconciliation. Section 12.1 step 3's ledger
+    set-equality predicate now exists as require_slice4_ledger(), but is
+    deliberately separate and is NOT called here. A caller holding these
+    paths has been authorized and has satisfied none of those obligations.
+    They belong to the executor that is built in a later slice.
     """
     pending = set(snapshot.pending_protected())
 
@@ -504,3 +504,30 @@ def resolve_protected_execution(
         snapshot.discovered[version]
         for version in sorted(authorization.versions)
     )
+
+
+def require_slice4_ledger(snapshot: MigrationSnapshot) -> None:
+    """Refuse unless the ledger equals all discovered versions below 015.
+
+    Slice-4 design section 12.1 step 3 requires SET EQUALITY, not merely
+    that all earlier files were recorded. A later or unknown recorded
+    version is as invalid as a missing earlier one. The generic protected
+    seam intentionally does not enforce this migration-specific condition.
+
+    This is one pure predicate over the supplied snapshot: no connection,
+    directory scan, transaction or SQL. It does not prove the snapshot is
+    fresh. The future executor must take it under its write lock and also
+    verify explicit authorization/pending versions, the next-applicable
+    version, backup, quiescence, approved plan, SQL and reconciliation
+    before it may commit. Passing
+    this predicate alone does not even prove that a 015 file exists.
+    """
+    expected = frozenset(version for version in snapshot.discovered if version < 15)
+    if snapshot.recorded != expected:
+        missing = sorted(expected - snapshot.recorded)
+        unexpected = sorted(snapshot.recorded - expected)
+        raise ProtectedMigrationError(
+            "Slice-4 ledger refused: recorded versions must equal all "
+            "discovered versions below 015; "
+            f"missing={missing}, unexpected={unexpected}."
+        )
