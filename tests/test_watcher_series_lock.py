@@ -67,7 +67,8 @@ def wired(tmp_path, monkeypatch):
     def fake_apply_fallback(parsed, series_name, dir_number):
         record("mutate:rename", series_name)
 
-    def fake_shadow(comic_dir, dest, series_name, archives, results):
+    def fake_shadow(comic_dir, dest, series_name, archives, results,
+                    handoffs=None, mixed_parent=False):
         record("classify", series_name)
 
     def fake_move_dir(comic_dir, dest, *, target_name, chapter_number=None):
