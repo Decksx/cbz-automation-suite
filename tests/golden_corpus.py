@@ -449,14 +449,54 @@ def _many_entries(path: Path) -> Path:
     """A legitimate high-entry-count archive, used as a control.
 
     120 pages is more than a typical chapter and less than anything
-    pathological. This is **not** the roadmap's "excessive entries" case:
-    there is no entry-count limit in the codebase to exercise, so this
-    fixture pins that a large-but-ordinary archive is handled normally
-    rather than proving a guard. See `CORPUS_GAPS`.
+    pathological. This is **not** the roadmap's "excessive entries" case --
+    that is `excessive_entries` below. This fixture pins that a
+    large-but-ordinary archive is handled normally, so that when an
+    entry-count limit lands it can be shown to leave ordinary archives
+    alone.
     """
     entries: list[tuple[str, bytes]] = [(COMIC_INFO, comic_info_xml())]
     entries.extend(
         (f"{index:04d}.png", page_image(index)) for index in range(1, 121)
+    )
+    return build_cbz(path, entries)
+
+
+# Image-named members in `excessive_entries`. Chosen to sit far beyond any
+# real comic (the `many_entries` control is 120; a large omnibus is a few
+# thousand) while keeping the fixture cheap: the corpus tests build every
+# case several times, and 20,000 zero-byte members measured 0.6-0.7 s per
+# build (1.9 MB) where 60,000 measured 1.9 s. It also stays below 65,535,
+# so the archive is a plain ZIP rather than ZIP64 -- a different structural
+# shape that would deserve its own case rather than arriving by accident.
+#
+# **If an entry-count cap is introduced above this value, this fixture no
+# longer exceeds it** and the pin in `test_golden_corpus.py` would go on
+# passing while proving nothing about the cap. Raise the constant with the
+# cap, not after it.
+EXCESSIVE_ENTRY_COUNT = 20_000
+
+
+def _excessive_entries(path: Path) -> Path:
+    """Far more members than any real archive, each one empty.
+
+    The roadmap's "excessive entries" shape. It exists to exercise an
+    entry-count limit, and **no such limit exists yet** (Step 7,
+    `archive_io_resource_audit.md`): today inspection lists every member and
+    reports them all as pages. The corpus tests therefore pin that current
+    acceptance rather than asserting a rejection that does not happen, and
+    `CORPUS_GAPS["excessive_entries"]` records the missing guard.
+
+    Members are zero bytes on purpose. Entry count is the property under
+    test, and empty payloads keep the uncompressed total at zero so this
+    case cannot be mistaken for -- or accidentally trip -- a size cap.
+    Image-suffixed names are what make every member count as a page, which
+    is the cost a cap would bound.
+    """
+    entries: list[tuple[str, bytes]] = [(COMIC_INFO, comic_info_xml())]
+    entries.extend(
+        (f"{index:05d}.png", b"")
+        for index in range(1, EXCESSIVE_ENTRY_COUNT + 1)
     )
     return build_cbz(path, entries)
 
@@ -500,6 +540,10 @@ CASES: tuple[Case, ...] = (
     Case("many_entries",
          "120 pages: a legitimate high-count control, not a limit test.",
          _many_entries, tags=("control",)),
+    Case("excessive_entries",
+         "20,000 empty image members: the entry-count shape, accepted "
+         "today because no cap exists.",
+         _excessive_entries, tags=("limits", "resource", "expected-gap")),
     Case("decoded_pixel_warning",
          "Header declares 108 MP: above the pixel limit, below the "
          "raise threshold.",
@@ -516,10 +560,12 @@ CASES: tuple[Case, ...] = (
 # indistinguishable from an overlooked one.
 CORPUS_GAPS = {
     "excessive_entries": (
-        "No entry-count limit exists anywhere in the codebase, so there is "
-        "no guard to exercise. `many_entries` is a legitimate high-count "
-        "control instead. Deferred to resource hardening, which is where "
-        "such a limit would be introduced."
+        "The fixture exists (`excessive_entries`, EXCESSIVE_ENTRY_COUNT "
+        "members); the guard does not. No entry-count limit exists in the "
+        "codebase, so inspection accepts the case and the corpus tests pin "
+        "that acceptance. When resource hardening (Step 7) introduces the "
+        "cap, the pin fails by design and is replaced by an assertion of "
+        "rejection, and this entry is removed."
     ),
     "real_pixel_payload": (
         "`decoded_pixel_*` declare their dimensions in the PNG header "
@@ -560,6 +606,8 @@ EXPECTED_SHA256: dict[str, str] = {
         "ec385de8d2849a3b9a4b6d214bc32af957f08174e1c0c40a115451436ed7475d",
     "many_entries":
         "4c6ee6313f6e1edf4a7c975a0abe6a4f89cee2d738dd7d039ac23e777328d561",
+    "excessive_entries":
+        "5818b31e95047fd0c93c3f4bbff1e693406faaa4f700a83d0ad307dadab87295",
     "decoded_pixel_warning":
         "3a6afb0cc39d806942d7979156e8426ac739adbfebec7cb7d776ef9551bc68f5",
     "decoded_pixel_bomb":
