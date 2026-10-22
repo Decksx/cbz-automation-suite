@@ -104,6 +104,20 @@ separate, later design.
    "moves nothing" and "no legacy fallback" rules of A1, A2 and A5 describe
    that future activated behaviour, not shadow. A first PR that suppressed
    any movement would be a behaviour change needing its own gate.
+
+   *Implemented (2026-10-22)* in `scripts/cbz_shadow_handoff.py`, wired
+   through `_shadow_route` in the watcher. The review root is read from
+   `CBZ_CLASSIFICATION_REVIEW_ROOT`; unset or not an existing directory, the
+   shadow logs `review_root_unset` / `review_root_unavailable` and plans
+   nothing. Only that minimal check exists: the full gate of A3.2 (same volume
+   as the library, not inside the watch folder or a library root) is not
+   implemented, which is safe only because nothing here writes. The trigger
+   used is the one proposed in A1 and still open in D.1: `ambiguous_series`,
+   or `confidence == "unresolved"`. Because a v2 no-match is always
+   `unresolved`, every arrival that no rule classifies counts as a would-be
+   handoff; the shadow counts are the evidence D.1 should be decided on, not
+   a decision. The plan hashes the whole payload under the series lock, once
+   per would-be handoff, and only when a review root is configured.
 2. **Configuration gate.** The review root is an explicit, validated setting
    (no default): it exists; it passes the runtime topology checks (section
    1); it is on the same volume as the library roots, so promote stays a
