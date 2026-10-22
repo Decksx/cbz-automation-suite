@@ -46,14 +46,19 @@ and no database, by design. It therefore cannot carry folder revision sets
 or archive digests, and this design does not pretend it does.
 
 A decision is made against an **observation envelope**, versioned on its
-own, with two components:
+own, with three components (the third is defined below):
 
 ```text
 envelope_schema      1
 directory_report     {schema_version, report_sha256}        (from #101)
 revision_inventory   {schema, coverage, acquired, rows, inventory_sha256}
-envelope_sha256      sha256 over the canonical JSON of the above
+member_validation    {schema, coverage, rows, validation_sha256}
+envelope_sha256      sha256 over the canonical JSON of all of the above
 ```
+
+A component that has not been produced is recorded as absent, never as
+empty, and an envelope missing either the inventory or the member
+validation can only support key-level dispositions.
 
 The **revision inventory** is a separate read-only producer (not built yet)
 that, for exactly the folders named in the directory report, lists each
@@ -274,13 +279,18 @@ not in it:
 - While a subject has an **unreconciled** conflict entry it is
   **conflicted**, and the gate blocks it. Clock order never picks a winner.
 - **Reconciliation is an explicit operator event**: a receipt-verified
-  record of kind `reconcile` on that subject that names the `conflict_id`
-  and the **exact, complete** set of conflicting `record_id`s from the
-  entry, and the record that becomes canonical: either the current
-  canonical head (keep it) or one record from the set, which is then
-  admitted through the normal compare-and-set. A `reconcile` naming a
-  partial set, an unknown conflict, or a record outside the set is refused.
-  The unchosen records stay in the conflict log, so the conflict is
+  record **R** of kind `reconcile`, admitted through the normal
+  compare-and-set as the canonical child of the **current head**. R names
+  the `conflict_id` and the **exact, complete** set of conflicting
+  `record_id`s from the entry, and itself **carries the selected outcome**
+  — either the current head's outcome (keep it) or one conflicting
+  record's outcome — together with a bound observation that is current
+  now. No conflicting record is admitted, re-hashed, or re-parented: in a
+  fork A→B (canonical) and A→C (logged), choosing C's outcome writes R as
+  B's child with C's outcome and a fresh binding; C stays unchanged in the
+  conflict log as evidence, and its stale binding to A is never revived.
+  A `reconcile` naming a partial set, an unknown conflict, or an outcome
+  not drawn from the set or the current head is refused. The conflict is
   acknowledged, never erased; a single `supersedes` pointer cannot clear
   it.
 
@@ -394,6 +404,8 @@ lands with or before it.
 - `test_conflict_survives_a_crash_and_is_re_detected`
 - `test_partial_reconcile_set_is_refused`
 - `test_superseding_one_leaf_does_not_clear_the_conflict`
+- `test_reconcile_is_the_canonical_child_and_the_chosen_record_stays_logged`
+- `test_envelope_without_member_validation_supports_key_level_only`
 - `test_legacy_overrides_cannot_certify_a_per_path_distinct`
 
 Each guard must be shown load-bearing: removing it fails its named test.
