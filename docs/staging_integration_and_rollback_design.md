@@ -2,215 +2,310 @@
 
 Status: **design only**, for review. Nothing here is wired, implemented, or
 activated; accepted watcher modes remain `off` and `shadow`. Roadmap "Next
-work" item 3 (`docs/implementation_roadmap.md`): "the inert watcher-to-staging
-integration plan and a verified cross-volume rollback design". Author:
-claude-lead; reviewer: codex-lead. Written 2026-10-22 at master `cd2b774`.
+work" item 3 (`docs/implementation_roadmap.md`). Author: claude-lead;
+reviewer: codex-lead. First draft `002270d` (2026-10-22, master `cd2b774`);
+this revision answers codex-lead's review of that head (PR #103): a typed
+handoff decision and excluded mixed parents, a journalled retained source,
+ownership receipts instead of content equality, and versioned journals with
+a complete crash matrix.
 
 ## 0. Two different "stagings" — kept apart
 
 | | Classification staging (this design) | Routine staging |
 |---|---|---|
 | Module | `scripts/cbz_classification_staging.py` (#33, #38, #40–#42; retries #94) | `scripts/cbz_promote_staging.py` (#73) |
-| Purpose | hold an arrival whose classification needs **human review** | land routine arrivals in `X:\_staging\*`, then merge into the library |
-| Safety | manifest first; full-SHA inventory; source revalidation; recovery matrix; digest-checked operator commands | plan-then-`--apply`; no manifest, hash, or rollback |
-| Wired into the watcher | **no** (no production import) | the live `routing.json` points the watcher at `X:\_staging\*` |
+| Purpose | hold an arrival whose classification needs **human review** | land routine arrivals in a staging destination, then merge into the library |
+| Safety | manifest first (`classification-case-v1`, strict parser); full-SHA inventory; source revalidation; recovery matrix; digest-checked operator commands | plan-then-`--apply`; no manifest, hash, or rollback |
+| Wired into the watcher | **no** (no production import) | yes, via the live routing destinations |
 
-"Staging" below always means the classification-staging review machinery.
-The routine path is not changed by this design.
+"Staging" below always means classification staging. The routine path is
+not changed by this design.
 
-## 1. The constraint that shapes both halves
+## 1. Topology is an input, verified at runtime — never assumed
 
-Measured from code and records at `cd2b774` (sources in each line):
+The 2026-08-24 handoff and the code defaults describe the watch folder on C:
+and the library on X:, which would make a handoff a cross-volume
+`copy_verify`, a promote a same-volume rename, and a return to the source a
+cross-volume move. **Those are historical and default examples, not a current
+measurement**, and different drive letters alone do not prove different
+volumes. The design is therefore conditional on topology, and the eventual
+operator preflight must verify, at runtime and for each configured root:
+volume identity (`st_dev` / volume serial), access path (local, not SMB), and
+filesystem (NTFS; exFAT and SMB refused — engineering decision "Library
+volume filesystem and access path are architectural"). The staging module
+already chooses `rename` vs `copy_verify` by `st_dev` and refuses a plan
+whose method contradicts the recorded volumes; this design keeps that rule
+and adds nothing that infers volumes from letters.
 
-- The watch folder is on **C:** (`cbz_watcher.py:68`, `WATCH_FOLDER`); the
-  library and `X:\_staging\*` are on **X:** (`development_log_2026-08-24.md`).
-- Today's watcher move is `shutil.move` (`_move_cbz_dir`, `_merge_directories`):
-  across C:→X: that is a silent copy-then-delete, with no manifest, hash, or
-  post-copy verification.
-- Classification staging already **supports** cross-volume transfer in
-  (`execute_transfer`: copy into `.partial`, verify full-SHA inventory,
-  revalidate the source, publish `.partial → pending`; method chosen by
-  `st_dev`, `validate_execution_plan` refuses a contradicting method).
-- It **refuses** cross-volume promote (`_same_volume_move`) and cross-volume
-  rollback (`rollback_case`: "no verified cross-volume rollback protocol
-  exists", `cbz_classification_staging.py:2054-2069`).
+What is source-backed at `cd2b774`:
 
-So the natural review root (`X:\_classification_review`, documented but not
-configured anywhere) makes **every** watcher handoff cross-volume in (C:→X:),
-promote same-volume (X:→X:, supported), and **rollback cross-volume back to
-C:, which is refused**. Integration without part B would create review cases
-that can never be returned. That is why the two are one design.
+- the watcher moves with `shutil.move` (`_move_cbz_dir`, `_merge_directories`
+  / `_move_loose_files`): across volumes that is copy-then-delete without
+  manifest, hash, or verification;
+- `execute_transfer` supports cross-volume transfer in (copy into `.partial`,
+  verify the full-SHA inventory, revalidate the source, publish);
+- `_same_volume_move` refuses cross-volume promote, and `rollback_case`
+  refuses cross-volume return ("no verified cross-volume rollback protocol
+  exists", `cbz_classification_staging.py:2054-2069`) and an occupied return
+  target.
 
 ## Part A — Inert watcher-to-staging integration plan
 
-### A1. Where the handoff would sit
+### A1. A typed handoff decision, not the shadow log
 
-Inside `_process_and_move_directory_inner`, under the existing
-`stable_series_lock` (#43, already wired at `cbz_watcher.py:1756`), after
-`_shadow_route` has classified the arrival and **before** `_move_cbz_dir` /
-`_move_loose_files`. That is the only point where identity is settled (#32),
-the v2 classification exists, and nothing has moved.
+`_shadow_route()` today is a logging adapter: it returns `None` and catches
+classification errors. A handoff needs a typed result, produced at the same
+point (under the wired `stable_series_lock`, after identity is settled, before
+any move):
 
-The decision it would make, later and only under a separately approved
-activation: **a review-required classification is handed to staging instead
-of the legacy move; everything else keeps the legacy path unchanged.**
-"Review-required" is defined by the v2 router (`authoritative == False`, an
-ambiguous key, or an unresolved identity under #99's gate), never by
-destination priority.
+```text
+HandoffDecision
+  outcome      legacy_move | review_handoff | defer
+  reason       classification_failed | mixed_parent | ...  (for defer)
+  classification   the v2 decision when one was produced
+  payload      the exact set of member paths the handoff would own
+```
 
-### A2. Phases (each its own PR and review; none activates routing)
+- A classification **error** yields `defer` with the error recorded: the
+  arrival is left in place and reported, never moved by either path.
+- **Review policy is proposed here, not existing API.** The router has no
+  "review-required" call. This design proposes: `review_handoff` when the
+  key is ambiguous or unresolved under #99's gate. `authoritative == False`
+  alone is **not** the trigger, because it also covers otherwise resolved
+  metadata classifications. The policy itself needs review before
+  implementation.
 
-1. **Shadow-plan (inert, first).** At the handoff point, when the router is in
-   `shadow` and the classification is review-required, call the staging
-   *planner* only (`plan_case` / inventory of the arrival, read-only) and log
-   what would be staged: would-be case id, inventory digest and file count,
-   chosen method (`copy_verify` C:→X:), and the configured review root. No
-   copy, no `.partial`, no manifest. Count these in the shadow pass summary.
-   This measures how often review would trigger before anything depends on
-   it.
-2. **Configuration gate.** The review root becomes an explicit, validated
-   setting (no default): it must exist, be on the library volume (so promote
-   stays a same-volume rename), and not be inside the watch folder, the
-   library roots, or `X:\_staging`. A missing or invalid setting keeps phase 1
-   logging "review root unset" and nothing else.
-3. **Activation (not designed here).** Any real handoff is a separate,
-   separately reviewed decision, gated on part B existing and on the #99
-   authority work. It needs its own mode value; the current
-   `MODE_OFF`/`MODE_SHADOW` set does not grow in this design.
+### A2. Mixed parents are excluded until a selective-payload contract exists
 
-### A3. Rules the eventual handoff must keep
+The watcher has two move branches. A mixed drop point (loose archives
+alongside nested series directories) moves **only** the loose archives in
+`parsed_by_path` (`_move_loose_files`). `plan_case(staging_source_path=...)`
+inventories the **whole tree** (`build_inventory`), and transfer copies or
+moves that whole tree. Reusing it on a mixed parent would stage unrelated
+nested series.
 
-- **Source release.** `execute_transfer(delete_copied_source=False)` is the
-  default and must stay so on handoff: the C: arrival is the only rollback
-  target until part B can return bytes from X:. To stop the watcher
-  re-detecting it, the arrival is moved **within C:** (same-volume rename)
-  into a `handed-off/<case-id>` holding area recorded in the manifest. Only a
-  successful promote may release it, and only by quarantine-then-delete,
-  never by `rmtree` (CLAUDE.md "Quarantine, don't delete").
-- **Lock scope.** The copy runs under the series lock (same-series arrivals
-  wait, which is the #32 serialization) but **never** under the router index
-  lock (`_index_lock`, a plain `RLock`; lock_topology.md rule: series → index,
-  never the reverse). `note_move` is **not** called for a handed-off arrival:
-  it did not land, so the index must not learn a home for it.
-- **One owner per arrival.** An arrival handed to staging is never also given
-  to `_move_cbz_dir`; the handoff and the legacy move are exclusive branches,
-  with a test that removing the branch guard fails.
-- **No silent fallback.** If staging refuses (collision, partial recovery
-  required, source changed), the arrival stays where it is and is reported;
-  the watcher does not fall back to the legacy move for a review-required
-  classification.
+So: **a mixed parent always yields `defer` (reason `mixed_parent`)**, and the
+handoff covers only the whole-directory branch, where the payload is the
+whole tree and equals what `plan_case` inventories. A selective-payload
+contract (an explicit member list, inventoried and verified as such) is a
+separate, later design.
+
+### A3. Phases (each its own PR and review; none activates routing)
+
+1. **Shadow-plan (inert, first).** In `shadow`, compute the
+   `HandoffDecision`; for `review_handoff`, call the staging planner only
+   (`plan_case`, read-only) and log the would-be case id, inventory digest,
+   file count and method. No copy, `.partial`, or manifest. Count outcomes in
+   the shadow summary, including `defer` by reason.
+2. **Configuration gate.** The review root is an explicit, validated setting
+   (no default): it exists; it passes the runtime topology checks (section
+   1); it is on the same volume as the library roots, so promote stays a
+   rename; and it is not inside the watch folder, a library root, or a
+   routine staging destination. Invalid or unset: phase 1 logs that, nothing
+   else.
+3. **Activation is not designed here.** It requires its own mode value and a
+   separate decision, and depends on part B and on #99's authority work.
+
+### A4. Retained source and the handoff journal
+
+`execute_transfer(delete_copied_source=False)` stays the default on handoff:
+the original arrival is retained. To keep the watcher from re-detecting it,
+it is moved **within its own volume** to a case-owned holding area. That
+move creates a new authoritative path, so it is journalled, not implied.
+
+A **handoff journal** per case, in its own file with its own contract
+(`watcher-handoff-v1`, strict parser in the same style as the case
+manifest), records:
+
+```text
+case_id
+original_identity   the arrival's original path and the inventory digest
+                    planned for it — immutable for the life of the case
+source_location     where the retained source currently is: original path
+                    or holding path — the only mutable field, changed only
+                    by journalled steps
+state               planned → transferred → source_held → (released |
+                    restored)
+```
+
+| Crash point | What disk + journal show | Recovery |
+|---|---|---|
+| after `transferred`, before the holding move | journal `transferred`, source at original path | move to holding (re-verifying the digest first), then `source_held` |
+| during the holding move (same-volume rename) | the source at exactly one of the two paths | record whichever path holds the digest-matching tree; both or neither: `operator_required` |
+| source digest changed while held | mismatch at check time | `operator_required`; touch nothing |
+
+The watcher excludes the holding root by configuration (it is not under the
+watch folder), and recovery, not the watcher, owns anything in it.
+
+**Two different ways back, and only one needs part B.**
+- **Restore the retained source**: the held source is a verified, case-owned
+  copy on the original volume. Returning it is a **same-volume** journalled
+  rename from holding back to the original path (refused if that path is
+  occupied), plus discarding the staged copy through quarantine. This needs
+  no cross-volume protocol, so a handoff with a retained source is **not**
+  irreversible without part B.
+- **Return the staged payload across volumes** (part B) is needed only when
+  the source was released, or when the operator wants the staged bytes
+  rather than the retained ones.
+
+### A5. Rules the eventual handoff must keep
+
+- An arrival is either handed off or moved by the legacy path, never both;
+  the two are exclusive branches of the typed decision (guard-removal test).
+- `note_move` is not called for a handed-off arrival: it did not land.
+- The copy runs under the series lock (same-series arrivals wait, the #32
+  serialization) but **never** under the router index lock (lock_topology.md:
+  series → index, never the reverse).
+- If staging refuses (collision, partial recovery required, source changed),
+  the decision becomes `defer` and the arrival is reported; there is no
+  silent fallback to the legacy move.
 
 ## Part B — Verified cross-volume rollback
 
-### B1. What exists
+### B1. Scope
 
-`rollback_case` returns a `pending_review` payload to `staging_source_path`
-by atomic rename, and refuses if that path is occupied or on another volume
-(tested: `test_rollback_reports_cross_volume_unavailability_explicitly`). A
-promoted case is terminal and cannot be rolled back (out of scope here; an
-"un-promote" would be its own plan/apply).
+Return a `pending_review` case's **staged payload** to a target on another
+volume, when the retained source is released or not wanted (section A4).
+Promoted cases remain terminal (an "un-promote" is a different plan/apply).
+The existing same-volume `rollback_case` is unchanged.
 
-### B2. The protocol: a reverse transfer, verified before anything is released
+### B2. A rollback journal, versioned and separate from the case manifest
 
-Cross-volume rollback is the transfer protocol run backwards, with the same
-guarantees and no new kind of trust:
+The case manifest (`classification-case-v1`) rejects unknown fields and
+states, and `rolled_back` is terminal. So it is **not** extended. Each
+rollback attempt has its own journal file with its own contract
+(`cross-volume-rollback-v1`, strict, append-only progress), and the case
+manifest moves to its existing terminal `rolled_back` **only as the last
+step**, after everything else is durable. A v1 reader therefore never sees
+an unknown field or state.
 
 ```text
-precondition   case is pending_review; operator supplies record_digest
-               (show_case) — same gate as every operator command
-1 plan         manifest records state rollback_planned: target = original
-               staging_source_path (or the A3 holding area), method
-               copy_verify, the payload's recorded inventory digest
-2 copy         copytree pending/<case>/payload → <target-volume>
-               .rollback-partial/<case>/ (same volume as the target)
-3 verify       full-SHA inventory of .rollback-partial == the manifest's
-               recorded inventory digest (not merely == the pending copy)
-4 revalidate   re-hash pending/<case>/payload: unchanged since promotion
-               to pending (PayloadChangedError retryable, a different
-               digest is operator_required — never guessed)
-5 publish      same-volume rename .rollback-partial/<case>/payload →
-               target; refuse if target occupied (no merge, no overwrite)
-6 record       manifest: rolled_back, with both digests and paths
-7 release      move pending/<case> to rolled_back/<case> on X: (quarantine,
-               not delete); its eventual deletion is a separate,
-               operator-approved retention step
+attempt_id          unique per attempt; the ownership token
+case_id, record_digest   the case and the show_case digest the operator approved
+target              the return path; must be absent at start
+frozen_inventory    the case's recorded inventory digest
+layout              <target-volume>\.rollback-partial\<case>\<attempt>\payload
+progress            planned → copied → verified → published → quarantined →
+                    case_recorded
+published_receipt   written in the same step as the publish rename: target
+                    path, attempt_id, digest
+quarantine_path     <review-root>\rolled_back\<case>\<attempt>\
 ```
 
-Nothing is removed from either volume until the returned copy is verified and
-published (steps 1–6). After step 7 there are still two verified copies: the
-returned arrival and the quarantined staging copy.
+One layout for every step: the copy lands in
+`.rollback-partial\<case>\<attempt>\payload`, and publication renames that
+`payload` directory to the target.
 
-### B3. Crash and retry semantics
+### B3. Steps
 
-States extend the existing recovery matrix: `rollback_planned`,
-`rollback_copied_verified`, `rolled_back` (terminal). Recovery acts only on
-what disk and manifest together prove:
+```text
+precondition  case is pending_review; the operator supplies record_digest
+1 planned     journal written; target must not exist
+2 copied      copytree pending\<case>\payload → layout path (target volume)
+3 verified    full-SHA inventory of the copy == frozen_inventory; and, freshly,
+              pending\<case>\payload exists, belongs to this case, and still
+              verifies against frozen_inventory
+4 published   same-volume rename of the layout's payload → target, refused
+              if the target now exists; then published_receipt
+5 quarantined move pending\<case> → quarantine_path (same volume as review
+              root); never deleted here
+6 case_recorded  case manifest → rolled_back (terminal), last
+```
 
-| Found | Action |
-|---|---|
-| `rollback_planned`, no `.rollback-partial` | restart from step 2 |
-| `.rollback-partial` incomplete or digest mismatch | discard **only** `.rollback-partial` (it is a copy; pending is intact), restart step 2 |
-| `.rollback-partial` verified, target absent | resume at step 4 |
-| target present and equal to the recorded digest, manifest not yet `rolled_back` | record (step 6), then release (step 7) — idempotent |
-| target present with **different** content | `operator_required`; touch nothing |
-| pending payload changed | `operator_required`; touch nothing |
+Nothing is removed before step 5, and step 5 moves rather than deletes.
 
-Renames use the existing `_replace` retry (WinError 5/32 only, bounded,
-re-checking after each wait, #94). Every step is idempotent, and recovery is
-rebuildable from manifest plus disk alone, like `recover_case` today.
+### B4. Ownership, not equality
 
-### B4. Limits, stated
+A target that exists with bytes **equal** to the frozen inventory is not
+proof that this attempt published it: an earlier attempt, an operator, or a
+coincidence could have put it there. So:
 
-- The integrity check is the full-SHA inventory digest; the known
-  `(st_size, st_mtime_ns)` window for a same-size rewrite inside the mtime
-  quantum (`_hash_stable_file`) applies to the source re-check exactly as it
-  does on transfer.
-- Both volumes must be local NTFS. SMB targets stay refused (engineering
-  decision "Library volume filesystem and access path are architectural":
-  0/6 detection over `\\tower`); exFAT widens the quantum and is refused for
-  the same reason.
-- Not an atomic cross-volume operation: between steps 5 and 7 the bytes exist
-  on both volumes, by design.
+- Recovery treats the target as published by this attempt **only** if the
+  journal holds this attempt's `published_receipt`. Without it, an existing
+  target is **ambiguous** and reported, whether its bytes match or not;
+  nothing is recorded or quarantined automatically.
+- An incomplete or mismatched `.rollback-partial` may be discarded **only
+  after freshly re-proving** that the pending payload still exists, belongs
+  to this case (case id and path from the manifest), and verifies against
+  the frozen inventory. If pending is missing or changed, the partial may be
+  the only surviving copy: it is kept, and the attempt is `operator_required`.
+- The same fresh proof is repeated after any Windows-lock wait (`_replace`
+  retries, #94) before acting on the result.
 
-## C. What implementation must prove (named tests, for later PRs)
+### B5. Complete crash matrix
+
+| Last durable progress | Disk | Recovery |
+|---|---|---|
+| none / `planned` | no partial | start step 2 |
+| `planned` | partial present (copy interrupted) | fresh pending proof → discard the partial and recopy; proof fails → keep the partial, `operator_required` |
+| `copied` | partial complete, unverified | verify (step 3) |
+| `verified` | target absent | publish (step 4) |
+| `verified` | target present, **no receipt** | ambiguous target → `operator_required` |
+| `published` (receipt present) | target present | quarantine (step 5) |
+| `published` | target missing | `operator_required` (published bytes vanished) |
+| `published` | pending already at quarantine_path, journal not advanced | record `quarantined` (the move is the only way there), then step 6 |
+| `quarantined` | case manifest still `pending_review` | write `rolled_back` (step 6) |
+| `case_recorded` | — | terminal; nothing to do |
+| any | pending missing or changed before step 5 | keep everything, `operator_required` |
+
+Every action is idempotent and decided from journal plus disk alone. One
+attempt per case at a time: a second attempt is refused while an earlier
+one is not at `case_recorded` or explicitly abandoned by the operator.
+
+### B6. Limits, stated
+
+- Integrity rests on the full-SHA inventory; the known window for a
+  same-size rewrite inside the mtime quantum (`_hash_stable_file`) applies to
+  the pending re-checks, as on transfer.
+- Local NTFS only (section 1). Between steps 4 and 5 the bytes exist on both
+  volumes, by design; the operation is not atomic across volumes.
+
+## C. Named tests (for the implementation PRs)
 
 Part A:
 - `test_shadow_plan_logs_would_be_case_and_moves_nothing`
-- `test_shadow_plan_is_skipped_for_authoritative_classifications`
+- `test_classification_error_defers_and_moves_nothing`
+- `test_mixed_parent_with_loose_files_and_unrelated_nested_series_defers`
+- `test_authoritative_false_alone_is_not_a_review_handoff`
 - `test_missing_or_invalid_review_root_logs_and_does_nothing`
-- `test_review_root_inside_watch_or_library_roots_is_refused`
-- `test_handoff_and_legacy_move_are_exclusive` (guard removal fails it)
+- `test_review_root_on_another_volume_than_the_library_is_refused`
+- `test_handoff_and_legacy_move_are_exclusive`
 - `test_handed_off_arrival_does_not_update_the_series_index`
-- `test_staging_refusal_never_falls_back_to_legacy_move`
+- `test_staging_refusal_defers_without_legacy_fallback`
 - `test_copy_never_holds_the_router_index_lock`
+- `test_holding_move_crash_resolves_to_exactly_one_location`
+- `test_retained_source_restoration_is_a_same_volume_journalled_rename`
+- `test_changed_held_source_is_operator_required`
 
 Part B:
 - `test_cross_volume_rollback_returns_verified_bytes`
-- `test_rollback_verify_compares_to_the_recorded_digest_not_the_copy`
-- `test_rollback_refuses_an_occupied_target_without_merging`
-- `test_nothing_is_released_before_publish_and_record`
-- `test_released_payload_is_quarantined_not_deleted`
-- each recovery-table row as its own test
-- `test_changed_pending_payload_is_operator_required`
-- `test_smb_or_exfat_target_is_refused`
+- `test_verify_compares_to_the_frozen_inventory_not_the_copy`
+- `test_foreign_identical_target_without_receipt_is_ambiguous`
+- `test_partial_is_kept_when_pending_is_missing`
+- `test_partial_is_kept_when_pending_changed`
+- `test_pending_is_re_proved_after_a_windows_lock_wait`
+- `test_case_manifest_becomes_rolled_back_only_last`
+- `test_v1_case_manifest_reader_never_sees_rollback_fields`
+- `test_second_attempt_is_refused_while_one_is_open`
+- each crash-matrix row (B5) as its own test
+- `test_unsupported_topology_is_refused` (SMB, exFAT)
 
-Every cross-volume test in the suite today fakes volumes by monkeypatching
+Every cross-volume test today fakes volumes by monkeypatching
 `volume_identity` / `same_volume`. That stays for unit tests, but part B also
-needs **one opt-in integration test on two real local volumes** (for example
-a temporary directory on C: and one on a second local volume, skipped when
-none exists), because a faked `st_dev` cannot prove copy-then-rename
-behaviour across real filesystems. It is operator-run, never against the
-library.
+needs **one opt-in integration test on two real local volumes** (skipped when
+the host has only one), because a faked `st_dev` cannot prove
+copy-then-rename across real filesystems. It is operator-run and never
+touches the library.
 
 ## D. Open questions
 
-1. **Handoff holding area** (A3): rename within C: to `handed-off/`, or keep
-   the arrival in place and teach the watcher to skip paths with an open
-   case? The first is simpler to reason about; the second avoids a move.
-2. **Review-root location**: `X:\_classification_review` (library volume, so
-   promote stays same-volume) is assumed; confirm, and confirm it must not
-   be under `X:\_staging`.
-3. **Release of the handed-off source after promote**: quarantine retention
-   period and who approves deletion.
-4. **Order of work**: part B (rollback) before any part A phase beyond
-   shadow-plan, since without it every review case is irreversible.
+1. **Review policy** (A1): is "ambiguous or unresolved key under #99" the
+   right handoff trigger, and does any `authoritative == False` case also
+   belong?
+2. **Holding root** (A4): its location and retention, and who approves
+   releasing a held source after promote.
+3. **Order of work**: shadow-plan (A3.1) first; part B only when a released
+   source or an explicit staged-bytes return is wanted, since retained-source
+   restoration (A4) needs no cross-volume protocol.
+4. **Selective payloads** (A2): whether mixed parents ever get handed off, or
+   stay on the legacy path permanently.
