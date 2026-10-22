@@ -20,6 +20,11 @@ implementation                   read-only guard  busy_timeout  isolation_level
 `perceptual_reuse_analysis.py`   ``query_only``   60000         ``None``
 ===============================  ===============  ============  ===============
 
+(The table is the state when this module was written. `read_guards.py` has
+since been migrated onto `open_connection`; its "absent" busy_timeout was
+never absent in effect, because ``timeout=30.0`` installs the same 30000 ms
+handler.)
+
 Two of those differences are not cosmetic. A "read-only" connection without
 ``PRAGMA query_only`` is only read-only by convention. And a connection left
 on the driver's default ``isolation_level`` has pysqlite inserting implicit
@@ -901,10 +906,10 @@ SANCTIONED_CONNECT_SITES: dict[str, SanctionedSite] = {
             "changes behaviour in this PR."
         ),
     ),
-    "comic_automation/database/read_guards.py": SanctionedSite(
-        calls=1,
-        reason="The pre-existing read-only factory used by every audit.",
-    ),
+    # `comic_automation/database/read_guards.py` was listed here (1 call)
+    # until Step 5 migrated `readonly_database_connection` onto
+    # `open_connection(readonly=True)`. It is absent on purpose: a raw
+    # connect returning there is now an unsanctioned bypass.
     "comic_automation/database/backup_cli.py": SanctionedSite(
         calls=1,
         reason=(
