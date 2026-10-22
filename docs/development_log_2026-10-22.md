@@ -93,3 +93,81 @@ receipt on the PR and in the hive. This is a test/documentation slice and needs
 no production rollout. These local checks do not claim CI or review has already
 completed.
 
+
+## Ambiguity-report workstream -- issue #98
+
+David authorized the combined next-work plan in hive #1972. Codex owns the
+report command; Claude owns independent exact-head review. Claude's parallel
+manifest-design and roadmap work uses different files/worktrees.
+
+The earlier #97 handoff above completed: approved head
+`a7c0151753e5acfd1975996e553600dbbd033a84` merged as
+`f88d1da68a4213b1f3eb0030d5a851d3940e511e` at 11:31:58 UTC-6. Exact-head CI
+and independent review were green; #32/#35 closed completed with pointers.
+That merge is the base of this work, branch `feat/series-ambiguity-report`.
+
+### Report contract and changes
+
+Source commit `a0d578d0c6f57637bf933730807b5ec0e68563fb` adds
+`scripts/cbz_series_ambiguity_report.py`. Required `--routing` and `--scope`
+confirm the complete configured index population before enumeration. Partial,
+extra or duplicate scope and duplicate configured index labels refuse.
+There is no default config, output file or library mutation.
+
+The command supplies observed directory lists to the existing SeriesIndex,
+retains those exact lists in deterministic JSON, and fingerprints the full
+report plus exact config bytes. Non-colliding names are bound too. Failed
+roots remain explicit scan problems; disabled indexing scans nothing and
+cannot be clean. Exit 0 is a clear observation, 1 a produced blocked report,
+2 refusal without JSON. It does not implement reviewed exceptions or activate
+the watcher. Counts distinguish label-level directory observations from the
+index's deduplicated paths/keys.
+
+Tests are in commit `55c75e625bb3c79eddfb26eb81a62dd2c0b6b3d4`; the usage and
+fingerprint contract are in `docs/series_ambiguity_report.md`, commit
+`851d675bf70c6bdba9fd5bbb1e77841ee235eab3`.
+
+### Verification
+
+Windows / Python 3.11.3, isolated
+`C:\git\cbz-ambiguity-report-20261022`. Initial existing diagnostics baseline:
+**36 passed in 0.62 s**. New report plus existing diagnostics:
+**62 passed in 23.77 s**. Full suite:
+`python -m pytest -n 4 --dist loadfile -q`,
+**2438 passed, 8 skipped in 55.58 s**. The change adds 26 collected passes to
+the earlier 2412-pass / 8-skip base record; no fresh full-suite baseline was
+run before editing. Skips remain skips.
+
+Nine selected mutations independently rejected:
+
+| Mutation | Failing cases |
+| --- | ---: |
+| omit scope membership check | 3 |
+| omit scope duplicate check | 1 |
+| admit duplicate configured labels | 1 |
+| omit failed-root scan problems | 3 |
+| enumerate with indexing disabled | 1 |
+| fingerprint diagnostics only | 3 |
+| omit exact config-byte digest | 1 |
+| return success for blocked reports | 4 |
+| exclude all dot-prefixed directories | 1 |
+
+Each mutation restored exact original source bytes. Harness and raw logs stay
+outside Git at
+`C:\Users\david\Documents\Codex\control\comic98-mutations-20261022.py`
+and sibling `comic98-20261022\`. Fixture tests cover real CLI invocation from
+another directory, Unicode, input preservation/no archive content reads,
+all diagnostics populations, alias labels, absent/denied roots and digest
+reproducibility/drift. No live library or database path was opened.
+
+### Limits and next owner
+
+Directory metadata observations are not atomic or guaranteed fresh. Physical
+junction/SMB/symlink identity is not resolved. The fingerprint identifies report
+contents, not approval or archive contents. A clear result is not a complete
+watcher validation or permission to activate routing.
+
+Next owner: Claude independently reviews the final exact PR head and CI;
+Codex resolves findings and owns merge after approval and green exact-head CI.
+No runtime rollout or production census belongs to this feature slice.
+
