@@ -330,11 +330,10 @@ def readonly_database_connection(
     30000 ms busy handler, measured as ``PRAGMA busy_timeout`` reading
     30000 on the old connection too. A test pins both values.
 
-    One accepted difference: the private copy ran ``query_only`` inside
-    its ``try``, so a failure of that pragma closed the connection
-    deterministically. The DAL applies its pragmas before returning, so
-    the same failure now leaves the connection to the garbage collector.
-    The exception raised to the caller is unchanged.
+    If any part of the policy fails to apply, the DAL closes the
+    connection before re-raising, as the private copy did for
+    ``query_only``: a half-configured connection is never handed back
+    or left open.
 
     Rows are `sqlite3.Row`, as before. No migrations are applied and no
     schema is created: the database is read exactly as found, so this is
