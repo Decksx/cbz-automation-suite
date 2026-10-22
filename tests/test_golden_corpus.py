@@ -212,6 +212,7 @@ def test_the_corpus_covers_every_required_shape() -> None:
         "unicode_paths",
         "unsafe_members",
         "many_entries",
+        "excessive_entries",
     }
 
     assert required <= set(gc.CASES_BY_NAME)
@@ -512,6 +513,52 @@ def test_many_entries_inspects_without_special_casing(
     assert result.page_count == 120
 
 
+def test_excessive_entries_is_accepted_today_because_no_cap_exists(
+    tmp_path: Path,
+) -> None:
+    """Pins current behaviour: an expected gap, not a guarantee.
+
+    There is no entry-count limit, so inspection lists all
+    `EXCESSIVE_ENTRY_COUNT` members and reports every one as a page. This
+    asserts exactly that, because asserting a rejection that does not happen
+    would be a test of nothing.
+
+    **This test is meant to fail when the cap lands.** That is the flip
+    signal `CORPUS_GAPS` promises: whoever introduces the limit replaces
+    this with an assertion that the case is rejected (and how it is
+    classified), and removes the gap entry. If the cap is set above
+    `EXCESSIVE_ENTRY_COUNT` this goes on passing -- raise the constant with
+    the cap.
+    """
+    result = inspect_archive(gc.build_case("excessive_entries", tmp_path))
+
+    assert result.entry_count == gc.EXCESSIVE_ENTRY_COUNT + 1  # + ComicInfo
+    assert result.page_count == gc.EXCESSIVE_ENTRY_COUNT
+
+
+def test_excessive_entries_is_large_in_count_only(tmp_path: Path) -> None:
+    """The case isolates entry count from every other resource axis.
+
+    A cap on total uncompressed size, or on a single page's size, must not
+    be what rejects this fixture -- otherwise its eventual flip would be
+    credited to the wrong guard. Every page member is empty, the archive is
+    plain ZIP rather than ZIP64, and it stays small on disk.
+    """
+    path = gc.build_case("excessive_entries", tmp_path)
+
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+
+    pages = [info for info in infos if info.filename != gc.COMIC_INFO]
+
+    assert len(pages) == gc.EXCESSIVE_ENTRY_COUNT
+    assert {info.file_size for info in pages} == {0}
+    assert len(infos) < 0xFFFF  # below the ZIP64 entry-count threshold
+    assert path.stat().st_size < 4 * 1024 * 1024
+    # And it really is excessive relative to the control.
+    assert gc.EXCESSIVE_ENTRY_COUNT >= 100 * 120
+
+
 def test_non_cbz_suffix_is_rejected_before_reading(tmp_path: Path) -> None:
     path = gc.build_case("ordinary", tmp_path)
     renamed = path.with_suffix(".zip")
@@ -632,15 +679,16 @@ def test_the_pixel_fixtures_stay_tiny_on_disk(tmp_path: Path) -> None:
 
 
 def test_the_corpus_records_what_it_does_not_cover() -> None:
-    """Excessive *entries* is deferred, and says so.
+    """The excessive-entries *guard* is missing, and the corpus says so.
 
-    There is no entry-count limit anywhere in the codebase, so there is no
-    guard for a fixture to exercise; `many_entries` is a legitimate
-    high-count control instead. Recorded in `CORPUS_GAPS` rather than left
-    as an absence, because a missing fixture is otherwise indistinguishable
-    from an overlooked one.
+    The fixture exists, but there is no entry-count limit anywhere in the
+    codebase for it to exercise. Recorded in `CORPUS_GAPS` and tagged
+    `expected-gap` rather than left as an absence, because a missing guard
+    is otherwise indistinguishable from an overlooked one; `many_entries`
+    stays a legitimate high-count control.
     """
     assert "excessive_entries" in gc.CORPUS_GAPS
+    assert "expected-gap" in gc.CASES_BY_NAME["excessive_entries"].tags
     assert "control" in gc.CASES_BY_NAME["many_entries"].tags
     assert "limits" not in gc.CASES_BY_NAME["many_entries"].tags
 
