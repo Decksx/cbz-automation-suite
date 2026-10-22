@@ -1791,9 +1791,14 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
             # infolist() walk below.
             before_fingerprint = _central_directory_fingerprint(zin)
             # Refuse before materializing anything: this loop holds every
-            # member in memory at once, so the declared-size and entry-count
-            # ceilings bound it, and an encrypted member would otherwise
-            # fail mid-loop on a password prompt. UnsafeArchiveError is a
+            # member in memory at once. The declared-size and entry-count
+            # ceilings are admission checks on metadata -- what read(info)
+            # returns, and so what this list retains, is at most each
+            # record's declared size, but the transient decompressor work
+            # behind each read is NOT bounded by them (see
+            # comic_automation/archive/archive_limits.py). An encrypted
+            # member would otherwise fail mid-loop on a password prompt.
+            # UnsafeArchiveError is a
             # ValueError, so it lands in the broad handler below -- the
             # rewrite is abandoned with the original untouched and False
             # returned -- rather than being mistaken for a transient OSError.
@@ -1806,7 +1811,12 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
                 # output. Names are otherwise not normalized; see
                 # comic_automation/archive/archive_limits.py for what is and
                 # is not checked.
-                entries.append((info, zin.read(info.filename)))
+                #
+                # Read by ZipInfo, never by name: with duplicate names,
+                # zin.read(info.filename) returns the *last* record of that
+                # name every time, so the rewrite would materialize (and
+                # write) bytes the validator above never admitted.
+                entries.append((info, zin.read(info)))
 
         with zipfile.ZipFile(tmp_path, "w") as zout:
             wrote = False
