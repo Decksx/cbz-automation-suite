@@ -297,11 +297,12 @@ def _unicode_paths(path: Path) -> Path:
 def _unsafe_members(path: Path) -> Path:
     """Member names that would escape the destination on naive extraction.
 
-    Nothing in this project extracts archives to disk, so these are not an
-    active vulnerability -- see `docs/archive_io_resource_audit.md`,
-    "Confirmed risks in current code". They are in the corpus because the
-    rewrite paths *preserve* such names verbatim rather than rejecting them,
-    and that behaviour should be pinned rather than left to be rediscovered.
+    Nothing in this project extracts archives to disk, so these were never
+    an active vulnerability. The rewrite paths used to *preserve* such names
+    verbatim (`docs/archive_io_resource_audit.md`, "Confirmed risks in
+    current code"); since 2026-10-22 `archive_limits` refuses them at
+    inspection, hashing and `write_comicinfo`. The fixture is unchanged so
+    that refusal is asserted against the same bytes the old pin used.
     """
     return build_cbz(
         path,
@@ -450,9 +451,9 @@ def _many_entries(path: Path) -> Path:
 
     120 pages is more than a typical chapter and less than anything
     pathological. This is **not** the roadmap's "excessive entries" case:
-    there is no entry-count limit in the codebase to exercise, so this
-    fixture pins that a large-but-ordinary archive is handled normally
-    rather than proving a guard. See `CORPUS_GAPS`.
+    it pins that a large-but-ordinary archive is handled normally, far
+    below `archive_limits.MAX_ARCHIVE_ENTRIES`, rather than proving the
+    guard. See `CORPUS_GAPS`.
     """
     entries: list[tuple[str, bytes]] = [(COMIC_INFO, comic_info_xml())]
     entries.extend(
@@ -516,10 +517,13 @@ CASES: tuple[Case, ...] = (
 # indistinguishable from an overlooked one.
 CORPUS_GAPS = {
     "excessive_entries": (
-        "No entry-count limit exists anywhere in the codebase, so there is "
-        "no guard to exercise. `many_entries` is a legitimate high-count "
-        "control instead. Deferred to resource hardening, which is where "
-        "such a limit would be introduced."
+        "The entry-count limit (`archive_limits.MAX_ARCHIVE_ENTRIES`, "
+        "added 2026-10-22) is exercised by `tests/test_archive_limits.py`, "
+        "which builds an archive one entry over the shipped ceiling. The "
+        "corpus does not carry that archive: the test that builds and "
+        "inspects it took 1.72 s here (2026-10-22), a cost every corpus "
+        "build would pay to duplicate a test that already exists. "
+        "`many_entries` stays a legitimate high-count control."
     ),
     "real_pixel_payload": (
         "`decoded_pixel_*` declare their dimensions in the PNG header "
