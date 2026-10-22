@@ -182,9 +182,13 @@ def inspect_cbz(
                 in IMAGE_EXTENSIONS
             ]
 
+            # Every record, directories included: testzip() below opens
+            # directory records too, so a flag on "folder/" alone is enough
+            # to make it raise. Judging only file records let such an
+            # archive through as encrypted=False and into that crash.
             encrypted = any(
                 is_encrypted_member(entry)
-                for entry in files
+                for entry in entries
             )
 
             comic_info_entry = next(
