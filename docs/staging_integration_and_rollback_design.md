@@ -96,7 +96,14 @@ separate, later design.
    `HandoffDecision`; for `review_handoff`, call the staging planner only
    (`plan_case`, read-only) and log the would-be case id, inventory digest,
    file count and method. No copy, `.partial`, or manifest. Count outcomes in
-   the shadow summary, including `defer` by reason.
+   the shadow summary, including `defer` by reason. **In shadow the decision
+   is an observation only: the existing move path runs exactly as today**
+   (`_move_loose_files` for a mixed parent, the whole-directory move
+   otherwise), whatever the decision says. `defer` and `review_handoff`
+   change no movement until a separately approved activation (A3.3); the
+   "moves nothing" and "no legacy fallback" rules of A1, A2 and A5 describe
+   that future activated behaviour, not shadow. A first PR that suppressed
+   any movement would be a behaviour change needing its own gate.
 2. **Configuration gate.** The review root is an explicit, validated setting
    (no default): it exists; it passes the runtime topology checks (section
    1); it is on the same volume as the library roots, so promote stays a
@@ -169,47 +176,85 @@ volume, when the retained source is released or not wanted (section A4).
 Promoted cases remain terminal (an "un-promote" is a different plan/apply).
 The existing same-volume `rollback_case` is unchanged.
 
-### B2. A rollback journal, versioned and separate from the case manifest
+### B2. Case ownership: one contract every mutator obeys
 
-The case manifest (`classification-case-v1`) rejects unknown fields and
-states, and `rolled_back` is terminal. So it is **not** extended. Each
-rollback attempt has its own journal file with its own contract
-(`cross-volume-rollback-v1`, strict, append-only progress), and the case
-manifest moves to its existing terminal `rolled_back` **only as the last
-step**, after everything else is durable. A v1 reader therefore never sees
-an unknown field or state.
+A separate journal keeps the v1 parser intact but would not, by itself, stop
+the existing operator commands: `_ready_for_operator` accepts the same
+`pending_review` manifest and digest throughout an attempt, and
+`promote_case`, `reject_case`, `rollback_case`, and `recover_case` know
+nothing of it. So ownership is part of the case record, under one lock:
+
+- **One per-case OS lock**, `<review-root>\locks\<case>.lock` (non-blocking
+  exclusive lock, released by the OS if the holder dies), held by **every**
+  mutator for the whole of its mutation: promote, reject, same-volume
+  rollback, recovery, and every step of a cross-volume attempt. A mutator
+  that cannot take it refuses; it never waits indefinitely.
+- **Ownership is claimed by bumping the case contract.** Under the lock, an
+  attempt rewrites the case manifest (atomic replace) from
+  `classification-case-v1` to **`classification-case-v2`**, which adds one
+  field: `owner = {journal: cross-volume-rollback-v1, attempt_id}`. Today's
+  strict parser refuses any contract that is not `classification-case-v1`,
+  so **older binaries cannot read, and therefore cannot operate, a
+  journal-owned case**: the exclusion comes from existing code, not a hope.
+  New code reads v1 and v2.
+- **Every new mutator checks `owner`** after taking the lock and refuses
+  when a journal owns the case, except that journal's own recovery for the
+  same `attempt_id`.
+- **Two simultaneous claims** serialize on the lock; the second sees `owner`
+  already set and is refused. A crash leaves the lock released and `owner`
+  set, so only the owning journal's recovery can continue: the claim
+  survives the crash.
+- The attempt's terminal step writes `rolled_back` and keeps `owner` (the
+  record of who finished it); an operator-abandoned attempt clears `owner`
+  under the lock with a journalled reason, returning the case to v1-readable
+  `pending_review` only if its payload still verifies.
+
+### B2a. The rollback journal
+
+Each attempt has its own journal file with its own contract
+(`cross-volume-rollback-v1`, strict, append-only progress). It also freezes
+the case identity it acted on (case id, the manifest's `record_digest`, the
+frozen inventory) and recovery checks that the manifest still matches.
 
 ```text
 attempt_id          unique per attempt; the ownership token
 case_id, record_digest   the case and the show_case digest the operator approved
 target              the return path; must be absent at start
 frozen_inventory    the case's recorded inventory digest
-layout              <target-volume>\.rollback-partial\<case>\<attempt>\payload
+staged_root         the case's actual staged payload root,
+                    pending\<case>\payload\<source-name> (`_staged_payload_root`)
+layout              <target-volume>\.rollback-partial\<case>\<attempt>\<source-name>
 progress            planned → copied → verified → published → quarantined →
                     case_recorded
-published_receipt   written in the same step as the publish rename: target
-                    path, attempt_id, digest
+published_receipt   target path, attempt_id, digest — written immediately
+                    AFTER the publish rename (two filesystem writes, not atomic)
 quarantine_path     <review-root>\rolled_back\<case>\<attempt>\
 ```
 
-One layout for every step: the copy lands in
-`.rollback-partial\<case>\<attempt>\payload`, and publication renames that
-`payload` directory to the target.
+**The copy is bound to the real staged root**, not its parent: step 2 copies
+`pending\<case>\payload\<source-name>` to
+`.rollback-partial\<case>\<attempt>\<source-name>`, and publication renames
+exactly that directory to the target. The inventory root is the same
+`<source-name>` tree that transfer inventoried, so the frozen inventory
+applies unchanged and the returned tree has the original shape; no
+flattening contract is introduced.
 
 ### B3. Steps
 
 ```text
 precondition  case is pending_review; the operator supplies record_digest
+0 claimed     under the case lock: case manifest v1 → v2 with owner
 1 planned     journal written; target must not exist
-2 copied      copytree pending\<case>\payload → layout path (target volume)
+2 copied      copytree staged_root → layout path (target volume)
 3 verified    full-SHA inventory of the copy == frozen_inventory; and, freshly,
-              pending\<case>\payload exists, belongs to this case, and still
-              verifies against frozen_inventory
-4 published   same-volume rename of the layout's payload → target, refused
-              if the target now exists; then published_receipt
-5 quarantined move pending\<case> → quarantine_path (same volume as review
-              root); never deleted here
-6 case_recorded  case manifest → rolled_back (terminal), last
+              staged_root exists, belongs to this case, and still verifies
+4 published   same-volume rename of the layout tree → target, refused if the
+              target now exists; then published_receipt (separate write)
+5 quarantined freshly verify the TARGET (exists, full-SHA == frozen_inventory)
+              and the staged root; then move pending\<case> → quarantine_path
+6 case_recorded  freshly verify the target again and that quarantine_path
+              holds exactly this case's tree (full-SHA == frozen_inventory);
+              then case manifest → rolled_back (terminal), last
 ```
 
 Nothing is removed before step 5, and step 5 moves rather than deletes.
@@ -231,6 +276,16 @@ coincidence could have put it there. So:
   the only surviving copy: it is kept, and the attempt is `operator_required`.
 - The same fresh proof is repeated after any Windows-lock wait (`_replace`
   retries, #94) before acting on the result.
+- **A receipt proves a past publish, not the present.** Before quarantine
+  (step 5) and before the terminal record (step 6), the target is freshly
+  re-verified against the frozen inventory; a missing, replaced, or changed
+  target stops the attempt as `operator_required`, keeping the pending (or
+  quarantined) copy. Likewise, a directory at `quarantine_path` is accepted
+  as this attempt's move only if it holds exactly this case's tree and
+  verifies against the frozen inventory.
+- **The rename-then-receipt gap** (a crash after the publish rename, before
+  the receipt write) leaves a target without a receipt; it is treated
+  conservatively as ambiguous (`operator_required`), never inferred.
 
 ### B5. Complete crash matrix
 
@@ -241,16 +296,18 @@ coincidence could have put it there. So:
 | `copied` | partial complete, unverified | verify (step 3) |
 | `verified` | target absent | publish (step 4) |
 | `verified` | target present, **no receipt** | ambiguous target → `operator_required` |
-| `published` (receipt present) | target present | quarantine (step 5) |
-| `published` | target missing | `operator_required` (published bytes vanished) |
-| `published` | pending already at quarantine_path, journal not advanced | record `quarantined` (the move is the only way there), then step 6 |
-| `quarantined` | case manifest still `pending_review` | write `rolled_back` (step 6) |
+| `published` (receipt present) | target present and freshly verifies | quarantine (step 5) |
+| `published` | target missing, replaced, or not verifying | `operator_required`; keep pending |
+| `published` | pending already at quarantine_path, journal not advanced | accept only if quarantine_path verifies as exactly this case's tree, then record `quarantined`; otherwise `operator_required` |
+| `quarantined` | target and quarantine both freshly verify, manifest still owned v2 `pending_review` | write `rolled_back` (step 6) |
+| `quarantined` | target or quarantine no longer verifies | `operator_required`; keep the quarantined copy |
 | `case_recorded` | — | terminal; nothing to do |
 | any | pending missing or changed before step 5 | keep everything, `operator_required` |
 
-Every action is idempotent and decided from journal plus disk alone. One
-attempt per case at a time: a second attempt is refused while an earlier
-one is not at `case_recorded` or explicitly abandoned by the operator.
+Every action is idempotent and decided from journal plus disk alone, under
+the case lock (B2). One attempt per case: the v2 `owner` field, set under the
+lock, refuses any second attempt and every other mutator until the owning
+attempt reaches `case_recorded` or the operator abandons it.
 
 ### B6. Limits, stated
 
@@ -285,8 +342,18 @@ Part B:
 - `test_partial_is_kept_when_pending_changed`
 - `test_pending_is_re_proved_after_a_windows_lock_wait`
 - `test_case_manifest_becomes_rolled_back_only_last`
-- `test_v1_case_manifest_reader_never_sees_rollback_fields`
-- `test_second_attempt_is_refused_while_one_is_open`
+- `test_v1_parser_refuses_a_journal_owned_v2_case`
+- `test_promote_reject_and_rollback_refuse_a_journal_owned_case`
+- `test_recover_case_refuses_a_journal_owned_case_except_its_own_attempt`
+- `test_paused_rollback_racing_promote_is_refused_by_the_case_lock`
+- `test_two_simultaneous_attempt_claims_admit_exactly_one`
+- `test_ownership_survives_a_crash_and_only_the_owner_recovers`
+- `test_target_drift_after_receipt_stops_before_quarantine`
+- `test_target_replaced_after_quarantine_stops_before_terminal`
+- `test_foreign_tree_at_quarantine_path_is_not_accepted`
+- `test_copy_is_rooted_at_the_staged_payload_root`
+- `test_crash_between_publish_and_receipt_is_ambiguous`
+- `test_shadow_decision_never_changes_the_existing_move`
 - each crash-matrix row (B5) as its own test
 - `test_unsupported_topology_is_refused` (SMB, exFAT)
 
