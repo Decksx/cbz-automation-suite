@@ -483,11 +483,11 @@ def resolve_protected_execution(
 
     This seam still does NOT enforce the executor's other obligations
     (design sections 8 and 12): verified writer quiescence, protected
-    backup, plan-digest and expected-count revalidation, the next-applicable
-    test, statement-by-statement application, the in-transaction ledger
-    row, and section 12.2 reconciliation. Section 12.1 step 3's ledger
-    set-equality predicate now exists as require_slice4_ledger(), but is
-    deliberately separate and is NOT called here. A caller holding these
+    backup, plan-digest and expected-count revalidation, statement-by-statement
+    application, the in-transaction ledger row, and section 12.2 reconciliation.
+    Section 12.1 steps 3 and 4 have pure predicates, require_slice4_ledger()
+    and require_slice4_next_applicable(), but both remain deliberately
+    separate and are NOT called here. A caller holding these
     paths has been authorized and has satisfied none of those obligations.
     They belong to the executor that is built in a later slice.
     """
@@ -530,4 +530,27 @@ def require_slice4_ledger(snapshot: MigrationSnapshot) -> None:
             "Slice-4 ledger refused: recorded versions must equal all "
             "discovered versions below 015; "
             f"missing={missing}, unexpected={unexpected}."
+        )
+
+
+def require_slice4_next_applicable(snapshot: MigrationSnapshot) -> None:
+    """Refuse unless 015 is the next unapplied discovered migration.
+
+    Section 12.1 step 4 checks ALL pending versions, including ordinary
+    ones: protected authorization alone can select 015 while an earlier
+    ordinary file is still unapplied. No pending version is a refusal too,
+    rather than success for an already-applied or absent 015.
+
+    This pure predicate uses only the supplied snapshot and proves neither
+    freshness nor ledger equality. It does not replace require_slice4_ledger()
+    or explicit protected authorization, and the generic seam calls neither
+    predicate. The future executor must compose these checks under its write
+    lock with the other section 12 obligations before applying anything.
+    """
+    pending = snapshot.pending()
+    next_version = pending[0] if pending else None
+    if next_version != 15:
+        raise ProtectedMigrationError(
+            "Slice-4 execution refused: 015 must be the next applicable "
+            f"migration; next={next_version}, pending={pending}."
         )
