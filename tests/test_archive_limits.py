@@ -18,7 +18,10 @@ first member read, the tripwire fires instead of the expected refusal.
 from __future__ import annotations
 
 import struct
+import tracemalloc
+import warnings
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -70,6 +73,7 @@ NEW_XML = "<ComicInfo><Title>Rewritten</Title></ComicInfo>"
 # Central-directory and local-header field offsets (APPNOTE 4.3.7, 4.3.12).
 _CD_SIGNATURE = b"PK\x01\x02"
 _CD_FLAGS = 8
+_CD_CRC = 16
 _CD_UNCOMPRESSED_SIZE = 24
 _CD_NAME_LENGTH = 28
 _CD_HEADER_OFFSET = 42
@@ -94,14 +98,17 @@ def _patch_central_directory(
     member: str,
     *,
     declared_size: int | None = None,
+    crc: int | None = None,
     flag_bits_or: int = 0,
 ) -> None:
     """Rewrite one member's central-directory record (and local flags).
 
     `declared_size` replaces the central-directory uncompressed size, which
-    is the value `ZipInfo.file_size` reports. `flag_bits_or` is OR-ed into
-    the general-purpose flags in both the central directory and the local
-    header, so the archive is consistently marked rather than half-marked.
+    is the value `ZipInfo.file_size` reports. `crc` replaces the
+    central-directory CRC-32, which is the value `ZipExtFile` checks the
+    returned bytes against. `flag_bits_or` is OR-ed into the general-purpose
+    flags in both the central directory and the local header, so the
+    archive is consistently marked rather than half-marked.
     """
     data = bytearray(path.read_bytes())
     position = data.find(_CD_SIGNATURE)
@@ -121,6 +128,8 @@ def _patch_central_directory(
                     "<I", data, position + _CD_UNCOMPRESSED_SIZE,
                     declared_size,
                 )
+            if crc is not None:
+                struct.pack_into("<I", data, position + _CD_CRC, crc)
             if flag_bits_or:
                 flags = struct.unpack_from("<H", data, position + _CD_FLAGS)[0]
                 struct.pack_into(
@@ -219,25 +228,47 @@ def test_the_encrypted_fixture_really_is_unreadable_without_a_password(
             archive.read("002.png")
 
 
-def test_an_understated_declared_size_cannot_smuggle_bytes_past_the_cap(
+def test_the_size_cap_does_not_bound_decompressor_work(
     tmp_path: Path,
 ) -> None:
-    """Pins the interpreter behaviour the size cap's soundness rests on.
+    """Pins the limitation: the cap is an admission check on metadata only.
 
-    The cap sums *declared* sizes. That only bounds memory if zipfile never
-    returns more than the declaration. Here a 1,000,000-byte deflated member
-    is declared as 1,000 bytes: CPython must refuse it as corrupt rather
-    than return the real payload. If an interpreter upgrade changed this,
-    the declared-size cap would stop being a bound and this fails first.
+    A 1,000,000-byte deflated member is declared as 1,000 bytes, with its
+    CRC-32 set to that of the first 1,000 bytes -- the attacker writes the
+    CRC as well as the size. It passes the validator at a 1,000-byte
+    ceiling, and `ZipFile.read` *succeeds*, returning exactly the declared
+    1,000 bytes. On CPython 3.11.3 `ZipExtFile._read1` hands the
+    decompressor a large `max_length` and only slices to the declared
+    length afterwards, so the whole 1,000,000 bytes are decompressed and
+    allocated to produce them; tracemalloc's peak shows it.
+
+    If this ever starts failing, the interpreter has begun bounding
+    decompression by the declared size, and the open "decompression /
+    allocation budget" item in `docs/archive_io_resource_audit.md` should be
+    re-examined rather than this test deleted.
     """
+    payload = b"\0" * 1_000_000
     path = tmp_path / "liar.cbz"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("big.bin", b"\0" * 1_000_000)
-    _patch_central_directory(path, "big.bin", declared_size=1_000)
+        archive.writestr("big.bin", payload)
+    _patch_central_directory(
+        path, "big.bin", declared_size=1_000, crc=zlib.crc32(payload[:1_000])
+    )
+
+    infos = _infos(path)
+    validate_archive_members(infos, max_total_uncompressed_bytes=1_000)
 
     with zipfile.ZipFile(path) as archive:
-        with pytest.raises(zipfile.BadZipFile):
-            archive.read("big.bin")
+        tracemalloc.start()
+        try:
+            returned = archive.read("big.bin")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    assert returned == payload[:1_000]
+    # Far more than the declared 1,000 bytes was produced to return them.
+    assert peak > 900_000
 
 
 # --- the validator -----------------------------------------------------------
@@ -512,6 +543,59 @@ def _run_inspection_job(
         return queue.get(queued.id)
 
 
+def _encrypted_directory_record(path: Path, flag: int) -> Path:
+    """An ordinary page plus a `folder/` directory record carrying `flag`.
+
+    `testzip()` opens every central-directory record, directories included,
+    so a flag on the directory record alone is enough to make it raise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr(zipfile.ZipInfo("folder/", gc.FIXED_DATE_TIME), b"")
+        archive.writestr(
+            zipfile.ZipInfo("folder/001.png", gc.FIXED_DATE_TIME),
+            gc.page_image(1),
+        )
+    _patch_central_directory(path, "folder/", flag_bits_or=flag)
+    return path
+
+
+@pytest.mark.parametrize("flag", [0x0001, 0x0040])
+def test_an_encrypted_directory_record_is_reported_by_crc_inspection(
+    tmp_path: Path, flag: int
+) -> None:
+    """Encryption is judged over every record, not only file records.
+
+    Inspection used to scan only files, so a flagged directory record left
+    `encrypted=False` and the CRC pass then raised a bare RuntimeError
+    (bit 0) or NotImplementedError (bit 6) out of testzip().
+    """
+    path = _encrypted_directory_record(tmp_path / "dir.cbz", flag)
+
+    with zipfile.ZipFile(path) as archive:
+        assert archive.getinfo("folder/").is_dir()
+        assert is_encrypted_member(archive.getinfo("folder/"))
+
+    result = inspect_archive(path, verify_crc=True)
+
+    assert result.status == "encrypted"
+    assert result.encrypted is True
+    assert result.crc_verified is False
+
+
+@pytest.mark.parametrize("flag", [0x0001, 0x0040])
+def test_an_encrypted_directory_record_does_not_become_unclassified(
+    tmp_path: Path, flag: int
+) -> None:
+    """Through the real handler and worker: the job completes."""
+    archive = _encrypted_directory_record(tmp_path / "lib" / "dir.cbz", flag)
+
+    job = _run_inspection_job(tmp_path, archive, verify_crc=True)
+
+    assert job.status == JobStatus.COMPLETED
+    assert job.failure_category is None
+
+
 def test_handler_records_the_reason_code_as_a_permanent_failure(
     tmp_path: Path,
 ) -> None:
@@ -682,6 +766,55 @@ def test_write_comicinfo_refuses_too_many_entries(
 
     assert write_comicinfo(path, gc.COMIC_INFO, NEW_XML, dry_run=False) is False
     assert fi.file_snapshot([path]) == before
+
+
+def test_write_comicinfo_reads_each_duplicate_name_record_by_its_own_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Duplicate names must not all resolve to the last record.
+
+    Three `page.bin` records of 0, 0 and 1,000 bytes fit a 1,000-byte
+    ceiling. Reading by name returns the *last* record for every one of
+    them, so the old rewrite materialized 3,000 bytes and wrote an archive
+    that fails the same validator. Reading by `ZipInfo` keeps each record's
+    own bytes. Duplicate names themselves are still accepted (a policy for
+    them is out of scope); this pins only that each record is copied as is.
+    """
+    monkeypatch.setattr(
+        archive_limits, "MAX_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES", 1_000
+    )
+    path = tmp_path / "dupes.cbz"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # "Duplicate name"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+            for size in (0, 0, 1_000):
+                archive.writestr(
+                    zipfile.ZipInfo("page.bin", gc.FIXED_DATE_TIME),
+                    b"x" * size,
+                )
+
+    def record_payloads(archive_path: Path) -> list[tuple[str, bytes]]:
+        with zipfile.ZipFile(archive_path) as archive:
+            return [
+                (info.filename, archive.read(info))
+                for info in archive.infolist()
+            ]
+
+    original = record_payloads(path)
+    assert [len(data) for _, data in original] == [0, 0, 1_000]
+
+    with warnings.catch_warnings():
+        # The rewrite re-emits the duplicates, and zipfile warns again.
+        warnings.simplefilter("ignore", UserWarning)
+        assert write_comicinfo(path, None, NEW_XML, dry_run=False) is True
+
+    rewritten = record_payloads(path)
+    assert rewritten[:3] == original
+    assert rewritten[3] == ("ComicInfo.xml", NEW_XML.encode("utf-8"))
+    validate_archive_members(
+        _infos(path),
+        max_total_uncompressed_bytes=1_000 + len(NEW_XML.encode("utf-8")),
+    )
 
 
 def test_write_comicinfo_still_rewrites_an_ordinary_archive(
