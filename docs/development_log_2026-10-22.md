@@ -255,3 +255,67 @@ Claude independently reviews the exact candidate head and CI; Codex handles
 findings and merge after approval and green matching CI. No production rollout
 belongs to this preparation slice.
 
+## Slice 4B-2: next-applicable-015 predicate (issue #105)
+
+David approved the next parallel priorities in hive #2079. Codex owns this
+fixture-only executor-contract slice; Claude owns inert watcher shadow planning
+and independently reviews this candidate. Base: merged master
+`fee1dc256e9147dcd767452cff0750ef4bd47c22` (#103), including #104's ledger guard.
+No production database, library, migration or runtime was accessed.
+
+Source commit `c54fc4362eb2f0ab405d3b4cdaf08f2333ca5fc4` adds
+`require_slice4_next_applicable(snapshot)` for section 12.1 step 4:
+`min(discovered - recorded) == 15`. An empty pending set refuses. It inspects
+ordinary as well as protected pending versions: explicit protected authorization
+can still select 015 while an earlier ordinary migration remains unapplied.
+The generic seam remains unchanged and calls neither migration-specific
+predicate. Its docstring now names both implemented but separate predicates.
+
+Test commit `52f6c467107bc3b718916b0be4350e7a40134706` adds 16 cases to the
+existing R15 contract file. They cover valid ordering with later files pending,
+sparse discovered versions, earlier unapplied files, missing/already-applied
+015, empty discovery, composition with ledger equality and authorization,
+absence of ledger creation, preserved inputs, and deliberately stale snapshots.
+Neither pure predicate refreshes its input; the future executor must take the
+snapshot under its write lock and verify the approved release-file set.
+No synthetic migration payload SQL is applied by these tests.
+
+### Checks and load-bearing mutations
+
+Windows / Python 3.11.3 in isolated worktree
+`C:\git\cbz-executor-contracts-20261022`. Fresh full-suite baseline on exact base,
+`python -m pytest -n 4 --dist loadfile -q`: **2457 passed, 8 skipped in 58.68 s**.
+Focused R15 plus existing protected-migration contracts: **89 passed in 4.67 s**.
+Final full suite: **2473 passed, 8 skipped in 59.77 s**, exactly +16 passes with
+unchanged skips. Individual timings are not a performance claim.
+
+Six selected mutations were independently injected into this worktree, one at a
+time, and all six were rejected by `tests/test_slice4_ledger_contract.py`:
+
+| Mutation | Failing cases |
+| --- | ---: |
+| accept membership of 015 instead of requiring it next | 7 |
+| inspect only pending protected versions | 7 |
+| use the last pending version | 7 |
+| accept an empty pending set | 3 |
+| substitute max(recorded) + 1 | 7 |
+| omit refusal | 10 |
+
+Original source bytes were restored after every run and verified restored at
+completion. Harness and individual logs remain outside Git at
+`C:\Users\david\Documents\Codex\control\comic-next-applicable-mutations-20261022.py`
+and `comic-next-applicable-20261022\`. Source/log working-tree CRLF and test LF
+were preserved; `git diff --check` passes.
+
+### Remaining work and handoff
+
+This completes a second pure precondition, not an executor. The seam does not
+compose the predicates automatically. Transaction ownership and rollback,
+verified backup/quiescence, locked plan validation, exact SQL application and
+same-transaction ledger growth, applied-projection reconciliation, postflight,
+restore, producer cutover and migration 015 remain open. No CLI, migration SQL,
+SQL execution path or production rollout was added.
+
+Claude reviews the exact candidate and matching CI; Codex owns findings and merge
+after independent approval and green CI. The next bounded preparation slice is
+transaction/failure contracts, with live execution still separately gated.

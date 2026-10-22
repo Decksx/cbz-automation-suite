@@ -1,4 +1,4 @@
-"""R15 ledger admission, before a protected executor exists (issue #102).
+"""R15 ledger and ordering admission, before a protected executor exists.
 
 All SQL files and databases are synthetic tmp_path inputs. No test applies
 even the synthetic 015 file: these are predicate/seam contracts, not proof of
@@ -173,5 +173,111 @@ def test_a_missing_ledger_is_not_created_by_the_refusal(tmp_path):
         before = _state(connection, directory)
         with pytest.raises(protected.ProtectedMigrationError, match="missing="):
             protected.require_slice4_ledger(snapshot)
+        assert _state(connection, directory) == before
+        assert connection.execute("SELECT name FROM sqlite_master").fetchall() == []
+
+
+@pytest.mark.parametrize("discovered,recorded", [
+    (FILES, EARLIER),
+    (FILES + (16,), EARLIER),
+    ((3, 7, 15), (3, 7)),
+    ((15,), ()),
+])
+def test_015_next_applicable_passes_without_applying_any_payload(
+        migration_state, discovered, recorded):
+    """Order is among discovered files, not max(recorded)+1 or a range."""
+    connection, directory = migration_state(discovered=discovered, recorded=recorded)
+    snapshot = protected.take_migration_snapshot(connection, directory)
+    before = _state(connection, directory)
+    protected.require_slice4_ledger(snapshot)
+    assert protected.require_slice4_next_applicable(snapshot) is None
+    assert protected.resolve_protected_execution(snapshot, _authorization()) == (
+        directory / "015_fixture.sql",
+    )
+    assert _state(connection, directory) == before
+
+
+@pytest.mark.parametrize("discovered,recorded,next_version", [
+    (FILES, tuple(range(1, 14)), 14),
+    (FILES, (), 1),
+    (EARLIER, EARLIER, None),
+    (FILES, FILES, None),
+    (EARLIER + (16,), EARLIER, 16),
+    (FILES + (16,), FILES, 16),
+    ((), (), None),
+])
+def test_next_applicable_refusal_preserves_ledger_files_and_transaction(
+        migration_state, discovered, recorded, next_version):
+    connection, directory = migration_state(discovered=discovered, recorded=recorded)
+    snapshot = protected.take_migration_snapshot(connection, directory)
+    before = _state(connection, directory)
+    with pytest.raises(protected.ProtectedMigrationError, match="next applicable") as exc:
+        protected.require_slice4_next_applicable(snapshot)
+    assert f"next={next_version}," in str(exc.value)
+    assert _state(connection, directory) == before
+
+
+def test_protected_authorization_alone_still_does_not_check_earlier_ordinary_files(
+        migration_state):
+    connection, directory = migration_state(recorded=tuple(range(1, 14)))
+    snapshot = protected.take_migration_snapshot(connection, directory)
+    # The existing seam intentionally keeps its generic contract. The new
+    # predicate must inspect all pending files, not just pending_protected().
+    assert snapshot.pending() == [14, 15]
+    assert protected.resolve_protected_execution(snapshot, _authorization()) == (
+        directory / "015_fixture.sql",
+    )
+    with pytest.raises(protected.ProtectedMigrationError, match="next=14"):
+        protected.require_slice4_next_applicable(snapshot)
+
+
+def test_next_applicable_does_not_replace_the_ledger_equality_guard(migration_state):
+    connection, directory = migration_state(recorded=EARLIER + (16,))
+    snapshot = protected.take_migration_snapshot(connection, directory)
+    protected.require_slice4_next_applicable(snapshot)
+    with pytest.raises(protected.ProtectedMigrationError, match=r"unexpected=\[16\]"):
+        protected.require_slice4_ledger(snapshot)
+
+
+def test_next_applicable_does_not_replace_explicit_protected_authorization(
+        migration_state, monkeypatch):
+    connection, directory = migration_state(discovered=FILES + (16,))
+    monkeypatch.setattr(protected, "PROTECTED_MIGRATIONS", frozenset({15, 16}))
+    snapshot = protected.take_migration_snapshot(connection, directory)
+    protected.require_slice4_ledger(snapshot)
+    protected.require_slice4_next_applicable(snapshot)
+    with pytest.raises(protected.ProtectedMigrationError, match="pending protected"):
+        protected.resolve_protected_execution(snapshot, _authorization())
+
+
+def test_next_applicable_uses_the_snapshot_without_refreshing(migration_state, monkeypatch):
+    connection, directory = migration_state()
+    snapshot = protected.take_migration_snapshot(connection, directory)
+    connection.execute("DELETE FROM schema_migrations WHERE version=14")
+    connection.commit()
+    current = protected.take_migration_snapshot(connection, directory)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("predicate tried to refresh the supplied snapshot")
+
+    monkeypatch.setattr(protected, "recorded_versions", forbidden)
+    monkeypatch.setattr(protected, "discover_migrations", forbidden)
+    # Staleness is deliberately visible, rather than hidden behind a fresh
+    # scan. The future executor owns taking the snapshot under its write lock.
+    protected.require_slice4_next_applicable(snapshot)
+    with pytest.raises(protected.ProtectedMigrationError, match="next=14"):
+        protected.require_slice4_next_applicable(current)
+
+
+def test_next_applicable_refusal_does_not_create_an_absent_ledger(tmp_path):
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "001_fixture.sql").write_text("-- never applied\n", encoding="utf-8")
+    (directory / "015_fixture.sql").write_text("-- never applied\n", encoding="utf-8")
+    with closing(sqlite3.connect(tmp_path / "empty.db")) as connection:
+        snapshot = protected.take_migration_snapshot(connection, directory)
+        before = _state(connection, directory)
+        with pytest.raises(protected.ProtectedMigrationError, match="next=1,"):
+            protected.require_slice4_next_applicable(snapshot)
         assert _state(connection, directory) == before
         assert connection.execute("SELECT name FROM sqlite_master").fetchall() == []
