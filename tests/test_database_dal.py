@@ -306,6 +306,63 @@ def test_a_custom_policy_is_still_honoured(database_path: Path) -> None:
     finally:
         conn.close()
 
+
+class _PragmaFails(sqlite3.Connection):
+    """A real connection whose `PRAGMA <name> = ...` raises.
+
+    Subclassed rather than mocked: everything except the one named pragma
+    is a genuine SQLite connection, so the test exercises the real open
+    path up to the failure.
+    """
+
+    fail_on = ""
+
+    def execute(self, sql, *args):
+        if sql.startswith(f"PRAGMA {self.fail_on} ="):
+            raise sqlite3.OperationalError(f"injected failure on {self.fail_on}")
+        return super().execute(sql, *args)
+
+
+@pytest.mark.parametrize("readonly, fail_on", [
+    # The first pragma of the read-only policy: without it a read-only
+    # connection would still accept the query_only=OFF it exists to stop.
+    (True, "query_only"),
+    # A later pragma, after query_only has already applied.
+    (True, "busy_timeout"),
+    # The last pragma of the writable policy, after the others applied.
+    (False, dal.WRITABLE_POLICY.pragmas[-1][0]),
+])
+def test_a_connection_whose_policy_fails_is_closed_before_the_error(
+        database_path: Path, monkeypatch, readonly, fail_on) -> None:
+    """A half-configured connection is never left open, even briefly.
+
+    The caller gets the original exception and no connection; the one
+    that was opened is closed at once rather than left to the garbage
+    collector, because until then it is usable without its policy.
+    """
+    opened = []
+    real_connect = sqlite3.connect
+
+    class Failing(_PragmaFails):
+        pass
+
+    Failing.fail_on = fail_on
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, factory=Failing, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(dal.sqlite3, "connect", connect)
+
+    with pytest.raises(sqlite3.OperationalError,
+                       match=f"injected failure on {fail_on}"):
+        dal.open_connection(database_path, readonly=readonly)
+
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
 # --- transaction ownership -----------------------------------------------
 
 
