@@ -68,12 +68,40 @@ function (measured 2026-10-22 on this branch; it catches only
 `process_cbz_file` prefetch, `_patch_comicinfo_for_range`) catch the same
 pair and were not traced.
 
-**Why a declared-size cap is a real bound here.** Measured on CPython
-3.11.3, 2026-10-22: a 10,000,000-byte deflated member with its declared size
-patched to 1,000 is returned truncated at 1,000 bytes and rejected with
-`BadZipFile: Bad CRC-32`, by both `ZipFile.read` and a chunked
-`ZipFile.open` stream. `tests/test_archive_limits.py` pins this with a
-1,000,000-byte member so an interpreter change fails loudly.
+**The caps are admission checks on declared metadata, not a memory or
+decompression bound.** *(Corrected 2026-10-22 after review of PR #110. The
+first version of this entry claimed "a declared-size cap is a real bound
+here", on the strength of an understated size failing CRC. That
+measurement left the CRC unpatched; the archive's author controls the CRC
+too, so the claim was false.)* Measured on CPython 3.11.3: a
+1,000,000-byte deflated member declared as 1,000 bytes with its CRC-32 set
+to the first 1,000 bytes passes the validator at a 1,000-byte ceiling, and
+`ZipFile.read` returns 1,000 bytes successfully while the decompressor
+produced the whole 1,000,000 (`ZipExtFile._read1` slices to the declared
+length only after decompressing; tracemalloc peak above 900,000 bytes).
+`test_the_size_cap_does_not_bound_decompressor_work` pins this limitation.
+What a reader retains from `read(info)` is at most the declared size; the
+transient decompressor allocation is not bounded.
+
+**Still open: a decompression/allocation budget.** Bounded per-member
+decompression (or a `compress_size` ratio check) is deliberately not
+implemented in this change and remains a roadmap Step 7 item.
+
+**Duplicate-name reads in `write_comicinfo`, fixed.** It read each member
+with `zin.read(info.filename)`, which for duplicate names returns the last
+record of that name every time: three `page.bin` records of 0, 0 and 1,000
+bytes passed a 1,000-byte ceiling, the rewrite materialized 3,000 bytes, and
+its output failed the same validator. It now reads by `ZipInfo`. Duplicate
+names themselves are still accepted; a policy for them stays open.
+`cbz_sanitizer._write_cbz_with_comicinfo` has the same by-name read and is
+not changed (see "Deliberately not done").
+
+**Encrypted directory records, fixed.** Inspection judged encryption over
+file records only, while `testzip()` opens every record: flag bit 0 (or 6)
+on a `folder/` record plus an ordinary page left `encrypted=False`, and
+`verify_crc=True` then raised a bare `RuntimeError` (`NotImplementedError`
+for bit 6) that the worker would record as a retryable
+`unclassified_error`. Encryption is now judged over every record.
 
 **What the limits are calibrated on: nothing.** Both values are ceilings
 chosen to sit far above any plausible comic archive, not a measured
@@ -86,7 +114,7 @@ traversal. On this Windows host, `os.path.abspath` resolves
 `base/sub/../x.png` to `base/x.png` but keeps `...`, `.. `, `. .`, `....`
 and ` ..` as literal components, so those are accepted.
 
-Tests: `tests/test_archive_limits.py` (57). Three pins of the old
+Tests: `tests/test_archive_limits.py` (62 after the review fixes). Three pins of the old
 pass-through behaviour were replaced, as their docstrings asked:
 `test_unsafe_member_names_are_preserved_not_rejected` →
 `test_unsafe_member_names_are_rejected_by_inspection`,
@@ -108,7 +136,8 @@ tests failed by name (16 bypasses, 1–12 failures each).
 - `scripts/cbz_watcher.py` has its own whole-archive ComicInfo rewrite
   (outside this audit's six components); not guarded, not audited.
 - `scripts/cbz_compilation_resolver.py` remains unaudited.
-- Streaming rewrite, duplicate member names, nested archives, processing
+- Decompression/allocation budget (see above), streaming rewrite,
+  duplicate-member-name policy, nested archives, processing
   timeout, temporary-disk budget, and NTFS alternate-data-stream names
   (`page.png:stream`) are not covered by the validator. Rejecting `:` would
   refuse legitimate archives built on non-Windows hosts.
