@@ -213,8 +213,16 @@ def open_connection(
             isolation_level=None,
         )
 
-    connection.row_factory = sqlite3.Row
-    resolved_policy.apply(connection)
+    # A connection whose policy did not fully apply is not the connection
+    # that was asked for -- a read-only one missing query_only would still
+    # be usable -- so it is closed before the error propagates instead of
+    # being left open until the garbage collector reaches it.
+    try:
+        connection.row_factory = sqlite3.Row
+        resolved_policy.apply(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 
