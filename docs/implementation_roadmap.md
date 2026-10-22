@@ -1,6 +1,61 @@
 # Implementation Roadmap
 
-## Status as of 2026-08-20
+## Status as of 2026-10-22
+
+Measured against `master` = `f88d1da` on 2026-10-22. This roadmap was last
+edited at `ed7fec1` (2026-08-21); every merge from #79 to #97 landed after
+that. This section supersedes the 2026-08-20 status below and the stale
+checkboxes listed at the end of it. The step sections themselves are kept
+as the plan of record. Evidence is the merged PR or the dated log named in
+each row; anything not established that way says so.
+
+| Item | Status | Evidence | What remains |
+|---|---|---|---|
+| Step 1: V1 perceptual backfill and audit | **Done** | #74, #77, #78; "Audited baseline — 2026-08-21" below | — |
+| Step 1A A–D, G, H | **Done** | dated "Completed" notes in each sub-step below | — |
+| Step 1A E (bulk exact reuse), F (selective missing pages) | **Measured; deferred** | E: 333 archives would gain; F: 4,624 decodes (sub-steps below) | optional |
+| Step 2: immutable archive revisions | **Done** | #83, migration 014, applied to production 2026-08-24 (`development_log_2026-08-24.md`) | — |
+| Step 3: retention and guarded pruning | **Planner only** | #85 (`revision_retention.py`, no apply path) | guarded plan/apply; the relaxed delete guard (log 2026-08-24, "Open") |
+| Step 4: revision-aware provenance | **Partly done** | #86 assessment, #87 page-inventory design, #88 backfill planner, #89 slice-4 design (its five questions are answered as design rulings in `slice4_migration_design.md` §2), #90 4A fail-closed guard, #91 4B-1 plan reader | 4B-2 protected executor; migration 015 SQL (not in the migrations directory); producer cutover; slices 5–7; re-measurement and a production dry run before any execution |
+| Step 5: minimum local DAL | **Partly done** | #80 (`comic_automation/database/dal.py`; the package is `database/`, not the `db/` shape sketched in Step 5) | direct `sqlite3.connect` remains in 5 files outside `database/connection.py` and `database/dal.py` (grep at `f88d1da`); no lint rule; call sites not migrated |
+| Step 6: persistent job queue | **Partly done** | worker-audit §3 items resolved; migration 010 active-job uniqueness; `enqueue_if_absent`; failure categories (migration 005); cancellation (migration 011) | leases/fencing tokens, heartbeats and backoff (deferred on purpose, see the queue audits); `idempotency_key`; tracing direct `jobs` writers |
+| Step 7: archive resource handling | **Partly done** | pixel pin, page byte cap, staleness re-checks (#9, #18); CRC guard; #81 interrupted-rewrite fix | entry-count and total-uncompressed caps; unsafe member-path rejection; encrypted-member handling; streaming rewrite; `compilation_resolver` unaudited (`archive_io_resource_audit.md`) |
+| Step 8: golden corpus and tests | **Partly done** | #79: 18-case corpus, `tests/fault_injection.py` | the excessive-entries case (`CORPUS_GAPS`) and the external real-world fixture manifest; no property-based tests (none of the ten listed invariants); fault injection for job acquisition, hash saves and quarantine moves unverified |
+| Step 9: decisions log | **Done, ongoing** | `engineering_decisions.md` | — |
+| Watcher routing and staging | **Mechanics done; inactive** | #30, #33, #38, #40–#43, #46, #94 (closes #82), #96 (closes #60), #97 (closes #32/#35); `development_log_2026-10-22.md` | activation gates (modes stay `off`/`shadow`); staging wiring into the watcher; verified cross-volume rollback |
+| Phase 4: series identity (#57) | **Rules recorded; building** | #57 closed with the rules below; sequence step 1 (#56) and step 3 (#96) done | step 4 re-measurement (#98, ambiguity report); step 5 candidate model and decision manifest (design PR #99); MangaDex adapter; review surface; plan/apply; canonical series records do not exist yet |
+| Phase 5: perceptual deduplication | **Backfill and audit done** | Step 1 | richer signatures, compilation detection, review; the scale of the existing near-duplicate candidates is unverified here |
+| Phases 6, 7, 9 | **Not started** (9: design only, `gui_architecture_implementation_roadmap.md`) | — | everything |
+| Phase 8: managed resolution | **Tooling exists; plans not executed** | staging and quarantine tooling | the exact-duplicate plans for the two groups below |
+
+### Next work, as agreed 2026-10-22 (hive #1970)
+
+1. Read-only ambiguity report (#98), codex-lead, which completes Phase 4
+   steps 2 and 4 once run on the target. A run against `X:\` is the
+   operator's.
+2. Candidate model and decision manifest design (#99), claude-lead.
+3. Then the inert watcher-to-staging integration plan and a verified
+   cross-volume rollback design.
+4. Alternative platform track: Step 4 slice 4B-2 (protected executor
+   tests) toward migration 015.
+
+### Statements below that this section supersedes
+
+- The 2026-08-20 status: the backfill is no longer the active workstream
+  (finished 2026-08-19, audited 2026-08-21), and the golden corpus and DAL
+  no longer "still come first" (both merged 2026-08-24).
+- Phase checklists not updated since: "complete the focused golden corpus"
+  (#79), "introduce immutable archive revisions" (#83), "complete the V1
+  backfill", "execute the remaining Step 1A", the final coverage audit,
+  and Phase 2's DAL and job-hardening items (partly done; see the table).
+- Phase 4 text treating #60 as open: it is closed by #96. Re-measurement
+  (sequence step 4) remains open under #98.
+- The "Return sequence" items 1–4, all done.
+- `docs/slice4_migration_design.md` still heads itself "design under
+  review" after #89 merged (acknowledged and deferred in
+  `development_log_2026-09-02.md`).
+
+## Status as of 2026-08-20 (historical; superseded by the section above)
 
 The project has moved beyond a collection of standalone scripts into a
 SQLite-backed automation platform for discovering, inspecting, hashing,
