@@ -127,6 +127,8 @@ def test_the_consumer_list_matches_the_modules_that_import_the_rule():
         "scripts/cbz_library_maintenance.py",
         "scripts/cbz_library_reclassify.py",
         "scripts/cbz_lock_order.py",
+        # Keys the would-be staging case; imports the rule, never shadows it.
+        "scripts/cbz_shadow_handoff.py",
     }
     assert importers == expected, (
         f"the set of modules importing series_key changed: {sorted(importers)}. "

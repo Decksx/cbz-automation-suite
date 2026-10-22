@@ -1207,7 +1207,9 @@ def _source_folder_name(comic_dir: Path) -> str:
 
 
 def _shadow_route(comic_dir: Path, legacy_dest: str, series_name: str,
-                  archives: list[Path], results: list) -> None:
+                  archives: list[Path], results: list,
+                  handoffs: list | None = None,
+                  mixed_parent: bool = False) -> None:
     """Log how v2 would have classified this batch. Changes nothing.
 
     Called after the series identity is resolved and the archives have been
@@ -1218,13 +1220,41 @@ def _shadow_route(comic_dir: Path, legacy_dest: str, series_name: str,
     """
     if _router is None or not _router.enabled:
         return
+    comparison, error = None, ""
     try:
         comparison = _router.shadow(comic_dir, _source_folder_name(comic_dir),
                                     legacy_dest, series_name, archives)
         if comparison is not None:
             results.append(comparison)
     except Exception as e:                       # noqa: BLE001 — never fatal
+        error = f"{type(e).__name__}: {e}"
         log.error(f"  Routing v2 shadow failed for '{comic_dir.name}': "
+                  f"{type(e).__name__}: {e}")
+    if handoffs is not None:
+        _shadow_handoff(comic_dir, series_name, archives, comparison, error,
+                        mixed_parent, handoffs)
+
+
+def _shadow_handoff(comic_dir: Path, series_name: str, archives: list[Path],
+                    comparison, error: str, mixed_parent: bool,
+                    handoffs: list) -> None:
+    """Record what a staging handoff would do with this arrival. Moves nothing.
+
+    An observation only (design A3.1): the caller's move runs next exactly as
+    it would without this call, whatever the outcome. A classification error
+    is passed through rather than swallowed, because it is itself an outcome
+    (`defer`, classification_failed) and must be counted, not lost.
+    """
+    try:
+        from scripts.cbz_shadow_handoff import observe
+        observation = observe(
+            comic_dir, series_name, _source_folder_name(comic_dir),
+            comparison.decision if comparison is not None else None,
+            mixed_parent=mixed_parent, archives=archives, error=error)
+        handoffs.append(observation)
+        log.info(f"  {observation.describe()}")
+    except Exception as e:                       # noqa: BLE001 — never fatal
+        log.error(f"  Staging shadow-plan failed for '{comic_dir.name}': "
                   f"{type(e).__name__}: {e}")
 
 
@@ -1616,6 +1646,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
     # Bounded to this pass. The router keeps no state of its own, so a
     # long-running watcher never accumulates a record per directory.
     shadow_results: list = []
+    shadow_handoffs: list = []
 
     for comic_dir, cbz_files in sorted(cbz_dirs.items()):
         dest_folder = _resolve_dest(comic_dir)
@@ -1778,12 +1809,14 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     )
                     archives = list(parsed_by_path.keys())
                     _shadow_route(comic_dir, dest_folder, series_name, archives,
-                                  shadow_results)
+                                  shadow_results, shadow_handoffs,
+                                  mixed_parent=True)
                     landed = _move_loose_files(archives, dest_folder, series_name)
                     _note_move(series_name, dest_folder, landed)
                 else:
                     _shadow_route(comic_dir, dest_folder, series_name,
-                                  list(parsed_by_path.keys()), shadow_results)
+                                  list(parsed_by_path.keys()), shadow_results,
+                                  shadow_handoffs)
                     landed = _move_cbz_dir(comic_dir, dest_folder,
                                            target_name=series_name,
                                            chapter_number=dir_number)
@@ -1807,6 +1840,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
     if _router is not None and _router.enabled:
         from scripts.cbz_watcher_router import summarise
         log.info(summarise(shadow_results))
+        from scripts.cbz_shadow_handoff import summarise as summarise_handoffs
+        log.info(summarise_handoffs(shadow_handoffs))
 
 
 # ─────────────────────────────────────────────
