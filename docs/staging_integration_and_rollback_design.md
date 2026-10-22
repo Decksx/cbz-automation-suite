@@ -189,14 +189,37 @@ nothing of it. So ownership is part of the case record, under one lock:
   mutator for the whole of its mutation: promote, reject, same-volume
   rollback, recovery, and every step of a cross-volume attempt. A mutator
   that cannot take it refuses; it never waits indefinitely.
-- **Ownership is claimed by bumping the case contract.** Under the lock, an
+- **Ownership is claimed by bumping the reader contract.** Under the lock, an
   attempt rewrites the case manifest (atomic replace) from
   `classification-case-v1` to **`classification-case-v2`**, which adds one
   field: `owner = {journal: cross-volume-rollback-v1, attempt_id}`. Today's
   strict parser refuses any contract that is not `classification-case-v1`,
-  so **older binaries cannot read, and therefore cannot operate, a
-  journal-owned case**: the exclusion comes from existing code, not a hope.
-  New code reads v1 and v2.
+  so an older binary **that reads the case after the claim** refuses it.
+  That fences fresh reads only; in-flight legacy operations are handled by
+  the rollout rule below. New code reads v1 and v2.
+- **Identity hashes do not move with the reader contract.** Today
+  `CASE_CONTRACT` feeds `case_identity()` and the inventory digest as well as
+  the parser check. The implementation splits them: a frozen
+  `CASE_IDENTITY_NAMESPACE = "classification-case-v1"` for case identity and
+  inventory hashing, and `contract` for the record's reader schema only, so
+  a v2 record keeps every existing case id and inventory digest unchanged.
+- **The approved digest and the owned record are bound, not equal.**
+  `record_digest` hashes the whole serialized record (contract, state,
+  timestamps), so the claim necessarily changes it. The operator approves
+  the **pre-claim v1 digest D** (from `show_case`); the journal freezes D. The
+  only allowed transition is: v1 record with digest D → v2 record whose
+  **projection** (the v2 record with `owner` removed and `contract` set back
+  to v1, re-serialized) has digest exactly D. Any other difference between
+  the owned record and that preimage is tampering, and recovery refuses.
+  Terminal completion is the same projection rule plus `state: rolled_back`
+  and its timestamp.
+- **Rollout precondition (activation, not now).** Strict parsing cannot fence
+  a legacy promote, reject, or rollback that already read v1 and is about to
+  move: old code takes no case lock, and `_replace`'s first attempt does not
+  re-check. So claims may be enabled only after every legacy staging mutator
+  is stopped and drained, the new code is the only version installed, and no
+  mixed-version writer is running (verified at the operator preflight).
+  While any legacy process might still be running, claims stay disabled.
 - **Every new mutator checks `owner`** after taking the lock and refuses
   when a journal owns the case, except that journal's own recovery for the
   same `attempt_id`.
@@ -205,9 +228,15 @@ nothing of it. So ownership is part of the case record, under one lock:
   set, so only the owning journal's recovery can continue: the claim
   survives the crash.
 - The attempt's terminal step writes `rolled_back` and keeps `owner` (the
-  record of who finished it); an operator-abandoned attempt clears `owner`
-  under the lock with a journalled reason, returning the case to v1-readable
-  `pending_review` only if its payload still verifies.
+  record of who finished it).
+- **Abandonment is journalled and conservative.** The operator writes
+  `abandoned` (reason, operator receipt) to the attempt journal under the
+  case lock. It is **refused** if anything exists at the target path, with
+  or without a receipt: a target whose publish cannot be attributed is
+  ambiguous and must first be dispositioned by the operator outside this
+  protocol, then recorded. Only after that is `owner` cleared, by restoring
+  the exact v1 preimage with digest D, and only if the staged root still
+  verifies against the frozen inventory.
 
 ### B2a. The rollback journal
 
@@ -243,8 +272,12 @@ flattening contract is introduced.
 
 ```text
 precondition  case is pending_review; the operator supplies record_digest
-0 claimed     under the case lock: case manifest v1 → v2 with owner
-1 planned     journal written; target must not exist
+i intent      journal written FIRST with the complete immutable intent:
+              attempt_id, case_id, approved digest D, target, staged_root,
+              frozen_inventory, layout; target must not exist
+0 claimed     under the case lock: compare-and-set the manifest — still v1
+              with digest D and no owner — to v2 with owner = this attempt
+1 planned     journal progress → planned
 2 copied      copytree staged_root → layout path (target volume)
 3 verified    full-SHA inventory of the copy == frozen_inventory; and, freshly,
               staged_root exists, belongs to this case, and still verifies
@@ -291,7 +324,11 @@ coincidence could have put it there. So:
 
 | Last durable progress | Disk | Recovery |
 |---|---|---|
-| none / `planned` | no partial | start step 2 |
+| `intent`, manifest still v1 with digest D, no owner | orphan intent | only an operator-initiated recovery may claim (step 0) or mark it `abandoned`; nothing automatic |
+| `intent`, manifest v1 but digest ≠ D | case changed since approval | intent `abandoned` (stale); nothing touched |
+| `intent`, manifest v2 owned by this attempt | claimed without progress | verify the projection equals D, then progress → `planned` |
+| manifest v2 owned by an attempt with **no journal** | should be impossible with intent-first | `operator_required`; never reconstruct a target or digest from absent metadata |
+| `planned` | no partial | start step 2 |
 | `planned` | partial present (copy interrupted) | fresh pending proof → discard the partial and recopy; proof fails → keep the partial, `operator_required` |
 | `copied` | partial complete, unverified | verify (step 3) |
 | `verified` | target absent | publish (step 4) |
@@ -354,6 +391,16 @@ Part B:
 - `test_copy_is_rooted_at_the_staged_payload_root`
 - `test_crash_between_publish_and_receipt_is_ambiguous`
 - `test_shadow_decision_never_changes_the_existing_move`
+- `test_owned_v2_projection_must_equal_the_approved_v1_digest`
+- `test_tampered_owned_record_is_refused`
+- `test_case_identity_and_inventory_digest_are_stable_across_v1_to_v2`
+- `test_crash_after_claim_before_planned_resumes_from_intent`
+- `test_orphan_intent_without_claim_is_not_auto_claimed`
+- `test_stale_intent_after_case_change_is_abandoned_without_mutation`
+- `test_owned_case_without_journal_is_operator_required`
+- `test_abandon_is_refused_while_a_target_exists`
+- `test_abandon_restores_the_exact_v1_preimage`
+- `test_claims_stay_disabled_while_a_legacy_mutator_may_run`
 - each crash-matrix row (B5) as its own test
 - `test_unsupported_topology_is_refused` (SMB, exFAT)
 
