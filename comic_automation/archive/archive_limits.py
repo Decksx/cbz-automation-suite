@@ -5,8 +5,8 @@ after the archive is opened and before any member is read. It is the
 archive-level counterpart of the per-member guards that already exist:
 ``MAX_COMIC_INFO_BYTES`` in ``inspection.py``,
 ``MAX_PAGE_UNCOMPRESSED_BYTES`` and the pinned ``Image.MAX_IMAGE_PIXELS``
-in ``perceptual_hashing.py`` (#9, #18). Those bound a single member; nothing
-bounded the archive as a whole, and nothing looked at member names at all.
+in ``perceptual_hashing.py`` (#9, #18). Those check a single member; nothing
+checked the archive as a whole, and nothing looked at member names at all.
 
 Four checks, each with its own reason code. The reason code is the string
 the job layer records as ``jobs.failure_category``, so it is part of the
@@ -26,18 +26,29 @@ operational vocabulary and must not be renamed casually:
   ``reject_encrypted=False`` for inspection, which reports encryption as a
   status rather than failing on it.
 
-Why declared sizes are enough
------------------------------
+Declared metadata only: not a memory or decompression bound
+-----------------------------------------------------------
 
-The size cap reads ``ZipInfo.file_size``, the size the archive *claims*.
-That is only a bound if the reader refuses to return more than the claim.
-Measured on CPython 3.11.3 (the project interpreter) on 2026-10-22: a
-deflated 10,000,000-byte member whose declared size was patched down to
-1,000 is returned truncated at the declared length and then rejected with
-``BadZipFile: Bad CRC-32``, by both ``ZipFile.read`` and a chunked
-``ZipFile.open`` stream. An understated size therefore produces a corrupt-
-archive failure, not an unbounded read. ``tests/test_archive_limits.py``
-pins that interpreter behaviour so an upgrade that changed it fails loudly.
+The count and size caps are *admission checks on the central directory*.
+The size cap reads ``ZipInfo.file_size``, the size the archive claims, and
+the archive's author also writes the CRC-32. They refuse an archive whose
+own metadata is out of bounds; they do not bound the work or the memory
+spent decompressing an archive whose metadata lies.
+
+Measured on CPython 3.11.3 (the project interpreter): a 1,000,000-byte
+deflated member declared as 1,000 bytes, with its CRC-32 set to that of the
+first 1,000 bytes, passes the validator at a 1,000-byte ceiling and
+``ZipFile.read`` returns exactly 1,000 bytes *successfully*.
+``ZipExtFile._read1`` hands the decompressor a large ``max_length`` and
+slices to the declared length afterwards, so the full 1,000,000 bytes are
+decompressed and allocated to produce them (tracemalloc peak above
+900,000 bytes). ``test_the_size_cap_does_not_bound_decompressor_work``
+pins that limitation. What a caller *retains* from ``read(info)`` is at
+most the declared size; the transient decompressor allocation is not.
+
+A real decompression/allocation budget (bounded ``decompressobj`` reads,
+or a per-member ``compress_size`` ratio check) is an open roadmap Step 7
+item. It is deliberately not implemented here.
 
 What the limits are not
 -----------------------
@@ -51,9 +62,10 @@ ceiling.
 Lowering either needs a measured distribution first, recorded with its
 numerator, denominator and population.
 
-The validator does not cover duplicate member names, nested archives, a
-processing timeout, a temporary-disk budget, or NTFS alternate-data-stream
-names (``page.png:stream``); those remain open roadmap Step 7 items. See
+The validator does not cover a decompression/allocation budget (above),
+duplicate member names, nested archives, a processing timeout, a
+temporary-disk budget, or NTFS alternate-data-stream names
+(``page.png:stream``); those remain open roadmap Step 7 items. See
 ``docs/archive_io_resource_audit.md``, "Implemented 2026-10-22".
 """
 
