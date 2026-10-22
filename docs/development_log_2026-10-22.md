@@ -171,3 +171,87 @@ Next owner: Claude independently reviews the final exact PR head and CI;
 Codex resolves findings and owns merge after approval and green exact-head CI.
 No runtime rollout or production census belongs to this feature slice.
 
+
+## Protected-executor contract preparation -- issue #102
+
+David authorized the next comic tracks in hive #2035. Ownership settled in
+#2042/#2043: Claude leads staging/rollback design; Codex leads the protected
+executor contracts and reviews Claude's design. This first bounded B slice was
+proposed in #2044 and accepted in #2045; it is not the whole executor.
+
+Branch `test/slice4b2-executor-contracts`, base
+`cd2b774ed2e2f83dd5e14a9b27dd01faab4b72ca`. Production was not opened.
+
+### The admission gap and bounded change
+
+The generic `resolve_protected_execution()` seam intentionally compares only
+the pending protected set with explicit authorization. Both discovered
+`{1..15}` / recorded `{1..14,16}` and the same ledger with 016 also discovered
+pass that seam. This is the exact R15 counterexample in
+`docs/slice4_migration_design.md` section 12.1.
+
+Source commit `f30eeae59d2226313617ebe1de674b57c4adeb1d` adds the pure
+`require_slice4_ledger(snapshot)` predicate for section 12.1 **step 3 only**:
+recorded versions must equal all discovered versions below 15, as set equality.
+Missing and unexpected versions are reported separately. The seam's docstring
+now distinguishes this implemented predicate from obligations it still does
+not enforce. Its call graph/behavior is unchanged: it does not call the new
+predicate or apply anything.
+
+Test commit `b8729197172c31ac65522ad825d3fde5168cda47` adds 19 fixture cases.
+They include both counterexamples, partial ledgers, a removed migration file,
+unknown/later/already-applied rows, the absent-ledger refusal without creation,
+composition with explicit protected authorization, and input preservation.
+A later unprotected file remains pending and is not selected. Passing ledger
+equality does not prove a 015 file exists. The comparison follows the specified
+discovered-file equation, not a synthesized contiguous range.
+
+A stale snapshot deliberately remains stale: the pure predicate neither opens
+a connection nor re-reads a directory/ledger. The test shows fresh state can
+refuse while the old snapshot still passes. The future executor must take its
+snapshot under its write lock and check the approved release-file set; this
+helper supplies no freshness proof.
+
+### Fresh verification
+
+Windows / Python 3.11.3, isolated
+`C:\git\cbz-executor-contracts-20261022`. Full-suite baseline on the exact base:
+`python -m pytest -n 4 --dist loadfile -q`:
+**2438 passed, 8 skipped in 69.72 s**. New contracts plus existing guard tests:
+**73 passed in 3.57 s**. After a test connection-close correction, all
+**19 new cases passed in 5.83 s**. Final full suite:
+**2457 passed, 8 skipped in 59.20 s**, exactly +19 passes and unchanged skips.
+These timings are individual runs, not a performance claim.
+
+Six independent selected mutations were rejected:
+
+| Mutation | Failing cases |
+| --- | ---: |
+| check missing predecessors only (subset) | 8 |
+| check unexpected rows only (reverse subset) | 5 |
+| silently filter out later recorded rows | 6 |
+| exclude predecessor 014 | 17 |
+| include pending 015 as a predecessor | 14 |
+| omit the refusal | 14 |
+
+Original source bytes were restored after each run. Raw harness and logs are
+outside Git at
+`C:\Users\david\Documents\Codex\control\comic102-mutations-20261022.py`
+and sibling `comic102-20261022\`. Source remains index LF / working-tree CRLF;
+`git diff --check` passes. The SQL statements in tests create only synthetic
+ledger fixtures; no test applies even a synthetic 015 payload.
+
+### Remaining executor obligations / next owner
+
+This delivers one reusable precondition and its contracts. The next-applicable
+test (section 12.1 step 4, `min(discovered-recorded)==15`) remains explicitly
+open, along with verified quiescence/backup, locked plan revalidation,
+statement-by-statement SQL, same-transaction ledger insertion, applied
+projection reconciliation, commit/postflight/restore, producer cutover and
+production execution. No migration015 file, CLI or SQL-application path was
+added, and no database/library runtime operation was performed.
+
+Claude independently reviews the exact candidate head and CI; Codex handles
+findings and merge after approval and green matching CI. No production rollout
+belongs to this preparation slice.
+
