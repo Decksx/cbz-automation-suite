@@ -70,9 +70,40 @@ acquired: WAL-aware read — PRAGMA data_version before, one deferred read
           inventory (the read-only audit rule in CLAUDE.md)
 ```
 
-**Until that inventory exists, folder- and archive-level dispositions
-cannot pass the gate.** Key-level dispositions bound only to the directory
-report can be recorded, but are still subject to section 4.
+**The database inventory alone is not authoritative.** A WAL-consistent read
+proves the rows agree with each other, not with the disk: a new archive
+dropped into a folder that no job has registered, or a file rewritten while
+the database still describes its old bytes, need not change `data_version`
+at all, and either would leave a folder decision looking current.
+
+So the envelope needs a third component, a **filesystem member
+validation** producer (not built yet), for exactly the covered folders:
+
+```text
+member_validation  {schema, coverage, rows, validation_sha256}
+row: folder_path, member_relpath, size, sha256 (computed now from the bytes),
+     matched archive_id | null
+outcome per folder: complete | unowned_file | missing_file | drifted_bytes
+                    | unreadable
+```
+
+Reconciliation is against actual members: every archive file on disk must
+map to an inventory row whose current established digest equals the
+freshly computed digest, and every inventory row must have its file on
+disk. Any unowned, missing, drifted, or unreadable member makes that folder
+**unverified**, and unverified folders cannot carry a passing folder or
+archive disposition.
+
+**Until both the revision inventory and member validation exist, folder- and
+archive-level dispositions cannot pass the gate.** Key-level dispositions
+bound only to the directory report can be recorded, but are still subject to
+sections 4 and 5.
+
+**Limits, stated plainly.** The three components are separate reads, not an
+atomic snapshot (#101 already records `atomic_filesystem_snapshot: false`).
+An observation can be stale by the time anything is applied; every apply
+step is a content-addressed plan/apply that revalidates its own sources
+(rule 7), and the gate is never a substitute for that.
 
 ### Archive freshness rules (open question 2, answered)
 
@@ -126,6 +157,7 @@ Decision kinds (from Phase 4 step 9, made explicit):
 | `none_of_these` | no offered candidate is right | any |
 | `unresolved` | reviewed and explicitly left open | any |
 | `withdraw` | retract the current decision without replacing it | any |
+| `reconcile` | acknowledge a recorded conflict and choose the canonical record (section 4) | the conflicted subject |
 
 Outcomes reference **canonical series by a stable local id**
 (`series_id`), with titles and aliases as attributes; a mutable
@@ -139,21 +171,35 @@ count as unresolved for the gate.
 
 ## 3. The decision record and who may write it
 
-Append-only; never updated, never deleted.
+Append-only; never updated, never deleted. A record has two layers, built
+in this order so neither hash depends on the other:
 
 ```text
-decision_id      sha256 over the canonical JSON of every field below except
-                 itself (record integrity, not authorship)
-subject_id       stable subject identity (section 2)
-supersedes       decision_id of the subject's current head, or null for the
-                 subject's first decision
-kind, outcome    as above; outcome uses series_id
-bound            the bound observation and the envelope_sha256 it came from
-candidates_shown candidate ids shown, with scores and sources
-rationale        required, non-empty
-authority        typed: {type: operator_receipt, receipt_id}
-                     | {type: rule, name, version}
+payload                       (what the operator reviews and approves)
+  subject_id       stable subject identity (section 2)
+  supersedes       record_id of the subject's current head, or null for the
+                   subject's first decision
+  kind, outcome    as above; outcome uses series_id
+  bound            the bound observation and the envelope_sha256 it came from
+  candidates_shown candidate ids shown, with scores and sources
+  rationale        required, non-empty
+payload_id         sha256 over the canonical JSON of payload  (computed 1st)
+
+authority          (attached after approval; never inside the payload)
+  {type: operator_receipt, hub_message_id, hub_sender, payload_id,
+   envelope_sha256}
+  | {type: rule, name, version, payload_id}
+
+record_id          sha256 over canonical JSON of {payload_id, authority}
+                   (computed last; this is what `supersedes` points at)
 ```
+
+**What the operator approves is the `payload_id`**: the review command shows
+the payload and its `payload_id`, and the approval names that id. Admission
+recomputes `payload_id` from the stored payload and requires the receipt to
+name exactly it; import does the same for every record. Changing any payload
+field after approval changes `payload_id`, so the receipt no longer matches
+and the record is refused.
 
 ### Approval provenance (trusted ingestion boundary)
 
@@ -164,16 +210,17 @@ approved it. A self-asserted operator name is not provenance. So:
   command (CLI first, GUI later). No library function, script, job handler,
   or import path can create an `operator_receipt` authority.
 - **The receipt is anchored in an authenticated operator event.** The review
-  command shows the operator the decision and its `decision_id`, and admits
+  command shows the operator the payload and its `payload_id`, and admits
   it only after an approval posted **by the hub's authenticated `admin`
-  identity** that names that exact `decision_id` (for example a hive
-  message `APPROVE <decision_id>`). The hub records sender identity from the
+  identity** that names that exact `payload_id` (for example a hive
+  message `APPROVE <payload_id>`). The hub records sender identity from the
   credential that authenticated the post, not from message content. The
   receipt stores: hub message id, sender as recorded by the hub, the
-  `decision_id`, and the envelope fingerprint the decision was shown with.
+  `payload_id`, and the envelope fingerprint the payload was shown with.
 - **Admission verifies the receipt at write time** (message exists, sender
-  is `admin`, it names this `decision_id`) inside the same transaction that
-  appends the decision; a decision without a verified receipt is refused.
+  is `admin`, it names this `payload_id`, which matches the recomputed
+  payload) inside the same transaction that appends the record; a record
+  without a verified receipt is refused.
 - **Rule outputs** (rule 1: exactly one unambiguous result under an approved,
   deterministic, tested rule) use `authority.type = rule` with name and
   version. They can never carry an operator receipt, and the two are
@@ -209,11 +256,33 @@ structurally, not by convention:
 - **Cross-subject supersession is refused**: the superseded decision must
   have the same `subject_id`.
 - **`withdraw`** supersedes the head; the subject is then undecided.
-- **Import** must present parents before children; a missing parent, a
-  second root, or a second child of one parent refuses the whole import.
-  A fork that arrives anyway (for example from an older export) marks the
-  subject **conflicted**, which blocks the gate until an operator writes a
-  decision superseding a chosen head. Clock order never picks a winner.
+
+**The canonical chain never contains a fork**, so conflicts live beside it,
+not in it:
+
+- **Import** must present parents before children and is all-or-nothing for
+  the canonical table: a missing parent, a second root, or a second child of
+  one parent rolls the whole import back.
+- **Before** that rollback is reported, the complete conflicting set is
+  written, in its own committed transaction, to an append-only
+  **`decision_conflicts`** log: a `conflict_id`, the `subject_id`, and every
+  conflicting record in full (payload, `payload_id`, authority, `record_id`),
+  plus the canonical head at detection time. A crash before that commit
+  leaves nothing half-written; re-running the import detects the same fork
+  and writes the entry then. The log is evidence, never a source of current
+  decisions.
+- While a subject has an **unreconciled** conflict entry it is
+  **conflicted**, and the gate blocks it. Clock order never picks a winner.
+- **Reconciliation is an explicit operator event**: a receipt-verified
+  record of kind `reconcile` on that subject that names the `conflict_id`
+  and the **exact, complete** set of conflicting `record_id`s from the
+  entry, and the record that becomes canonical: either the current
+  canonical head (keep it) or one record from the set, which is then
+  admitted through the normal compare-and-set. A `reconcile` naming a
+  partial set, an unknown conflict, or a record outside the set is refused.
+  The unchosen records stay in the conflict log, so the conflict is
+  acknowledged, never erased; a single `supersedes` pointer cannot clear
+  it.
 
 ## 5. Decision, reconciliation, and routing authority
 
@@ -232,9 +301,19 @@ mapping**. The gate keeps three things separate:
    - `split` needs the per-archive moves executed — the folder must no
      longer be mixed in a fresh observation; a complete set of per-archive
      `assign`s alone is a *planned* split and does not pass;
-   - `distinct` and `alternate_edition` need the routing configuration to
-     carry the mapping (alias/override entries that route each path to its
-     own series), visible in the config bytes the directory report hashed;
+   - `distinct` and `alternate_edition` need a routing mapping that sends
+     **each path** to its own `series_id`. **Today's routing cannot express
+     this, so these dispositions cannot reconcile yet.**
+     `RoutingConfig.override_for(series_name)` sees a normalized name, not
+     a folder path, and `parse()` refuses one alias claimed by two
+     canonical overrides (codex-lead probed two overrides for "Same Title"
+     and "Same Title - Uncensored": `RoutingConfigError: alias … is
+     claimed by both …`). Legacy `series_overrides` therefore never
+     certify a same-key, per-path outcome. They reconcile only through a
+     future, separately versioned **path- and series_id-aware routing
+     adapter**, and the gate must check that adapter's actual resolution
+     (feed each observed path, require the decided `series_id`), not the
+     mere presence of configuration entries;
    - `not_a_series` needs the routing policy to exclude that path.
 
 **Destination priority never overrides a human outcome.** If, for a resolved
@@ -244,7 +323,11 @@ the decided canonical home, the key is blocked, not "resolved by priority".
 ```text
 evaluate_authority(envelope, decisions, routing_config) -> GateReport
   refuse if the directory report has scan_problems        (incomplete)
-  refuse folder/archive dispositions without a revision inventory
+  refuse folder/archive dispositions without a revision inventory and a
+    complete member validation for that folder
+  block conflicted subjects (unreconciled decision_conflicts entry)
+  block distinct/alternate_edition until the path-aware adapter resolves
+    every observed path to the decided series_id
   per key: recorded? compatible? reconciled? -> resolved | unresolved |
            stale | conflicted | planned_not_applied | undecided
   pass only if every key is resolved
@@ -302,6 +385,16 @@ lands with or before it.
 - `test_folder_decision_without_revision_inventory_cannot_pass`
 - `test_incomplete_directory_report_is_refused`
 - `test_update_and_delete_are_refused_by_the_store`
+- `test_payload_changed_after_approval_is_refused`
+- `test_new_file_absent_from_the_database_makes_the_folder_unverified`
+- `test_disk_drift_with_an_unchanged_database_makes_the_folder_unverified`
+- `test_missing_member_file_makes_the_folder_unverified`
+- `test_db_inventory_without_member_validation_cannot_pass`
+- `test_forked_import_rolls_back_and_persists_the_conflict`
+- `test_conflict_survives_a_crash_and_is_re_detected`
+- `test_partial_reconcile_set_is_refused`
+- `test_superseding_one_leaf_does_not_clear_the_conflict`
+- `test_legacy_overrides_cannot_certify_a_per_path_distinct`
 
 Each guard must be shown load-bearing: removing it fails its named test.
 
@@ -311,9 +404,11 @@ Each guard must be shown load-bearing: removing it fails its named test.
    operator event, or should the review GUI hold its own operator
    credential? (The hub is the only operator-authenticated channel that
    exists today.)
-2. **Alias representation**: `distinct`/`alternate_edition` reconcile
-   through routing configuration today (`series_overrides`); should the
-   canonical series table replace that list before this gate is used?
-3. **Inventory producer ownership** and whether it runs as a standalone
-   read-only command alongside the directory report or inside it under a
-   second schema.
+2. **The path-aware routing adapter**: who owns it, and whether it reads the
+   canonical series table directly. Until it exists, `distinct` and
+   `alternate_edition` cannot reconcile (section 5).
+3. **Producer ownership** for the revision inventory and member validation,
+   and whether they run as standalone read-only commands alongside the
+   directory report or as later schemas of one command. Member validation
+   hashes every covered archive, so it is an operator-scheduled read of
+   `X:\`, never a background job.
