@@ -42,6 +42,7 @@ from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from comic_automation.archive.archive_limits import validate_archive_members
 from comic_automation.archive.page_hashing import calculate_page_hashes
 from scripts.cbz_routing import series_key
 
@@ -1789,15 +1790,22 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
             # Free: the central directory is already parsed for the
             # infolist() walk below.
             before_fingerprint = _central_directory_fingerprint(zin)
+            # Refuse before materializing anything: this loop holds every
+            # member in memory at once, so the declared-size and entry-count
+            # ceilings bound it, and an encrypted member would otherwise
+            # fail mid-loop on a password prompt. UnsafeArchiveError is a
+            # ValueError, so it lands in the broad handler below -- the
+            # rewrite is abandoned with the original untouched and False
+            # returned -- rather than being mistaken for a transient OSError.
+            validate_archive_members(zin.infolist())
             for info in zin.infolist():
                 # info.filename is round-tripped unchanged into the rewritten
-                # archive below. Nothing here extracts to a real filesystem
-                # path, so an unsafe ("..", absolute, or otherwise traversing)
-                # member name is not exploitable in this function -- but it is
-                # silently preserved into the output rather than rejected, and
-                # would be inherited by any downstream tool that later performs
-                # a naive extraction. See docs/archive_io_resource_audit.md,
-                # "Confirmed risks in current code".
+                # archive below. Absolute, drive-qualified and ".." names were
+                # rejected by validate_archive_members() above, so the rewrite
+                # can no longer carry an escaping name forward into the
+                # output. Names are otherwise not normalized; see
+                # comic_automation/archive/archive_limits.py for what is and
+                # is not checked.
                 entries.append((info, zin.read(info.filename)))
 
         with zipfile.ZipFile(tmp_path, "w") as zout:
