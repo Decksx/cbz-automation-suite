@@ -312,6 +312,25 @@ def test_equal_pages_with_different_non_image_members_go_to_review(folder, datab
     assert family.status == sv.FAMILY_REVIEW and family.keeper is None
 
 
+def test_equal_pages_differing_only_in_zip_packaging_say_so(folder, database):
+    """Same members and bytes, stored vs deflated: the files differ, the
+    members do not, and the reason must not claim they do."""
+    _book(folder, "Series ch. 1 v1.cbz", [P1, P2], {"notes.txt": b"n" * 200})
+    with zipfile.ZipFile(folder / "Series ch. 1 v2.cbz", "w",
+                         compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("001.png", P1)
+        archive.writestr("002.png", P2)
+        archive.writestr("notes.txt", b"n" * 200)
+
+    family = _family(_evaluate(folder, database), folder, "Series ch. 1 v1.cbz")
+    (relation,) = family.relations
+    assert (relation.relation, relation.outcome) == (sv.REL_EQUAL_PAGES, sv.OUTCOME_REVIEW)
+    assert relation.differing_non_image == ()
+    assert "ZIP packaging differs" in relation.reason
+    assert "non-image members differ" not in relation.reason
+    assert family.status == sv.FAMILY_REVIEW
+
+
 def test_equal_full_files_are_a_whole_archive_duplicate(folder, database):
     """Byte-identical files are a duplicate, never a supersession.
 
@@ -426,6 +445,41 @@ def test_dropping_comicinfo_needs_the_operator_flag(tmp_path, database):
     assert [m.name for m in family.relations[0].unique_non_image] == ["notes.txt"]
 
 
+@pytest.mark.parametrize(
+    "keeper_members",
+    [
+        {"ComicInfo.xml": b"not XML"},
+        {"ComicInfo.xml": _ci(notes="one"), "extra/ComicInfo.xml": _ci(notes="two")},
+        {"ComicInfo.xml": _ci(number="5", notes="x").replace(
+            b"</ComicInfo>", b"<Number>6</Number></ComicInfo>")},
+    ],
+    ids=["invalid-xml", "conflicting-documents", "contradictory-fields"],
+)
+def test_unusable_keeper_comicinfo_never_discharges_a_drop(
+    tmp_path, database, keeper_members
+):
+    """PR #123 review: the keeper's own ComicInfo must be usable metadata.
+
+    With the flag on, A's valid ComicInfo is still kept (review) when B's
+    is malformed, two differing documents, or self-contradictory. The valid
+    replacement and the missing-document cases are the controls in
+    `test_dropping_comicinfo_needs_the_operator_flag`.
+    """
+    folder = tmp_path / "keeper" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1],
+          {"ComicInfo.xml": _ci(notes="unique original notes")})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], keeper_members)
+
+    family = _family(
+        _evaluate(folder, database, accept_comicinfo_drop=True), folder,
+        "Series ch. 1 v1.cbz",
+    )
+    assert family.status == sv.FAMILY_REVIEW
+    (relation,) = family.relations
+    assert relation.accepted_comicinfo_drops == ()
+    assert [m.name for m in relation.unique_non_image] == ["ComicInfo.xml"]
+
+
 # --- §4.5 cycles ---------------------------------------------------------------
 
 
@@ -529,6 +583,11 @@ def test_legacy_or_incomplete_stored_rows_are_refused(tmp_path, database):
     result = _evaluate(folder, database, ids)
     reasons = _archive(result, folder, "Series ch. 1 v1.cbz").unresolved_reasons
     assert any("legacy ordering contract" in r for r in reasons)
+    # Refused for its contract, not claimed to differ in bytes.
+    (stored,) = [r for r in reasons if r.startswith("stored rows")]
+    assert stored.startswith("stored rows are not comparable evidence under the required contract")
+    assert "nothing about whether their page bytes differ" in stored
+    assert "stale" not in stored
     assert _family(result, folder, "Series ch. 1 v1.cbz").status == sv.FAMILY_UNRESOLVED
 
 
@@ -590,7 +649,11 @@ def test_same_size_same_mtime_replacement_is_detected_by_strong_identity(
     assert _family(before, folder, v1.name).status == sv.FAMILY_SUPERSESSION
 
 
-def test_a_file_changed_during_evaluation_is_unresolved(folder, database, monkeypatch):
+@pytest.mark.parametrize("max_held_bytes", [sv.DEFAULT_MAX_HELD_BYTES, 0],
+                         ids=["buffered", "private-copy"])
+def test_a_file_changed_during_evaluation_is_unresolved(
+    folder, database, monkeypatch, max_held_bytes
+):
     """The file on disk changes after its bytes were read and hashed.
 
     Simulated by rewriting v1 (same size) from inside the page-hashing pass
@@ -611,7 +674,7 @@ def test_a_file_changed_during_evaluation_is_unresolved(folder, database, monkey
         return result
 
     monkeypatch.setattr(sv, "hash_ordered_pages", hash_then_rewrite)
-    result = _evaluate(folder, database, ids)
+    result = _evaluate(folder, database, ids, max_held_bytes=max_held_bytes)
     member = _archive(result, folder, v1.name)
     assert member.derived.problem.startswith("file changed during evaluation")
     assert member.derived.pages == ()
@@ -631,72 +694,114 @@ def _without_snapshot_or_mode(result) -> dict:
     return data
 
 
-def test_the_streaming_path_matches_the_buffered_path(folder, database):
-    """An archive above ``max_held_bytes`` is streamed, with the same result.
+def test_the_private_copy_path_matches_the_buffered_path(tmp_path, folder, database):
+    """An archive above ``max_held_bytes`` is bound through a private copy.
 
-    The cap boundary is inclusive: an archive of exactly the cap is held.
+    Same result as the buffered path; the cap boundary is inclusive; the
+    copy lives under ``temp_dir`` and is gone afterwards, and the library is
+    untouched.
     """
     v1 = _book(folder, "Series ch. 1 v1.cbz", [P1, P2],
                {"ComicInfo.xml": _ci(), "notes.txt": b"n"})
     _book(folder, "Series ch. 1 v2.cbz", [P1, P2, P3],
           {"ComicInfo.xml": _ci(), "notes.txt": b"n"})
     ids = _seed_all(database, folder)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    library = tmp_path / "library"
+    tree_before = _tree(library)
 
     buffered = _evaluate(folder, database, ids)
-    streamed = _evaluate(folder, database, ids, max_held_bytes=1)
+    copied = _evaluate(folder, database, ids, max_held_bytes=0, temp_dir=scratch)
 
     assert {a.derived.read_mode for a in buffered.archives} == {sv.READ_BUFFERED}
-    assert {a.derived.read_mode for a in streamed.archives} == {sv.READ_STREAMED}
-    assert _without_snapshot_or_mode(streamed) == _without_snapshot_or_mode(buffered)
-    assert _family(streamed, folder, v1.name).status == sv.FAMILY_SUPERSESSION
+    assert {a.derived.read_mode for a in copied.archives} == {sv.READ_COPIED}
+    assert _without_snapshot_or_mode(copied) == _without_snapshot_or_mode(buffered)
+    assert _family(copied, folder, v1.name).status == sv.FAMILY_SUPERSESSION
+    assert list(scratch.iterdir()) == []
+    assert _tree(library) == tree_before
 
     size = v1.stat().st_size
     assert derive_archive(v1, max_held_bytes=size).read_mode == sv.READ_BUFFERED
-    assert derive_archive(v1, max_held_bytes=size - 1).read_mode == sv.READ_STREAMED
+    assert derive_archive(v1, max_held_bytes=size - 1).read_mode == sv.READ_COPIED
     assert derive_archive(v1, max_held_bytes=size - 1) == replace(
-        derive_archive(v1, max_held_bytes=size), read_mode=sv.READ_STREAMED
+        derive_archive(v1, max_held_bytes=size), read_mode=sv.READ_COPIED
     )
 
 
-@pytest.mark.parametrize("change", ["rewritten-same-stat", "touched"])
-def test_a_streamed_file_changed_during_derivation_is_unresolved(
-    folder, database, monkeypatch, change
+@pytest.mark.parametrize("max_held_bytes", [sv.DEFAULT_MAX_HELD_BYTES, 0],
+                         ids=["buffered", "private-copy"])
+def test_a_restored_change_during_derivation_never_binds_the_wrong_pages(
+    folder, database, monkeypatch, max_held_bytes
 ):
-    """The streaming path re-hashes and re-stats after deriving the members.
+    """PR #123 review witness: change the file only while members are read.
 
-    ``rewritten-same-stat`` changes the bytes but restores size and mtime
-    (in place, same file identity): only the second hash can see it.
-    ``touched`` changes only the mtime: only the stat comparison can see
-    it, because the members were read from the path rather than from the
-    hashed bytes.
+    The shorter archive holds ORIGINAL. Its stored nomination was taken
+    from an earlier revision holding P1, which *is* a prefix of the longer
+    archive. While the members are derived, the earlier revision is put
+    back at the path; afterwards the original bytes and mtime are restored.
+    Deriving from the path would see the earlier revision, agree with the
+    stored rows, and propose removing the shorter file under a hash that
+    names ORIGINAL. Deriving from the owned bytes sees ORIGINAL, so the
+    stored rows are stale and nothing is actionable.
     """
-    v1 = _book(folder, "Series ch. 1 v1.cbz", [P1, b"AAAA"])
-    _book(folder, "Series ch. 1 v2.cbz", [P1, b"AAAA", P3])
-    ids = _seed_all(database, folder)
-    stat = v1.stat()
-    real = sv.hash_ordered_pages
+    shorter = _book(folder, "Series ch. 1 v1.cbz", [b"ORIGINAL"])
+    original = shorter.read_bytes()
+    earlier = _book(folder.parent / "earlier", shorter.name, [P1]).read_bytes()
+    shorter.write_bytes(earlier)
+    ids = {shorter.name: _seed(database, shorter)}
+    shorter.write_bytes(original)
+    longer = _book(folder, "Series ch. 1 v2.cbz", [P1, P2])
+    ids[longer.name] = _seed(database, longer)
+    before = shorter.stat()
+    real = sv._derive_members
     calls = []
 
-    def hash_then_change(archive, **kwargs):
-        result = real(archive, **kwargs)
-        if not calls:
-            if change == "rewritten-same-stat":
-                _book(folder, v1.name, [P1, b"BBBB"])
-                os.utime(v1, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-                assert v1.stat().st_size == stat.st_size
-            else:
-                os.utime(v1, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    def switch_while_deriving(source, chunk_size):
         calls.append(1)
-        return result
+        if len(calls) > 1:              # only the shorter file (sorted first)
+            return real(source, chunk_size)
+        try:
+            shorter.write_bytes(earlier)
+            return real(source, chunk_size)
+        finally:
+            shorter.write_bytes(original)
+            os.utime(shorter, ns=(before.st_atime_ns, before.st_mtime_ns))
 
-    monkeypatch.setattr(sv, "hash_ordered_pages", hash_then_change)
-    result = _evaluate(folder, database, ids, max_held_bytes=1)
-    member = _archive(result, folder, v1.name)
-    assert member.derived.read_mode == sv.READ_STREAMED
-    assert member.derived.problem.startswith("file changed during evaluation")
-    if change == "touched":
-        assert "mtime_ns" in member.derived.problem
-    assert _family(result, folder, v1.name).status == sv.FAMILY_UNRESOLVED
+    monkeypatch.setattr(sv, "_derive_members", switch_while_deriving)
+    result = _evaluate(folder, database, ids, max_held_bytes=max_held_bytes)
+
+    member = _archive(result, folder, shorter.name)
+    family = _family(result, folder, shorter.name)
+    assert family.status != sv.FAMILY_SUPERSESSION
+    assert family.pointers == ()
+    assert not member.comparable
+    assert member.derived.sha256 == hashlib.sha256(original).hexdigest()
+    assert member.derived.page_digests == (hashlib.sha256(b"ORIGINAL").hexdigest(),)
+    assert member.stored_rows.startswith("stored rows are stale")
+
+
+def test_an_archive_that_cannot_be_copied_is_unresolved(tmp_path, folder, database):
+    """No private copy, no binding: "too large to bind", never comparable."""
+    v1 = _book(folder, "Series ch. 1 v1.cbz", [P1])
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2])
+    ids = _seed_all(database, folder)
+
+    for kwargs in (
+        {"max_copy_bytes": 10},
+        {"temp_dir": tmp_path / "does-not-exist"},
+    ):
+        result = _evaluate(folder, database, ids, max_held_bytes=0, **kwargs)
+        member = _archive(result, folder, v1.name)
+        assert member.derived.problem.startswith(sv.TOO_LARGE_TO_BIND), kwargs
+        assert member.derived.sha256 is None and member.derived.pages == ()
+        assert not member.comparable
+        assert _family(result, folder, v1.name).status == sv.FAMILY_UNRESOLVED
+    assert not (tmp_path / "does-not-exist").exists()
+    # Control: a cap the archive fits under copies and binds.
+    result = _evaluate(folder, database, ids, max_held_bytes=0,
+                       max_copy_bytes=v1.stat().st_size * 4)
+    assert _family(result, folder, v1.name).status == sv.FAMILY_SUPERSESSION
 
 
 def test_duplicate_member_names_make_the_archive_unresolved(folder, database):
