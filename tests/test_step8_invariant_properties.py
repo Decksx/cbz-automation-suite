@@ -132,8 +132,9 @@ def _random_string(rng: random.Random, alphabet: list[str], *, max_len: int):
 # that matter: decomposed accents, compatibility forms, case mappings that
 # emit combining marks (U+0130 lowercases to "i" + U+0307), CJK, every
 # separator the series rule unifies, and unusual whitespace. The marker
-# words "uncensored"/"decensored" are deliberately absent -- see
-# `_MARKER_TOKENS` and the strict xfail below.
+# words "uncensored"/"decensored" are deliberately absent here; they are
+# drawn separately from `_MARKER_TOKENS` by the marker-word properties below
+# (strict xfails until #114 fixed series_key).
 _NAME_TOKENS = [
     "a", "B", "z", "Q", "0", "1", "9", "42", "Vol", "Ch", "v2",
     " ", "  ", "\t", " ", "　",
