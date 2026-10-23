@@ -74,7 +74,9 @@ Version families (§4.2)
 A family needs affirmative evidence, independent of page overlap: the same
 decided series and the same resolved primary number (or a human decision
 declaring the family), the same edition set and the same ComicInfo
-``LanguageISO`` (absent counts as a value for both), the same unrecognised
+``LanguageISO`` (absent counts as a value for both), the same
+special/collection marker from the formatter's ``SPECIAL_WORDS`` (an
+Omnibus #1 is not a version of issue #1), the same unrecognised
 name tags (a tag the vocabulary does not know may be an unsupported
 variant), no member with conflicting human decisions, and at least one
 version-marked member. Page content is never family evidence.
@@ -131,7 +133,7 @@ from comic_automation.database.read_guards import (
     ConsistentSnapshot,
     read_consistent_snapshot,
 )
-from scripts.cbz_canonical_name import EDITION_WORDS
+from scripts.cbz_canonical_name import EDITION_WORDS, SPECIAL_WORDS
 from scripts.cbz_routing import series_key
 
 
@@ -179,6 +181,10 @@ FAMILY_INCOMPARABLE = "incomparable"
 # ("Coloured") is not silently folded into one inside it -- it is left as
 # an unrecognised tag, which refuses a family rather than vanishing.
 EDITION_VOCABULARY: tuple[str, ...] = EDITION_WORDS
+# The formatter's special/collection slot (`SPECIAL_WORDS`), also
+# provisional under §8 question 4. A special marker is work identity: an
+# Omnibus #1 is not a version of issue #1, whatever Series and Number say.
+SPECIAL_VOCABULARY: tuple[str, ...] = SPECIAL_WORDS
 # The decensor markers. Members differing only by these are a decensor
 # pair, which §4.5 says is never a version.
 DECENSOR_EDITIONS = frozenset({"Uncensored", "Decensored"})
@@ -659,16 +665,23 @@ _VOLUME_WORD_RE = re.compile(
     rf"(?<![A-Za-z])vol(?:ume)?\.?\s*({_NUMBER_TEXT})", re.IGNORECASE
 )
 _V_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+)(?![A-Za-z0-9.])", re.IGNORECASE)
-_EDITION_RE = re.compile(
-    r"(?<![A-Za-z])("
-    + "|".join(
-        re.escape(word).replace(r"\ ", r"\s+")
-        for word in sorted(EDITION_VOCABULARY, key=len, reverse=True)
+def _word_alternation_re(words: Iterable[str]) -> re.Pattern[str]:
+    """Whole-word, case-insensitive match of any of ``words``, longest first."""
+    return re.compile(
+        r"(?<![A-Za-z])("
+        + "|".join(
+            re.escape(word).replace(r"\ ", r"\s+")
+            for word in sorted(words, key=len, reverse=True)
+        )
+        + r")(?![A-Za-z])",
+        re.IGNORECASE,
     )
-    + r")(?![A-Za-z])",
-    re.IGNORECASE,
-)
+
+
+_EDITION_RE = _word_alternation_re(EDITION_VOCABULARY)
 _EDITION_BY_FOLD = {word.casefold(): word for word in EDITION_VOCABULARY}
+_SPECIAL_RE = _word_alternation_re(SPECIAL_VOCABULARY)
+_SPECIAL_BY_FOLD = {word.casefold(): word for word in SPECIAL_VOCABULARY}
 _TAG_YEAR_RE = re.compile(r"\d{4}")
 _TAG_VERSION_RE = re.compile(r"v\d+", re.IGNORECASE)
 _SERIES_TRIM = " \t-_.,~"
@@ -676,6 +689,10 @@ _SERIES_TRIM = " \t-_.,~"
 
 def _fold(text: str) -> str:
     return " ".join(text.split()).casefold()
+
+
+def _spelling(text: str) -> str:
+    return " ".join(text.split())
 
 
 @dataclass(frozen=True)
@@ -686,15 +703,23 @@ class NameTokens:
     (volume or version) is open. ``version_markers`` are bracketed ``[vN]``
     tokens, which are never volumes. ``volume_words`` are ``Vol.``/
     ``Volume`` tokens. ``chapters`` and ``issues`` are ``ch.``/``#``
-    numbers. All numbers are in `normalize_number` form; ``spellings``
-    maps each normalized number back to the first spelling the name used.
+    numbers. All numbers are in `normalize_number` form.
 
-    ``editions`` are `EDITION_VOCABULARY` words, in canonical spelling.
+    Each number tuple has a parallel ``*_spellings`` tuple holding that
+    occurrence's own text (``1.00``, ``012.50``). Spelling travels with the
+    token, never with the value: a ``Vol. 1.00`` and a ``ch. 1.0`` in one
+    name compare equal and keep their own spellings.
+
+    ``editions`` are `EDITION_VOCABULARY` words and ``specials`` are
+    `SPECIAL_VOCABULARY` words (the formatter's special/collection slot),
+    both in canonical spelling. A special word is work identity, not series
+    text: ``Series Omnibus #001`` proposes series ``Series`` with special
+    ``Omnibus``, so a later ComicInfo ``Series`` cannot erase the marker.
     ``other_tags`` is everything else the name says that is not series,
-    number, year, version or edition: bracket contents (``[Judas]``,
-    ``(Digital)``) and leftover text after the numbering. It cannot tell a
-    scanlator tag from an unsupported variant, so a version family whose
-    members differ in it is refused rather than guessed (§4.2).
+    number, year, version, edition or special: bracket contents
+    (``[Judas]``, ``(Digital)``) and leftover text after the numbering. It
+    cannot tell a scanlator tag from an unsupported variant, so a version
+    family whose members differ in it is refused rather than guessed (§4.2).
     """
 
     filename: str
@@ -707,7 +732,11 @@ class NameTokens:
     years: tuple[str, ...]
     editions: frozenset[str]
     other_tags: frozenset[str] = frozenset()
-    spellings: tuple[tuple[str, str], ...] = ()
+    specials: frozenset[str] = frozenset()
+    chapter_spellings: tuple[str, ...] = ()
+    issue_spellings: tuple[str, ...] = ()
+    volume_word_spellings: tuple[str, ...] = ()
+    v_token_spellings: tuple[str, ...] = ()
 
     @property
     def primary_numbers(self) -> tuple[tuple[str, str], ...]:
@@ -717,8 +746,24 @@ class NameTokens:
         )
 
     @property
+    def primary_spellings(self) -> tuple[str, ...]:
+        """The spelling of each `primary_numbers` entry, in the same order."""
+        return (
+            (self.chapter_spellings or self.chapters)
+            + (self.issue_spellings or self.issues)
+        )
+
+    @property
     def volume_tokens(self) -> tuple[str, ...]:
         return self.volume_words + self.v_tokens
+
+    @property
+    def volume_spellings(self) -> tuple[str, ...]:
+        """The spelling of each `volume_tokens` entry, in the same order."""
+        return (
+            (self.volume_word_spellings or self.volume_words)
+            + (self.v_token_spellings or self.v_tokens)
+        )
 
     @property
     def version_marked(self) -> bool:
@@ -730,10 +775,6 @@ class NameTokens:
         caught later, when its classification sees volume evidence too.
         """
         return bool(self.v_tokens or self.version_markers)
-
-    def spelling(self, value: str) -> str:
-        """The name's own spelling of normalized number ``value``."""
-        return dict(self.spellings).get(value, value)
 
 
 def parse_name_tokens(filename: str) -> NameTokens:
@@ -761,10 +802,17 @@ def parse_name_tokens(filename: str) -> NameTokens:
         _EDITION_BY_FOLD[_fold(match.group(1))]
         for match in _EDITION_RE.finditer(stem)
     )
+    # Edition phrases are blanked first, so "Special Edition" is an edition
+    # and never also the special word "Special".
+    specials = frozenset(
+        _SPECIAL_BY_FOLD[_fold(match.group(1))]
+        for match in _SPECIAL_RE.finditer(_EDITION_RE.sub(" ", stem))
+    )
 
-    # Bracket contents that are not a year, a version marker or an edition
-    # word: scanlator tags, source tags, or a variant the vocabulary does
-    # not know. Kept, so a family can refuse members that differ in them.
+    # Bracket contents that are not a year, a version marker, an edition or
+    # a special word: scanlator tags, source tags, or a variant the
+    # vocabulary does not know. Kept, so a family can refuse members that
+    # differ in them.
     other_tags: set[str] = set()
     for match in _BRACKET_GROUP_RE.finditer(stem):
         content = _fold(match.group(0)[1:-1])
@@ -772,7 +820,7 @@ def parse_name_tokens(filename: str) -> NameTokens:
             continue
         if _TAG_VERSION_RE.fullmatch(content) and match.group(0)[0] == "[":
             continue
-        if content in _EDITION_BY_FOLD:
+        if content in _EDITION_BY_FOLD or content in _SPECIAL_BY_FOLD:
             continue
         other_tags.add(content)
 
@@ -782,15 +830,18 @@ def parse_name_tokens(filename: str) -> NameTokens:
     body = _BRACKET_GROUP_RE.sub(" ", stem)
 
     spans: list[tuple[int, int]] = []
-    spellings: dict[str, str] = {}
 
-    def numbers(regex: re.Pattern[str]) -> tuple[tuple[int, str], ...]:
+    def numbers(regex: re.Pattern[str]) -> tuple[tuple[int, str, str], ...]:
         found = []
         for match in regex.finditer(body):
-            value = normalize_number(match.group(1)) or ""
-            spellings.setdefault(value, " ".join(match.group(1).split()))
             spans.append(match.span())
-            found.append((match.start(), value))
+            found.append(
+                (
+                    match.start(),
+                    normalize_number(match.group(1)) or "",
+                    _spelling(match.group(1)),
+                )
+            )
         return tuple(found)
 
     chapters = numbers(_CHAPTER_RE)
@@ -799,18 +850,22 @@ def parse_name_tokens(filename: str) -> NameTokens:
     v_tokens = numbers(_V_TOKEN_RE)
     starts = [
         start
-        for start, _ in chapters + issues + volume_words + v_tokens
+        for start, _, _ in chapters + issues + volume_words + v_tokens
     ]
     prefix = body[: min(starts)] if starts else body
+    # The special slot follows the series in the canonical grammar; it is
+    # identity evidence of its own (`specials`), not part of the series.
+    prefix = _SPECIAL_RE.sub(" ", _EDITION_RE.sub(" ", prefix))
     series = " ".join(prefix.split()).strip(_SERIES_TRIM) or None
 
     # Text after the numbering that is neither a number token nor an
-    # edition word ("ch. 1 Colourised") could be a variant too.
+    # edition or special word ("ch. 1 Colourised") could be a variant too.
     if starts:
         rest = list(body)
         for start, end in spans:
             rest[start:end] = " " * (end - start)
         leftover = _EDITION_RE.sub(" ", "".join(rest)[min(starts):])
+        leftover = _SPECIAL_RE.sub(" ", leftover)
         leftover = " ".join(leftover.split()).strip(_SERIES_TRIM)
         if leftover:
             other_tags.add(_fold(leftover))
@@ -818,15 +873,19 @@ def parse_name_tokens(filename: str) -> NameTokens:
     return NameTokens(
         filename=filename,
         series=series,
-        chapters=tuple(value for _, value in chapters),
-        issues=tuple(value for _, value in issues),
-        volume_words=tuple(value for _, value in volume_words),
-        v_tokens=tuple(value for _, value in v_tokens),
+        chapters=tuple(value for _, value, _ in chapters),
+        issues=tuple(value for _, value, _ in issues),
+        volume_words=tuple(value for _, value, _ in volume_words),
+        v_tokens=tuple(value for _, value, _ in v_tokens),
         version_markers=version_markers,
         years=years,
         editions=editions,
         other_tags=frozenset(other_tags),
-        spellings=tuple(sorted(spellings.items())),
+        specials=specials,
+        chapter_spellings=tuple(raw for _, _, raw in chapters),
+        issue_spellings=tuple(raw for _, _, raw in issues),
+        volume_word_spellings=tuple(raw for _, _, raw in volume_words),
+        v_token_spellings=tuple(raw for _, _, raw in v_tokens),
     )
 
 
@@ -1018,6 +1077,7 @@ class FamilyMember:
     or None. ``other_tags`` are `NameTokens.other_tags`. ``human_conflicts``
     names every decision field (`FIELDS` and `DECISION_FAMILY`) on which this
     archive's human decisions disagree; any of them refuses the family.
+    ``specials`` are `NameTokens.specials`, the special/collection slot.
     """
 
     archive_key: str
@@ -1031,6 +1091,7 @@ class FamilyMember:
     language: str | None = None
     other_tags: frozenset[str] = frozenset()
     human_conflicts: frozenset[str] = frozenset()
+    specials: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1140,9 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
     * same edition set, absent counting as a value; a difference only in
       the decensor markers is a decensor pair, never a version (§4.5);
     * same language, absent counting as a value;
+    * the same special/collection marker (absent counting as a value), and
+      no member with more than one -- an Omnibus #1 and an ordinary #1
+      share series and number but are different works;
     * the same unrecognised tags: a tag the vocabulary does not know may be
       an unsupported variant, so a difference refuses rather than being
       read as absence;
@@ -1158,6 +1222,17 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
         reasons.append(
             "members have different languages "
             f"{sorted(language or 'absent' for language in languages)}"
+        )
+    special_sets = {member.specials for member in members}
+    if any(len(specials) > 1 for specials in special_sets):
+        reasons.append(
+            "a member carries more than one special/collection marker "
+            f"{sorted(sorted(s) for s in special_sets)} (unresolved)"
+        )
+    elif len(special_sets) > 1:
+        reasons.append(
+            "members have different special/collection markers "
+            f"{sorted(sorted(s) or ['absent'] for s in special_sets)}"
         )
     tag_sets = {member.other_tags for member in members}
     if len(tag_sets) > 1:
@@ -1665,7 +1740,9 @@ def resolve_folder(
                     SOURCE_FOLDER,
                     number_run.values[key],
                     "consistently numbered siblings",
-                    display=token.spelling(number_run.values[key]),
+                    # The run requires exactly one primary token, so this
+                    # is that token's own spelling.
+                    display=token.primary_spellings[0],
                 )
             )
         evidence += [
@@ -1673,9 +1750,11 @@ def resolve_folder(
                 SOURCE_FILENAME,
                 value,
                 f"filename {kind}",
-                display=token.spelling(value),
+                display=spelling,
             )
-            for kind, value in token.primary_numbers
+            for (kind, value), spelling in zip(
+                token.primary_numbers, token.primary_spellings
+            )
         ]
         number[key] = _resolve(FIELD_NUMBER, evidence)
 
@@ -1758,6 +1837,7 @@ def resolve_folder(
                     ),
                     other_tags=tokens[m.archive_key].other_tags,
                     human_conflicts=conflicts[m.archive_key],
+                    specials=tokens[m.archive_key].specials,
                 )
                 for m in members
             ]
@@ -1813,15 +1893,23 @@ def resolve_folder(
                     SOURCE_FOLDER,
                     volume_run.values[key],
                     "volume run of different books",
-                    display=token.spelling(volume_run.values[key]),
+                    # Exactly one volume token, so this is its spelling.
+                    display=token.volume_spellings[0],
                 )
             )
         evidence += [
-            Evidence(SOURCE_FILENAME, value, "filename Vol.")
-            for value in token.volume_words
+            Evidence(SOURCE_FILENAME, value, "filename Vol.", display=spelling)
+            for value, spelling in zip(
+                token.volume_words, token.volume_word_spellings
+            )
         ] + [
-            Evidence(SOURCE_FILENAME, value, "filename v<N> (volume or version)")
-            for value in token.v_tokens
+            Evidence(
+                SOURCE_FILENAME,
+                value,
+                "filename v<N> (volume or version)",
+                display=spelling,
+            )
+            for value, spelling in zip(token.v_tokens, token.v_token_spellings)
         ]
         volume = _resolve(FIELD_VOLUME, evidence)
 
