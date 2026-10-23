@@ -657,6 +657,99 @@ def test_deep_comicinfo_is_refused_without_stopping_the_folder(tmp_path, databas
     assert _family(result, folder, "Series ch. 2 v1.cbz").status == sv.FAMILY_SUPERSESSION
 
 
+_HUGE_INDEX = b"9" * 5000
+_PAGE0 = _with(b'<Pages><Page Image="0" Bookmark="Important"/></Pages>')
+_HUGE = _with(b'<Pages><Page Image="' + _HUGE_INDEX + b'" Bookmark="Value"/></Pages>')
+
+
+@pytest.mark.parametrize(
+    "older, keeper, shape",
+    [
+        (_HUGE, _PAGE0, "Pages/Page[Image='999999999999...'] (invalid Image index)"),
+        (_PAGE0, _HUGE, "keeper Pages/Page[Image='999999999999...'] (invalid Image index)"),
+        (_with(b'<Pages><Page Image="1234567" Bookmark="a"/></Pages>'), _PAGE0,
+         "Pages/Page[Image='1234567'] (invalid Image index)"),
+    ],
+    ids=["oversized-older", "oversized-keeper", "seven-digits"],
+)
+def test_an_oversized_image_index_is_refused_without_stopping_the_folder(
+    tmp_path, database, older, keeper, shape
+):
+    """PR #123 round 4: a 5000-digit Image passed the old pattern and then
+    hit Python's int-string limit, stopping the folder. The index is bounded
+    to six digits before conversion; longer is an unsupported shape, and an
+    unrelated family in the same folder still supersedes."""
+    folder = tmp_path / "huge" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": older})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": keeper})
+    _book(folder, "Series ch. 2 v1.cbz", [P3])
+    _book(folder, "Series ch. 2 v2.cbz", [P3, P4])
+
+    result = _evaluate(folder, database, accept_comicinfo_drop=True)
+    family = _family(result, folder, "Series ch. 1 v1.cbz")
+    (relation,) = family.relations
+    assert family.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert "unsupported ComicInfo shape:" in relation.reason
+    assert shape in relation.reason
+    assert _family(result, folder, "Series ch. 2 v1.cbz").status == sv.FAMILY_SUPERSESSION
+
+
+def test_a_six_digit_image_index_is_supported(tmp_path, database):
+    """Control at the bound: six digits (999999) still match and cover."""
+    older = _with(b'<Pages><Page Image="999999" Bookmark="Important"/></Pages>')
+    keeper = _with(b'<Pages><Page Image="999999" Bookmark="Replacement"/></Pages>')
+    family = _drop_family(tmp_path, database, "six", older, keeper)
+    assert family.status == sv.FAMILY_SUPERSESSION
+
+
+_NS = b'xmlns:x="urn:unrelated"'
+
+
+@pytest.mark.parametrize(
+    "older, keeper, expected",
+    [
+        # Codex round 3: the keeper's only Bookmark is in a foreign namespace.
+        (_PAGE0, _with(b'<Pages><Page ' + _NS + b' Image="0" x:Bookmark="Replacement"/></Pages>'),
+         "keeper Pages/Page[Image='0'] (namespaced attributes ['{urn:unrelated}Bookmark'])"),
+        (_with(b'<Pages><Page ' + _NS + b' Image="0" x:Bookmark="Important"/></Pages>'),
+         _PAGE0, "Pages/Page[Image='0'] (namespaced attributes ['{urn:unrelated}Bookmark'])"),
+        (_with(b'<x:Pages ' + _NS + b'><Page Image="0" Bookmark="a"/></x:Pages>'), _PAGE0,
+         "{urn:unrelated}Pages (namespaced element)"),
+        (_with(b'<Pages><x:Page ' + _NS + b' Image="0" Bookmark="a"/></Pages>'), _PAGE0,
+         "Pages/{urn:unrelated}Page (not a Page)"),
+        (_with(b'<x:Writer ' + _NS + b'>W</x:Writer>'), _ci(notes="k"),
+         "{urn:unrelated}Writer (namespaced element)"),
+    ],
+    ids=["keeper-foreign-attribute", "older-foreign-attribute", "namespaced-pages",
+         "namespaced-page", "namespaced-simple-field"],
+)
+def test_namespaced_names_never_match_comicinfo_fields(
+    tmp_path, database, older, keeper, expected
+):
+    """PR #123 round 4: names are compared raw; ``x:Bookmark`` is not
+    ``Bookmark``, and a namespaced element is not the ComicInfo field."""
+    family = _drop_family(tmp_path, database, "ns", older, keeper)
+    (relation,) = family.relations
+    assert family.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert expected in relation.reason
+
+
+def test_a_namespaced_keeper_field_does_not_cover_and_plain_ones_do(tmp_path, database):
+    """A keeper Writer in a foreign namespace is no cover; the ordinary
+    unqualified Bookmark control still supersedes."""
+    older = _with(b"<Writer>W</Writer>")
+    keeper = _with(b'<x:Writer ' + _NS + b'>W</x:Writer>')
+    family = _drop_family(tmp_path, database, "ns-keeper", older, keeper)
+    assert family.status == sv.FAMILY_REVIEW
+    assert "does not cover ['Writer']" in family.relations[0].reason
+
+    keeper = _with(b'<Pages><Page Image="0" Bookmark="Replacement"/></Pages>')
+    family = _drop_family(tmp_path, database, "plain", _PAGE0, keeper)
+    assert family.status == sv.FAMILY_SUPERSESSION
+
+
 def test_simple_fields_with_other_values_still_cover(tmp_path, database):
     """Control: simple elements are covered by non-blank text, whatever the
     value; a blank simple element in A needs no cover."""
