@@ -262,6 +262,7 @@ _NON_LATIN_RE = re.compile(
 _CJK_ANY_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 _NUM_TOKEN_RE = re.compile(
     r'''
+    (?<![^\W\d_])
     (
         (?:
             ch(?:ap(?:ter)?)?p?
@@ -282,7 +283,7 @@ _DIR_TRAILING_STUB_RE = re.compile(
     r'[\s_\-]+(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
 )
 _CHAPTER_NUMBER_RE = re.compile(
-    r'(?:'
+    r'(?<![^\W\d_])(?:'
     r'ch(?:ap(?:ter)?)?p?\.?\s*(\d[\d.]*)'
     r'|issue\s*(\d[\d.]*)'
     r'|ep(?:isode)?\.?\s*(\d[\d.]*)'
@@ -291,14 +292,14 @@ _CHAPTER_NUMBER_RE = re.compile(
     re.IGNORECASE
 )
 _VOLUME_NUMBER_RE = re.compile(
-    r'(?:'
+    r'(?<![^\W\d_])(?:'
     r'vol(?:ume)?\.?\s*(\d[\d.]*)'
     r'|v(\d[\d.]*)(?=\s|ch|ep|$)'
     r')',
     re.IGNORECASE
 )
 _CHAPTER_TOKEN_RE = re.compile(
-    r'(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)', re.IGNORECASE
+    r'(?<![^\W\d_])(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)', re.IGNORECASE
 )
 
 
