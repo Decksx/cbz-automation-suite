@@ -565,9 +565,19 @@ code takes. They are open to review.
    `edited_template`. A missing, malformed or contradictory document (for
    example two differing ComicInfo members) does not qualify, and nor does
    the bare injected template. Otherwise the relation goes to review as
-   before. An accepted drop is listed in the relation. How many fields the
-   replacement must cover is still a design decision; an empty
-   `<ComicInfo/>` is well-formed and currently qualifies.
+   before. An accepted drop is listed in the relation.
+
+   **Field coverage, decided by David on #111:** "more accurate or more
+   comprehensive metadata can absolutely replace old metadata", applied
+   mechanically by field coverage, otherwise review. So B's usable
+   ComicInfo must also cover A's:
+   - every element non-empty in A's document must be non-empty in B's;
+   - free text such as Notes and Summary counts by presence;
+   - values may differ, because B's may be the more accurate.
+
+   An empty `<ComicInfo/>` therefore never replaces a filled one. If A's
+   ComicInfo is itself unusable (malformed or inconsistent), it has no
+   fields to cover, and a usable B may replace it.
 4. **Payload identity.** The non-image payload is compared by exact raw
    member name and sha256, as a multiset. A credits file moved into a
    subfolder therefore blocks supersession.
