@@ -888,6 +888,16 @@ def comicinfo_drop_refusal(older: DerivedArchive, newer: DerivedArchive) -> str 
             "be inventoried"
         )
     keeper = ElementTree.fromstring(newer.comicinfo_documents[0])
+    # The raw root tag must be exactly the unqualified ``ComicInfo`` on both
+    # sides (PR #123 round 5). Step 4 reads the root by local name, so a
+    # ``{uri}ComicInfo`` -- a prefixed root, or a default namespace whose
+    # children reset it with ``xmlns=""`` -- would otherwise pass as
+    # ComicInfo here. No namespace support is attempted: it is refused.
+    roots = [f"root {root.tag}" for root in older_roots if root.tag != "ComicInfo"]
+    if keeper.tag != "ComicInfo":
+        roots.append(f"keeper root {keeper.tag}")
+    if roots:
+        return f"unsupported ComicInfo shape: {', '.join(roots)}"
     unsupported, gaps = _coverage(older_roots, keeper)
     if unsupported:
         return f"unsupported ComicInfo shape: {', '.join(unsupported)}"
