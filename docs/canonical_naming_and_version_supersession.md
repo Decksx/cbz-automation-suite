@@ -567,17 +567,32 @@ code takes. They are open to review.
    the bare injected template. Otherwise the relation goes to review as
    before. An accepted drop is listed in the relation.
 
-   **Field coverage, decided by David on #111:** "more accurate or more
-   comprehensive metadata can absolutely replace old metadata", applied
-   mechanically by field coverage, otherwise review. So B's usable
-   ComicInfo must also cover A's:
-   - every element non-empty in A's document must be non-empty in B's;
-   - free text such as Notes and Summary counts by presence;
-   - values may differ, because B's may be the more accurate.
+   **Field coverage.** David's permission is recorded on #111: "more
+   accurate or more comprehensive metadata may replace old metadata". The
+   same record keeps that permission separate from a *proposed mechanical
+   rule*, and says accuracy is not judged automatically. Step 5 implements
+   that rule as the reviewed mechanism behind the explicit drop flag. It is
+   not itself David's decision, and presence alone does not establish
+   accuracy.
 
-   An empty `<ComicInfo/>` therefore never replaces a filled one. If A's
-   ComicInfo is itself unusable (malformed or inconsistent), it has no
-   fields to cover, and a usable B may replace it.
+   Under the rule, B's usable ComicInfo must also cover A's:
+   - Every element populated in A's document must be populated in B's.
+     Populated means non-whitespace text, any attribute, or any populated
+     descendant. Free text such as Notes and Summary counts by presence.
+   - **`Pages`:** every `Page` that A populates must appear in B with the
+     same `Image` index and at least the same attribute names. A `Page`
+     with no index, a duplicated index, or nested content cannot be
+     matched confidently, so it goes to review.
+   - **Other structured elements:** B must carry A's populated shape
+     (child paths and attribute names).
+   - Values may differ.
+
+   An empty `<ComicInfo/>` therefore never replaces a filled one.
+
+   **When A's ComicInfo is inconsistent but well-formed**, it is still
+   inventoried from its XML, including a field that holds contradictory
+   values: inconsistency is not emptiness. **When A's ComicInfo does not
+   parse**, it cannot be inventoried, so the drop goes to review.
 4. **Payload identity.** The non-image payload is compared by exact raw
    member name and sha256, as a multiset. A credits file moved into a
    subfolder therefore blocks supersession.
@@ -618,8 +633,9 @@ code takes. They are open to review.
       in-memory buffer.
     - **Larger archives** are copied into a private temp file, and the hash
       is taken over the copy stream. Everything is then derived from the
-      copy alone. The copy and its fresh `mkdtemp` directory are deleted
-      afterwards.
+      copy alone. Afterwards the copy and its fresh `mkdtemp` directory are
+      removed, best-effort. A leftover is logged at warning level with its
+      path; removal is not guaranteed.
     - **Writes.** The copy path writes temp files under `temp_dir` (default
       the system temp directory), never a library file.
     - **Failure.** If the copy cannot be made (no space, an I/O error, or
