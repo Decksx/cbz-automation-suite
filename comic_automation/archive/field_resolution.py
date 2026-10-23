@@ -727,7 +727,10 @@ class NameTokens:
     ComicInfo ``Series`` cannot erase the marker), while ``Extra Life ch.
     1``, ``The Special Ones #003`` and ``Extra ch. 1`` are series text whole.
     Whether a slot word is really the end of the series title is decided
-    against the decided series (`effective_specials`).
+    against the decided series (`effective_specials`), using
+    ``slot_prefix``: the whole pre-number prefix, series candidate *and*
+    slot word, exactly as the name spelled it. It is set only when a slot
+    special was recognised.
     ``other_tags`` is everything else the name says that is not series,
     number, year, version, edition or special: bracket contents
     (``[Judas]``, ``(Digital)``) and leftover text after the numbering. It
@@ -746,6 +749,7 @@ class NameTokens:
     editions: frozenset[str]
     other_tags: frozenset[str] = frozenset()
     specials: frozenset[str] = frozenset()
+    slot_prefix: str | None = None
     chapter_spellings: tuple[str, ...] = ()
     issue_spellings: tuple[str, ...] = ()
     volume_word_spellings: tuple[str, ...] = ()
@@ -864,9 +868,11 @@ def parse_name_tokens(filename: str) -> NameTokens:
     # else in the prefix is series text ("Extra Life", "The Special Ones").
     prefix = " ".join(_EDITION_RE.sub(" ", prefix).split())
     specials: frozenset[str] = frozenset()
+    slot_prefix: str | None = None
     slot = _SPECIAL_SLOT_RE.match(prefix)
     if slot is not None:
         specials = frozenset({_SPECIAL_BY_FOLD[_fold(slot.group(2))]})
+        slot_prefix = prefix.strip(_SERIES_TRIM)
         prefix = slot.group("series")
     series = prefix.strip(_SERIES_TRIM) or None
 
@@ -894,6 +900,7 @@ def parse_name_tokens(filename: str) -> NameTokens:
         editions=editions,
         other_tags=frozenset(other_tags),
         specials=specials,
+        slot_prefix=slot_prefix,
         chapter_spellings=tuple(raw for _, _, raw in chapters),
         issue_spellings=tuple(raw for _, _, raw in issues),
         volume_word_spellings=tuple(raw for _, _, raw in volume_words),
@@ -1486,28 +1493,31 @@ def _human_evidence(
 
 
 def effective_specials(
-    specials: frozenset[str], decided_series: str | None
+    tokens: NameTokens, decided_series: str | None
 ) -> frozenset[str]:
     """The special markers that remain once the decided series is known.
 
-    A slot word is series text, not a marker, when the decided series (from
-    a human decision, ComicInfo or the folder) itself ends with that word:
-    ``Super Special #001`` in the series "Super Special" is issue #1 of that
-    series, not a Special. Otherwise the marker stands, including when the
-    series is unresolved -- the marker is then kept, never dropped.
+    A slot word is series text, not a marker, only when *this occurrence*
+    is accounted for by the decided series (human decision, ComicInfo or
+    folder): the name's whole pre-number prefix, series candidate plus slot
+    word (``NameTokens.slot_prefix``), equals the decided series under
+    `series_key`. ``Super Special #001`` in the series "Super Special" is
+    issue #1 of that series. ``Super Special Special #001`` is not: its
+    prefix is the full title *plus* another Special, so that occurrence is a
+    marker even though the title also ends in the word. A suffix match
+    alone cannot tell those apart.
+
+    In every other case the marker stands -- an unresolved series, or a
+    prefix that matches neither reading -- so a doubtful
+    occurrence is kept for review, never dropped.
     """
-    if not decided_series:
-        return specials
-    return frozenset(
-        word
-        for word in specials
-        if not re.search(
-            r"(?<![A-Za-z])" + re.escape(word).replace(r"\ ", r"\s+")
-            + r"[\s\-_.,~]*$",
-            decided_series,
-            re.IGNORECASE,
-        )
-    )
+    if not tokens.specials or not decided_series or tokens.slot_prefix is None:
+        return tokens.specials
+    # The slot prefix always holds the special word, which series_key keeps,
+    # so its key is never empty and cannot match an empty decided key.
+    if series_key(tokens.slot_prefix) == series_key(decided_series):
+        return frozenset()
+    return tokens.specials
 
 
 def _human_conflicts(decisions: Sequence[HumanDecision]) -> frozenset[str]:
@@ -1875,7 +1885,7 @@ def resolve_folder(
                     other_tags=tokens[m.archive_key].other_tags,
                     human_conflicts=conflicts[m.archive_key],
                     specials=effective_specials(
-                        tokens[m.archive_key].specials,
+                        tokens[m.archive_key],
                         series[m.archive_key].value,
                     ),
                 )
