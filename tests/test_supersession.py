@@ -446,6 +446,65 @@ def test_dropping_comicinfo_needs_the_operator_flag(tmp_path, database):
 
 
 @pytest.mark.parametrize(
+    "keeper_comicinfo, accepted, missing",
+    [
+        (b"<ComicInfo/>", False, ["Notes", "Number", "Series"]),
+        (_ci(), False, ["Notes"]),
+        (b"<ComicInfo><Series>Series</Series><Number>001</Number>"
+         b"<Notes>better notes</Notes><Writer>W</Writer></ComicInfo>", True, []),
+    ],
+    ids=["empty-keeper", "keeper-missing-notes", "superset-different-values"],
+)
+def test_a_comicinfo_drop_needs_the_keeper_to_cover_every_field(
+    tmp_path, database, keeper_comicinfo, accepted, missing
+):
+    """David's #111 decision: more comprehensive metadata may replace old,
+    mechanically by field coverage, otherwise review.
+
+    Every element non-empty in A's ComicInfo (free text included, by
+    presence) must be non-empty in B's; values may differ. Codex's
+    ``empty_metadata`` probe is the first case.
+    """
+    folder = tmp_path / "coverage" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1],
+          {"ComicInfo.xml": _ci(notes="unique original notes")})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": keeper_comicinfo})
+
+    family = _family(
+        _evaluate(folder, database, accept_comicinfo_drop=True), folder,
+        "Series ch. 1 v1.cbz",
+    )
+    (relation,) = family.relations
+    if accepted:
+        assert family.status == sv.FAMILY_SUPERSESSION
+        assert [m.name for m in relation.accepted_comicinfo_drops] == ["ComicInfo.xml"]
+        return
+    assert family.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert [m.name for m in relation.unique_non_image] == ["ComicInfo.xml"]
+    assert f"does not cover {missing}" in relation.reason
+
+
+def test_an_unusable_older_comicinfo_may_be_dropped_for_a_usable_keeper(
+    tmp_path, database
+):
+    """A's ComicInfo is malformed: it has no fields to cover, so a usable
+    keeper ComicInfo discharges it under the flag (and not without it)."""
+    folder = tmp_path / "older-broken" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": b"<ComicInfo><broken"})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": _ci()})
+
+    family = _family(
+        _evaluate(folder, database, accept_comicinfo_drop=True), folder,
+        "Series ch. 1 v1.cbz",
+    )
+    assert family.status == sv.FAMILY_SUPERSESSION
+    assert [m.name for m in family.relations[0].accepted_comicinfo_drops] == ["ComicInfo.xml"]
+    family = _family(_evaluate(folder, database), folder, "Series ch. 1 v1.cbz")
+    assert family.status == sv.FAMILY_REVIEW
+
+
+@pytest.mark.parametrize(
     "keeper_members",
     [
         {"ComicInfo.xml": b"not XML"},
