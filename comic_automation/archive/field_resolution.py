@@ -681,6 +681,15 @@ def _word_alternation_re(words: Iterable[str]) -> re.Pattern[str]:
 _EDITION_RE = _word_alternation_re(EDITION_VOCABULARY)
 _EDITION_BY_FOLD = {word.casefold(): word for word in EDITION_VOCABULARY}
 _SPECIAL_RE = _word_alternation_re(SPECIAL_VOCABULARY)
+# The special slot: a special word that ends the pre-number prefix, with
+# non-empty series text before it (#118's grammar puts the special
+# immediately after the series and before the numbering).
+_SPECIAL_SLOT_RE = re.compile(
+    r"^(?P<series>.*?[^\s\-_.,~].*?)[\s\-_.,~]+"
+    + _SPECIAL_RE.pattern
+    + r"[\s\-_.,~]*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _SPECIAL_BY_FOLD = {word.casefold(): word for word in SPECIAL_VOCABULARY}
 _TAG_YEAR_RE = re.compile(r"\d{4}")
 _TAG_VERSION_RE = re.compile(r"v\d+", re.IGNORECASE)
@@ -711,10 +720,14 @@ class NameTokens:
     name compare equal and keep their own spellings.
 
     ``editions`` are `EDITION_VOCABULARY` words and ``specials`` are
-    `SPECIAL_VOCABULARY` words (the formatter's special/collection slot),
-    both in canonical spelling. A special word is work identity, not series
-    text: ``Series Omnibus #001`` proposes series ``Series`` with special
-    ``Omnibus``, so a later ComicInfo ``Series`` cannot erase the marker.
+    `SPECIAL_VOCABULARY` words, both in canonical spelling. A special is
+    recognised only in #118's special slot: the last word or phrase of the
+    pre-number prefix, with series text before it. So ``Series Omnibus
+    #001`` proposes series ``Series`` with special ``Omnibus`` (and a later
+    ComicInfo ``Series`` cannot erase the marker), while ``Extra Life ch.
+    1``, ``The Special Ones #003`` and ``Extra ch. 1`` are series text whole.
+    Whether a slot word is really the end of the series title is decided
+    against the decided series (`effective_specials`).
     ``other_tags`` is everything else the name says that is not series,
     number, year, version, edition or special: bracket contents
     (``[Judas]``, ``(Digital)``) and leftover text after the numbering. It
@@ -802,13 +815,6 @@ def parse_name_tokens(filename: str) -> NameTokens:
         _EDITION_BY_FOLD[_fold(match.group(1))]
         for match in _EDITION_RE.finditer(stem)
     )
-    # Edition phrases are blanked first, so "Special Edition" is an edition
-    # and never also the special word "Special".
-    specials = frozenset(
-        _SPECIAL_BY_FOLD[_fold(match.group(1))]
-        for match in _SPECIAL_RE.finditer(_EDITION_RE.sub(" ", stem))
-    )
-
     # Bracket contents that are not a year, a version marker, an edition or
     # a special word: scanlator tags, source tags, or a variant the
     # vocabulary does not know. Kept, so a family can refuse members that
@@ -820,7 +826,7 @@ def parse_name_tokens(filename: str) -> NameTokens:
             continue
         if _TAG_VERSION_RE.fullmatch(content) and match.group(0)[0] == "[":
             continue
-        if content in _EDITION_BY_FOLD or content in _SPECIAL_BY_FOLD:
+        if content in _EDITION_BY_FOLD:
             continue
         other_tags.add(content)
 
@@ -853,19 +859,25 @@ def parse_name_tokens(filename: str) -> NameTokens:
         for start, _, _ in chapters + issues + volume_words + v_tokens
     ]
     prefix = body[: min(starts)] if starts else body
-    # The special slot follows the series in the canonical grammar; it is
-    # identity evidence of its own (`specials`), not part of the series.
-    prefix = _SPECIAL_RE.sub(" ", _EDITION_RE.sub(" ", prefix))
-    series = " ".join(prefix.split()).strip(_SERIES_TRIM) or None
+    # Edition phrases are blanked first, so "Special Edition" is an edition
+    # and never also the special word "Special". A special word anywhere
+    # else in the prefix is series text ("Extra Life", "The Special Ones").
+    prefix = " ".join(_EDITION_RE.sub(" ", prefix).split())
+    specials: frozenset[str] = frozenset()
+    slot = _SPECIAL_SLOT_RE.match(prefix)
+    if slot is not None:
+        specials = frozenset({_SPECIAL_BY_FOLD[_fold(slot.group(2))]})
+        prefix = slot.group("series")
+    series = prefix.strip(_SERIES_TRIM) or None
 
     # Text after the numbering that is neither a number token nor an
-    # edition or special word ("ch. 1 Colourised") could be a variant too.
+    # edition word ("ch. 1 Colourised", or a special word out of its slot)
+    # could be a variant too.
     if starts:
         rest = list(body)
         for start, end in spans:
             rest[start:end] = " " * (end - start)
         leftover = _EDITION_RE.sub(" ", "".join(rest)[min(starts):])
-        leftover = _SPECIAL_RE.sub(" ", leftover)
         leftover = " ".join(leftover.split()).strip(_SERIES_TRIM)
         if leftover:
             other_tags.add(_fold(leftover))
@@ -1473,6 +1485,31 @@ def _human_evidence(
     return found
 
 
+def effective_specials(
+    specials: frozenset[str], decided_series: str | None
+) -> frozenset[str]:
+    """The special markers that remain once the decided series is known.
+
+    A slot word is series text, not a marker, when the decided series (from
+    a human decision, ComicInfo or the folder) itself ends with that word:
+    ``Super Special #001`` in the series "Super Special" is issue #1 of that
+    series, not a Special. Otherwise the marker stands, including when the
+    series is unresolved -- the marker is then kept, never dropped.
+    """
+    if not decided_series:
+        return specials
+    return frozenset(
+        word
+        for word in specials
+        if not re.search(
+            r"(?<![A-Za-z])" + re.escape(word).replace(r"\ ", r"\s+")
+            + r"[\s\-_.,~]*$",
+            decided_series,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _human_conflicts(decisions: Sequence[HumanDecision]) -> frozenset[str]:
     """Every decision field on which ``decisions`` disagree.
 
@@ -1837,7 +1874,10 @@ def resolve_folder(
                     ),
                     other_tags=tokens[m.archive_key].other_tags,
                     human_conflicts=conflicts[m.archive_key],
-                    specials=tokens[m.archive_key].specials,
+                    specials=effective_specials(
+                        tokens[m.archive_key].specials,
+                        series[m.archive_key].value,
+                    ),
                 )
                 for m in members
             ]
