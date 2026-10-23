@@ -23,7 +23,9 @@ implementation                   read-only guard  busy_timeout  isolation_level
 (The table is the state when this module was written. `read_guards.py` has
 since been migrated onto `open_connection`; its "absent" busy_timeout was
 never absent in effect, because ``timeout=30.0`` installs the same 30000 ms
-handler.)
+handler. `perceptual_reuse_analysis.py` has been migrated too, keeping its
+60 s wait as a caller-side `ConnectionPolicy` rather than a third policy
+here.)
 
 Two of those differences are not cosmetic. A "read-only" connection without
 ``PRAGMA query_only`` is only read-only by convention. And a connection left
@@ -932,14 +934,11 @@ SANCTIONED_CONNECT_SITES: dict[str, SanctionedSite] = {
             "operational database, so the read/write policy does not apply."
         ),
     ),
-    "comic_automation/archive/perceptual_reuse_analysis.py": SanctionedSite(
-        calls=1,
-        reason=(
-            "A fourth read-only implementation with its own 60s timeout. "
-            "Known drift; consolidating it changes behaviour and is out of "
-            "scope for this PR."
-        ),
-    ),
+    # `comic_automation/archive/perceptual_reuse_analysis.py` was listed
+    # here (1 call) until Step 5 migrated `connect_read_only` onto
+    # `open_connection(readonly=True, policy=REUSE_ANALYSIS_READ_ONLY_POLICY)`.
+    # It is absent on purpose: a raw connect returning there is now an
+    # unsanctioned bypass.
     "scripts/db.py": SanctionedSite(
         calls=2,
         reason=(
