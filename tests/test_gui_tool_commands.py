@@ -228,6 +228,45 @@ def test_watcher_ai_decensor_option_builds_ordered_cli_flags():
     ]
 
 
+def test_watcher_resolver_builds_z_library_cli_flags():
+    """The GUI's canonical resolver settings must reach the watcher unchanged."""
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "series_resolver": _OptionValue(True),
+        "resolver_comix_root": _OptionValue(r"Z:\comics\Comix"),
+        "resolver_manga_root": _OptionValue(r"Z:\comics\Manga"),
+        "resolver_quarantine_root": _OptionValue(
+            r"Z:\comics\_resolver_quarantine"
+        ),
+        "resolver_threshold": _OptionValue("0.95"),
+        "resolver_refresh": _OptionValue(True),
+        "resolver_normalize_apostrophes": _OptionValue(True),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert command[-11:] == [
+        "--series-resolver",
+        "--resolver-comix-root", r"Z:\comics\Comix",
+        "--resolver-manga-root", r"Z:\comics\Manga",
+        "--resolver-quarantine-root", r"Z:\comics\_resolver_quarantine",
+        "--resolver-threshold", "0.95",
+        "--resolver-refresh",
+        "--resolver-normalize-apostrophes",
+    ]
+
+
+def test_watcher_gui_enables_z_resolver_by_default() -> None:
+    watcher = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+    options = {option["key"]: option for option in watcher["options"]}
+
+    assert options["series_resolver"]["default"] is True
+    assert options["resolver_comix_root"]["default"] == r"Z:\comics\Comix"
+    assert options["resolver_manga_root"]["default"] == r"Z:\comics\Manga"
+    assert options["resolver_normalize_apostrophes"]["default"] is False
+
+
 def test_watcher_gui_can_append_mosaic_as_fourth_stage():
     launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
     launcher._option_vars = {
@@ -313,4 +352,3 @@ def test_reprocess_gui_options_reach_both_decensor_tools():
         "ai_decensor_reprocess": _OptionValue(True),
     }
     assert "--ai-decensor-reprocess" in launcher._build_command(watcher)
-

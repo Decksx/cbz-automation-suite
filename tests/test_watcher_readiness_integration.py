@@ -439,6 +439,23 @@ def test_startup_discovery_processes_ready_directory(
     process_mock.assert_called_once_with(comic_dir)
 
 
+def test_startup_discovery_ignores_syncthing_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watch_root = tmp_path / "incoming"
+    history_dir = watch_root / ".STVersions"
+    _make_cbz(history_dir / "old.cbz")
+    process_mock = Mock()
+    monkeypatch.setattr(watcher, "_process_directory_when_ready", process_mock)
+
+    watcher._discover_startup_directories(
+        watch_root,
+        DirectorySettleTracker(),
+    )
+
+    process_mock.assert_not_called()
+
+
 # --- no filesystem mutation before readiness passes -------------------------------------------------
 
 

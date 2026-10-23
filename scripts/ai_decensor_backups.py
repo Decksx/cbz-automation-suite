@@ -78,6 +78,29 @@ def comicinfo_series(source: Path) -> str:
         return safe_series_name(values[0])
 
 
+def backup_series(source: Path, fallback_series: str | None = None) -> str:
+    """Return embedded series metadata or an explicitly supplied safe fallback.
+
+    Camelia can legitimately process older CBZs that do not contain
+    ComicInfo.xml.  Their rollback copies still need to leave the local drive,
+    but the migration must not silently guess a series name.  Callers may opt
+    into a known library-folder name (or ``_Unclassified``) for only the two
+    missing-metadata cases; malformed or suspicious ComicInfo remains an
+    error.
+    """
+    try:
+        return comicinfo_series(source)
+    except ValueError as exc:
+        message = str(exc)
+        missing_metadata = (
+            message.startswith("Expected one ComicInfo.xml")
+            or message.startswith("Expected one nonempty ComicInfo Series")
+        )
+        if fallback_series and missing_metadata:
+            return safe_series_name(fallback_series)
+        raise
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(_fs(path), "rb") as stream:
@@ -189,7 +212,8 @@ def legacy_backups(source_root: Path) -> list[Path]:
 
 
 def migrate_existing(
-    source_root: Path, destination_root: Path, *, apply: bool = False, limit: int | None = None
+    source_root: Path, destination_root: Path, *, apply: bool = False,
+    limit: int | None = None, fallback_series: str | None = None,
 ) -> tuple[int, int]:
     files = legacy_backups(source_root)
     if limit is not None:
@@ -206,7 +230,7 @@ def migrate_existing(
     moved = failed = 0
     for index, source in enumerate(files, start=1):
         try:
-            series = comicinfo_series(source)
+            series = backup_series(source, fallback_series)
             destination = destination_root / series / source.name
             if apply:
                 destination = archive_backup(source, destination_root, series)
@@ -221,7 +245,10 @@ def migrate_existing(
     return (moved if apply else len(files) - failed), failed
 
 
-def offload_one(source: Path, source_root: Path, destination_root: Path) -> Path:
+def offload_one(
+    source: Path, source_root: Path, destination_root: Path,
+    fallback_series: str | None = None,
+) -> Path:
     """Offload one known Camelia rollback copy; never accept an arbitrary file."""
     if source.is_symlink() or source.parent.is_symlink() or source_root.is_symlink():
         raise ValueError("Symbolic links are not valid Camelia backup paths")
@@ -233,7 +260,7 @@ def offload_one(source: Path, source_root: Path, destination_root: Path) -> Path
         uuid.UUID(candidate.parent.name)
     except ValueError as exc:
         raise ValueError(f"Backup directory is not a Camelia job UUID: {source}") from exc
-    return archive_backup(candidate, destination_root, comicinfo_series(candidate))
+    return archive_backup(candidate, destination_root, backup_series(candidate, fallback_series))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -246,17 +273,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="Actually migrate; the default is preview only")
     parser.add_argument("--limit", type=int, help="Process only the first N backups (useful for a small trial)")
     parser.add_argument("--source-file", type=Path, help="Offload only this verified Camelia job backup")
+    parser.add_argument(
+        "--fallback-series",
+        help="Series folder used only when ComicInfo.xml or its Series value is missing",
+    )
     args = parser.parse_args(argv)
     if args.source_file is not None:
         if not args.apply:
             parser.error("--source-file requires --apply")
         try:
-            destination = offload_one(args.source_file, args.source_root, args.destination_root)
+            destination = offload_one(
+                args.source_file, args.source_root, args.destination_root, args.fallback_series,
+            )
         except (OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
             parser.exit(1, f"Backup offload refused: {type(exc).__name__}: {exc}\n")
         print(f"MOVED {args.source_file} -> {destination}", flush=True)
         return 0
-    _, failed = migrate_existing(args.source_root, args.destination_root, apply=args.apply, limit=args.limit)
+    _, failed = migrate_existing(
+        args.source_root, args.destination_root, apply=args.apply, limit=args.limit,
+        fallback_series=args.fallback_series,
+    )
     return 1 if failed else 0
 
 

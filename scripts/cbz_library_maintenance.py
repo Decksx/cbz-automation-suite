@@ -44,6 +44,10 @@ from pathlib import Path
 
 from comic_automation.archive.archive_limits import validate_archive_members
 from comic_automation.archive.page_hashing import calculate_page_hashes
+from comic_automation.library.exclusions import (
+    iter_files_excluding_directories,
+    iter_paths_excluding_directories,
+)
 from scripts.cbz_routing import series_key
 
 
@@ -143,7 +147,7 @@ _ASYM_HYPH_L_RE = re.compile(r"(\S) -(\S)")
 _ASYM_HYPH_R_RE = re.compile(r"(\S)- (\S)")
 _SPACES_RE = re.compile(r"\s+")
 _MARKER_WORDS_RE = re.compile(r"\b(uncensored|decensored)\b", re.IGNORECASE)
-_CHAPTER_TOKEN_RE = re.compile(r"(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
+_CHAPTER_TOKEN_RE = re.compile(r"(?<![^\W\d_])(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -230,11 +234,11 @@ def iter_dirs_with_files(root: Path, recursive: bool = True) -> list[Path]:
 
 def iter_series_dirs(root: Path) -> list[Path]:
     """Directories containing CBZ files directly are treated as series dirs."""
-    result: list[Path] = []
-    for d, _, files in os.walk(root):
-        if any(f.lower().endswith(".cbz") for f in files):
-            result.append(Path(d))
-    return sorted(result)
+    return sorted({
+        path.parent
+        for path in iter_files_excluding_directories(root)
+        if path.suffix.casefold() == ".cbz"
+    })
 
 
 def natural_key(path: Path):
@@ -837,7 +841,11 @@ def rename_generic_files(folder: Path, dry_run: bool) -> MaintenanceStats:
 def update_series_metadata(folder: Path, dry_run: bool, workers: int = 1) -> MaintenanceStats:
     """Update ComicInfo for all CBZ files under a merged series folder."""
     stats = MaintenanceStats()
-    cbz_files = sorted(folder.rglob("*.cbz"))
+    cbz_files = sorted(
+        path
+        for path in iter_files_excluding_directories(folder)
+        if path.suffix.casefold() == ".cbz"
+    )
     if not cbz_files:
         return stats
 
@@ -879,7 +887,7 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
 def merge_dir_contents(src: Path, dest: Path, dry_run: bool) -> MaintenanceStats:
     """Recursively move every file from *src* into *dest*, applying larger_file_wins on collisions, then delete *src*."""
     stats = MaintenanceStats()
-    for item in sorted(src.rglob("*")):
+    for item in sorted(iter_paths_excluding_directories(src)):
         if not item.is_file():
             continue
         rel = item.relative_to(src)
@@ -1673,7 +1681,11 @@ def run_organize_series(args: argparse.Namespace) -> int:
             continue
         parents = [root]
         if args.recursive_parents:
-            parents.extend(sorted({p.parent for p in root.rglob("*") if p.is_dir()}))
+            parents.extend(sorted({
+                p.parent
+                for p in iter_paths_excluding_directories(root)
+                if p.is_dir()
+            }))
         unique_parents = sorted(set(parents))
         planned_parents_by_root[root] = unique_parents
         planned_units += len(unique_parents)
@@ -1983,7 +1995,15 @@ def run_rename(args: argparse.Namespace) -> int:
     cbz_files: list[Path] = []
     for root_arg in args.paths:
         root = Path(root_arg)
-        cbz_files.extend(sorted(root.rglob("*.cbz")) if root.is_dir() else [root])
+        cbz_files.extend(
+            sorted(
+                path
+                for path in iter_files_excluding_directories(root)
+                if path.suffix.casefold() == ".cbz"
+            )
+            if root.is_dir()
+            else [root]
+        )
 
     progress = ProgressReporter(len(cbz_files), "files")
     stats = MaintenanceStats()
@@ -2007,7 +2027,15 @@ def run_metadata(args: argparse.Namespace) -> int:
     cbz_files: list[Path] = []
     for root_arg in args.paths:
         root = Path(root_arg)
-        cbz_files.extend(sorted(root.rglob("*.cbz")) if root.is_dir() else [root])
+        cbz_files.extend(
+            sorted(
+                path
+                for path in iter_files_excluding_directories(root)
+                if path.suffix.casefold() == ".cbz"
+            )
+            if root.is_dir()
+            else [root]
+        )
 
     progress = ProgressReporter(len(cbz_files), "files")
     stats = MaintenanceStats()
@@ -2205,7 +2233,7 @@ def run_repair_names(args: argparse.Namespace) -> int:
         if not root.exists():
             log.warning("  Path not found, skipping: %s", root)
             continue
-        for p in root.rglob("*"):
+        for p in iter_paths_excluding_directories(root):
             if p.is_dir():
                 dirs.append(p)
             elif p.suffix.lower() == ".cbz":
@@ -2442,7 +2470,11 @@ def run_propose_series(args: argparse.Namespace) -> int:
             continue
         parents = [root]
         if getattr(args, "recursive_parents", False):
-            parents.extend(sorted({p.parent for p in root.rglob("*") if p.is_dir()}))
+            parents.extend(sorted({
+                p.parent
+                for p in iter_paths_excluding_directories(root)
+                if p.is_dir()
+            }))
         for parent in sorted(set(parents)):
             all_groups.extend(
                 collect_series_proposals(

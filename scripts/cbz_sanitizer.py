@@ -27,6 +27,15 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from comic_automation.library.exclusions import (
+    iter_paths_excluding_directories,
+    iter_files_excluding_directories,
+)
+
 # Shared CJK translation helpers live in cbz_core so the sanitizer and watcher
 # behave identically. Import defensively: if cbz_core is unavailable the sanitizer
 # still runs, just without CJK translation.
@@ -93,7 +102,6 @@ except Exception:
 # CONFIGURATION
 # ─────────────────────────────────────────────
 SCAN_FOLDER    = r"\\tower\media\comics\manga"
-REPO_ROOT      = Path(__file__).resolve().parents[1]
 LOG_FILE       = REPO_ROOT / "Logs" / "cbz_sanitizer.log"
 PROGRESS_FILE  = REPO_ROOT / "progress_tracking" / "cbz_sanitizer_progress.json"
 DEFAULT_WORKERS = min(20, os.cpu_count() or 12)
@@ -254,6 +262,7 @@ _NON_LATIN_RE = re.compile(
 _CJK_ANY_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 _NUM_TOKEN_RE = re.compile(
     r'''
+    (?<![^\W\d_])
     (
         (?:
             ch(?:ap(?:ter)?)?p?
@@ -274,7 +283,7 @@ _DIR_TRAILING_STUB_RE = re.compile(
     r'[\s_\-]+(?:part|v|ch(?:ap(?:ter)?)?)\s*$', re.IGNORECASE
 )
 _CHAPTER_NUMBER_RE = re.compile(
-    r'(?:'
+    r'(?<![^\W\d_])(?:'
     r'ch(?:ap(?:ter)?)?p?\.?\s*(\d[\d.]*)'
     r'|issue\s*(\d[\d.]*)'
     r'|ep(?:isode)?\.?\s*(\d[\d.]*)'
@@ -283,14 +292,14 @@ _CHAPTER_NUMBER_RE = re.compile(
     re.IGNORECASE
 )
 _VOLUME_NUMBER_RE = re.compile(
-    r'(?:'
+    r'(?<![^\W\d_])(?:'
     r'vol(?:ume)?\.?\s*(\d[\d.]*)'
     r'|v(\d[\d.]*)(?=\s|ch|ep|$)'
     r')',
     re.IGNORECASE
 )
 _CHAPTER_TOKEN_RE = re.compile(
-    r'(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)', re.IGNORECASE
+    r'(?<![^\W\d_])(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)', re.IGNORECASE
 )
 
 
@@ -916,7 +925,7 @@ def _process_comicinfo_with_core(
 # DIRECTORY MERGE
 # ─────────────────────────────────────────────
 def _merge_directories(src_dir: Path, dest_dir: Path) -> None:
-    for src_item in sorted(src_dir.rglob("*")):
+    for src_item in sorted(iter_paths_excluding_directories(src_dir)):
         relative  = src_item.relative_to(src_dir)
         dest_item = dest_dir / relative
         if src_item.is_dir():
@@ -1431,7 +1440,11 @@ def sanitize_directory(
 
     cbz_dirs: dict[Path, list[Path]] = {}
     skipped_stale = 0
-    for cbz in sorted(dir_path.rglob("*.cbz")):
+    for cbz in sorted(
+        path
+        for path in iter_files_excluding_directories(dir_path)
+        if path.suffix.casefold() == ".cbz"
+    ):
         if cutoff is not None:
             try:
                 if cbz.stat().st_mtime < cutoff:
@@ -1641,7 +1654,9 @@ def main():
     def _count_cbz(targets, cut: float | None) -> int:
         n = 0
         for t in targets:
-            for f in t.rglob("*.cbz"):
+            for f in iter_files_excluding_directories(t):
+                if f.suffix.casefold() != ".cbz":
+                    continue
                 if cut is not None:
                     try:
                         if f.stat().st_mtime < cut:

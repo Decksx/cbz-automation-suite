@@ -24,6 +24,10 @@ from comic_automation.library import (
     scan_library,
 )
 from comic_automation.library.cli import main
+from comic_automation.library.exclusions import (
+    iter_files_excluding_directories,
+    iter_paths_excluding_directories,
+)
 
 
 MIGRATION_DIRECTORY = (
@@ -62,6 +66,35 @@ def test_default_syncthing_history_is_excluded(
     assert [item.path for item in discovered] == [
         active.resolve()
     ]
+
+
+def test_shared_traversal_prunes_syncthing_directories_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    """All CBZ tools can use one traversal that never enters Syncthing data."""
+    library = tmp_path / "library"
+    active = create_archive(library / "Series" / "Issue.cbz")
+    create_archive(library / ".STVersions" / "Series" / "Old.cbz")
+    create_archive(library / ".StVersion" / "Series" / "Older.cbz")
+    create_archive(library / ".STFolder" / "Marker.cbz")
+
+    files = list(iter_files_excluding_directories(library))
+    paths = list(iter_paths_excluding_directories(library))
+
+    assert files == [active]
+    assert all(
+        not part.casefold().startswith(".st")
+        for path in paths
+        for part in path.relative_to(library).parts
+    )
+
+
+def test_shared_traversal_ignores_an_excluded_root(tmp_path: Path) -> None:
+    """An explicitly supplied Syncthing directory is not scanned as a root."""
+    history = tmp_path / ".stversions"
+    create_archive(history / "Series" / "Old.cbz")
+
+    assert list(iter_files_excluding_directories(history)) == []
 
 
 def test_custom_directory_exclusion(

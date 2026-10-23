@@ -75,7 +75,7 @@ class ProgressReporter:
 # REGEX
 # ─────────────────────────────────────────────
 _CHAPTER_NUMBER_RE = re.compile(
-    r'(?:'
+    r'(?<![^\W\d_])(?:'
     r'ch(?:ap(?:ter)?)?p?\.?\s*(\d[\d.]*)'
     r'|issue\s*(\d[\d.]*)'
     r'|ep(?:isode)?\.?\s*(\d[\d.]*)'
@@ -84,7 +84,7 @@ _CHAPTER_NUMBER_RE = re.compile(
     re.IGNORECASE
 )
 _COMPILATION_RE = re.compile(
-    r'ch(?:ap(?:ter)?)?p?\.?\s*(\d[\d.]*)\s*[-–—]\s*(\d[\d.]*)',
+    r'(?<![^\W\d_])ch(?:ap(?:ter)?)?p?\.?\s*(\d[\d.]*)\s*[-–—]\s*(\d[\d.]*)',
     re.IGNORECASE
 )
 

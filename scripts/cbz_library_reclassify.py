@@ -41,6 +41,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from comic_automation.library.exclusions import (  # noqa: E402
+    iter_files_excluding_directories,
+)
 from scripts.cbz_routing import (  # noqa: E402
     RoutingConfig,
     build_context,
@@ -156,7 +159,12 @@ def spread_sample(archives: list[Path], limit: int) -> list[Path]:
 def sample_archives(series_dir: Path, limit: int) -> list[Path]:
     """Spread the sample across every archive under *series_dir*."""
     return spread_sample(
-        [p for p in series_dir.rglob("*.cbz") if p.is_file()], limit
+        [
+            p
+            for p in iter_files_excluding_directories(series_dir)
+            if p.suffix.casefold() == ".cbz"
+        ],
+        limit,
     )
 
 
@@ -174,7 +182,11 @@ def tree_digest(source: Path) -> tuple[str, int, int]:
         key=lambda p: p.name.casefold(),
     )
     for series_dir in series_dirs:
-        archives = sorted(p for p in series_dir.rglob("*.cbz") if p.is_file())
+        archives = sorted(
+            p
+            for p in iter_files_excluding_directories(series_dir)
+            if p.suffix.casefold() == ".cbz"
+        )
         total_files += len(archives)
         digest.update(series_dir.name.encode("utf-8", "replace"))
         digest.update(str(len(archives)).encode())
@@ -191,7 +203,11 @@ def plan_series(
     sample_limit: int,
     active_roots: dict[str, Path],
 ) -> SeriesPlan:
-    archives = sorted(p for p in series_dir.rglob("*.cbz") if p.is_file())
+    archives = sorted(
+        p
+        for p in iter_files_excluding_directories(series_dir)
+        if p.suffix.casefold() == ".cbz"
+    )
     sampled = sample_archives(series_dir, sample_limit)
 
     decision = None
@@ -343,7 +359,14 @@ def cmd_plan(args: argparse.Namespace) -> None:
     # A directory with no archives is not a series -- it is the shell left
     # behind by an earlier merge. Planning a move for it would create an
     # empty series folder in the destination, which Komga would then show.
-    empty = [d for d in all_dirs if not any(d.rglob("*.cbz"))]
+    empty = [
+        d
+        for d in all_dirs
+        if not any(
+            p.suffix.casefold() == ".cbz"
+            for p in iter_files_excluding_directories(d)
+        )
+    ]
     series_dirs = [d for d in all_dirs if d not in empty]
 
     print(f"planning {len(series_dirs)} series / {file_count} files from {source}")
@@ -458,7 +481,7 @@ def apply_series(row: dict, source: Path, quarantine: Path,
     # or silently winning.
     print(f"  MERGE {row['series']}  ->  {dst_dir}")
     stats.series_merged += 1
-    for item in sorted(src_dir.rglob("*")):
+    for item in sorted(iter_files_excluding_directories(src_dir)):
         if item.is_dir():
             continue
         relative = item.relative_to(src_dir)
@@ -582,7 +605,11 @@ def cmd_move(args: argparse.Namespace) -> None:
     if not _same_volume(from_root, target):
         raise SystemExit("REFUSING: cross-volume move is not implemented.")
 
-    archives = [p for p in src_dir.rglob("*.cbz") if p.is_file()]
+    archives = [
+        p
+        for p in iter_files_excluding_directories(src_dir)
+        if p.suffix.casefold() == ".cbz"
+    ]
     print(f"  from : {src_dir}  ({len(archives)} archives)")
     print(f"  to   : {target}"
           f"{'  (merging into existing)' if existing is not None else ''}")

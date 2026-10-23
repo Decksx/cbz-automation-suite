@@ -43,6 +43,7 @@ import json
 import ntpath
 import os
 import shutil
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -50,6 +51,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from comic_automation.library.exclusions import (  # noqa: E402
+    iter_files_excluding_directories,
+)
 
 # Versioned, and part of the hashed material: a change to how identity is
 # computed must not silently collide with cases minted under the old scheme.
@@ -334,7 +341,7 @@ def _members(root: Path) -> list[Path]:
     walking the same tree must produce the same inventory, and os.scandir
     order is not a promise.
     """
-    return sorted((p for p in root.rglob("*") if p.is_file()),
+    return sorted(iter_files_excluding_directories(root),
                   key=lambda p: _relative_posix(p, root))
 
 

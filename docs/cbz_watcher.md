@@ -29,9 +29,96 @@ The immediate comic directory is the batch:
 6. Rename archives when needed.
 7. Create or update `ComicInfo.xml`.
 8. Optionally AI-decensor each archive with Camelia, one book at a time.
-9. Resolve the destination through `routing.json`.
-10. Move the directory.
-11. Merge file-by-file if the destination exists.
+9. Use `routing.json` to obtain a fallback category for a new series.
+10. Optionally resolve the canonical series directory across both libraries.
+11. Move the directory.
+12. Merge file-by-file if the destination exists.
+
+## Canonical series resolver
+
+The GUI enables **Resolve series names and import directly to Z:** by default.
+The source/category rules in `routing.json` provide the fallback category only
+for a genuinely new series. Existing series aliases are checked in both Comix
+and Manga first, so a mixed download source cannot override an established
+library location. The current `X:\_staging` paths remain review fallbacks.
+Confirmed imports go to:
+
+```text
+Z:\comics\Comix\<canonical series>
+Z:\comics\Manga\<canonical series>
+```
+
+The trailing `\<canonical series>` is a placeholder, not a literal `$`
+directory. The roots can be changed in the GUI or with CLI arguments when the
+future X: migration is ready; no X: final-library destination is hard-coded.
+
+Each root stores `_series_registry.json` and `_series_aliases.json`. A missing
+registry is built automatically at resolver-enabled startup. Enable **Rebuild
+series registries before watching** after manually moving or renaming series.
+That scan teaches the resolver the corrected Comix/Manga location on the next
+watcher start. If a folder was moved without being renamed, the watcher also
+recognizes its new root immediately by validating the old registry path against
+both libraries. The refresh remains important because it removes the stale old
+record and makes the correction durable. Otherwise the watcher loads the
+existing registry and records newly observed aliases after a successful import.
+Registry and alias writes are atomic.
+
+New series names always normalize curly, modifier, full-width, and other
+apostrophe variants to the straight ASCII apostrophe. To repair existing names,
+enable **Normalize apostrophes and merge duplicate series names** for one
+watcher start, or add `--resolver-normalize-apostrophes`. The repair runs before
+registry loading across folders and files. If normalized names collide, exact
+duplicates are removed; non-identical files keep the larger copy and move the
+smaller copy below the external resolver quarantine. The registry is then
+rebuilt, preventing `Debra's Story` and `Debra’s Story` from remaining
+ambiguous aliases.
+
+Resolution uses, in order:
+
+1. exact normalized aliases;
+2. one unambiguous fuzzy alias at or above 95%;
+3. a safe new title, using the metadata pipeline's English translation when available.
+
+Normalization ignores case, accents, whitespace, underscores, hyphens, and
+punctuation. Alias sources include directory names, `_series_aliases.json`,
+`series.json`, representative `ComicInfo.xml`, and compatible cleanup history.
+The watcher's existing metadata translation runs before lookup, so native
+foreign-script and confidently detected romanized titles can use their English
+ComicInfo series name. Original-language and romanized aliases remain usable
+for later imports.
+
+An ambiguous exact or fuzzy result is never guessed. The same applies when a
+title has equally strong matches in both libraries. It stays in the legacy
+`X:\_staging\Comix` or `X:\_staging\Manga` path and is logged with its
+candidates and candidate categories for review.
+
+When a destination filename already exists, resolver mode hashes equal-size
+files. Byte-identical incoming duplicates are removed. For non-identical
+conflicts the larger file is retained and the smaller file is moved outside
+Komga to:
+
+```text
+Z:\comics\_resolver_quarantine\Comix\<series>\...
+Z:\comics\_resolver_quarantine\Manga\<series>\...
+```
+
+Plain CLI launches retain the legacy staging behavior. Enable direct resolving
+explicitly with:
+
+```powershell
+python -m scripts.cbz_watcher --series-resolver
+```
+
+Relevant overrides are `--resolver-comix-root`, `--resolver-manga-root`,
+`--resolver-quarantine-root`, `--resolver-threshold`, and
+`--resolver-refresh`. Resolver-enabled startup fails if a configured Z: root is
+unavailable, rather than silently accumulating imports in the old staging
+workflow.
+
+After correcting a location manually, stop the watcher and launch once with
+`--series-resolver --resolver-refresh`, or select **Rebuild series registries
+before watching** in the GUI before starting it again. The refresh is performed
+at startup; it is not a background rescan of a running watcher.
 
 ## Optional Camelia stage
 

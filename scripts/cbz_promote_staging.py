@@ -50,6 +50,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from comic_automation.library.exclusions import (  # noqa: E402
+    iter_files_excluding_directories,
+)
 from scripts.cbz_watcher import (  # noqa: E402
     REPLACEMENT_MIN_GAIN_BYTES,
     _find_archive_collision,
@@ -92,9 +95,7 @@ def plan_series(source: Path, destination: Path) -> SeriesPlan:
     """
     plan = SeriesPlan(name=source.name, source=source, destination=destination)
 
-    for item in sorted(source.rglob("*")):
-        if item.is_dir():
-            continue
+    for item in sorted(iter_files_excluding_directories(source)):
 
         target = destination / item.relative_to(source)
 
