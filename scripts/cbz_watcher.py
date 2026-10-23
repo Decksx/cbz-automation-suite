@@ -1011,13 +1011,24 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     (e.g. "Series Ch.1" and "Series Ch. 1"), so the merge keeps one copy instead
     of letting both cosmetic variants survive. Returns None when none match.
 
-    A ``(Uncensored)``/``(Decensored)`` display token compares as the bare word
-    that every name before design §5.5 carried, so a decensored re-arrival
-    still meets its earlier copy. The other display tokens -- year, version,
-    edition -- stay in the key on purpose: a match here moves the incoming
-    bytes under the *existing* name, and a [v3] stored as "... [v2]" would be
-    a wrong version label (§4.6). Differing tokens therefore land side by side
-    for the supersession plan to judge, rather than replace each other here.
+    Display tokens (design §5.5) compare as the pre-§5.5 names did:
+
+    * ``(YYYY)`` is dropped from the key. Names before §5.5 never carried
+      it, so ``Berserk Ch. 5 (2019)`` arriving beside ``Berserk Ch. 5`` is
+      the same book and still meets it.
+    * ``(Uncensored)``/``(Decensored)`` compares as the bare word every
+      earlier name carried, so a decensored re-arrival meets its copy.
+    * ``[vN]`` and the other edition tokens stay in the key on purpose: a
+      [v3] stored as "... [v2]" would be a wrong version label (§4.6), and
+      two editions are not one book. Those land side by side for the
+      supersession plan to judge.
+
+    On a match the merge works as before: the existing **name** always
+    survives. The incoming bytes replace the existing bytes under that name
+    only when they are larger by ``REPLACEMENT_MIN_GAIN_BYTES``; otherwise
+    the incoming copy is discarded. So a ``(2019)`` arrival that wins on size
+    loses its year token from the name -- accepted: the existing name wins,
+    exactly as it did when both names were token-free.
     """
     if not target_dir.is_dir():
         return None
@@ -1029,9 +1040,15 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     return None
 
 
+# A canonical year token, as cbz_core's display path writes it.
+_YEAR_TOKEN_RE = re.compile(r"\(([1-9][0-9]{3})\)")
+
+
 def _archive_collision_key(stem: str) -> str:
     """The book-identity key ``_find_archive_collision`` compares."""
-    return normalise_archive_key(decensor_tokens_as_words(stem))
+    return normalise_archive_key(
+        decensor_tokens_as_words(_YEAR_TOKEN_RE.sub(" ", stem))
+    )
 
 
 # A stem is a "placeholder" name — carrying no information of its own — when
