@@ -549,22 +549,25 @@ def _with(extra: bytes) -> bytes:
 @pytest.mark.parametrize(
     "keeper, gaps",
     [
-        (_ci(), ["Pages"]),
-        (_with(b"<Pages/>"), ["Pages"]),
+        (_ci(), ["Pages/Page[Image=0]"]),
+        (_with(b"<Pages/>"), ["Pages/Page[Image=0]"]),
         (_with(b'<Pages><Page Image="1" Type="FrontCover"/></Pages>'),
          ["Pages/Page[Image=0]"]),
         (_with(b'<Pages><Page Image="0"/><Page Image="1" Type="Story"/></Pages>'),
          ["Pages/Page[Image=0]@Bookmark", "Pages/Page[Image=0]@Type"]),
+        (_with(b'<Pages><Page Image="0" Type="" Bookmark=" "/></Pages>'),
+         ["Pages/Page[Image=0]@Bookmark", "Pages/Page[Image=0]@Type"]),
         (_with(b'<Pages><Page Image="0" Type="Story" Bookmark="Other"/></Pages>'), []),
     ],
     ids=["keeper-missing", "keeper-empty", "other-page-only", "page-without-annotations",
-         "keeper-carries-it"],
+         "blank-annotations", "keeper-carries-it"],
 )
-def test_structured_comicinfo_fields_count_for_coverage(tmp_path, database, keeper, gaps):
-    """PR #123 round 2: a Pages annotation lives in attributes, not text.
-
-    A's page annotation must be carried by the keeper's Page with the same
-    Image index and at least the same attribute names (values may differ).
+def test_page_annotations_need_non_blank_cover_by_image_index(
+    tmp_path, database, keeper, gaps
+):
+    """A's Page annotation must be non-blank on the keeper's Page with the
+    same Image index; values may differ. Blank or whitespace attribute
+    values (Codex round-2 ``blank_annotations``) are not cover.
     """
     family = _drop_family(tmp_path, database, "pages", _with(_PAGES), keeper)
     (relation,) = family.relations
@@ -577,36 +580,99 @@ def test_structured_comicinfo_fields_count_for_coverage(tmp_path, database, keep
     assert f"does not cover {gaps}" in relation.reason
 
 
+_DEEP = b"<Node>" * 1100 + b"x" + b"</Node>" * 1100
+
+
 @pytest.mark.parametrize(
-    "keeper, gaps",
+    "older, keeper, shape",
     [
-        (_with(b'<Credits><Credit name="someone"/></Credits>'), ["Credits/Credit@role"]),
-        (_with(b'<Credits><Credit role="Inker"/></Credits>'), []),
+        # Codex round 2: blank_generic_attribute, empty_page_index,
+        # opaque_pages_text, tail_text.
+        (_with(b'<Credits><Credit role="Writer"/></Credits>'),
+         _with(b'<Credits><Credit role=""/></Credits>'), "Credits"),
+        (_with(b'<Pages><Page Image="" Bookmark="Important"/></Pages>'),
+         _with(b'<Pages><Page Image="" Bookmark="Replacement"/></Pages>'),
+         "Pages/Page[Image=''] (invalid Image index)"),
+        (_with(b'<Pages><Page Image="-1" Bookmark="Important"/></Pages>'),
+         _with(b'<Pages><Page Image="-1" Bookmark="Replacement"/></Pages>'),
+         "Pages/Page[Image='-1'] (invalid Image index)"),
+        (_with(b'<Pages><Page Image="0" Bookmark="a"/><Page Image="00" Bookmark="b"/></Pages>'),
+         _with(_PAGES), "Pages/Page[Image='00'] (duplicate Image index)"),
+        (_with(b'<Pages><Page Bookmark="Important"/></Pages>'),
+         _with(b'<Pages><Page Bookmark="Important"/></Pages><Notes>k</Notes>'),
+         "Pages/Page[Image=None] (invalid Image index)"),
+        (_with(b"<Pages>irreplaceable opaque annotation</Pages>"),
+         _with(b'<Pages><Page Image="0"/></Pages>'), "Pages (text)"),
+        (_with(b"<Credits><Credit/>unique tail text</Credits>"), _ci(),
+         "Credits/Credit (tail text)"),
+        (_with(b"<Series2>s</Series2>tail after a simple field"),
+         _with(b"<Series2>t</Series2>"), "Series2 (tail text)"),
+        # The keeper's Pages must be in the supported shape too.
+        (_with(_PAGES),
+         _with(b'<Pages>junk<Page Image="0" Type="x" Bookmark="y"/></Pages>'),
+         "keeper Pages (text)"),
+        # Control: ordinary shallow nesting is refused as unsupported, not
+        # matched and not crashing.
+        (_with(b"<Credits><Credit>Writer</Credit></Credits>"),
+         _with(b"<Credits><Credit>Writer</Credit></Credits><Notes>k</Notes>"),
+         "Credits"),
     ],
-    ids=["other-attribute", "same-shape-other-value"],
+    ids=["blank-generic-attribute", "empty-page-index", "negative-page-index",
+         "duplicate-page-index", "missing-page-index", "opaque-pages-text",
+         "tail-text-in-credits", "tail-text-after-simple", "keeper-pages-unsupported",
+         "shallow-nesting"],
 )
-def test_other_structured_fields_are_covered_by_shape(tmp_path, database, keeper, gaps):
-    """Outside Pages, B must carry A's populated child paths and attribute names."""
-    older = _with(b'<Credits><Credit role="Writer"/></Credits>')
-    family = _drop_family(tmp_path, database, "shape", older, keeper)
-    (relation,) = family.relations
-    if not gaps:
-        assert family.status == sv.FAMILY_SUPERSESSION
-        return
-    assert family.status == sv.FAMILY_REVIEW
-    assert f"does not cover {gaps}" in relation.reason
-
-
-def test_unmatchable_page_annotations_go_to_review(tmp_path, database):
-    """A Page without an Image index cannot be matched confidently."""
-    older = _with(b'<Pages><Page Type="FrontCover"/></Pages>')
-    # The keeper carries the same Page (and extra Notes, so the documents
-    # differ and a drop is actually needed); it still cannot be matched.
-    keeper = older.replace(b"<Number>1</Number>", b"<Number>1</Number><Notes>k</Notes>")
-    family = _drop_family(tmp_path, database, "no-index", older, keeper)
+def test_unsupported_comicinfo_shapes_are_refused_for_review(
+    tmp_path, database, older, keeper, shape
+):
+    """PR #123 round 3: only simple elements and the supported Pages shape
+    can certify coverage; anything else is refused, never matched."""
+    family = _drop_family(tmp_path, database, "unsupported", older, keeper)
     (relation,) = family.relations
     assert family.status == sv.FAMILY_REVIEW
-    assert "Pages/Page without an Image index" in relation.reason
+    assert relation.accepted_comicinfo_drops == ()
+    assert "unsupported ComicInfo shape:" in relation.reason
+    assert shape in relation.reason
+
+
+def test_deep_comicinfo_is_refused_without_stopping_the_folder(tmp_path, database):
+    """Codex round 2 ``deep_structure``: 1100 nested elements in A.
+
+    The scan stops at `MAX_COMICINFO_DEPTH` and refuses the drop; the same
+    folder's unrelated chapter-2 family still evaluates to a supersession.
+    """
+    folder = tmp_path / "deep" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": _with(_DEEP)})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": _ci(notes="k")})
+    _book(folder, "Series ch. 2 v1.cbz", [P3])
+    _book(folder, "Series ch. 2 v2.cbz", [P3, P4])
+
+    result = _evaluate(folder, database, accept_comicinfo_drop=True)
+    deep = _family(result, folder, "Series ch. 1 v1.cbz")
+    (relation,) = deep.relations
+    assert deep.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert f"(nested deeper than {sv.MAX_COMICINFO_DEPTH})" in relation.reason
+    assert relation.reason.count("Node") <= sv.MAX_COMICINFO_DEPTH + 2
+    assert _family(result, folder, "Series ch. 2 v1.cbz").status == sv.FAMILY_SUPERSESSION
+
+
+def test_simple_fields_with_other_values_still_cover(tmp_path, database):
+    """Control: simple elements are covered by non-blank text, whatever the
+    value; a blank simple element in A needs no cover."""
+    older = _with(b"<Writer>A. Writer</Writer><Summary>  </Summary>")
+    keeper = _with(b"<Writer>B. Writer</Writer>")
+    family = _drop_family(tmp_path, database, "simple", older, keeper)
+    assert family.status == sv.FAMILY_SUPERSESSION
+    keeper = _with(b"<Writer>   </Writer>")
+    family = _drop_family(tmp_path, database, "simple-blank-keeper", older, keeper)
+    assert family.status == sv.FAMILY_REVIEW
+    assert "does not cover ['Writer']" in family.relations[0].reason
+    # A blank Page attribute in A needs no cover either.
+    older = _with(b'<Pages><Page Image="0" Type="" Bookmark="Important"/></Pages>')
+    keeper = _with(b'<Pages><Page Image="0" Bookmark="Other"/></Pages>')
+    family = _drop_family(tmp_path, database, "blank-older-attribute", older, keeper)
+    assert family.status == sv.FAMILY_SUPERSESSION
 
 
 def test_a_leftover_private_copy_is_logged(tmp_path, folder, monkeypatch, caplog):
