@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import time
+import types
 import warnings
 from pathlib import Path
 
@@ -791,20 +792,41 @@ def test_a_moved_backup_artifact_is_refused(library, tmp_path):
     _refused(tmp_path, db, plan_path, document, report, "does not exist")
 
 
-def test_a_backup_moved_after_verification_is_refused_under_the_lock(
+def test_a_backup_replaced_after_verification_is_refused_under_the_lock(
     library, tmp_path, monkeypatch
 ) -> None:
+    """The replacement check: the backup path now names another file.
+
+    Simulated through `rc._stat`, because on Windows the held read-only
+    connection keeps the real file from being moved at all.
+    """
     db, ids = library
     plan_path, document, report = _plan_and_backup(tmp_path, db)
-    real = rc.verify_backup
+    backup = os.path.normcase(os.path.realpath(
+        _report(report)["backup_database"]))
+    real_verify, real_stat = rc.verify_backup, os.stat
+    replaced = {"yes": False}
 
-    def then_move(database, body, backup_report):
-        verified = real(database, body, backup_report)
-        os.replace(verified["path"], tmp_path / "gone.db")
-        return verified
+    def stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if replaced["yes"] and os.path.normcase(
+                os.path.realpath(str(path))) == backup:
+            # Another file at the same path: a new st_ino, all else equal.
+            return types.SimpleNamespace(
+                st_dev=result.st_dev, st_ino=result.st_ino + 1,
+                st_size=result.st_size, st_mtime_ns=result.st_mtime_ns)
+        return result
 
-    monkeypatch.setattr(rc, "verify_backup", then_move)
-    _refused(tmp_path, db, plan_path, document, report, "after verification")
+    def then_replace(database, body, backup_report):
+        window = real_verify(database, body, backup_report)
+        replaced["yes"] = True
+        return window
+
+    monkeypatch.setattr(rc, "_stat", stat)
+    monkeypatch.setattr(rc, "verify_backup", then_replace)
+    _refused(tmp_path, db, plan_path, document, report,
+             "moved or was replaced after the live write lock")
+    assert {_version(db, ids["stable"]), _version(db, ids["stable2"])} == {"1"}
 
 
 @pytest.mark.parametrize("field", ["verified", "checks"])
@@ -936,12 +958,51 @@ def test_a_corrupt_backup_is_refused(library, tmp_path):
     backup.write_bytes(bytes(raw))
     os.utime(backup, ns=(data["backup_modified_time_ns"],
                          data["backup_modified_time_ns"]))
-    _refused(tmp_path, db, plan_path, document, report, "failed verification")
+    _refused(tmp_path, db, plan_path, document, report,
+             "failed (verification|quick_check)")
 
 
-def test_a_backup_changed_during_verification_is_refused(
+def _on_backup(connection, backup: str) -> bool:
+    return Path(connection.execute("PRAGMA database_list").fetchone()[2]
+                ).name == Path(backup).name
+
+
+def test_a_backup_failing_quick_check_is_refused(
     library, tmp_path, monkeypatch
 ) -> None:
+    """quick_check's answer is enforced even when every later read works."""
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    backup = _report(report)["backup_database"]
+    real = rc.quick_check
+    monkeypatch.setattr(
+        rc, "quick_check",
+        lambda c: "row 1 missing from index x" if _on_backup(c, backup)
+        else real(c))
+    _refused(tmp_path, db, plan_path, document, report, "failed quick_check")
+
+
+def test_a_backup_read_error_is_a_refusal(library, tmp_path, monkeypatch):
+    """Any SQLite error while reading the backup refuses, never escapes raw."""
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    backup = _report(report)["backup_database"]
+    real = rc.classify_legacy
+
+    def failing(connection):
+        if _on_backup(connection, backup):
+            raise sqlite3.DatabaseError("simulated read failure")
+        return real(connection)
+
+    monkeypatch.setattr(rc, "classify_legacy", failing)
+    _refused(tmp_path, db, plan_path, document, report,
+             "failed verification: simulated read failure")
+
+
+def test_a_backup_touched_during_verification_is_refused(
+    library, tmp_path, monkeypatch
+) -> None:
+    """The replacement fingerprint moved inside the verification read."""
     db, _ = library
     plan_path, document, report = _plan_and_backup(tmp_path, db)
     backup = _report(report)["backup_database"]
@@ -956,7 +1017,169 @@ def test_a_backup_changed_during_verification_is_refused(
 
     monkeypatch.setattr(rc, "classify_legacy", touching)
     _refused(tmp_path, db, plan_path, document, report,
-             "changed during verification")
+             "replaced during verification")
+
+
+# --- the backup window: WAL-only commits ----------------------------------
+
+
+@pytest.fixture()
+def tracked_connections(monkeypatch):
+    """Every connection the tool opens, so a test can prove each was closed."""
+    opened = []
+    real = rc.open_connection
+
+    def tracking(*args, **kwargs):
+        connection = real(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(rc, "open_connection", tracking)
+    return opened
+
+
+def _all_closed(connections) -> bool:
+    for connection in connections:
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            continue
+        return False
+    return True
+
+
+def _wal_holder(backup: Path) -> sqlite3.Connection:
+    """A writer on the backup whose commits stay in -wal (Codex's probe).
+
+    Auto-checkpoint is off, so the main file's size and mtime do not move:
+    only data_version can see the commit.
+    """
+    holder = sqlite3.connect(backup, isolation_level=None)
+    holder.execute("PRAGMA journal_mode=WAL")
+    holder.execute("PRAGMA wal_autocheckpoint=0")
+    return holder
+
+
+def _delete_planned_from_backup(holder, ids) -> tuple[dict, dict, int]:
+    backup = holder.execute("PRAGMA database_list").fetchone()[2]
+    before = rc._backup_fingerprint(backup)
+    holder.execute("DELETE FROM archive_content_signatures "
+                   "WHERE archive_id IN (?, ?)",
+                   (ids["stable"], ids["stable2"]))
+    return before, rc._backup_fingerprint(backup), os.stat(
+        backup + "-wal").st_size
+
+
+def test_a_wal_only_backup_commit_before_the_live_lock_refuses_apply(
+    library, tmp_path, monkeypatch, tracked_connections
+) -> None:
+    """(a) Committed after verify_backup returns, before BEGIN IMMEDIATE.
+
+    The reviewed counterexample: the main-file fingerprint is unchanged,
+    so only the held connection's data_version can refuse it.
+    """
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    holder = _wal_holder(Path(_report(report)["backup_database"]))
+    real = rc.verify_backup
+    seen = {}
+
+    def then_commit(database, body, backup_report):
+        window = real(database, body, backup_report)
+        seen["fingerprints"] = _delete_planned_from_backup(holder, ids)
+        return window
+
+    monkeypatch.setattr(rc, "verify_backup", then_commit)
+    try:
+        with pytest.raises(rc.PlanRefusedError,
+                           match="committed to after the live write lock"):
+            _apply(tmp_path, db, plan_path, document, backup_report=report)
+    finally:
+        holder.close()
+
+    before, after, wal_bytes = seen["fingerprints"]
+    assert before == after and wal_bytes > 0  # precondition: WAL-only
+    assert {_version(db, ids["stable"]), _version(db, ids["stable2"])} == {"1"}
+    assert len(tracked_connections) == 2
+    assert _all_closed(tracked_connections)
+
+
+def test_a_wal_only_backup_commit_while_rows_are_processed_rolls_back(
+    library, tmp_path, monkeypatch, tracked_connections
+) -> None:
+    """(b) Committed after the first planned row was re-classified.
+
+    The first relabel UPDATE has already executed inside the live
+    transaction when the final check fires, so this proves rollback of
+    every relabel, not just a refusal before any.
+    """
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    holder = _wal_holder(Path(_report(report)["backup_database"]))
+    real = rc.classify_archive
+    calls = []
+
+    def committing(connection, archive_id):
+        found = real(connection, archive_id)
+        calls.append(archive_id)
+        if len(calls) == 1:
+            _delete_planned_from_backup(holder, ids)
+        return found
+
+    monkeypatch.setattr(rc, "classify_archive", committing)
+    try:
+        with pytest.raises(rc.PlanRefusedError,
+                           match="committed to while planned rows"):
+            _apply(tmp_path, db, plan_path, document, backup_report=report)
+    finally:
+        holder.close()
+
+    assert calls == [ids["stable"], ids["stable2"]]
+    assert {_version(db, ids["stable"]), _version(db, ids["stable2"])} == {"1"}
+    assert len(tracked_connections) == 2
+    assert _all_closed(tracked_connections)
+
+
+def test_a_wal_only_backup_commit_during_verification_is_refused(
+    library, tmp_path, monkeypatch, tracked_connections
+) -> None:
+    """Committed inside the preimage read: caught by the first check."""
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    backup = Path(_report(report)["backup_database"])
+    holder = _wal_holder(backup)
+    real = rc.classify_legacy
+
+    def committing(connection):
+        result = real(connection)
+        if Path(connection.execute("PRAGMA database_list").fetchone()[2]
+                ).name == backup.name:
+            _delete_planned_from_backup(holder, ids)
+        return result
+
+    monkeypatch.setattr(rc, "classify_legacy", committing)
+    try:
+        with pytest.raises(rc.PlanRefusedError,
+                           match="committed to during verification"):
+            _apply(tmp_path, db, plan_path, document, backup_report=report)
+    finally:
+        holder.close()
+    assert _version(db, ids["stable"]) == "1"
+    assert _all_closed(tracked_connections)
+
+
+def test_a_normal_apply_and_its_rerun_close_every_connection(
+    library, tmp_path, tracked_connections
+) -> None:
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    first = _apply(tmp_path, db, plan_path, document, backup_report=report)
+    second = _apply(tmp_path, db, plan_path, document, backup_report=report)
+    assert first["relabelled"] == [ids["stable"], ids["stable2"]]
+    assert second["already_recertified"] == [ids["stable"], ids["stable2"]]
+    assert set(first["backup"]) >= {"path", "data_version", "st_ino"}
+    assert len(tracked_connections) == 4
+    assert _all_closed(tracked_connections)
 
 
 # --- per-row drift --------------------------------------------------------
