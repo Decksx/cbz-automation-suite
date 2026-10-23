@@ -168,7 +168,11 @@ _ROMANIZED_MARKER_RE = re.compile(
 )
 _TRANSLATION_CACHE_LOCK = threading.Lock()
 
+# A marker cannot begin inside a word ("Bitch 1" is not "Bit Ch 1").
+# Allow digits before markers so compact sequences like v01ch005 still work.
+_NUMBER_MARKER_START = r"(?<![^\W\d_])"
 _NUM_TOKEN_RE = re.compile(
+    _NUMBER_MARKER_START +
     r"""
     (
         (?:
@@ -190,7 +194,7 @@ _DIR_TRAILING_STUB_RE = re.compile(
     r"[\s_\-]+(?:part|v|ch(?:ap(?:ter)?)?)\s*$", re.IGNORECASE
 )
 _CHAPTER_NUMBER_RE = re.compile(
-    r"(?:"
+    _NUMBER_MARKER_START + r"(?:"
     r"ch(?:ap(?:ter)?)?p?\.?\s*(\d[\d.]*)"
     r"|issue\s*(\d[\d.]*)"
     r"|#\s*(\d[\d.]*)"
@@ -198,7 +202,7 @@ _CHAPTER_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 _VOLUME_NUMBER_RE = re.compile(
-    r"(?:"
+    _NUMBER_MARKER_START + r"(?:"
     r"vol(?:ume)?\.?\s*(\d[\d.]*)"
     r"|v(\d[\d.]*)(?=\s|ch|ep|$)"
     r")",
@@ -656,11 +660,13 @@ def clean_xml_field(value: str, rules: set[str] = ALL_RULES) -> str:
 # clobbering a titular number (``Area 88``, ``Mobile Suit Gundam 0079``) can opt
 # out of the bare-number rule.
 _TRAILING_TOKEN_BODY = (
+    _NUMBER_MARKER_START + r"(?:"
     r"ch(?:ap(?:ter)?)?p?\.?\s*\d[\d.]*"
     r"|issue\s*\d[\d.]*"
     r"|ep(?:isode)?\.?\s*\d[\d.]*"
     r"|vol(?:ume)?\.?\s*\d[\d.]*"
     r"|v\d[\d.]*(?=\s*$)"
+    r")"
 )
 _TRAILING_TOKEN_RE = re.compile(
     rf"[\s_\-]*(?:{_TRAILING_TOKEN_BODY}|\d+$)[\s_\-.,]*$",
