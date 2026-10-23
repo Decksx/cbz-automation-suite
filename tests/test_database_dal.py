@@ -208,10 +208,14 @@ def test_opening_a_missing_database_read_only_creates_nothing(
 def test_the_two_policies_differ_only_where_intended() -> None:
     """Pins the policy difference as data.
 
-    The read-only policy exists to add `query_only`; if it ever also
-    stopped setting `busy_timeout`, read-only callers would start failing
-    immediately on a locked database instead of retrying -- which is
-    exactly the drift found in `read_guards.py`.
+    The read-only policy exists to add `query_only`, and waits on a locked
+    database exactly as long as the writable one does. The explicit
+    `busy_timeout` pragma restates the handler `timeout_seconds` already
+    installs at connect time, so dropping it alone would not make readers
+    fail immediately; the equality below is what keeps the two modes'
+    waits from diverging. (`read_guards.py`'s pre-DAL factory set no such
+    pragma and was once listed as drifting here; measured, its
+    connections read 30000 from ``timeout=30.0``, so it never drifted.)
     """
     writable = dict(dal.WRITABLE_POLICY.pragmas)
     readonly = dict(dal.READ_ONLY_POLICY.pragmas)
