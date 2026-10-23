@@ -29,12 +29,12 @@ there is no shrinking, and the inputs are drawn from hand-chosen alphabets
 aimed at the characters that have bitten this project before. That is
 weaker than a real property-testing engine and is recorded as such.
 
-Two invariants found false, one since fixed
--------------------------------------------
+Two invariants found false, both since fixed
+--------------------------------------------
 
 Running these properties found two places where the stated invariant was
-false on master. The ``series_key`` one is now fixed (below); the page-order
-one is not. Neither was fixed in the slice that found them, and
+false on master. Both are now fixed (below). Neither was fixed in the
+slice that found them, and
 neither is hidden by narrowing the generator until it passes. Each is split
 into:
 
@@ -53,10 +53,15 @@ to ``berserk uncensored`` while ``Berserk Uncensored`` keyed to
 ``berserk``. **Fixed by #111's reorder** (marker removal after the
 separator rule); its two strict xfails are now ordinary passing tests.
 
-Page order is not deterministic when two image names have equal natural
-keys (``a.png``/``A.png``, ``01.png``/``1.png``): the sort is stable, so
-physical archive order decides, and the content signature changes when the
-same archive is merely re-packed in a different order.
+Page order was not deterministic when two image names had equal natural
+keys (``a.png``/``A.png``, ``01.png``/``1.png``): the sort was stable, so
+physical archive order decided, and the content signature changed when the
+same archive was merely re-packed in a different order. **Fixed by the
+raw-name tie-break** (``page_hashing.page_order_key``, design
+``docs/canonical_naming_and_version_supersession.md`` §1.2); its three
+strict xfails are now ordinary passing tests. The fix holds for *unique*
+names only: identical names cannot be ordered and are reported as
+unresolved instead, which ``tests/test_page_order_tie_break.py`` covers.
 
 Also probed, not pinned: ``cbz_core.sanitize``, ``clean_filename`` and
 ``clean_directory_name`` are not idempotent either. Minimal examples from
@@ -287,8 +292,8 @@ def test_page_order_ignores_member_order_for_distinct_natural_keys(
     must be identical for every physical permutation, because it is what
     `archive_content_signatures` compares across archives.
 
-    Names here have distinct natural keys by construction. Equal keys break
-    the property; see the strict xfail below.
+    Names here have distinct natural keys by construction. Equal keys are
+    covered by the tie-break test below.
     """
     rng = random.Random(seed)
 
@@ -328,16 +333,6 @@ def test_page_order_ignores_member_order_for_distinct_natural_keys(
         assert len(signatures) == 1, (trial, expected)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "Names with equal natural keys ('a.png'/'A.png', '01.png'/'1.png') "
-        "sort stably, so physical archive order decides page order and "
-        "the content signature differs between two packings of the same "
-        "pages. Not fixed in this slice."
-    ),
-)
 @pytest.mark.parametrize(
     "names",
     [("a.png", "A.png"), ("01.png", "1.png"), ("p1.png", "p01.png")],
@@ -346,10 +341,12 @@ def test_page_order_ignores_member_order_for_distinct_natural_keys(
 def test_page_order_is_deterministic_when_natural_keys_tie(
     names: tuple[str, str], tmp_path: Path
 ) -> None:
-    """The full determinism claim, including tied names.
+    """The full determinism claim, including tied (but distinct) names.
 
-    Strict: a tie-break (for example on the raw entry name) makes this
-    XPASS and fails the run, which is the cue to drop the marker.
+    These were the minimal counterexamples, pinned as strict xfails until
+    the raw-name tie-break landed. Each pair ties on the natural key; the
+    two packings are mirror images, so a sort that fell back to physical
+    order would give opposite page orders and different signatures.
     """
     entries = [(name, f"payload {name}".encode()) for name in names]
 
