@@ -542,6 +542,71 @@ without David's explicit go-ahead.
 8. A live dry-run plan for David's review. Then, only on his approval of a
    digest, a batched apply on Tower.
 
+### Step 5 implementation notes
+
+Step 5 is `comic_automation/archive/supersession.py`, which is read-only.
+The design was silent on the points below, so each records the reading the
+code takes. They are open to review.
+
+1. **Stored rows are required.** §4.3 says the planner compares the
+   re-derived sequence with the stored rows, but not what happens when there
+   are none. The evaluator takes `archive_ids` and a database. A file with
+   no id, or an id with no rows, is unresolved, so a new arrival blocks its
+   family until it has been inventoried.
+2. **Rows that are not comparable evidence are stale**, even when their
+   digests match the bytes. This covers legacy ordering contract `"1"`, an
+   unresolved stored order, and an incomplete inventory.
+3. **Dropping ComicInfo (§8 question 6, conservative reading).** With
+   `accept_comicinfo_drop` (default off), A's ComicInfo.xml may be dropped
+   only when B carries its own ComicInfo.xml. Otherwise the relation goes
+   to review as before. An accepted drop is listed in the relation.
+4. **Payload identity.** The non-image payload is compared by exact raw
+   member name and sha256, as a multiset. A credits file moved into a
+   subfolder therefore blocks supersession.
+5. **Duplicates at the top of a family.** Byte-identical duplicates there
+   are two maximal members, so there is no keeper and the family goes to
+   review. Duplicates below the keeper both point at it.
+6. **Inserted pages.** The proposed keeper, pointers and index maps are
+   reported, but the family status is `review`. Only `supersession` is
+   actionable by a later step.
+7. **Direction.** For unequal lengths, the shorter sequence is the older
+   one. A shorter archive that is a subsequence of a longer one is reported
+   as superseded with inserted pages, whatever its name claims.
+8. **No ComicInfo version label yet.** §4.6 allows a label from the keeper's
+   own ComicInfo. ComicInfo has no standard version element and step 4 reads
+   none, so that route never fires and such a label is held for a decision.
+9. **A bare `v<N>` is the keeper's own marker** once step 4 has classified
+   it as a version through the established family and the version field is
+   resolved, that is, uncontradicted.
+10. **Higher numbers on other members are not contradictions.** Another
+    member's higher number is a note for review, never a contradiction and
+    never the label (§4.6, the v2-versus-v8 example).
+11. **Unreachable guards.** Relations derived from bytes cannot cycle,
+    because every edge strictly lengthens the sequence, and containment is
+    transitive. So the cycle guard, the missing-direct-relation guard and
+    the two-established-families guard raise
+    `InconsistentRelationsError`, and are proven only by tests that inject
+    relations.
+12. **Memory bound.** An archive of at most `max_held_bytes` (512 MiB by
+    default) is held in one buffer, and its sequence is derived from exactly
+    the hashed bytes. A larger archive is streamed:
+    - stat it and hash it;
+    - derive its members from the path, with the same `hash_ordered_pages`
+      pass;
+    - hash it and stat it again.
+
+    Any difference in hash or stat makes the archive unresolved. **Residual
+    window:** in the streamed path a change that is made after the first
+    hash, and fully reverted before the second, goes undetected. Fully
+    reverted means the bytes, size, mtime and file identity are all
+    restored. Step 7 revalidates against the recorded hash either way.
+13. **Scope of failure.** One unreadable, corrupt or refused archive makes
+    its own family unresolved. It does not stop the folder. Only an
+    inconsistent relation set (item 11) or a concurrent database commit
+    stops the run.
+
+Perceptual hashes are not consulted at all in step 5.
+
 ## 7. Named tests (for the implementation PRs)
 
 Naming and resolution:
