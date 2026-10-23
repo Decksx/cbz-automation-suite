@@ -1990,6 +1990,44 @@ def _find_censorship_sibling(dir_name: str, dest_folder: str) -> Path | None:
     return None
 
 
+def _remove_merged_source(src_dir: Path) -> None:
+    """Clean up *src_dir* after ``_merge_directories`` emptied it.
+
+    The merge skips excluded directories (Syncthing's ``.stversions`` and
+    ``.stfolder``, and the rest of ``DEFAULT_EXCLUDED_DIRECTORIES``), so those
+    are still in the source when the merge returns. Deleting the whole tree
+    would destroy them. Everything the merge handled has already left the
+    source, so only directories that are now empty are removed. Excluded
+    subtrees, the directories leading to them, and any file the merge did not
+    move stay in place, and are logged.
+    """
+    if not src_dir.exists():
+        return
+    excluded: list[Path] = []
+    leftover: list[Path] = []
+    walked: list[Path] = []
+    for directory, directory_names, filenames in os.walk(src_dir, topdown=True):
+        current = Path(directory)
+        walked.append(current)
+        kept_names = []
+        for name in directory_names:
+            if name.casefold() in DEFAULT_EXCLUDED_DIRECTORIES:
+                excluded.append(current / name)
+            else:
+                kept_names.append(name)
+        directory_names[:] = kept_names
+        leftover.extend(current / name for name in filenames)
+    for directory in reversed(walked):  # deepest first
+        try:
+            directory.rmdir()
+        except OSError:
+            pass  # not empty: holds an excluded subtree or a leftover file
+    for path in excluded:
+        log.info(f"  Left excluded directory in place: {path}")
+    for path in leftover:
+        log.warning(f"  Left unmerged file in place: {path}")
+
+
 def _move_cbz_dir(
     dir_path: Path,
     dest_folder: str,
@@ -2051,8 +2089,7 @@ def _move_cbz_dir(
                 dir_path, dest_dir,
                 conflict_quarantine_root=conflict_quarantine_root,
             )
-            if dir_path.exists():
-                shutil.rmtree(dir_path, ignore_errors=True)
+            _remove_merged_source(dir_path)
             log.info(f"  Merge complete.")
             return dest_dir
         else:
@@ -2071,8 +2108,7 @@ def _move_cbz_dir(
                         dir_path, dest_dir,
                         conflict_quarantine_root=conflict_quarantine_root,
                     )
-                    if dir_path.exists():
-                        shutil.rmtree(dir_path, ignore_errors=True)
+                    _remove_merged_source(dir_path)
                     log.info(f"  Merge complete.")
                     return dest_dir
                 else:
