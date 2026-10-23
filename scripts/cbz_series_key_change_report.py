@@ -31,7 +31,7 @@ import unicodedata
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.cbz_routing import series_key
+from scripts.cbz_routing import NON_SERIES_DIRECTORIES, series_key
 
 
 # The rule as it stood before #111, kept verbatim so the report compares
@@ -75,6 +75,10 @@ def build_report(roots: list[Path]) -> dict:
       these are listed on their own and are never counted as a merge.
     * ``splits``: old keys whose folders now differ. Not expected from this
       fix; listed so that an unexpected one cannot pass unseen.
+    * ``excluded``: folders the series index never treats as series
+      (``NON_SERIES_DIRECTORIES``, e.g. Syncthing's ``.stfolder``). They are
+      kept out of every key comparison above, as SeriesIndex keeps them out
+      of the index, but listed so nothing is silently dropped.
 
     Each root's full, sorted list of observed names is part of the report,
     and so of its fingerprint. Without it, renaming a folder the fix does
@@ -85,12 +89,16 @@ def build_report(roots: list[Path]) -> dict:
         raise ValueError("--root names the same directory more than once")
 
     rows = []
+    excluded = []
     root_rows = []
     for root in absolute:
         names = _directory_names(root)
         root_rows.append({"root": str(root), "directories": len(names),
                           "names": names})
         for name in names:
+            if name.casefold() in NON_SERIES_DIRECTORIES:
+                excluded.append({"root": str(root), "name": name})
+                continue
             rows.append({"root": str(root), "name": name,
                          "legacy_key": legacy_series_key(name),
                          "key": series_key(name)})
@@ -117,10 +125,11 @@ def build_report(roots: list[Path]) -> dict:
         "roots": root_rows,
         "counts": {"directories": len(rows), "changed": len(changed),
                    "merges": len(merges), "empty_keys": len(empty_keys),
-                   "splits": len(splits)},
+                   "splits": len(splits), "excluded": len(excluded)},
         "changed": changed,
         "merges": merges,
         "empty_keys": empty_keys,
+        "excluded": excluded,
         "splits": splits,
     }
     report["report_sha256"] = hashlib.sha256(_canonical_bytes(report)).hexdigest()
