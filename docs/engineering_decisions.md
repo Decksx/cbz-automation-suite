@@ -969,3 +969,59 @@ unapplied count as a measured figure. `project_planned_binding()` refuses a
 `page_inventory` binding outright rather than returning `None`, so a caller
 that bypassed the selection cannot leave that count quietly disagreeing
 with reality.
+
+## Page order breaks natural-key ties on the raw name; duplicate names are unresolved
+
+Design `docs/canonical_naming_and_version_supersession.md` §1.2, step 2 of
+§6. The Step 8 property tests pinned the defect as three strict xfails
+(`a.png`/`A.png`, `01.png`/`1.png`, `p1.png`/`p01.png`): the natural key
+tied, the sort was stable, and physical member order decided page order and
+so the content signature.
+
+**One ordering function.** `page_hashing.order_page_entries` sorts image
+members by `page_order_key` -- the natural key, then the raw name by code
+point -- and is the only definition of page order. Exact page hashing,
+perceptual hashing and the source-drift live inventory all call it. They
+must agree exactly, because the perceptual save refuses unless its pages
+match the stored exact rows index for index.
+
+**Duplicate names are reported, not ordered.** Identical raw image names
+cannot be ordered by name. `order_page_entries` returns them in
+`PageOrder.duplicate_names`; `ArchivePageHashes.duplicate_entry_names` and
+`order_resolved` carry them on the page-hash result. Such an archive is
+still fully inventoried -- same-named members keep physical order only
+because each page needs an index -- but its order, and its content
+signature, carry no authority. The stored form needs no schema change:
+two `archive_pages` rows of one archive with the same `entry_name`.
+Consumers that act on it today:
+
+- `ArchivePageHashRepository.duplicate_content_groups` excludes such
+  archives before grouping; `unresolved_page_order_archive_ids` lists them.
+- `scripts/cbz_library_maintenance._archive_content_fingerprint`, the
+  deletion guard, returns `None` for them, isolating the archive.
+
+Deliberately **not** gated yet, and open: `content_duplicate_audit`, the
+pairwise `near_duplicate` comparison (which aligns pages by `page_index`),
+and any future supersession evaluator (§4.1 item 4). Duplicate *non-image*
+names do not make the page order unresolved; whether they block a
+supersession comparison is §4.1/§4.4 work.
+
+**Digests stay with their member.** `ArchivePageHashRepository.save`
+deletes and reinserts the whole inventory, writing each row and its sha256
+from one `PageContentHash`, so a digest is bound to its `entry_name` by
+construction rather than to an index. The perceptual save matches stored
+rows on `(page_index, entry_name)`, never on the index alone, so rows
+stored under the old order are refused (the existing source-drift error)
+instead of receiving another member's dhash/phash.
+
+**What a deployment leaves stale.** Nothing recomputes stored data. An
+archive holding tied names keeps the rows and content signature written
+under the old order until it is re-saved; any `ordered-page-sha256`
+signature computed under the old order must be recomputed before it is
+compared. The signature algorithm version was not bumped, so a stale and a
+fresh signature are not distinguishable by their columns. Re-saving an
+archive cascades away its perceptual rows (they are not carried across by
+`entry_name`), so a re-inventory of affected archives also costs a V1
+perceptual recompute for them. The re-inventory itself is an operator
+action against production and was not run. The V1 per-page digest
+semantics are unchanged: only which index a page occupies moved.
