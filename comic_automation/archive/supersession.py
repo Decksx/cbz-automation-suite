@@ -83,8 +83,9 @@ of A may be dropped only when the caller passes
 ``accept_comicinfo_drop=True`` (operator acceptance, default off); the drop
 is then listed, not silent, and is allowed only when B carries its own
 usable ComicInfo.xml -- well-formed, consistent, not the bare injected
-template -- that covers every field A's fills, structured fields
-included (`comicinfo_drop_refusal`). David's #111 permission is that more
+template -- that covers every field A's fills, in the deliberately narrow
+set of supported shapes; any other shape is refused for review
+(`comicinfo_drop_refusal`). David's #111 permission is that more
 accurate or more comprehensive metadata may replace old; field coverage is
 the proposed, reviewed mechanism under the explicit flag, and it judges
 presence only, never accuracy. Otherwise the relation is downgraded to review,
@@ -130,6 +131,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -643,63 +645,83 @@ def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
     )
 
 
+# How deep `_scan_comicinfo` descends into an older ComicInfo. No supported
+# shape is deeper than 2 (ComicInfo/Pages/Page); the bound only keeps the
+# scan of an unsupported document small, and is itself a refusal.
+MAX_COMICINFO_DEPTH = 8
+
+_IMAGE_INDEX_RE = re.compile(r"[0-9]+")
+
+
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _populated(element: ElementTree.Element) -> bool:
-    """Non-whitespace text, any attribute, or any populated descendant."""
-    return (
-        bool((element.text or "").strip())
-        or bool(element.attrib)
-        or any(_populated(child) for child in element)
-    )
+def _blank(text: str | None) -> bool:
+    return not (text or "").strip()
 
 
-def _shape(element: ElementTree.Element, path: str) -> set[str]:
-    """Every populated path under ``element``: text, attribute names, children.
+def _scan_comicinfo(root: ElementTree.Element) -> list[str]:
+    """Tail text and excess depth anywhere in ``root``, iteratively.
 
-    ``Foo`` for populated text, ``Foo@x`` for an attribute, ``Foo/Bar`` for a
-    populated child, recursively. Values are not compared, only presence.
+    Explicit stack, no recursion, and no descent below
+    `MAX_COMICINFO_DEPTH`: a document nested deeper is reported at the
+    bound, never walked, so a hostile older ComicInfo costs a bounded
+    amount of work and can never raise ``RecursionError``.
     """
-    shape: set[str] = set()
-    if (element.text or "").strip():
-        shape.add(path)
-    shape |= {f"{path}@{_local(name)}" for name in element.attrib}
-    for child in element:
-        if _populated(child):
-            shape |= _shape(child, f"{path}/{_local(child.tag)}")
-    return shape
-
-
-def _page_annotations(
-    pages: ElementTree.Element,
-) -> tuple[dict[str, frozenset[str]], list[str]]:
-    """``Pages``: {Image index: attribute names} per Page, plus problems.
-
-    A populated Page without an ``Image`` index, two Pages with one index,
-    or anything populated in ``Pages`` other than ``Page`` elements cannot
-    be matched confidently; each is returned as a problem.
-    """
-    annotated: dict[str, frozenset[str]] = {}
     problems: list[str] = []
-    for child in pages:
-        if not _populated(child):
+    if not _blank(root.text):
+        problems.append("ComicInfo (text)")
+    if root.attrib:
+        problems.append("ComicInfo (attributes)")
+    stack = [(child, 1, _local(child.tag)) for child in reversed(list(root))]
+    while stack:
+        element, depth, path = stack.pop()
+        if not _blank(element.tail):
+            problems.append(f"{path} (tail text)")
+        if len(element) and depth >= MAX_COMICINFO_DEPTH:
+            problems.append(f"{path} (nested deeper than {MAX_COMICINFO_DEPTH})")
             continue
-        if _local(child.tag) != "Page":
-            problems.append(f"Pages/{_local(child.tag)} (not a Page)")
+        stack.extend(
+            (child, depth + 1, f"{path}/{_local(child.tag)}")
+            for child in reversed(list(element))
+        )
+    return problems
+
+
+def _pages_entries(
+    pages: ElementTree.Element,
+) -> tuple[dict[int, dict[str, str]], list[str]]:
+    """The supported ``Pages`` shape: {Image index: attributes}, plus problems.
+
+    Supported: no attributes, text or tails on ``Pages``; only ``Page``
+    children, each with no children, text or tail, and an ``Image`` that is
+    a non-negative decimal integer, unique within ``Pages``. Anything else
+    is a problem, and a document with a problem never certifies coverage.
+    """
+    entries: dict[int, dict[str, str]] = {}
+    problems: list[str] = []
+    if pages.attrib:
+        problems.append("Pages (attributes)")
+    if not _blank(pages.text):
+        problems.append("Pages (text)")
+    for page in pages:
+        if _local(page.tag) != "Page":
+            problems.append(f"Pages/{_local(page.tag)} (not a Page)")
             continue
-        image = child.attrib.get("Image")
-        if image is None:
-            problems.append("Pages/Page without an Image index")
+        image = page.attrib.get("Image")
+        where = f"Pages/Page[Image={image!r}]"
+        if len(page) or not _blank(page.text) or not _blank(page.tail):
+            problems.append(f"{where} (content)")
+        if image is None or not _IMAGE_INDEX_RE.fullmatch(image):
+            problems.append(f"{where} (invalid Image index)")
             continue
-        if image in annotated:
-            problems.append(f"Pages/Page[Image={image}] appears twice")
+        index = int(image)
+        if index in entries:
+            problems.append(f"{where} (duplicate Image index)")
             continue
-        if len(child) or (child.text or "").strip():
-            problems.append(f"Pages/Page[Image={image}] has nested content")
-        annotated[image] = frozenset(_local(name) for name in child.attrib)
-    return annotated, problems
+        entries[index] = {_local(name): value for name, value in page.attrib.items()}
+    return entries, problems
 
 
 def _parse_comicinfo(documents: Sequence[bytes]) -> list[ElementTree.Element] | None:
@@ -713,44 +735,93 @@ def _parse_comicinfo(documents: Sequence[bytes]) -> list[ElementTree.Element] | 
     return roots
 
 
-def _coverage_gaps(
-    older_roots: Sequence[ElementTree.Element], keeper: ElementTree.Element
-) -> list[str]:
-    """What ``older_roots`` fill that ``keeper`` does not carry.
+def _keeper_offer(
+    keeper: ElementTree.Element,
+) -> tuple[set[str], dict[int, dict[str, str]] | None, list[str]]:
+    """What the keeper carries in supported shapes.
 
-    Top-level elements by name; ``Pages`` by Page ``Image`` index with at
-    least the same attribute names; any other structured element by its
-    populated shape (`_shape`). Presence only: a value that differs is
-    covered, because coverage judges presence, not accuracy.
+    (simple elements with non-blank text, the Pages map or None when it has
+    no Pages, problems with its Pages). Only these shapes can cover.
     """
-    keeper_top = {
-        _local(child.tag): child for child in keeper if _populated(child)
+    simple = {
+        _local(child.tag)
+        for child in keeper
+        if not child.attrib and not len(child) and not _blank(child.text)
     }
+    pages = [child for child in keeper if _local(child.tag) == "Pages"]
+    if not pages:
+        return simple, None, []
+    if len(pages) > 1:
+        return simple, None, ["keeper Pages (repeated)"]
+    entries, problems = _pages_entries(pages[0])
+    return simple, entries, [f"keeper {p}" for p in problems]
+
+
+def _coverage(
+    older_roots: Sequence[ElementTree.Element], keeper: ElementTree.Element
+) -> tuple[list[str], list[str]]:
+    """(unsupported shapes, coverage gaps) of ``older_roots`` against ``keeper``.
+
+    Only two shapes in the older document can be covered:
+
+    * a simple element -- no attributes, no children, non-blank text --
+      covered by a keeper element of the same name with non-blank text;
+    * the supported ``Pages`` shape (`_pages_entries`): each Page attribute
+      with a non-blank value, other than ``Image``, must be non-blank on the
+      keeper's Page with the same Image index.
+
+    An element with only blank content needs nothing. Every other shape is
+    unsupported and refuses the drop. Values may differ: coverage judges
+    presence, never accuracy.
+    """
+    unsupported: list[str] = []
     gaps: list[str] = []
+    simple, keeper_pages, keeper_problems = _keeper_offer(keeper)
     for root in older_roots:
+        unsupported += _scan_comicinfo(root)
+        pages_seen = 0
         for child in root:
             name = _local(child.tag)
-            if not _populated(child):
-                continue
-            mine = keeper_top.get(name)
-            if mine is None:
-                gaps.append(name)
-                continue
             if name == "Pages":
-                older_pages, problems = _page_annotations(child)
-                keeper_pages, keeper_problems = _page_annotations(mine)
-                gaps += problems + [f"keeper {p}" for p in keeper_problems]
-                for image, attributes in older_pages.items():
-                    if image not in keeper_pages:
-                        gaps.append(f"Pages/Page[Image={image}]")
-                    else:
-                        gaps += [
-                            f"Pages/Page[Image={image}]@{a}"
-                            for a in sorted(attributes - keeper_pages[image])
-                        ]
+                pages_seen += 1
+                if pages_seen > 1:
+                    unsupported.append("Pages (repeated)")
+                    continue
+                entries, problems = _pages_entries(child)
+                unsupported += problems
+                needs = {
+                    index: sorted(
+                        attribute
+                        for attribute, value in attributes.items()
+                        if attribute != "Image" and not _blank(value)
+                    )
+                    for index, attributes in entries.items()
+                }
+                needs = {index: names for index, names in needs.items() if names}
+                if not needs:
+                    continue
+                if keeper_problems:
+                    unsupported += keeper_problems
+                    continue
+                for index, names in sorted(needs.items()):
+                    page = (keeper_pages or {}).get(index)
+                    if page is None:
+                        gaps.append(f"Pages/Page[Image={index}]")
+                        continue
+                    gaps += [
+                        f"Pages/Page[Image={index}]@{attribute}"
+                        for attribute in names
+                        if _blank(page.get(attribute))
+                    ]
                 continue
-            gaps += sorted(_shape(child, name) - _shape(mine, name))
-    return sorted(set(gaps))
+            if child.attrib or len(child):
+                unsupported.append(name)
+                continue
+            if _blank(child.text):
+                continue
+            if name not in simple:
+                gaps.append(name)
+    return sorted(set(unsupported)), sorted(set(gaps))
 
 
 def comicinfo_drop_refusal(older: DerivedArchive, newer: DerivedArchive) -> str | None:
@@ -763,13 +834,19 @@ def comicinfo_drop_refusal(older: DerivedArchive, newer: DerivedArchive) -> str 
     Coverage establishes only that nothing the older document fills is
     missing from the keeper's; it says nothing about which is accurate.
 
+    Deliberately narrow (PR #123 review): only the shapes in `_coverage`
+    can certify coverage, and anything else is "unsupported ComicInfo
+    shape" and goes to review. This is not an XML merger.
+
     * The keeper's ComicInfo must be usable (`keeper_comicinfo_is_usable`).
-    * The older ComicInfo must parse. One that cannot be parsed cannot be
-      inventoried, so it can never certify an empty requirement set: the
-      drop is refused and goes to review.
-    * Every field the older document(s) fill must be carried by the keeper
-      (`_coverage_gaps`), including a field the older document holds twice
-      with contradictory values: inconsistency is not emptiness.
+    * The older ComicInfo must parse; one that cannot be parsed cannot be
+      inventoried, so it can never certify an empty requirement set.
+    * A well-formed but inconsistent older document is inventoried like any
+      other, contradictory fields included: inconsistency is not emptiness.
+
+    The only failure caught here is ``ElementTree.ParseError``, from the
+    older document; the traversal itself is bounded and cannot raise for
+    depth.
     """
     if not keeper_comicinfo_is_usable(newer):
         return "the newer archive has no usable ComicInfo.xml of its own"
@@ -780,7 +857,9 @@ def comicinfo_drop_refusal(older: DerivedArchive, newer: DerivedArchive) -> str 
             "be inventoried"
         )
     keeper = ElementTree.fromstring(newer.comicinfo_documents[0])
-    gaps = _coverage_gaps(older_roots, keeper)
+    unsupported, gaps = _coverage(older_roots, keeper)
+    if unsupported:
+        return f"unsupported ComicInfo shape: {', '.join(unsupported)}"
     if gaps:
         return f"the newer archive's ComicInfo.xml does not cover {gaps}"
     return None
