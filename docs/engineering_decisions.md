@@ -152,6 +152,24 @@ than waiting.
 Modules may still differ from each other where that difference is
 deliberate.
 
+Classification staging (`scripts/cbz_classification_staging.py`) is one
+such deliberate difference (#82). Its every rename goes through one helper,
+`_replace`, with one module-level schedule (`REPLACE_RETRY_DELAYS`, about
+3 s in total, starting at 50 ms). The lock it waits out is a brief handle
+inside a freshly written local tree, not a network-share lock. A scanner or
+indexer is the leading hypothesis for the holder; the #82 runs never
+identified it. It retries only `PermissionError` carrying Windows code 5 or
+32. A failed `os.replace` moves nothing, so a retry cannot duplicate a
+payload.
+
+A wait makes earlier checks stale, so nothing irreversible trusts them.
+Library-source moves revalidate the source after each wait. Deleting a
+copied-away source revalidates it immediately before the delete, and refuses
+on drift. Operator moves (promote, reject, rollback) re-run their own
+preconditions before retrying: the frozen record, the staged-payload
+verification and an empty destination. Exhausting the schedule raises the
+original error with nothing moved.
+
 ## Audits record evidence; fixes record resolution
 
 Audit documents are preserved unedited as the evidence record of the
@@ -242,6 +260,55 @@ resolves nothing. Enabling index authority over unresolved duplicates
 would encode that disagreement as an authoritative prior decision, and
 the first production index build would make it one — after which the
 evidence that it was ever ambiguous is a log line.
+
+### SeriesIndex diagnostics are the input to that gate (#60)
+
+The index retains every distinct lexical source path for a canonical key,
+including multiple paths inside one destination. Re-observing the same path
+does not manufacture a collision. Path identity uses the host filesystem's
+lexical case policy and an absolute normalized path; it does not resolve
+symlinks, junctions, SMB aliases or Unicode path spellings into physical
+identity. Two distinct Unicode spellings can be separate directories even
+when their canonical series keys agree.
+
+`SeriesIndex.diagnostics()` returns an immutable `SeriesIndexDiagnostics`:
+`collisions` contains each key and all its contributing destination/path
+entries; `empty_keys` contains directories that cannot be indexed;
+`excluded` records the explicit non-series policy; `scan_problems` records an
+unbuilt or disabled index and unavailable configured roots. `to_dict()` is a
+JSON-ready report with the full paths. The watcher exposes the same snapshot
+as `WatcherRouter.index_diagnostics()` under its existing index lock, and
+reports unresolved diagnostics at startup without enabling moves.
+
+The non-series policy names only Syncthing's `.stfolder` and `.stversions`,
+case-insensitively. It does not generalize the old census's four UUID
+exclusions: a UUID-looking title, or another dot-prefixed title such as
+`.hack`, remains a candidate. Any broader exclusion needs its own evidence
+and tests. Files remain outside the default directory lister's input.
+
+The zero-ambiguity branch of the gate is now executable:
+`router.index_diagnostics().require_clear()` (or the equivalent standalone
+index snapshot). It refuses collisions, empty keys, and incomplete scans;
+`is_ambiguous()` alone is never a gate evaluation. A complete scan containing
+only explicitly excluded control directories may pass. An injected lister
+must enumerate the configured root's child directories completely or raise;
+a lister that silently omits input cannot certify a census. Default-lister
+errors propagate, including a root disappearing during enumeration.
+
+The reviewed-exception branch still needs its own manifest identity and
+provenance design. No unchecked key list waives this stricter gate. The gate
+evaluates one in-memory observation; it is not a filesystem transaction, a
+freshness guarantee, a human identity resolution, or permission to activate
+v2. Rebuild and remeasure against the actual target before an authority
+decision. Incremental additions update diagnostics; removals require a
+rebuild rather than silently clearing a prior collision.
+
+Legacy routing continues to choose the configured destination priority so
+archives are not stranded. Within a same-root collision, a deterministic
+path ordering replaces enumeration order. That choice remains explicitly
+reported as an unresolved identity and is not evidence that the authority
+gate passed. Unambiguous routing, adult signals, shadow mode, staging and
+production activation are unchanged by this diagnostic work.
 
 ## Office PC is the worker
 
@@ -946,3 +1013,388 @@ unapplied count as a measured figure. `project_planned_binding()` refuses a
 `page_inventory` binding outright rather than returning `None`, so a caller
 that bypassed the selection cannot leave that count quietly disagreeing
 with reality.
+
+## Page order breaks natural-key ties on the raw name; duplicate names are unresolved
+
+Design `docs/canonical_naming_and_version_supersession.md` §1.2, step 2 of
+§6. The Step 8 property tests pinned the defect as three strict xfails
+(`a.png`/`A.png`, `01.png`/`1.png`, `p1.png`/`p01.png`): the natural key
+tied, the sort was stable, and physical member order decided page order and
+so the content signature.
+
+**One ordering function.** `page_hashing.order_page_entries` sorts image
+members by `page_order_key` -- the natural key, then the raw name by code
+point -- and is the only definition of page order. Exact page hashing,
+perceptual hashing and the source-drift live inventory all call it. They
+must agree exactly, because the perceptual save refuses unless its pages
+match the stored exact rows index for index.
+
+**Duplicate names are reported, not ordered.** Identical raw image names
+cannot be ordered by name. `order_page_entries` returns them in
+`PageOrder.duplicate_names`; `ArchivePageHashes.duplicate_entry_names` and
+`order_resolved` carry them on the page-hash result. Such an archive is
+still fully inventoried -- same-named members keep physical order only
+because each page needs an index -- but its order, and its content
+signature, carry no authority. The stored form needs no schema change:
+two `archive_pages` rows of one archive with the same `entry_name`.
+Duplicate *non-image* names do not make the page order unresolved;
+whether they block a supersession comparison is §4.1/§4.4 work.
+
+**The ordering contract is versioned.** `CONTENT_SIGNATURE_VERSION` moved
+from `"1"` (natural key, ties in physical order) to `"2"` (ties on the raw
+name). Without the bump, old-order and new-order rows were
+indistinguishable and could collide for different archives: A packed
+`a.png`=X, `A.png`=Y stores X,Y under the old rule; B packed `a.png`=Y,
+`A.png`=X stores X,Y under the new one. The per-page sha256 version and
+the V1 perceptual algorithms and versions are unchanged.
+
+**One gate for every ordered-content reader.**
+`page_hashing.comparable_ordered_signature_sql(alias)` is true only for the
+current algorithm and version *and* a resolved stored order. Every reader
+that groups on `archive_content_signatures.digest` or aligns pages by
+`page_index` applies it:
+
+- `ArchivePageHashRepository.duplicate_content_groups`;
+- `content_duplicate_audit.collect_duplicate_groups` (its version is now
+  taken from `page_hashing`, not hardcoded), with `run_audit` reporting
+  what was excluded under `excluded_signatures`;
+- `NearDuplicateRepository.load_fingerprints`, which previously checked
+  neither the signature algorithm nor its version, so no legacy or
+  unresolved archive is aligned, scored or written as a candidate.
+
+`page_hashing.signature_evidence_counts` counts rows as `comparable`,
+`legacy_ordering_version`, `unknown_algorithm` or `unresolved_page_order`;
+the excluded classes are diagnostics, never evidence. The in-memory
+deletion guard (`scripts/cbz_library_maintenance._archive_content_fingerprint`)
+computes a fresh current-version result and returns `None` when
+`order_resolved` is false. `unresolved_page_order_archive_ids` lists the
+stored unresolved archives.
+
+Not gated, because they are not ordered-content readers in production:
+`dal.ContentSignatureRepository.archives_sharing_digest` /
+`duplicate_digests` have no production caller (tests only, under their own
+`ordered-page` algorithm name); perceptual eligibility, classification and
+relocation repair read a signature's presence, page count or source
+metadata, never its digest or order.
+
+**Digests stay with their member.** `ArchivePageHashRepository.save`
+deletes and reinserts the whole inventory, writing each row and its sha256
+from one `PageContentHash`, so a digest is bound to its `entry_name` by
+construction rather than to an index. The perceptual save matches stored
+rows on `(page_index, entry_name)`, never on the index alone, so rows
+stored under the old order are refused (the existing source-drift error)
+instead of receiving another member's dhash/phash.
+
+**What a deployment leaves stale.** Nothing recomputes stored data, and
+`enqueue_missing` deliberately does not look at the version: re-enqueueing
+every version-`"1"` row would re-inventory the whole library, and each
+re-save cascades away that archive's perceptual rows (they are not carried
+across by `entry_name`), throwing away the V1 backfill. So from deployment
+until the plan below is run, **every existing signature is legacy** and the
+duplicate report, the content audit and near-duplicate generation return
+nothing for it. That is the honest state: those rows were computed under an
+ordering contract this code no longer vouches for.
+
+### Re-certification and re-inventory plan (operator-gated, not run)
+
+Nothing here has been run against production. Each step is a guarded,
+report-first operation of its own: dry run, expected count plus snapshot
+digest, backup before apply, and David's approval.
+
+1. **Identify legacy rows.** `archive_content_signatures` with
+   `algorithm = 'ordered-page-sha256'` and `algorithm_version = '1'`
+   (`signature_evidence_counts()['legacy_ordering_version']`).
+2. **Classify each, read-only, from stored rows.** Only rows still bound
+   to current bytes are candidates (signature source size/mtime equal the
+   current location's). Then, over the archive's stored
+   `archive_pages.entry_name` values:
+   - **order-stable:** no two names tie on `_natural_key` and no name
+     repeats. The old and new orders of those names are identical, so the
+     stored digest *is* the version-`"2"` digest;
+   - **tied:** some names tie on the natural key. The stored order may
+     differ from the new one; the digest must be recomputed;
+   - **unresolved:** some name repeats. It stays unresolved under any
+     version and is excluded either way;
+   - **stale:** not bound to current bytes. Ordinary rehash path.
+3. **Re-certify order-stable rows in place:** set `algorithm_version` to
+   `'2'` after re-checking, in the same transaction, that the stored names
+   and source metadata still match the classification. No file is read,
+   no page row changes, perceptual rows are kept.
+4. **Re-inventory tied (and unresolved) rows:** run `hash_archive_pages`
+   for each. This rewrites page rows and the signature under version
+   `"2"`, cascades their perceptual rows away, and requires the perceptual
+   worker to recompute V1 hashes for exactly those archives. Their count is
+   the cost to report before approval.
+5. **Postflight:** `signature_evidence_counts` shows no
+   `legacy_ordering_version` rows for current locations, and the content
+   audit is re-run for review.
+
+Steps 2 and 3 needed a tool that did not exist when this entry was written;
+the PR that introduced the gate provided only the gate and the counts. The
+re-inventory itself is an operator action against production. The V1
+per-page digest semantics are unchanged: only which index a page occupies
+moved.
+
+### The re-certification tool (steps 2, 3 and 5)
+
+`comic_automation/archive/content_signature_recertify.py`, tested by
+`tests/test_content_signature_recertify.py` on `tmp_path` fixtures only. It
+has not been run against production; running it is the operator's step,
+under the same rules as the plan above.
+
+**Operational contract.** The order is fixed:
+
+1. Plan.
+2. Take a backup **after** the plan.
+3. Apply.
+4. Run postflight.
+
+```text
+python -m comic_automation.archive.content_signature_recertify plan \
+    --database DB --json-out PLAN.json
+python -m comic_automation.database.backup_cli --database DB \
+    --backup BACKUP.db --json-output BACKUP_REPORT.json
+python -m comic_automation.archive.content_signature_recertify apply \
+    --database DB --plan PLAN.json --expect-digest HEX --expect-count N \
+    --backup-report BACKUP_REPORT.json [--json-out APPLY.json]
+python -m comic_automation.archive.content_signature_recertify postflight \
+    --database DB --plan PLAN.json [--json-out POST.json]
+```
+
+Exit codes:
+
+- `0`: done.
+- `1`: failed.
+- `2`: refused, and nothing was written.
+- `3`: apply skipped a row, or postflight did not pass.
+
+**Supported transition: exactly `"1"` to `"2"`.** Both versions are
+literals in the module. Every mode refuses when the writer's
+`CONTENT_SIGNATURE_VERSION` is not `"2"`. The order-stable argument holds
+for those two orderings only, so a later bump turns this tool off rather
+than turning it into a `"1"` to `"3"` relabel.
+
+**Provenance: recorded metadata, never live bytes.** No archive file is
+opened.
+
+- **When a row counts as bound.** A row is bound to current bytes when
+  `archive_content_signatures.source_file_size = file_locations.file_size`
+  and `archive_content_signatures.source_modified_time_ns =
+  file_locations.modified_time_ns`, both taken from the archive's single
+  `is_current = 1` location. These are the same fields `enqueue_missing`
+  compares.
+- **What makes a row `stale`.** No current location, more than one, or a
+  NULL or unequal value.
+- **What equality does not prove.** Equal values are a diagnostic. They do
+  not prove that the stored page rows describe the bytes on disk today.
+- **What a relabel certifies.** **The recorded order only**: the stored
+  names sort the same way under contracts `"1"` and `"2"`, and the stored
+  digest equals the version-`"2"` digest recomputed from the stored page
+  sha256 rows. It does not meet #112's full-file/member validation for
+  authoritative supersession.
+
+**Location references are diagnostics, and foreign ones are
+inconsistent.** If a signature's `location_id` or a page row's
+`location_id` names another archive's location, the row is
+`inconsistent`. The following conditions are reported in the basis
+`location_diagnostics` and in the plan's `location_diagnostics` counts:
+
+- `signature_location_not_current`: the signature names a non-current
+  location of the same archive, for example after a relocation;
+- `signature_location_null`: the signature names no location;
+- `signature_location_dangling`: the signature names a location row that
+  does not exist;
+- `page_location_not_current`: page rows name a location other than the
+  current one.
+
+Those conditions alone do not change the class. A relocation does not
+change the recorded order.
+
+**Classes, first match wins.**
+
+1. `stale`: not bound, as above.
+2. `unresolved`: a repeated raw `entry_name`.
+3. `tied`: distinct names that tie on `_natural_key`.
+4. `inconsistent`: either of these:
+   - a foreign location reference;
+   - a stored basis that does not reproduce the stored digest. The causes
+     are a page-row count different from `page_count`, `page_index` values
+     that are not `0..n-1`, a page without its sha256 row, a stored order
+     that is not the `page_order_key` order, or a recomputed digest that
+     differs.
+
+   This class was added beyond steps 1 to 5, and Codex accepted it on #117
+   as fail-closed scope.
+5. `order_stable`: none of the above. A test recomputes the version-`"2"`
+   digest independently, both from the stored rows and fresh from the
+   archive bytes. It shows the two are equal for order-stable rows and
+   unequal for a tied row.
+
+`tied`, `unresolved` and `inconsistent` together are
+`reinventory_archive_ids`. This list is a **proposed** population for step
+4, which is authorised separately; nothing here enqueues it. `stale` rows
+take the ordinary rehash path.
+
+**Plan.**
+
+- **How it reads.** It reads one `read_consistent_snapshot`: `mode=ro`
+  plus `query_only`, `data_version` taken before and after, and one
+  deferred transaction.
+- **What it writes.** A JSON plan whose `plan_digest` is the SHA-256 of
+  the body's canonical JSON (sorted keys, compact separators, ASCII).
+- **What the digested body contains.**
+  - the classification;
+  - `target`, the database binding;
+  - `planned_at_ns`, taken before the read.
+- **What stays outside the digest.** Snapshot readings such as
+  `data_version` are recorded beside the body, outside the digest. They are
+  per-connection numbers, not identities.
+
+**Target binding.** `target` holds three values: the normalised real path
+of the database, `st_dev` and `st_ino`. On Windows these are the volume
+serial number and the NTFS file index. Apply and planned postflight
+recompute the binding from `--database` and refuse before any write if it
+differs. Apply checks it again after `BEGIN IMMEDIATE`.
+
+- **Alias policy.** Any spelling that resolves to the same real path *and*
+  the same file is accepted. That covers relative paths, case, `..`,
+  symlinks and junctions. These are refused:
+  - a hard link, which has another real path;
+  - a copy;
+  - a SQLite backup clone;
+  - any file at another path.
+- **Restore policy.** Restoring a backup over the target replaces the file
+  and changes `st_ino`. The restored database is therefore refused and must
+  be planned again.
+- **Filesystems without file identity.** A filesystem that reports
+  `st_ino == 0` is refused rather than bound on its path alone.
+
+**Backup binding.** Creating the backup is the operator's job, through
+`backup_cli`. The report only says where the backup is. Apply then checks
+the artifact itself (`verify_backup`), before any write:
+
+1. The report says `verified: true` and every entry in `checks` is true.
+2. Its `source_database` has the plan's target identity.
+3. The named backup file exists.
+4. The backup is not the live database by any alias: not the same real
+   path, not the same file id (which catches hard links), and not a WAL or
+   SHM sidecar.
+5. Its size and mtime equal the report's `backup_size_bytes` and
+   `backup_modified_time_ns`.
+6. **Freshness.** Its mtime is at or after the plan's `planned_at_ns`.
+7. It opens read-only. Its `quick_check` is `ok`, and its user-table row
+   counts equal the report's `backup_table_counts`.
+8. **Preimage.** Classifying the backup's own legacy rows reproduces the
+   plan's classification exactly: the counts, every class list, the
+   order-stable bases, the re-inventory list and the location diagnostics.
+9. Nothing committed to it, and it was not replaced, while it was being
+   verified.
+
+**The backup window.** The first version compared only the backup's
+main-file size and mtime under the lock. Codex showed on #117 that this
+does not prove the SQLite artifact unchanged. A WAL-mode commit to the
+backup made after verification lands in `-wal` and leaves those fields
+identical. In the probe, a commit deleted both planned signatures from the
+backup, and apply still relabelled them and passed postflight. The guard is
+now `BackupWindow`:
+
+- **One held connection.** `verify_backup` opens one read-only connection
+  to the backup (`mode=ro` plus `query_only`). It keeps that connection
+  open until apply ends and closes it on every path, refusals included.
+- **The first reading.** The connection's `PRAGMA data_version` is read
+  outside any read transaction, before the preimage read.
+- **Where it is checked.** The reading must be unchanged at three points:
+  - after the preimage read;
+  - after the live `BEGIN IMMEDIATE`;
+  - as the last statement before the live `COMMIT`.
+
+  `data_version` counts commits by other connections, WAL-only ones
+  included.
+- **What a change does.** A change before the lock refuses the apply with
+  nothing written. A change while planned rows are processed rolls back
+  every relabel in the transaction.
+- **The replacement check.** The file fingerprint (`st_dev`, `st_ino`,
+  size, mtime) is compared at the same three points, for a different
+  failure. It notices the backup being moved, deleted or replaced, which a
+  connection that still holds the old file would not see as a commit. It
+  is a replacement check only, not evidence about the backup's content.
+- **Checked window.** From the first `data_version` reading in
+  `verify_backup` to the final check just before the live `COMMIT`.
+- **Remaining non-atomic limit.** The live database's lock does not lock
+  the backup. A commit to the backup after the final check, while the live
+  `COMMIT` itself is executing, is not detected. That interval holds no
+  reads or writes by this tool. Do not run writers against the backup
+  file.
+- **Windows measurement.** Measured on 2026-10-22 on the Windows temp
+  volume of the development checkout: `os.replace` of a database held open
+  by a read-only connection fails with `PermissionError` (WinError 32). The
+  replacement-check test therefore simulates a new file id instead of
+  moving the file. This has not been measured on the production volumes.
+
+- **What the preimage check guarantees.** Apply relabels a row only when
+  the live basis equals the plan basis. The preimage check makes that plan
+  basis equal to the backup basis. So the backup holds the exact pre-apply
+  state of every row apply changes.
+- **What the backup is not guaranteed to hold.** Changes made after the
+  backup to rows apply does not touch are not in it.
+- **Rerun policy.** The same plan and the same backup may be applied
+  again: apply is idempotent, and the backup is still the preimage. A new
+  plan needs a new backup, because freshness is measured against that
+  plan's time.
+- **Clock assumption.** Freshness compares the backup file's mtime with
+  the planning host's clock. A backup written to a volume whose clock
+  differs from that host's can be refused.
+
+**Apply, per row.** One `dal.transaction` (`BEGIN IMMEDIATE`) re-classifies
+every planned archive from the rows as they are inside the lock. A row is
+relabelled only if all of these still hold:
+
+- the algorithm is `ordered-page-sha256` and the version is `"1"`;
+- the row is `order_stable`;
+- the basis is identical: signature id, digest, `page_count`, source size
+  and mtime, current location id, signature location id, location
+  diagnostics, and a SHA-256 of the stored names in `page_index` order.
+
+Each other row is skipped and named:
+
+- `missing`;
+- `algorithm_<a>`;
+- `now_<class>:<reason>`;
+- `basis_changed`;
+- `version_<v>`.
+
+A row already at `"2"` with the planned basis is `already_recertified`. The
+`UPDATE` also requires `algorithm_version = '1'`. If that predicate matches
+no row, the whole apply rolls back. A relabel writes only
+`archive_content_signatures.algorithm_version` and `updated_at`. Page rows,
+`page_hashes` (exact and perceptual), `calculated_at` and `archive_files`
+are not written.
+
+**Postflight proves each planned outcome.** Given a plan, postflight first
+verifies it: the digest is recomputed, and the format, transition and
+target are checked. It then states the outcome of every planned row,
+reusing apply's classification:
+
+- `recertified` is success: the row is present, `ordered-page-sha256`,
+  version `"2"`, and still `order_stable` with the approved basis;
+- `legacy_as_planned` means the row is still the untouched preimage;
+- `missing`, `algorithm_<a>`, `version_<v>`, `now_<class>:<reason>` and
+  `basis_changed` name drift.
+
+Every outcome except `recertified` is listed in `planned_failures` and
+fails the run.
+
+The report also states its populations:
+
+- `signature_evidence_counts` covers every signature row, in any location
+  state.
+- `legacy_rows_by_class` covers the remaining version-`"1"` rows. It must
+  show zero `order_stable`.
+
+`stale`, `tied`, `unresolved` and `inconsistent` rows stay legacy, excluded
+from comparison, until step 4 re-inventories them. Postflight counts them
+but does not fail on them.
+
+**Not done here.** Step 4 (re-inventory) is not done. The tool does not
+take the backup itself. Apply refuses unless the backup it is given passes
+all the checks above.

@@ -18,8 +18,11 @@ from comic_automation.archive.candidate_selection import (
     revalidate_for_enqueue,
     select_candidates,
 )
-from comic_automation.archive.inspection import IMAGE_EXTENSIONS
-from comic_automation.archive.page_hashing import _natural_key
+from comic_automation.archive.archive_limits import (
+    UnsafeArchiveError,
+    validate_archive_members,
+)
+from comic_automation.archive.page_hashing import order_page_entries
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
@@ -412,16 +415,17 @@ def calculate_perceptual_hashes(
     try:
         phase_started = time.perf_counter() if profile else 0.0
         with zipfile.ZipFile(archive_path, mode="r") as archive:
-            entries = sorted(
-                (
-                    entry
-                    for entry in archive.infolist()
-                    if not entry.is_dir()
-                    and Path(entry.filename).suffix.casefold()
-                    in IMAGE_EXTENSIONS
-                ),
-                key=lambda entry: _natural_key(entry.filename),
-            )
+            members = archive.infolist()
+            # Archive-wide limits, member names and encryption, checked on
+            # the central directory before the first member is opened. An
+            # encrypted member would otherwise surface from archive.open()
+            # as a bare RuntimeError and be filed as archive_unreadable.
+            validate_archive_members(members)
+            # The exact inventory's ordering helper, not a local sort: the
+            # save below refuses unless these pages match the stored exact
+            # rows index for index, so the two must order tied names alike.
+            # Order only; per-page decoding and digests are untouched.
+            entries = order_page_entries(members).entries
             if profile:
                 zip_open_and_inventory_seconds += (
                     time.perf_counter() - phase_started
@@ -523,6 +527,13 @@ def calculate_perceptual_hashes(
             f"Invalid or corrupt CBZ archive: {archive_path}",
             category="archive_corrupt",
         ) from exc
+    except UnsafeArchiveError as exc:
+        # Permanent: the same central directory fails the same way on
+        # every retry. The reason code is the category.
+        raise PermanentJobError(
+            f"Refused CBZ archive {archive_path}: {exc}",
+            category=exc.reason,
+        ) from exc
     except RuntimeError as exc:
         raise PermanentJobError(
             f"Unreadable CBZ entry in {archive_path}: {exc}",
@@ -602,6 +613,12 @@ class ArchivePerceptualHashRepository:
             for page in result.pages
         ]
 
+        # The match is on (page_index, entry_name), never on the index or
+        # the count alone. After a page-order change (design §1.2) rows
+        # stored under the old order hold the same indices with different
+        # names, and an index-only match would write one member's dhash and
+        # phash onto another member's row. Refusing routes the archive to
+        # source-drift recovery, which re-inventories it first.
         if expected != actual:
             raise OSError(
                 "Stored page inventory does not match the current "

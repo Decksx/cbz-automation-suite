@@ -481,15 +481,15 @@ def resolve_protected_execution(
     needed because every pending version was read out of
     `snapshot.discovered` in the first place.
 
-    Deliberately **not** implemented here, and therefore not enforced by
-    anything yet (design sections 8 and 12): verified writer quiescence,
-    the protected backup, plan-digest and expected-count revalidation,
-    the ledger preconditions of section 12.1 steps 3-4 (recorded against
-    discovered set equality, and the next-applicable test),
-    statement-by-statement application, the in-transaction ledger row,
-    and the section 12.2 reconciliation. A caller holding these paths has
-    been authorized and has satisfied none of those obligations. They
-    belong to the executor that is built in a later slice.
+    This seam still does NOT enforce the executor's other obligations
+    (design sections 8 and 12): verified writer quiescence, protected
+    backup, plan-digest and expected-count revalidation, statement-by-statement
+    application, the in-transaction ledger row, and section 12.2 reconciliation.
+    Section 12.1 steps 3 and 4 have pure predicates, require_slice4_ledger()
+    and require_slice4_next_applicable(), but both remain deliberately
+    separate and are NOT called here. A caller holding these
+    paths has been authorized and has satisfied none of those obligations.
+    They belong to the executor that is built in a later slice.
     """
     pending = set(snapshot.pending_protected())
 
@@ -504,3 +504,53 @@ def resolve_protected_execution(
         snapshot.discovered[version]
         for version in sorted(authorization.versions)
     )
+
+
+def require_slice4_ledger(snapshot: MigrationSnapshot) -> None:
+    """Refuse unless the ledger equals all discovered versions below 015.
+
+    Slice-4 design section 12.1 step 3 requires SET EQUALITY, not merely
+    that all earlier files were recorded. A later or unknown recorded
+    version is as invalid as a missing earlier one. The generic protected
+    seam intentionally does not enforce this migration-specific condition.
+
+    This is one pure predicate over the supplied snapshot: no connection,
+    directory scan, transaction or SQL. It does not prove the snapshot is
+    fresh. The future executor must take it under its write lock and also
+    verify explicit authorization/pending versions, the next-applicable
+    version, backup, quiescence, approved plan, SQL and reconciliation
+    before it may commit. Passing
+    this predicate alone does not even prove that a 015 file exists.
+    """
+    expected = frozenset(version for version in snapshot.discovered if version < 15)
+    if snapshot.recorded != expected:
+        missing = sorted(expected - snapshot.recorded)
+        unexpected = sorted(snapshot.recorded - expected)
+        raise ProtectedMigrationError(
+            "Slice-4 ledger refused: recorded versions must equal all "
+            "discovered versions below 015; "
+            f"missing={missing}, unexpected={unexpected}."
+        )
+
+
+def require_slice4_next_applicable(snapshot: MigrationSnapshot) -> None:
+    """Refuse unless 015 is the next unapplied discovered migration.
+
+    Section 12.1 step 4 checks ALL pending versions, including ordinary
+    ones: protected authorization alone can select 015 while an earlier
+    ordinary file is still unapplied. No pending version is a refusal too,
+    rather than success for an already-applied or absent 015.
+
+    This pure predicate uses only the supplied snapshot and proves neither
+    freshness nor ledger equality. It does not replace require_slice4_ledger()
+    or explicit protected authorization, and the generic seam calls neither
+    predicate. The future executor must compose these checks under its write
+    lock with the other section 12 obligations before applying anything.
+    """
+    pending = snapshot.pending()
+    next_version = pending[0] if pending else None
+    if next_version != 15:
+        raise ProtectedMigrationError(
+            "Slice-4 execution refused: 015 must be the next applicable "
+            f"migration; next={next_version}, pending={pending}."
+        )

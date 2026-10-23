@@ -297,11 +297,12 @@ def _unicode_paths(path: Path) -> Path:
 def _unsafe_members(path: Path) -> Path:
     """Member names that would escape the destination on naive extraction.
 
-    Nothing in this project extracts archives to disk, so these are not an
-    active vulnerability -- see `docs/archive_io_resource_audit.md`,
-    "Confirmed risks in current code". They are in the corpus because the
-    rewrite paths *preserve* such names verbatim rather than rejecting them,
-    and that behaviour should be pinned rather than left to be rediscovered.
+    Nothing in this project extracts archives to disk, so these were never
+    an active vulnerability. The rewrite paths used to *preserve* such names
+    verbatim (`docs/archive_io_resource_audit.md`, "Confirmed risks in
+    current code"); since 2026-10-22 `archive_limits` refuses them at
+    inspection, hashing and `write_comicinfo`. The fixture is unchanged so
+    that refusal is asserted against the same bytes the old pin used.
     """
     return build_cbz(
         path,
@@ -450,13 +451,52 @@ def _many_entries(path: Path) -> Path:
 
     120 pages is more than a typical chapter and less than anything
     pathological. This is **not** the roadmap's "excessive entries" case:
-    there is no entry-count limit in the codebase to exercise, so this
-    fixture pins that a large-but-ordinary archive is handled normally
-    rather than proving a guard. See `CORPUS_GAPS`.
+    it pins that a large-but-ordinary archive is handled normally, far
+    below `archive_limits.MAX_ARCHIVE_ENTRIES`, rather than proving the
+    guard. See `CORPUS_GAPS`.
     """
     entries: list[tuple[str, bytes]] = [(COMIC_INFO, comic_info_xml())]
     entries.extend(
         (f"{index:04d}.png", page_image(index)) for index in range(1, 121)
+    )
+    return build_cbz(path, entries)
+
+
+# Image-named members in `high_entry_count`. Far beyond any real comic (the
+# `many_entries` control is 120; a large omnibus is a few thousand) and
+# still **below** `archive_limits.MAX_ARCHIVE_ENTRIES` (50,000), so this is
+# the "very many entries, still admitted" side of the cap. Kept at 20,000
+# for cost: the corpus tests build every case several times, and 20,000
+# zero-byte members measured 0.6-0.7 s per build (1.9 MB) where 60,000
+# measured 1.9 s. It also stays below 65,535, so the archive is a plain ZIP
+# rather than ZIP64 -- a different structural shape that would deserve its
+# own case rather than arriving by accident.
+#
+# The over-the-cap side is deliberately not in the corpus; see
+# `CORPUS_GAPS["excessive_entries"]`. If the cap is ever lowered to or
+# below this value, the corpus pin fails, which is the intended signal.
+HIGH_ENTRY_COUNT = 20_000
+
+
+def _high_entry_count(path: Path) -> Path:
+    """Far more members than any real archive, each empty, under the cap.
+
+    Pins that the entry-count limit (`archive_limits`, 2026-10-22) admits a
+    pathologically large but sub-ceiling archive and inspection still lists
+    every member as a page. The refusal one entry over the shipped ceiling
+    is tested in `tests/test_archive_limits.py`
+    (`test_the_real_entry_ceiling_refuses_an_archive_one_entry_over`), so it
+    is not duplicated here.
+
+    Members are zero bytes on purpose. Entry count is the property under
+    test, and empty payloads keep the declared uncompressed total at zero,
+    so this case can neither trip nor be mistaken for the size cap.
+    Image-suffixed names are what make every member count as a page.
+    """
+    entries: list[tuple[str, bytes]] = [(COMIC_INFO, comic_info_xml())]
+    entries.extend(
+        (f"{index:05d}.png", b"")
+        for index in range(1, HIGH_ENTRY_COUNT + 1)
     )
     return build_cbz(path, entries)
 
@@ -500,6 +540,10 @@ CASES: tuple[Case, ...] = (
     Case("many_entries",
          "120 pages: a legitimate high-count control, not a limit test.",
          _many_entries, tags=("control",)),
+    Case("high_entry_count",
+         "20,000 empty image members: very many entries, admitted below "
+         "the 50,000 entry cap.",
+         _high_entry_count, tags=("resource", "below-cap")),
     Case("decoded_pixel_warning",
          "Header declares 108 MP: above the pixel limit, below the "
          "raise threshold.",
@@ -516,10 +560,15 @@ CASES: tuple[Case, ...] = (
 # indistinguishable from an overlooked one.
 CORPUS_GAPS = {
     "excessive_entries": (
-        "No entry-count limit exists anywhere in the codebase, so there is "
-        "no guard to exercise. `many_entries` is a legitimate high-count "
-        "control instead. Deferred to resource hardening, which is where "
-        "such a limit would be introduced."
+        "The entry-count limit (`archive_limits.MAX_ARCHIVE_ENTRIES`, "
+        "added 2026-10-22) is exercised by `tests/test_archive_limits.py`, "
+        "which builds an archive one entry over the shipped ceiling. The "
+        "corpus does not carry that archive: the test that builds and "
+        "inspects it took 1.72 s here (2026-10-22), a cost every corpus "
+        "build would pay to duplicate a test that already exists. "
+        "The corpus carries the sub-ceiling side instead "
+        "(`high_entry_count`, 20,000 entries), and `many_entries` stays a "
+        "legitimate high-count control."
     ),
     "real_pixel_payload": (
         "`decoded_pixel_*` declare their dimensions in the PNG header "
@@ -560,6 +609,8 @@ EXPECTED_SHA256: dict[str, str] = {
         "ec385de8d2849a3b9a4b6d214bc32af957f08174e1c0c40a115451436ed7475d",
     "many_entries":
         "4c6ee6313f6e1edf4a7c975a0abe6a4f89cee2d738dd7d039ac23e777328d561",
+    "high_entry_count":
+        "5818b31e95047fd0c93c3f4bbff1e693406faaa4f700a83d0ad307dadab87295",
     "decoded_pixel_warning":
         "3a6afb0cc39d806942d7979156e8426ac739adbfebec7cb7d776ef9551bc68f5",
     "decoded_pixel_bomb":

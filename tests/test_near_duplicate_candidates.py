@@ -12,6 +12,10 @@ from comic_automation.archive.near_duplicate import (
     hamming_distance,
 )
 from comic_automation.archive.near_duplicate_cli import main
+from comic_automation.archive.page_hashing import (
+    CONTENT_SIGNATURE_ALGORITHM,
+    CONTENT_SIGNATURE_VERSION,
+)
 from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
 
@@ -89,6 +93,9 @@ def seed_fingerprint(
             1,
         ),
     )
+    # The writer's own algorithm and version: the loader accepts only
+    # canonical ordered evidence, and this fixture used to carry a made-up
+    # algorithm name that production never writes.
     connection.execute(
         """
         INSERT INTO archive_content_signatures (
@@ -102,11 +109,13 @@ def seed_fingerprint(
             source_file_size,
             source_modified_time_ns
         )
-        VALUES (?, ?, 'sha256-page-sequence', '1', ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             archive.archive_id,
             int(location.lastrowid),
+            CONTENT_SIGNATURE_ALGORITHM,
+            CONTENT_SIGNATURE_VERSION,
             archive.content_signature,
             archive.page_count,
             900,

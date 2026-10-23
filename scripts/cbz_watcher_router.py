@@ -44,6 +44,7 @@ from scripts.cbz_routing import (
     RoutingDecision,
     RoutingConfigError,
     SeriesIndex,
+    SeriesIndexDiagnostics,
     build_context,
     is_terminal_sample,
     load,
@@ -92,14 +93,14 @@ def _reject_indexed_review(cfg: RoutingConfig) -> None:
 
 
 def _reject_mismatched_priority(cfg: RoutingConfig, index: SeriesIndex) -> None:
-    """An index whose precedence disagrees with the config decides by luck.
+    """Refuse an index whose deterministic selection uses the wrong policy.
 
     Destination order in series_index is precedence: Comix is listed first
     because its membership encodes a deliberate adult determination that must
     outrank a metadata-derived origin signal. An index built without that
-    order ranks every destination equally, so `rank < existing` is never true
-    and a series present in two libraries keeps whichever entry was written
-    first -- thread scheduling deciding an adult classification.
+    order ranks every destination equally, so lexical destination order would
+    replace the configured policy. Before #60, the single-entry index kept
+    the first write instead; neither choice represents configuration.
 
     SeriesIndex.build always sets it, so this cannot happen through load().
     It caught a test helper that constructed a bare SeriesIndex and therefore
@@ -112,7 +113,7 @@ def _reject_mismatched_priority(cfg: RoutingConfig, index: SeriesIndex) -> None:
         raise RoutingConfigError(
             f"series index priority {tuple(index.priority)} does not match the "
             f"configured destination order {tuple(expected)}; ambiguity would "
-            "be resolved by write order rather than by configuration"
+            "be selected by a different policy from configuration"
         )
 
 
@@ -204,12 +205,11 @@ class WatcherRouter:
         # Timer threads -- its own guard only prevents two threads working the
         # same or a nested path -- and they share this router and its index.
         #
-        # SeriesIndex.add is a compound read-modify-write: it reads _entries,
-        # branches on whether the key was present, and only then writes and
-        # marks ambiguity. Two threads adding the same series can both see it
-        # absent, both write, and lose the ambiguity marker along with the
-        # configured destination priority. The GIL makes each dict operation
-        # atomic; it does not make that sequence atomic.
+        # SeriesIndex.add is a compound read-modify-write: it finds a path's
+        # previous observation, compares destination priority, then updates it.
+        # Concurrent updates could retain the wrong destination, and a reader
+        # could see a lookup and diagnostics from different index states. The
+        # GIL makes each dict operation atomic, not these sequences.
         self._index_lock = threading.RLock()
 
     @classmethod
@@ -226,6 +226,10 @@ class WatcherRouter:
             mode, len(cfg.rules), len(cfg.series_overrides),
             "on" if cfg.series_index_enabled else "off", len(index),
         )
+        diagnostics = index.diagnostics()
+        if cfg.series_index_enabled and not diagnostics.clear:
+            log.warning("  Routing v2 index diagnostics (not an authority "
+                        "approval): %s", diagnostics.to_dict())
         return cls(cfg, index, mode=mode, sample_limit=sample_limit)
 
     @property
@@ -318,6 +322,17 @@ class WatcherRouter:
         return comparison
 
     # ------------------------------------------------------- index upkeep
+
+    def index_diagnostics(self) -> SeriesIndexDiagnostics:
+        """Return one coherent snapshot while excluding concurrent note_move.
+
+        Both the gate evaluator and any report use this snapshot, rather
+        than counting ambiguous lookups while Timer threads update the index.
+        The snapshot's require_clear() checks the zero-ambiguity gate only;
+        nothing here enables v2 or changes the legacy destination.
+        """
+        with self._index_lock:
+            return self.index.diagnostics()
 
     def dest_key_for_path(self, dest_folder: str) -> str | None:
         """Map a legacy destination path back to its v2 destination key."""

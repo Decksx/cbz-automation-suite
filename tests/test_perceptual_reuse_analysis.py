@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from comic_automation.archive.perceptual_reuse_analysis import (
     analyze_reuse_opportunity,
+    connect_read_only,
 )
 from comic_automation.archive.perceptual_reuse_cli import main
 from comic_automation.database.connection import database_connection
@@ -271,3 +276,336 @@ def test_cli_writes_json_report_without_modifying_database(
     assert "WITH eligible_archives AS" in report["query"]["sql"]
     assert report["json_output"] == str(output.resolve())
     assert _database_digest(database) == before_digest
+
+
+# --- the connection comes from the DAL (Step 5) ---------------------------
+#
+# `connect_read_only` used to call `sqlite3.connect` itself and now opens
+# through `dal.open_connection` under a caller-side policy. The tests above
+# the "migration-only" marker pin the connection to the state the private
+# copy produced -- measured on that copy at master `6410880` before it was
+# replaced, and passing against it when it is swapped back in -- so the
+# migration is shown to be behaviour-preserving rather than assumed to be.
+
+
+def _plain_database(path: Path) -> None:
+    """A one-row WAL database whose row records the path it was made at."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("CREATE TABLE marker (path TEXT)")
+        connection.execute("INSERT INTO marker VALUES (?)", (str(path),))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _spy_on_connect(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every `sqlite3.connect` call, wherever it is made from.
+
+    Patched on the `sqlite3` module itself, so it sees the private copy's
+    call and the DAL's alike: both look the function up on the module at
+    call time.
+    """
+    calls: list = []
+    real_connect = sqlite3.connect
+
+    def spy(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        calls.append((args, kwargs, connection))
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    return calls
+
+
+def test_reuse_connection_state_matches_the_pre_dal_factory(
+    tmp_path: Path,
+) -> None:
+    """Every connection property the analysis can observe, pinned at once.
+
+    Measured on the private factory: query_only 1, busy_timeout 60000,
+    isolation_level None, sqlite3.Row rows, no open transaction, nothing
+    changed. foreign_keys and synchronous are SQLite's defaults and
+    journal_mode is the file's own: a read-only analysis must not adopt
+    the writable factory's settings.
+    """
+    database = tmp_path / "state.db"
+    seed_reuse_scenario(database)
+
+    connection = connect_read_only(database)
+    try:
+        def pragma(name: str):
+            return connection.execute(f"PRAGMA {name}").fetchone()[0]
+
+        assert pragma("query_only") == 1
+        assert pragma("busy_timeout") == 60000
+        assert pragma("foreign_keys") == 0
+        assert pragma("journal_mode") == "wal"
+        assert pragma("synchronous") == 2  # FULL: SQLite's default
+        assert connection.isolation_level is None
+        assert connection.row_factory is sqlite3.Row
+        assert connection.in_transaction is False
+        assert connection.total_changes == 0
+
+        row = connection.execute(
+            "SELECT id FROM archive_files ORDER BY id"
+        ).fetchone()
+        assert row["id"] == 1
+    finally:
+        connection.close()
+
+
+def test_reuse_connection_is_opened_with_the_pre_dal_connect_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One `mode=ro` URI connect, 60 s timeout, autocommit isolation.
+
+    The timeout is only observable here: the later ``busy_timeout``
+    pragma overwrites the handler ``timeout=`` installs, so a changed
+    timeout leaves every PRAGMA reading the same.
+    """
+    database = tmp_path / "arguments.db"
+    _plain_database(database)
+    calls = _spy_on_connect(monkeypatch)
+
+    connect_read_only(database).close()
+
+    assert len(calls) == 1
+    args, kwargs, _ = calls[0]
+    assert kwargs == {"uri": True, "timeout": 60.0, "isolation_level": None}
+    assert len(args) == 1
+    assert args[0].startswith("file:")
+    assert args[0].endswith("?mode=ro")
+
+
+def test_reuse_connection_refuses_writes_with_query_only_turned_off(
+    tmp_path: Path,
+) -> None:
+    """`mode=ro` is the layer that survives the pragma being cleared."""
+    database = tmp_path / "readonly.db"
+    _plain_database(database)
+    before = database.read_bytes()
+
+    connection = connect_read_only(database)
+    try:
+        connection.execute("PRAGMA query_only = OFF")
+
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("DELETE FROM marker")
+    finally:
+        connection.close()
+
+    assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "plain.db",
+        "with space.db",
+        "hash#1.db",
+        "percent%41.db",
+        "query&x=1.db",
+        "semi;colon.db",
+        "naïve_日本.db",
+        "dir with space#%/inner.db",
+    ],
+)
+def test_reuse_connection_opens_exactly_the_named_file(
+    tmp_path: Path, relative: str
+) -> None:
+    """URI-significant characters reach SQLite escaped, not interpreted.
+
+    The private copy built ``file:`` + `quote(...)`; the DAL builds
+    `Path.as_uri()`. An unescaped ``#`` or ``?`` would end the path early
+    and ``%41`` would be decoded to ``A``, so SQLite would open -- or, if
+    not read-only, create -- a different file. Each case checks the file
+    SQLite reports, the row only the intended file holds, and that nothing
+    new appeared beside it except the database's own WAL sidecars.
+    """
+    database = tmp_path / relative
+    _plain_database(database)
+    before = sorted(p.name for p in database.parent.iterdir())
+
+    connection = connect_read_only(database)
+    try:
+        listed = connection.execute("PRAGMA database_list").fetchone()
+        marker = connection.execute("SELECT path FROM marker").fetchone()
+    finally:
+        connection.close()
+
+    assert Path(listed["file"]) == database.resolve()
+    assert marker["path"] == str(database)
+    after = sorted(p.name for p in database.parent.iterdir())
+    sidecars = {f"{database.name}-wal", f"{database.name}-shm"}
+    assert {name for name in after if name not in before} <= sidecars
+
+
+def test_a_missing_database_raises_file_not_found_and_creates_nothing(
+    tmp_path: Path,
+) -> None:
+    """Unchanged by the migration: `Path.resolve(strict=True)` refuses it.
+
+    The errno tells the two refusals apart. The OS error from `resolve`
+    carries ENOENT; the DAL's own ``FileNotFoundError("Database does not
+    exist: ...")`` carries none, so it reaching a missing path first would
+    mean the strict resolve had been dropped.
+    """
+    missing = tmp_path / "absent.db"
+
+    with pytest.raises(FileNotFoundError) as caught:
+        connect_read_only(missing)
+
+    assert caught.value.errno == errno.ENOENT
+
+    with pytest.raises(FileNotFoundError):
+        analyze_reuse_opportunity(missing)
+
+    assert not missing.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_analysis_closes_its_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The analysis owns the close of the connection it opened."""
+    database = tmp_path / "close.db"
+    seed_reuse_scenario(database)
+    calls = _spy_on_connect(monkeypatch)
+
+    analyze_reuse_opportunity(database)
+
+    assert len(calls) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        calls[0][2].execute("SELECT 1")
+
+
+# --- migration-only: these fail against the private copy, by design -------
+
+
+def test_reuse_connection_opens_through_the_dal_with_its_own_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The factory is the DAL's, asked for read-only, with the 60 s policy.
+
+    A spy rather than a source grep: it proves the call happens on the
+    path the analysis takes, with the arguments that matter.
+    """
+    from comic_automation.archive import perceptual_reuse_analysis as module
+    from comic_automation.database import dal
+
+    calls: list = []
+    real_open = dal.open_connection
+
+    def spy(database_path, **kwargs):
+        calls.append((database_path, kwargs))
+        return real_open(database_path, **kwargs)
+
+    monkeypatch.setattr(module, "open_connection", spy)
+
+    database = tmp_path / "spy.db"
+    seed_reuse_scenario(database)
+
+    analyze_reuse_opportunity(database)
+
+    assert calls == [
+        (
+            database.resolve(),
+            {
+                "readonly": True,
+                "policy": module.REUSE_ANALYSIS_READ_ONLY_POLICY,
+            },
+        )
+    ]
+
+
+def test_the_reuse_policy_is_the_read_only_policy_with_a_60s_wait() -> None:
+    """Pinned as data, so a change to it is a visible diff and a red test."""
+    from comic_automation.archive import perceptual_reuse_analysis as module
+    from comic_automation.database import dal
+
+    policy = module.REUSE_ANALYSIS_READ_ONLY_POLICY
+
+    assert policy.readonly is True
+    assert policy.timeout_seconds == 60.0
+    assert policy.pragmas == (
+        ("query_only", "ON"),
+        ("busy_timeout", "60000"),
+    )
+    assert [name for name, _ in policy.pragmas] == [
+        name for name, _ in dal.READ_ONLY_POLICY.pragmas
+    ]
+
+
+def test_a_directory_is_refused_before_sqlite_is_touched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The one deliberate behaviour change of the migration.
+
+    The private copy passed a directory to SQLite, which raised
+    `sqlite3.OperationalError("unable to open database file")` -- not an
+    `OSError`, so the CLI's handler missed it and it escaped as a
+    traceback. The DAL refuses it first with `FileNotFoundError`, which
+    the CLI reports as an ordinary failure.
+    """
+    directory = tmp_path / "not-a-database"
+    directory.mkdir()
+    calls = _spy_on_connect(monkeypatch)
+
+    with pytest.raises(FileNotFoundError, match="Database does not exist"):
+        connect_read_only(directory)
+
+    assert main(["--database", str(directory)]) == 1
+    assert "Database does not exist" in capsys.readouterr().err
+    assert calls == []
+    assert list(directory.iterdir()) == []
+
+
+def test_a_policy_failure_closes_the_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-configured connection is closed, not left to the GC.
+
+    The private copy applied its pragmas with no cleanup, so a failing
+    ``busy_timeout`` left open a connection that already had
+    ``query_only`` set and could still read. The connection class here
+    fails only that pragma; everything else is a real connection.
+    """
+
+    class FailingBusyTimeout(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA busy_timeout"):
+                raise sqlite3.OperationalError("injected busy_timeout failure")
+            return super().execute(sql, *args)
+
+    calls: list = []
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, factory=FailingBusyTimeout, **kwargs)
+        calls.append(connection)
+        return connection
+
+    database = tmp_path / "failing.db"
+    _plain_database(database)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        connect_read_only(database)
+
+    assert len(calls) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        calls[0].execute("SELECT 1")
+
+
+def test_perceptual_reuse_analysis_is_no_longer_a_sanctioned_connect_site() -> None:
+    """A raw connect returning to the module must trip the DAL guard."""
+    from comic_automation.database import dal
+
+    repo_root = Path(__file__).resolve().parent.parent
+    name = "comic_automation/archive/perceptual_reuse_analysis.py"
+
+    assert name not in dal.SANCTIONED_CONNECT_SITES
+    assert name not in dal.find_connect_sites(repo_root)

@@ -1,6 +1,61 @@
 # Implementation Roadmap
 
-## Status as of 2026-08-20
+## Status as of 2026-10-22
+
+Measured against `master` = `f88d1da` on 2026-10-22. This roadmap was last
+edited at `ed7fec1` (2026-08-21); every merge from #79 to #97 landed after
+that. This section supersedes the 2026-08-20 status below and the stale
+checkboxes listed at the end of it. The step sections themselves are kept
+as the plan of record. Evidence is the merged PR or the dated log named in
+each row; anything not established that way says so.
+
+| Item | Status | Evidence | What remains |
+|---|---|---|---|
+| Step 1: V1 perceptual backfill and audit | **Done** | #74, #77, #78; "Audited baseline — 2026-08-21" below | — |
+| Step 1A A–D, G, H | **Done** | dated "Completed" notes in each sub-step below | — |
+| Step 1A E (bulk exact reuse), F (selective missing pages) | **Measured; deferred** | E: 333 archives would gain; F: 4,624 decodes (sub-steps below) | optional |
+| Step 2: immutable archive revisions | **Done** | #83, migration 014, applied to production 2026-08-24 (`development_log_2026-08-24.md`) | — |
+| Step 3: retention and guarded pruning | **Planner only** | #85 (`revision_retention.py`, no apply path) | guarded plan/apply; the relaxed delete guard (log 2026-08-24, "Open") |
+| Step 4: revision-aware provenance | **Partly done** | #86 assessment, #87 page-inventory design, #88 backfill planner, #89 slice-4 design (its five questions are answered as design rulings in `slice4_migration_design.md` §2), #90 4A fail-closed guard, #91 4B-1 plan reader | 4B-2 protected executor; migration 015 SQL (not in the migrations directory); producer cutover; slices 5–7; re-measurement and a production dry run before any execution |
+| Step 5: minimum local DAL | **Partly done** | #80 (`comic_automation/database/dal.py`; the package is `database/`, not the `db/` shape sketched in Step 5). An AST guard already exists: `find_connect_sites` / `unsanctioned_connect_sites` with the `SANCTIONED_CONNECT_SITES` allowlist, and `tests/test_database_dal.py` fails on any new bypass, a stale entry, or a count mismatch (0 unsanctioned sites at `f88d1da`) | migrate the sanctioned bypasses: the allowlist named 7 files and 9 calls at `f88d1da`, of which 5 files lie outside `database/connection.py` and `database/dal.py`. `read_guards.py` is migrated onto `open_connection(readonly=True)` by #109 (2026-10-22; allowlist then 6 files / 8 calls). `perceptual_reuse_analysis.py` is migrated onto `open_connection(readonly=True, policy=...)` with a caller-side 60 s policy (#115; allowlist then 5 files / 7 calls); its one behaviour change is that a directory path now raises `FileNotFoundError` instead of `sqlite3.OperationalError`. Remaining: `duplicate_resolution_cli.py`, `backup_cli.py`, `scripts/db.py` |
+| Step 6: persistent job queue | **Partly done** | worker-audit §3 items resolved; migration 010 active-job uniqueness; `enqueue_if_absent`; failure categories (migration 005); cancellation (migration 011) | leases/fencing tokens, heartbeats and backoff (deferred on purpose, see the queue audits); `idempotency_key`; tracing direct `jobs` writers |
+| Step 7: archive resource handling | **Partly done** | pixel pin, page byte cap, staleness re-checks (#9, #18); CRC guard; #81 interrupted-rewrite fix; 2026-10-22 `archive_limits.py`: entry-count and declared-total caps, unsafe member-path rejection, encrypted-member refusal at inspection, both hashing modules and `write_comicinfo` (audit, "Implemented 2026-10-22") | a decompression/allocation budget (the caps are declared-metadata admission checks and do not bound decompressor work); the same guards for `cbz_sanitizer._write_cbz_with_comicinfo` and the watcher's rewrite; encrypted `ComicInfo.xml` in the ComicInfo-only readers (`read_comicinfo` measured to raise); limits uncalibrated against the library; duplicate names, nested archives, timeout, disk budget; streaming rewrite; `compilation_resolver` unaudited (`archive_io_resource_audit.md`) |
+| Step 8: golden corpus and tests | **Partly done** | #79: 18-case corpus, `tests/fault_injection.py` | the excessive-entries case (`CORPUS_GAPS`) and the external real-world fixture manifest; no property-based tests (none of the ten listed invariants); fault injection for job acquisition, hash saves and quarantine moves unverified |
+| Step 9: decisions log | **Done, ongoing** | `engineering_decisions.md` | — |
+| Watcher routing and staging | **Mechanics done; inactive** | #30, #33, #38, #40–#43, #46, #94 (closes #82), #96 (closes #60), #97 (closes #32/#35); `development_log_2026-10-22.md` | activation gates (modes stay `off`/`shadow`); staging wiring into the watcher; verified cross-volume rollback |
+| Phase 4: series identity (#57) | **Rules recorded; building** | #57 closed with the rules below; sequence step 1 (#56) and step 3 (#96) done | step 4 re-measurement (#98, ambiguity report); step 5 candidate model and decision manifest (design PR #99); MangaDex adapter; review surface; plan/apply; canonical series records do not exist yet |
+| Phase 5: perceptual deduplication | **Backfill and audit done** | Step 1 | richer signatures, compilation detection, review; the scale of the existing near-duplicate candidates is unverified here |
+| Phases 6, 7, 9 | **Not started** (9: design only, `gui_architecture_implementation_roadmap.md`) | — | everything |
+| Phase 8: managed resolution | **Tooling exists; plans not executed** | staging and quarantine tooling | the exact-duplicate plans for the two groups below |
+
+### Next work, as agreed 2026-10-22 (hive #1970)
+
+1. Read-only ambiguity report (#98), codex-lead, which completes Phase 4
+   steps 2 and 4 once run on the target. A run against `X:\` is the
+   operator's.
+2. Candidate model and decision manifest design (#99), claude-lead.
+3. Then the inert watcher-to-staging integration plan and a verified
+   cross-volume rollback design.
+4. Alternative platform track: Step 4 slice 4B-2 (protected executor
+   tests) toward migration 015.
+
+### Statements below that this section supersedes
+
+- The 2026-08-20 status: the backfill is no longer the active workstream
+  (finished 2026-08-19, audited 2026-08-21), and the golden corpus and DAL
+  no longer "still come first" (both merged 2026-08-24).
+- Phase checklists not updated since: "complete the focused golden corpus"
+  (#79), "introduce immutable archive revisions" (#83), "complete the V1
+  backfill", "execute the remaining Step 1A", the final coverage audit,
+  and Phase 2's DAL and job-hardening items (partly done; see the table).
+- Phase 4 text treating #60 as open: it is closed by #96. Re-measurement
+  (sequence step 4) remains open under #98.
+- The "Return sequence" items 1–4, all done.
+- `docs/slice4_migration_design.md` still heads itself "design under
+  review" after #89 merged (acknowledged and deferred in
+  `development_log_2026-09-02.md`).
+
+## Status as of 2026-08-20 (historical; superseded by the section above)
 
 The project has moved beyond a collection of standalone scripts into a
 SQLite-backed automation platform for discovering, inspecting, hashing,
@@ -1450,6 +1505,49 @@ Use property-based tests for inexpensive invariants:
 
 Add crash and fault-injection tests around job acquisition, hash saves,
 database commits, archive replacement, quarantine moves, and recovery.
+
+**Progress, 2026-10-22 (branch `test/step8-corpus-and-properties`, off
+`f957bde`, merged with `657e129`).** Tests only; no production code
+changed.
+
+- *Entry count.* `high_entry_count` (20,000 empty image members, plain
+  ZIP) is now in the corpus: the sub-ceiling side of
+  `archive_limits.MAX_ARCHIVE_ENTRIES` (50,000, #110). The corpus pins that
+  its count is below the cap and that inspection admits it. The over-cap
+  refusal is not duplicated in the corpus; `tests/test_archive_limits.py`
+  builds an archive one entry over the shipped ceiling, and
+  `CORPUS_GAPS["excessive_entries"]` says so. Lowering the cap to 20,001 or
+  below fails the corpus pin by design.
+- *Property tests* (`tests/test_step8_invariant_properties.py`) cover
+  invariants 1, 2, 4, 6, 7 and 10 of the list above. `hypothesis` is not
+  installed or declared, so they are seeded standard-library generators:
+  reproducible, with no shrinking. Not covered: 3 (no `idempotency_key`
+  exists to test, per the Step 6 row), 5 (archive identity is path-keyed
+  by design today, so a move mints a new identity; the bytes side is
+  already pinned by the corpus), 8 and 9 (not attempted in this slice).
+- *Fault injection* now covers hash saves (a fault at the final write of
+  `ArchiveHashRepository.save` leaves all five tables unchanged) and job
+  acquisition (a fault at `claim_next`'s update consumes no attempt and
+  releases the write lock). Quarantine moves are still unverified.
+- **Two invariants are false on master**, recorded as strict `xfail` tests
+  that turn into failures when fixed, and not fixed here:
+  1. `series_key` is not idempotent. A marker word glued to a character
+     that a later step turns into a separator survives the first pass:
+     `"_decensored"` -> `"decensored"` -> `""`. Consequence:
+     `Berserk_Uncensored` keys to `berserk uncensored` but
+     `Berserk Uncensored` keys to `berserk`, which is a series split. U+0130 (`İ`, which lowercases to
+     `i` + U+0307) produces the same failure, so converting only `_` first
+     does not fix all of it. A simulated fix like that was measured to
+     clear the three underscore cases and not the randomized property.
+  2. Page order is not deterministic when two image names share a natural
+     key (`a.png`/`A.png`, `01.png`/`1.png`, `p1.png`/`p01.png`). The sort
+     is stable, so physical member order decides, and the content
+     signature differs between two packings of the same pages.
+
+  Also probed and not pinned: `cbz_core.sanitize`, `clean_filename` and
+  `clean_directory_name` are not idempotent (`"Batman].cC"` ->
+  `"Batman.cC"` -> `""`). Whether the sanitizer should be a fixpoint is an
+  open decision, so no test asserts either answer.
 
 ### Step 9 — Maintain a lightweight decisions log
 

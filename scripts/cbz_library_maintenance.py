@@ -42,6 +42,7 @@ from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from comic_automation.archive.archive_limits import validate_archive_members
 from comic_automation.archive.page_hashing import calculate_page_hashes
 from comic_automation.library.exclusions import (
     iter_files_excluding_directories,
@@ -447,6 +448,10 @@ def _archive_content_fingerprint(cbz_path: Path) -> str | None:
     whatsoever and delete one of them -- deletion justified by the *absence* of
     evidence, which is the same defect the guard exists to prevent.
     `content_duplicate_audit` excludes `page_count = 0` for the same reason.
+
+    Returns None, for the same reason, when two image members share a raw
+    name: their relative order is physical position, not page order
+    (`page_hashing.order_page_entries`), so the digest is not evidence.
     """
     try:
         result = calculate_page_hashes(cbz_path)
@@ -455,6 +460,16 @@ def _archive_content_fingerprint(cbz_path: Path) -> str | None:
         return None
     if not result.pages:
         log.debug("No image pages to fingerprint in %s", cbz_path)
+        return None
+    if not result.order_resolved:
+        # Duplicate image member names: the order among them, and so the
+        # digest, is physical-order noise. Two archives sharing it prove
+        # nothing, so the archive is isolated rather than grouped.
+        log.debug(
+            "Unresolved page order (duplicate names %s) in %s",
+            list(result.duplicate_entry_names),
+            cbz_path,
+        )
         return None
     return result.content_digest
 
@@ -1801,16 +1816,33 @@ def write_comicinfo(cbz_path: Path, entry_name: str | None, xml: str, dry_run: b
             # Free: the central directory is already parsed for the
             # infolist() walk below.
             before_fingerprint = _central_directory_fingerprint(zin)
+            # Refuse before materializing anything: this loop holds every
+            # member in memory at once. The declared-size and entry-count
+            # ceilings are admission checks on metadata -- what read(info)
+            # returns, and so what this list retains, is at most each
+            # record's declared size, but the transient decompressor work
+            # behind each read is NOT bounded by them (see
+            # comic_automation/archive/archive_limits.py). An encrypted
+            # member would otherwise fail mid-loop on a password prompt.
+            # UnsafeArchiveError is a
+            # ValueError, so it lands in the broad handler below -- the
+            # rewrite is abandoned with the original untouched and False
+            # returned -- rather than being mistaken for a transient OSError.
+            validate_archive_members(zin.infolist())
             for info in zin.infolist():
                 # info.filename is round-tripped unchanged into the rewritten
-                # archive below. Nothing here extracts to a real filesystem
-                # path, so an unsafe ("..", absolute, or otherwise traversing)
-                # member name is not exploitable in this function -- but it is
-                # silently preserved into the output rather than rejected, and
-                # would be inherited by any downstream tool that later performs
-                # a naive extraction. See docs/archive_io_resource_audit.md,
-                # "Confirmed risks in current code".
-                entries.append((info, zin.read(info.filename)))
+                # archive below. Absolute, drive-qualified and ".." names were
+                # rejected by validate_archive_members() above, so the rewrite
+                # can no longer carry an escaping name forward into the
+                # output. Names are otherwise not normalized; see
+                # comic_automation/archive/archive_limits.py for what is and
+                # is not checked.
+                #
+                # Read by ZipInfo, never by name: with duplicate names,
+                # zin.read(info.filename) returns the *last* record of that
+                # name every time, so the rewrite would materialize (and
+                # write) bytes the validator above never admitted.
+                entries.append((info, zin.read(info)))
 
         with zipfile.ZipFile(tmp_path, "w") as zout:
             wrote = False

@@ -7,6 +7,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 
+from comic_automation.archive.page_hashing import (
+    comparable_ordered_signature_sql,
+)
 from comic_automation.archive.perceptual_hashing import (
     DHASH_ALGORITHM,
     DHASH_ALGORITHM_VERSION,
@@ -271,8 +274,18 @@ class NearDuplicateRepository:
         # JOINs against page_hashes (aliased dh/ph) each pick out a
         # specific algorithm/version, effectively pivoting the
         # per-algorithm hash rows onto a single page row.
+        #
+        # Only archives whose signature is canonical ordered evidence are
+        # loaded. The comparison aligns pages by page_index and
+        # short-circuits on equal content_signature, so both the index
+        # order and the signature must come from the current ordering
+        # contract: a legacy-version row stored tied names in physical
+        # order, and an archive with duplicated raw image names has no
+        # order at all -- comparing either would produce an ordered
+        # similarity score for an order that does not exist.
+        comparable = comparable_ordered_signature_sql("acs")
         rows = self.connection.execute(
-            """
+            f"""
             SELECT
                 acs.archive_id,
                 acs.digest AS content_signature,
@@ -294,6 +307,7 @@ class NearDuplicateRepository:
              AND ph.algorithm = ?
              AND ph.algorithm_version = ?
             WHERE acs.page_count > 0
+              AND {comparable}
               AND EXISTS (
                   SELECT 1
                   FROM file_locations AS fl

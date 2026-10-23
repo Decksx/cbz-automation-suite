@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -109,12 +110,27 @@ def series_key(name: str) -> str:
     The normalization, in order:
 
         0. Unicode composition normalized to NFC
-        1. `uncensored` / `decensored` removed as whole words, case-insensitive
-        2. lowercased
-        3. every non-word, non-space character *and every underscore*
+        1. lowercased
+        2. every non-word, non-space character *and every underscore*
            replaced with a space
+        3. `uncensored` / `decensored` removed as whole words
         4. runs of whitespace collapsed, ends stripped
         5. the result normalized to NFC again, as a postcondition
+
+    **Markers are removed after separators exist, not before** (#111). Run
+    first, as it was until then, the whole-word match misses a marker glued
+    to anything that is a word character but later becomes a separator: an
+    underscore (`\\b` does not match between `_` and a letter), or a
+    combining mark produced by lowercasing (`İ` lowers to `i` plus U+0307).
+    The marker then survived the first pass and was removed by a second, so
+    the function was not a fixpoint, and the practical result was a split:
+    `Berserk_Uncensored` keyed to `berserk uncensored` while
+    `Berserk Uncensored` keyed to `berserk`. Matching after step 2 sees
+    every separator as a space, so the two spellings key alike and
+    `series_key(series_key(x)) == series_key(x)` holds. Keys change only
+    where a marker was glued that way, which is why an index built under the
+    old order has to be rebuilt; `scripts/cbz_series_key_change_report.py`
+    lists exactly which names change.
 
     So "BERSERK", "Berserk!!", "Berserk (Uncensored)" and "Berserk " all key
     alike, and "Attack-on-Titan", "Attack_on_Titan" and "Attack on Titan" are
@@ -188,8 +204,8 @@ def series_key(name: str) -> str:
     behaviour to depend on.
     """
     name = unicodedata.normalize("NFC", name or "")
-    name = _MARKER_WORDS_RE.sub("", name)
     name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
+    name = _MARKER_WORDS_RE.sub("", name)
     name = _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
     # Postcondition, not a repeat of the call above: callers are entitled to
     # an NFC identity regardless of what the transforms in between do.
@@ -307,8 +323,80 @@ class RoutingConfig:
         return None
 
 
+@dataclass(frozen=True)
+class SeriesIndexEntry:
+    """One observed series directory and the destination it belongs to."""
+
+    dest_key: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class SeriesIndexCollision:
+    """Every distinct observed path contributing to one canonical key."""
+
+    key: str
+    entries: tuple[SeriesIndexEntry, ...]
+
+
+@dataclass(frozen=True)
+class SeriesIndexDiagnostics:
+    """Immutable measurement for the zero-ambiguity branch of the index gate.
+
+    Exclusions are evidence of the input policy, not ambiguous series. Empty
+    keys and incomplete scans are independent blockers, even with no collision.
+    This snapshot neither authenticates reviewed exceptions nor activates v2.
+    It records observations, not an atomic snapshot of a changing filesystem.
+    """
+
+    collisions: tuple[SeriesIndexCollision, ...]
+    empty_keys: tuple[SeriesIndexEntry, ...]
+    excluded: tuple[SeriesIndexEntry, ...]
+    scan_problems: tuple[str, ...]
+
+    @property
+    def clear(self) -> bool:
+        """Whether this completed scan has no unresolved index diagnostics."""
+        return not (self.collisions or self.empty_keys or self.scan_problems)
+
+    def require_clear(self) -> None:
+        """Refuse the zero-ambiguity gate on any unresolved diagnostic.
+
+        There is deliberately no string-list waiver. A reviewed exception
+        manifest needs its own identity/provenance contract before the other
+        branch of the documented authority gate can be implemented.
+        """
+        if not self.clear:
+            raise RoutingConfigError(
+                "series index gate is not clear: "
+                f"{len(self.collisions)} colliding key(s), "
+                f"{len(self.empty_keys)} empty-key path(s), "
+                f"{len(self.scan_problems)} scan problem(s); inspect diagnostics")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return JSON-ready evidence, retaining the full contributing paths."""
+        def entry(value: SeriesIndexEntry) -> dict[str, str]:
+            return {"dest_key": value.dest_key, "path": str(value.path)}
+
+        return {
+            "collisions": [{"key": collision.key,
+                            "entries": [entry(e) for e in collision.entries]}
+                           for collision in self.collisions],
+            "empty_keys": [entry(e) for e in self.empty_keys],
+            "excluded": [entry(e) for e in self.excluded],
+            "scan_problems": list(self.scan_problems),
+            "clear": self.clear,
+        }
+
+
+# These names belong to Syncthing, not to comic identity. Keep the policy
+# narrow: dot-prefixed titles (for example .hack) and UUID-looking names can
+# be real series. The old census's ad-hoc UUID exclusions are not a rule.
+NON_SERIES_DIRECTORIES = frozenset({".stfolder", ".stversions"})
+
+
 class SeriesIndex:
-    """`series_key -> destination` for series that already exist on disk.
+    """Canonical keys mapped to all observed series paths, with diagnostics.
 
     Built once per scan pass rather than per directory: the destinations hold
     ~18k series folders between them and enumerating those costs ~400 ms,
@@ -326,8 +414,12 @@ class SeriesIndex:
         # is listed first and wins. Deferring to the rules instead would let a
         # metadata signal quietly overturn that decision.
         self._priority = priority
-        self._entries: dict[str, tuple[str, Path, int]] = {}
-        self._ambiguous: set[str] = set()
+        self._entries: dict[str, dict[str, SeriesIndexEntry]] = {}
+        self._empty_keys: dict[str, SeriesIndexEntry] = {}
+        self._excluded: dict[str, SeriesIndexEntry] = {}
+        # An incrementally populated index supports routing, but an empty
+        # hand-built index must not masquerade as a completed clean census.
+        self._scan_problems: list[str] = ["index not built from configured roots"]
 
     @property
     def priority(self) -> tuple[str, ...]:
@@ -335,9 +427,9 @@ class SeriesIndex:
 
         Public because a caller handed an index has no other way to check it
         agrees with the configuration. An index built with no priority ranks
-        every destination equally, so a series present in two libraries is
-        decided by whichever write happened first -- silently, and differently
-        run to run.
+        every destination equally, so lexical destination order would silently
+        replace the configured policy. Determinism does not make that policy
+        correct.
         """
         return self._priority
 
@@ -350,46 +442,102 @@ class SeriesIndex:
     @classmethod
     def build(cls, cfg: RoutingConfig,
               lister=None) -> "SeriesIndex":
+        """Scan configured roots once; keep omissions visible to the gate.
+
+        An injected lister has the same contract as the default: yield the
+        root's child directories or raise on failure. It may use virtual
+        paths for tests. Missing roots in a real scan preserve the legacy
+        empty-index behavior, but are not a successful ambiguity measurement.
+        """
         keys = cfg.series_index_destinations or tuple(cfg.destinations)
         index = cls(priority=keys)
         if not cfg.series_index_enabled:
+            index._scan_problems = ["series index is disabled; roots not scanned"]
             return index
+        index._scan_problems = []
         listdir = lister or _default_lister
         for dest_key in keys:
             root = cfg.destinations.get(dest_key)
             if not root:
+                index._scan_problems.append(f"no configured root for {dest_key}")
+                continue
+            if lister is None and not Path(root).is_dir():
+                index._scan_problems.append(f"root unavailable: {dest_key}: {root}")
                 continue
             for path in listdir(Path(root)):
                 index.add(path.name, dest_key, path)
         return index
 
+    @staticmethod
+    def _path_identity(path: Path) -> str:
+        # Lexical filesystem identity, without resolving links or doing I/O.
+        # Windows folds case; POSIX does not. Do not NFC-normalize paths:
+        # two distinct spellings may exist even when their series keys agree.
+        return os.path.normcase(os.path.abspath(path))
+
+    def _entry_order(self, entry: SeriesIndexEntry) -> tuple:
+        return (self._rank(entry.dest_key), entry.dest_key,
+                str(entry.path).casefold(), str(entry.path))
+
+    def _remember(self, entries: dict[str, SeriesIndexEntry],
+                  entry: SeriesIndexEntry) -> None:
+        identity = self._path_identity(entry.path)
+        previous = entries.get(identity)
+        # Repeated observations (including two configured labels for the same
+        # lexical root) do not manufacture a second directory. Keep the best
+        # configured destination and a stable spelling for that one path.
+        if previous is None or self._entry_order(entry) < self._entry_order(previous):
+            entries[identity] = entry
+
     def add(self, series_name: str, dest_key: str, path: Path) -> None:
+        """Record a directory without collapsing another path with its key.
+
+        The watcher's existing lock protects this compound update and reads.
+        This class adds no independent lock or filesystem write.
+        """
+        entry = SeriesIndexEntry(dest_key, Path(path))
+        if entry.path.name.casefold() in NON_SERIES_DIRECTORIES:
+            self._remember(self._excluded, entry)
+            return
         key = series_key(series_name)
         if not key:
+            self._remember(self._empty_keys, entry)
             return
-        rank = self._rank(dest_key)
-        existing = self._entries.get(key)
-        if existing is None:
-            self._entries[key] = (dest_key, path, rank)
-            return
-        if existing[0] == dest_key:
-            return
-        # Present in two libraries. Resolve by priority rather than refusing,
-        # but keep it flagged so a genuine split is visible rather than
-        # silently papered over.
-        self._ambiguous.add(key)
-        if rank < existing[2]:
-            self._entries[key] = (dest_key, path, rank)
+        self._remember(self._entries.setdefault(key, {}), entry)
+
+    def locations(self, series_name: str) -> tuple[SeriesIndexEntry, ...]:
+        """Return every contributing path, in stable routing-priority order."""
+        entries = self._entries.get(series_key(series_name), {})
+        return tuple(sorted(entries.values(), key=self._entry_order))
 
     def lookup(self, series_name: str) -> tuple[str, Path] | None:
-        key = series_key(series_name)
-        if not key:
-            return None
-        entry = self._entries.get(key)
-        return (entry[0], entry[1]) if entry else None
+        """Keep legacy routing priority, without treating it as gate evidence.
+
+        Same-root collisions previously chose by enumeration order. A stable
+        path order now breaks that tie, but does not resolve the collision.
+        """
+        entries = self.locations(series_name)
+        return (entries[0].dest_key, entries[0].path) if entries else None
 
     def is_ambiguous(self, series_name: str) -> bool:
-        return series_key(series_name) in self._ambiguous
+        """Whether a key has multiple paths, even inside one destination.
+
+        This per-key answer does not see empty keys or scan failures; use
+        diagnostics().require_clear() for the zero-ambiguity gate.
+        """
+        return len(self._entries.get(series_key(series_name), {})) > 1
+
+    def diagnostics(self) -> SeriesIndexDiagnostics:
+        """Freeze the current index evidence; caller holds any shared lock."""
+        collisions = tuple(
+            SeriesIndexCollision(key, tuple(sorted(entries.values(),
+                                                    key=self._entry_order)))
+            for key, entries in sorted(self._entries.items()) if len(entries) > 1)
+        return SeriesIndexDiagnostics(
+            collisions,
+            tuple(sorted(self._empty_keys.values(), key=self._entry_order)),
+            tuple(sorted(self._excluded.values(), key=self._entry_order)),
+            tuple(self._scan_problems))
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -423,9 +571,10 @@ def is_terminal_sample(decision: RoutingDecision) -> bool:
 
 
 def _default_lister(root: Path):
-    if not root.is_dir():
-        return []
-    return [p for p in root.iterdir() if p.is_dir()]
+    # build() records an initially missing root. If it disappears between
+    # that check and enumeration, raise instead of certifying an empty scan.
+    return sorted((p for p in root.iterdir() if p.is_dir()),
+                  key=lambda p: (p.name.casefold(), p.name))
 
 
 # ---------------------------------------------------------------- context
@@ -663,7 +812,8 @@ def resolve(
         hit = index.lookup(effective)
         if hit is not None:
             dest_key, path = hit
-            note = " (also present elsewhere; resolved by priority)" if ambiguous else ""
+            note = (" (multiple paths; compatibility selection, identity unresolved)"
+                    if ambiguous else "")
             return RoutingDecision(
                 dest_key, cfg.destinations[dest_key], "existing series",
                 f"series {effective!r} already exists in {dest_key}{note}",
@@ -721,7 +871,7 @@ def explain(
         if index is not None:
             name = override.canonical if override else series_name
             if index.is_ambiguous(name):
-                lines.append("  --  series index: ambiguous (in >1 library)")
+                lines.append("  --  series index: ambiguous (multiple paths)")
             elif index.lookup(name):
                 dest_key, path = index.lookup(name)
                 lines.append(f"MATCH series index -> {dest_key} ({path})")

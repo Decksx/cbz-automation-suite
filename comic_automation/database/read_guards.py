@@ -83,6 +83,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Generic, Iterator, TypeVar
 
+from comic_automation.database.dal import open_connection
+
 
 T = TypeVar("T")
 
@@ -297,12 +299,23 @@ def readonly_database_connection(
     codebase (there used to be five near-copies, which had already
     drifted on the `isolation_level` argument).
 
-    Three deliberately layered safeguards:
+    The connection itself comes from `dal.open_connection(readonly=True)`
+    under `dal.READ_ONLY_POLICY`; this function adds only the close.
+    It used to call `sqlite3.connect` itself, and was one of the
+    sanctioned bypasses of the DAL's connection-factory guard. Opening
+    through the DAL means the read-only policy has one definition, so a
+    change to it reaches every audit instead of drifting from a private
+    copy here.
+
+    Three deliberately layered safeguards, all supplied by that policy:
 
     - The `mode=ro` SQLite URI flag opens the connection read-only at
       the OS/VFS level and refuses to create the file if it does not
       already exist (unlike a plain `sqlite3.connect`, which would
-      silently create an empty database).
+      silently create an empty database). The DAL checks
+      `path.is_file()` before touching SQLite at all, so a missing path
+      -- or a directory -- raises `FileNotFoundError("Database does not
+      exist: ...")` and can never result in a created file.
     - `PRAGMA query_only = ON` rejects any statement that would modify
       the database *at the statement level*, in case a future edit
       accidentally introduces a write.
@@ -311,29 +324,24 @@ def readonly_database_connection(
       isolation level the driver's own bookkeeping fights the explicit
       BEGIN/END that bracket a consistent snapshot.
 
-    No migrations are applied and no schema is created: the database is
-    read exactly as found, so this is safe to point at a live or
-    protected backup database.
+    The policy also issues ``PRAGMA busy_timeout = 30000``, which the
+    private copy did not. That is not a behaviour change: the 30 s
+    `timeout` passed to `sqlite3.connect` already installs the same
+    30000 ms busy handler, measured as ``PRAGMA busy_timeout`` reading
+    30000 on the old connection too. A test pins both values.
+
+    If any part of the policy fails to apply, the DAL closes the
+    connection before re-raising, as the private copy did for
+    ``query_only``: a half-configured connection is never handed back
+    or left open.
+
+    Rows are `sqlite3.Row`, as before. No migrations are applied and no
+    schema is created: the database is read exactly as found, so this is
+    safe to point at a live or protected backup database.
     """
-    path = Path(database_path)
-
-    # Checked before touching SQLite at all, so a missing path can
-    # never result in a created file or directory.
-    if not path.is_file():
-        raise FileNotFoundError(f"Database does not exist: {path}")
-
-    resolved = path.resolve(strict=True)
-    uri = f"{resolved.as_uri()}?mode=ro"
-    connection = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=30.0,
-        isolation_level=None,
-    )
-    connection.row_factory = sqlite3.Row
+    connection = open_connection(database_path, readonly=True)
 
     try:
-        connection.execute("PRAGMA query_only = ON")
         yield connection
     finally:
         connection.close()

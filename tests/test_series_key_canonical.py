@@ -127,6 +127,11 @@ def test_the_consumer_list_matches_the_modules_that_import_the_rule():
         "scripts/cbz_library_maintenance.py",
         "scripts/cbz_library_reclassify.py",
         "scripts/cbz_lock_order.py",
+        # Keys the would-be staging case; imports the rule, never shadows it.
+        "scripts/cbz_shadow_handoff.py",
+        # Compares against a private legacy copy of the pre-#111 rule; it
+        # imports the canonical rule and never shadows that name.
+        "scripts/cbz_series_key_change_report.py",
     }
     assert importers == expected, (
         f"the set of modules importing series_key changed: {sorted(importers)}. "
@@ -213,3 +218,49 @@ def test_no_call_site_actually_depends_on_the_none_tolerance():
             "field() no longer promises str; None could now reach series_key "
             "and the tolerance would stop being a floor"
         )
+
+
+# --- marker words glued to a future separator (#111) -------------------
+
+
+@pytest.mark.parametrize("name, expected", [
+    # The minimal counterexamples the Step 8 generator found (#113). Each
+    # used to key to a value that a second pass changed again.
+    ("_decensored", ""),
+    ("decensored_", ""),
+    ("_Uncensored", ""),
+    ("Uncensored_", ""),
+    ("İUncensored", "i"),
+    ("İdecensored", "i"),
+    # The series split those caused.
+    ("Berserk_Uncensored", "berserk"),
+    ("Berserk_decensored", "berserk"),
+    ("Uncensored_Berserk", "berserk"),
+])
+def test_a_marker_glued_to_a_separator_is_removed_in_one_pass(
+        name: str, expected: str) -> None:
+    """Marker removal runs after separators exist, so one pass is enough.
+
+    Run before the separator rule, as it was until #111, the whole-word
+    match cannot see a boundary between `_` (a word character) and the
+    marker, nor across the combining mark `İ` lowers into; the marker
+    survived one pass and fell to the next.
+    """
+    assert CANONICAL(name) == expected
+    assert CANONICAL(expected) == expected
+
+
+def test_glued_and_spaced_marker_spellings_are_one_series() -> None:
+    """The practical consequence: an uncensored edition no longer splits."""
+    assert CANONICAL("Berserk_Uncensored") == CANONICAL("Berserk Uncensored")
+    assert CANONICAL("Berserk_Uncensored") == CANONICAL("Berserk (Uncensored)")
+
+
+def test_a_marker_inside_a_longer_word_is_still_kept() -> None:
+    """The reorder did not loosen whole-word matching.
+
+    `Uncensoredness` and `PreUncensored` contain the marker but are not the
+    marker, before or after the change.
+    """
+    assert CANONICAL("Uncensoredness") == "uncensoredness"
+    assert CANONICAL("PreUncensored") == "preuncensored"
