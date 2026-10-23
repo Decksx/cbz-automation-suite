@@ -22,8 +22,7 @@ from comic_automation.archive.archive_limits import (
     UnsafeArchiveError,
     validate_archive_members,
 )
-from comic_automation.archive.inspection import IMAGE_EXTENSIONS
-from comic_automation.archive.page_hashing import _natural_key
+from comic_automation.archive.page_hashing import order_page_entries
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
 )
@@ -422,16 +421,11 @@ def calculate_perceptual_hashes(
             # encrypted member would otherwise surface from archive.open()
             # as a bare RuntimeError and be filed as archive_unreadable.
             validate_archive_members(members)
-            entries = sorted(
-                (
-                    entry
-                    for entry in members
-                    if not entry.is_dir()
-                    and Path(entry.filename).suffix.casefold()
-                    in IMAGE_EXTENSIONS
-                ),
-                key=lambda entry: _natural_key(entry.filename),
-            )
+            # The exact inventory's ordering helper, not a local sort: the
+            # save below refuses unless these pages match the stored exact
+            # rows index for index, so the two must order tied names alike.
+            # Order only; per-page decoding and digests are untouched.
+            entries = order_page_entries(members).entries
             if profile:
                 zip_open_and_inventory_seconds += (
                     time.perf_counter() - phase_started
@@ -619,6 +613,12 @@ class ArchivePerceptualHashRepository:
             for page in result.pages
         ]
 
+        # The match is on (page_index, entry_name), never on the index or
+        # the count alone. After a page-order change (design §1.2) rows
+        # stored under the old order hold the same indices with different
+        # names, and an index-only match would write one member's dhash and
+        # phash onto another member's row. Refusing routes the archive to
+        # source-drift recovery, which re-inventories it first.
         if expected != actual:
             raise OSError(
                 "Stored page inventory does not match the current "
