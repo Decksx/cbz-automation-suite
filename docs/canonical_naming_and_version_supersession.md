@@ -586,8 +586,9 @@ code takes. They are open to review.
      - `Pages` has no attributes and no non-blank text;
      - its children are only `Page` elements;
      - each `Page` has no children, no text and no tail, and an `Image`
-       attribute that is a non-negative decimal integer, unique within
-       `Pages`.
+       attribute of one to six decimal digits, unique by value within
+       `Pages`. The length is checked before conversion, so an oversized
+       index is a refusal rather than an interpreter error.
 
      It is covered when every A `Page` attribute other than `Image` with a
      non-blank value is also non-blank on B's `Page` with the same `Image`
@@ -600,7 +601,11 @@ code takes. They are open to review.
    - any other element with attributes or children;
    - non-blank tail text anywhere;
    - text or attributes on `Pages`, or on the root;
-   - a missing, blank, invalid or duplicate `Image` index;
+   - a missing, blank, invalid (including more than six digits) or
+     duplicate `Image` index;
+   - any namespaced (`{uri}`-qualified) element or `Page` attribute. Names
+     are compared raw, so `x:Bookmark` is never `Bookmark`. A namespaced
+     element in the keeper's document never covers;
    - a repeated `Pages`;
    - nesting deeper than `MAX_COMICINFO_DEPTH` (8).
 
