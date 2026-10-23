@@ -1095,6 +1095,42 @@ def test_an_unplaceable_marker_run_is_refused_for_review():
         assert not result.renamable
 
 
+def test_a_title_sharing_only_the_last_word_with_the_series_stays_ambiguous():
+    """PR #119 approval witness (Codex suffix-only mutant). The decided
+    series "Super Special" ends with ``Special``, the name's title
+    candidate, but no split of ``Special Omnibus`` equals the whole series.
+    A suffix-only match would place Omnibus as a marker on both members and
+    establish a renamable family; the whole-prefix comparison keeps it
+    ambiguous, refuses the family, and sends both archives to review."""
+    names = ("Special Omnibus #001 [v1].cbz", "Special Omnibus #001 [v2].cbz")
+    results = _resolve(
+        *(_archive(n, info=_ci(series="Super Special"), pages=_pages("p1")) for n in names)
+    )
+    assert set(results) == set(names)
+    for result in results.values():
+        assert result.fields["series"].value == "Super Special"
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("title text or markers" in r for r in result.family.reasons)
+        assert any("title text or markers" in r for r in result.review)
+        assert not result.renamable
+
+
+def test_a_lone_unplaceable_marker_run_is_not_renamable():
+    """PR #119 approval witness (Codex omitted single-archive review
+    mutant). A lone ``Series Omnibus #001`` decided as "Berserk" has no
+    family and no version token, so neither the family refusal nor a v<N>
+    gate can block it; the archive's own marker ambiguity must."""
+    name = "Series Omnibus #001.cbz"
+    results = _resolve(_archive(name, info=_ci(series="Berserk"), pages=_pages("p1")))
+    result = results[name]
+    assert result.fields["series"].value == "Berserk"
+    assert result.fields["number"].resolved
+    assert result.family is None or not result.family.established
+    assert result.v_tokens == ()
+    assert any("title text or markers" in r for r in result.review)
+    assert not result.renamable
+
+
 def test_marker_comparison_does_not_strip_decensor_words():
     """`title_key` keeps "Uncensored", so "Series Uncensored" decided as
     the series "Series" reads the word as a marker, not title text."""
