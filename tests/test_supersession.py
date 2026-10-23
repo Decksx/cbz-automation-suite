@@ -717,6 +717,51 @@ def test_an_oversized_comicinfo_number_cannot_stop_the_folder(tmp_path, database
     assert _family(result, folder, "Series ch. 1 v1.cbz").status == sv.FAMILY_SUPERSESSION
 
 
+_PLAIN_ROOT = b"<ComicInfo><Series>Series</Series><Number>1</Number><Writer>W</Writer></ComicInfo>"
+_QUALIFIED_ROOT = (
+    b'<x:ComicInfo xmlns:x="urn:unrelated"><Series>Series</Series><Number>1</Number>'
+    b"<Writer>W</Writer></x:ComicInfo>"
+)
+_DEFAULT_NS_ROOT = (
+    b'<ComicInfo xmlns="urn:unrelated"><Series xmlns="">Series</Series>'
+    b'<Number xmlns="">1</Number><Writer xmlns="">W</Writer></ComicInfo>'
+)
+
+
+@pytest.mark.parametrize(
+    "older, keeper, expected",
+    [
+        (_QUALIFIED_ROOT, _PLAIN_ROOT, "root {urn:unrelated}ComicInfo"),
+        (_DEFAULT_NS_ROOT, _PLAIN_ROOT, "root {urn:unrelated}ComicInfo"),
+        (_PLAIN_ROOT, _QUALIFIED_ROOT, "keeper root {urn:unrelated}ComicInfo"),
+        (_PLAIN_ROOT, _DEFAULT_NS_ROOT, "keeper root {urn:unrelated}ComicInfo"),
+    ],
+    ids=["older-prefixed-root", "older-default-namespace-reset-children",
+         "keeper-prefixed-root", "keeper-default-namespace-reset-children"],
+)
+def test_a_namespaced_comicinfo_root_never_certifies_a_drop(
+    tmp_path, database, older, keeper, expected
+):
+    """PR #123 round 5: the raw root must be exactly ``ComicInfo``.
+
+    Step 4 reads the root by local name, so a ``{uri}ComicInfo`` (prefixed,
+    or a default namespace whose children reset it with ``xmlns=""``) was
+    usable there and its unqualified children covered or were covered here.
+    """
+    family = _drop_family(tmp_path, database, "root", older, keeper)
+    (relation,) = family.relations
+    assert family.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert f"unsupported ComicInfo shape: {expected}" in relation.reason
+
+
+def test_a_plain_comicinfo_root_still_supersedes(tmp_path, database):
+    keeper = _PLAIN_ROOT.replace(b">W<", b">Writer<")
+    family = _drop_family(tmp_path, database, "plain-root", _PLAIN_ROOT, keeper)
+    assert family.status == sv.FAMILY_SUPERSESSION
+    assert [m.name for m in family.relations[0].accepted_comicinfo_drops] == ["ComicInfo.xml"]
+
+
 def test_a_six_digit_image_index_is_supported(tmp_path, database):
     """Control at the bound: six digits (999999) still match and cover."""
     older = _with(b'<Pages><Page Image="999999" Bookmark="Important"/></Pages>')
