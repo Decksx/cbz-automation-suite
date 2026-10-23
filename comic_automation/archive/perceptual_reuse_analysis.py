@@ -5,7 +5,6 @@ import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 
 from comic_automation.archive.page_hashing import (
     PAGE_HASH_ALGORITHM,
@@ -17,6 +16,7 @@ from comic_automation.archive.perceptual_hashing import (
     PHASH_ALGORITHM,
     PHASH_ALGORITHM_VERSION,
 )
+from comic_automation.database.dal import ConnectionPolicy, open_connection
 
 
 JOB_TYPE = "hash_archive_pages_perceptual"
@@ -272,19 +272,60 @@ def _parameters() -> dict[str, str]:
     }
 
 
+# The analysis's own read-only policy, held caller-side rather than added to
+# the DAL: it is `dal.READ_ONLY_POLICY` with a 60 s wait instead of 30 s.
+# The 60 s figure is this module's, carried over unchanged from the private
+# `sqlite3.connect` it replaces -- the analysis is one long read against a
+# database a backfill worker may be writing, and a shorter wait would turn a
+# slow report into a failed one. Pragma order matches that private copy:
+# query_only first, then busy_timeout.
+REUSE_ANALYSIS_READ_ONLY_POLICY = ConnectionPolicy(
+    name="perceptual_reuse_read_only",
+    readonly=True,
+    timeout_seconds=60.0,
+    pragmas=(
+        ("query_only", "ON"),
+        ("busy_timeout", "60000"),
+    ),
+)
+
+
 def connect_read_only(database: str | Path) -> sqlite3.Connection:
+    """Open *database* read-only for the reuse analysis.
+
+    Opens through `dal.open_connection` under
+    `REUSE_ANALYSIS_READ_ONLY_POLICY`. This used to call `sqlite3.connect`
+    itself and was a sanctioned bypass of the DAL's connection-factory
+    guard. The connection it returns is unchanged, pinned field by field in
+    `tests/test_perceptual_reuse_analysis.py`: a ``mode=ro`` URI,
+    ``timeout=60.0``, ``isolation_level=None``, `sqlite3.Row` rows,
+    ``query_only`` 1 and ``busy_timeout`` 60000.
+
+    Accepted differences from the private copy:
+
+    - The URI is spelled ``file:///C:/...`` (`Path.as_uri`) instead of
+      ``file:C:/...``. Both percent-encode the same characters, and both
+      were measured to open the same file through spaces, ``#``, ``%``,
+      ``&``, ``=``, ``;`` and non-ASCII names.
+    - A path that exists but is not a file -- a directory -- is refused by
+      the DAL with ``FileNotFoundError("Database does not exist: ...")``
+      before SQLite is touched. The private copy let SQLite fail on it with
+      ``sqlite3.OperationalError("unable to open database file")``. Being
+      an `OSError`, it is now reported by `perceptual_reuse_cli.main` as an
+      ordinary failure (exit 1) instead of escaping as a traceback.
+    - If a pragma fails to apply, the DAL closes the connection before
+      re-raising; the private copy left it open for the garbage collector.
+
+    The path is still resolved strictly here, before the DAL is reached, so
+    a missing database raises the same `FileNotFoundError` from
+    `Path.resolve` that it always did.
+    """
     path = Path(database).resolve(strict=True)
-    uri_path = quote(path.as_posix(), safe="/:")
-    connection = sqlite3.connect(
-        f"file:{uri_path}?mode=ro",
-        uri=True,
-        timeout=60.0,
-        isolation_level=None,
+    return open_connection(
+        path,
+        readonly=True,
+        policy=REUSE_ANALYSIS_READ_ONLY_POLICY,
     )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only = ON")
-    connection.execute("PRAGMA busy_timeout = 60000")
-    return connection
 
 
 def analyze_reuse_opportunity(database: str | Path) -> dict:
