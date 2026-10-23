@@ -30,6 +30,8 @@ from comic_automation.archive import (
     UnsupportedArchiveFormatError,
     inspect_archive,
 )
+from comic_automation.archive import archive_limits
+from comic_automation.archive.inspection import UnsafeArchiveContentError
 from comic_automation.archive.page_hashing import calculate_page_hashes
 from comic_automation.archive.perceptual_hashing import (
     calculate_perceptual_hashes,
@@ -212,7 +214,7 @@ def test_the_corpus_covers_every_required_shape() -> None:
         "unicode_paths",
         "unsafe_members",
         "many_entries",
-        "excessive_entries",
+        "high_entry_count",
     }
 
     assert required <= set(gc.CASES_BY_NAME)
@@ -513,50 +515,49 @@ def test_many_entries_inspects_without_special_casing(
     assert result.page_count == 120
 
 
-def test_excessive_entries_is_accepted_today_because_no_cap_exists(
+def test_high_entry_count_is_accepted_under_the_entry_cap(
     tmp_path: Path,
 ) -> None:
-    """Pins current behaviour: an expected gap, not a guarantee.
+    """20,000 entries sits below the cap, and inspection admits it.
 
-    There is no entry-count limit, so inspection lists all
-    `EXCESSIVE_ENTRY_COUNT` members and reports every one as a page. This
-    asserts exactly that, because asserting a rejection that does not happen
-    would be a test of nothing.
+    Asserts both halves, so neither can drift unnoticed: the fixture's
+    entry count really is below `archive_limits.MAX_ARCHIVE_ENTRIES`, and
+    inspection then lists every member and reports each as a page. The
+    other side of the boundary -- one entry over the shipped ceiling is
+    refused -- belongs to `tests/test_archive_limits.py`
+    (`test_the_real_entry_ceiling_refuses_an_archive_one_entry_over`) and
+    is not duplicated here.
 
-    **This test is meant to fail when the cap lands.** That is the flip
-    signal `CORPUS_GAPS` promises: whoever introduces the limit replaces
-    this with an assertion that the case is rejected (and how it is
-    classified), and removes the gap entry. If the cap is set above
-    `EXCESSIVE_ENTRY_COUNT` this goes on passing -- raise the constant with
-    the cap.
+    If the cap is lowered to or below this fixture, this fails, and that is
+    the intended signal rather than a regression to patch over.
     """
-    result = inspect_archive(gc.build_case("excessive_entries", tmp_path))
+    result = inspect_archive(gc.build_case("high_entry_count", tmp_path))
 
-    assert result.entry_count == gc.EXCESSIVE_ENTRY_COUNT + 1  # + ComicInfo
-    assert result.page_count == gc.EXCESSIVE_ENTRY_COUNT
+    assert gc.HIGH_ENTRY_COUNT + 1 < archive_limits.MAX_ARCHIVE_ENTRIES
+    assert result.entry_count == gc.HIGH_ENTRY_COUNT + 1  # + ComicInfo
+    assert result.page_count == gc.HIGH_ENTRY_COUNT
 
 
-def test_excessive_entries_is_large_in_count_only(tmp_path: Path) -> None:
+def test_high_entry_count_is_large_in_count_only(tmp_path: Path) -> None:
     """The case isolates entry count from every other resource axis.
 
-    A cap on total uncompressed size, or on a single page's size, must not
-    be what rejects this fixture -- otherwise its eventual flip would be
-    credited to the wrong guard. Every page member is empty, the archive is
-    plain ZIP rather than ZIP64, and it stays small on disk.
+    Every page member is empty, so the declared uncompressed total is zero
+    and the size cap can never be what decides this fixture's fate; the
+    archive is plain ZIP rather than ZIP64, and it stays small on disk.
     """
-    path = gc.build_case("excessive_entries", tmp_path)
+    path = gc.build_case("high_entry_count", tmp_path)
 
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
 
     pages = [info for info in infos if info.filename != gc.COMIC_INFO]
 
-    assert len(pages) == gc.EXCESSIVE_ENTRY_COUNT
+    assert len(pages) == gc.HIGH_ENTRY_COUNT
     assert {info.file_size for info in pages} == {0}
     assert len(infos) < 0xFFFF  # below the ZIP64 entry-count threshold
     assert path.stat().st_size < 4 * 1024 * 1024
-    # And it really is excessive relative to the control.
-    assert gc.EXCESSIVE_ENTRY_COUNT >= 100 * 120
+    # And it really is extreme relative to the control.
+    assert gc.HIGH_ENTRY_COUNT >= 100 * 120
 
 
 def test_non_cbz_suffix_is_rejected_before_reading(tmp_path: Path) -> None:
@@ -679,37 +680,37 @@ def test_the_pixel_fixtures_stay_tiny_on_disk(tmp_path: Path) -> None:
 
 
 def test_the_corpus_records_what_it_does_not_cover() -> None:
-    """The excessive-entries *guard* is missing, and the corpus says so.
+    """Excessive *entries* has no corpus fixture, and says so.
 
-    The fixture exists, but there is no entry-count limit anywhere in the
-    codebase for it to exercise. Recorded in `CORPUS_GAPS` and tagged
-    `expected-gap` rather than left as an absence, because a missing guard
-    is otherwise indistinguishable from an overlooked one; `many_entries`
-    stays a legitimate high-count control.
+    The entry-count limit (`archive_limits.MAX_ARCHIVE_ENTRIES`, 2026-10-22)
+    is exercised by `tests/test_archive_limits.py` against an archive built
+    one entry over the shipped ceiling; the corpus does not carry a copy of
+    it. `many_entries` stays a legitimate high-count control. Recorded in
+    `CORPUS_GAPS` rather than left as an absence, because a missing fixture
+    is otherwise indistinguishable from an overlooked one.
     """
     assert "excessive_entries" in gc.CORPUS_GAPS
-    assert "expected-gap" in gc.CASES_BY_NAME["excessive_entries"].tags
+    assert "excessive_entries" not in gc.CASES_BY_NAME
     assert "control" in gc.CASES_BY_NAME["many_entries"].tags
     assert "limits" not in gc.CASES_BY_NAME["many_entries"].tags
 
 
-# --- unsafe members: current behaviour, pinned ---------------------------
+# --- unsafe members: refused ----------------------------------------------
 
 
-def test_unsafe_member_names_are_preserved_not_rejected(
+def test_unsafe_member_names_are_rejected_by_inspection(
     tmp_path: Path,
 ) -> None:
-    """Pins an accepted limitation rather than asserting a fix.
+    """[RESOLVED 2026-10-22] Replaces the pin on the accepted limitation.
 
-    Nothing in this project extracts archives to disk, so traversing member
-    names are not an active vulnerability -- `docs/archive_io_resource_audit.md`
-    records this deliberately under "Confirmed risks in current code": the
-    rewrite paths carry such names through verbatim instead of rejecting
-    them, and a downstream tool doing naive extraction would inherit them.
+    This used to assert that inspection accepted the fixture (page_count 4)
+    and said it should fail and be replaced once member validation landed.
+    It did: `archive_limits.validate_archive_members` now refuses
+    absolute, drive-qualified and `..` names on the central directory, and
+    inspection raises rather than reporting the archive as ordinary.
 
-    This test asserts what the code does *today*. If member validation is
-    later added, this test should fail and be replaced by one asserting
-    rejection -- that is the intended signal, not a regression.
+    The fixture is unchanged, and still carries all three shapes, so the
+    corpus keeps its frozen digest.
     """
     path = gc.build_case("unsafe_members", tmp_path)
     names = gc.member_names(path)
@@ -718,15 +719,18 @@ def test_unsafe_member_names_are_preserved_not_rejected(
     assert "nested/../../escape2.png" in names
     assert "/absolute.png" in names
 
-    # It inspects rather than raising: the names are data, not paths.
-    result = inspect_archive(path)
-    assert result.page_count == 4
+    with pytest.raises(UnsafeArchiveContentError) as caught:
+        inspect_archive(path)
+
+    assert caught.value.reason == "archive_unsafe_member_path"
+    # The first offending name in archive order is the one reported.
+    assert caught.value.member == "../escape.png"
 
 
 def test_inspecting_unsafe_members_writes_nothing_outside_the_archive(
     tmp_path: Path,
 ) -> None:
-    """The reason the above is safe: inspection never extracts.
+    """Inspection never extracts, and refusing does not change that.
 
     Asserted by observation rather than by reading the implementation --
     if inspection ever started extracting, the traversing names in this
@@ -737,7 +741,8 @@ def test_inspecting_unsafe_members_writes_nothing_outside_the_archive(
     path = gc.build_case("unsafe_members", workspace)
 
     before = {p for p in tmp_path.rglob("*")}
-    inspect_archive(path)
+    with pytest.raises(UnsafeArchiveContentError):
+        inspect_archive(path)
     after = {p for p in tmp_path.rglob("*")}
 
     assert before == after
@@ -755,12 +760,21 @@ def test_every_case_behaves_as_its_metadata_claims(
     These flags let other tests iterate the corpus and know what to expect.
     A flag that drifts out of step with its fixture would send those tests
     down the wrong branch silently.
+
+    The `safety` case is a valid zip that inspection now refuses outright
+    (archive_limits, 2026-10-22), so it asserts the refusal instead of a
+    page count.
     """
     path = case.build(tmp_path / f"{case.name}.cbz")
 
     assert zipfile.is_zipfile(path) == case.expects_valid_zip
 
     if not case.expects_valid_zip:
+        return
+
+    if "safety" in case.tags:
+        with pytest.raises(UnsafeArchiveContentError):
+            inspect_archive(path)
         return
 
     result = inspect_archive(path)

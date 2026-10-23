@@ -8,6 +8,10 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from comic_automation.archive.archive_limits import (
+    UnsafeArchiveError,
+    validate_archive_members,
+)
 from comic_automation.archive.inspection import IMAGE_EXTENSIONS
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
@@ -82,10 +86,16 @@ def calculate_page_hashes(
 
     try:
         with zipfile.ZipFile(archive_path, mode="r") as archive:
+            members = archive.infolist()
+            # Archive-wide limits, member names and encryption, checked on
+            # the central directory before the first member is opened. An
+            # encrypted member would otherwise surface from archive.open()
+            # as a bare RuntimeError and be filed as archive_unreadable.
+            validate_archive_members(members)
             entries = sorted(
                 (
                     entry
-                    for entry in archive.infolist()
+                    for entry in members
                     if not entry.is_dir()
                     and Path(entry.filename).suffix.casefold()
                     in IMAGE_EXTENSIONS
@@ -117,6 +127,13 @@ def calculate_page_hashes(
         raise PermanentJobError(
             f"Invalid or corrupt CBZ archive: {archive_path}",
             category="archive_corrupt",
+        ) from exc
+    except UnsafeArchiveError as exc:
+        # Permanent: the same central directory fails the same way on
+        # every retry. The reason code is the category.
+        raise PermanentJobError(
+            f"Refused CBZ archive {archive_path}: {exc}",
+            category=exc.reason,
         ) from exc
     except RuntimeError as exc:
         raise PermanentJobError(

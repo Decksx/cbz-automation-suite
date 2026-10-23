@@ -1,3 +1,7 @@
+from comic_automation.archive.archive_limits import (
+    UnsafeArchiveError,
+    validate_archive_members,
+)
 from comic_automation.archive.handlers import (
     InspectArchiveHandler,
     InvalidInspectionJobError,
@@ -13,6 +17,7 @@ from comic_automation.archive.inspection import (
     ArchiveInspectionError,
     CorruptArchiveError,
     ComicInfoMetadata,
+    UnsafeArchiveContentError,
     UnsupportedArchiveFormatError,
     UnsafeComicInfoError,
     inspect_archive,
@@ -80,6 +85,8 @@ __all__ = [
     "QuarantineRepository",
     "UnsupportedQuarantineCategoryError",
     "UnsupportedArchiveFormatError",
+    "UnsafeArchiveContentError",
+    "UnsafeArchiveError",
     "UnsafeComicInfoError",
     "inspect_archive",
     "inspect_cbz",
@@ -90,6 +97,7 @@ __all__ = [
     "connect_read_only",
     "difference_hash",
     "perceptual_hash",
+    "validate_archive_members",
     "execute_quarantine",
     "propose_quarantine_filename",
 ]

@@ -389,24 +389,25 @@ def test_a_rewrite_preserves_every_page_byte_for_byte(
     assert pages_after == pages_before
 
 
-def test_a_rewrite_preserves_unsafe_member_names_verbatim(
+def test_a_rewrite_refuses_unsafe_member_names_and_leaves_the_original(
     tmp_path: Path,
 ) -> None:
-    """Pins the accepted limitation on the write path.
+    """[RESOLVED 2026-10-22] Replaces the pin on the accepted limitation.
 
-    `docs/archive_io_resource_audit.md` records that the rewrite paths carry
-    traversing member names through rather than rejecting them. Asserted
-    here so the behaviour is visible and deliberate. If member validation is
-    added later this test should fail and be replaced -- that is the signal,
-    not a regression.
+    This used to assert that `write_comicinfo` carried traversing member
+    names through verbatim, and said it should fail and be replaced once
+    member validation landed. It did: the rewrite now refuses the archive
+    on its central directory, before materializing anything, so the
+    original is left byte-identical and no temp or backup file survives.
     """
     path = gc.build_case("unsafe_members", tmp_path)
+    before = fi.file_snapshot([path])
 
-    assert write_comicinfo(path, gc.COMIC_INFO, NEW_XML, dry_run=False)
+    assert write_comicinfo(path, gc.COMIC_INFO, NEW_XML, dry_run=False) is False
 
-    names = gc.member_names(path)
-    assert "../escape.png" in names
-    assert "/absolute.png" in names
+    assert fi.file_snapshot([path]) == before
+    assert not list(tmp_path.glob("*.tmp.cbz"))
+    assert not list(tmp_path.glob("*.bak.cbz"))
 
 
 # --- interrupted rewrite -------------------------------------------------

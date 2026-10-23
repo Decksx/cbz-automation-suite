@@ -6,6 +6,7 @@ from pathlib import Path
 from comic_automation.archive.inspection import (
     ArchiveInspectionError,
     CorruptArchiveError,
+    UnsafeArchiveContentError,
     UnsupportedArchiveFormatError,
     inspect_archive,
 )
@@ -56,6 +57,15 @@ class InspectArchiveHandler:
             raise PermanentJobError(
                 str(exc),
                 category="unsupported_archive_format",
+            ) from exc
+        except UnsafeArchiveContentError as exc:
+            # The archive_limits reason code is the category, so each
+            # refusal (entry count, declared size, unsafe member name) is
+            # distinguishable in failure reports instead of collapsing
+            # into the generic archive_inspection_error bucket below.
+            raise PermanentJobError(
+                str(exc),
+                category=exc.reason,
             ) from exc
         except ArchiveInspectionError as exc:
             raise PermanentJobError(

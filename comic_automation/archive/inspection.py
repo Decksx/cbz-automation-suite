@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
+from comic_automation.archive.archive_limits import (
+    UnsafeArchiveError,
+    is_encrypted_member,
+    validate_archive_members,
+)
+
 
 IMAGE_EXTENSIONS = frozenset({
     ".avif",
@@ -42,6 +48,29 @@ class UnsafeComicInfoError(ArchiveInspectionError):
 
 class CorruptArchiveError(ArchiveInspectionError):
     """Raised when an archive cannot be parsed or fails validation."""
+
+
+class UnsafeArchiveContentError(ArchiveInspectionError):
+    """Raised when the central directory breaks an archive-wide limit.
+
+    Wraps ``archive_limits.UnsafeArchiveError`` so inspection keeps a single
+    exception family for its handler. ``reason`` is the archive_limits
+    reason code (``archive_too_many_entries``, ``archive_too_large``,
+    ``archive_unsafe_member_path``) and becomes the job failure category.
+    Encryption never raises this from inspection: it is reported as
+    ``status="encrypted"`` instead, as it was before the limits existed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        member: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.member = member
 
 
 @dataclass(frozen=True)
@@ -126,6 +155,21 @@ def inspect_cbz(
     try:
         with zipfile.ZipFile(archive_path, mode="r") as archive:
             entries = archive.infolist()
+
+            # Before any member is read, including ComicInfo.xml and the
+            # optional CRC pass: a central directory that declares a bomb,
+            # an absurd entry count, or an escaping name is refused on
+            # metadata alone. Encryption is excluded here because
+            # inspection's contract is to *report* it as a status.
+            try:
+                validate_archive_members(entries, reject_encrypted=False)
+            except UnsafeArchiveError as exc:
+                raise UnsafeArchiveContentError(
+                    f"{exc} ({archive_path})",
+                    reason=exc.reason,
+                    member=exc.member,
+                ) from exc
+
             files = [entry for entry in entries if not entry.is_dir()]
             directories = [
                 entry for entry in entries if entry.is_dir()
@@ -138,9 +182,13 @@ def inspect_cbz(
                 in IMAGE_EXTENSIONS
             ]
 
+            # Every record, directories included: testzip() below opens
+            # directory records too, so a flag on "folder/" alone is enough
+            # to make it raise. Judging only file records let such an
+            # archive through as encrypted=False and into that crash.
             encrypted = any(
-                bool(entry.flag_bits & 0x1)
-                for entry in files
+                is_encrypted_member(entry)
+                for entry in entries
             )
 
             comic_info_entry = next(
@@ -171,7 +219,14 @@ def inspect_cbz(
 
             crc_verified = False
 
-            if verify_crc:
+            # testzip() opens every member, and zipfile raises a bare
+            # RuntimeError ("password required") for an encrypted one. That
+            # is outside the corrupt-archive tuple below and outside the
+            # handler's ladder, so the worker recorded it as a retryable
+            # "unclassified_error" instead of saving the archive as
+            # encrypted. An encrypted archive cannot be CRC-checked without
+            # its password, so it is reported with crc_verified=False.
+            if verify_crc and not encrypted:
                 bad_entry = archive.testzip()
 
                 if bad_entry is not None:

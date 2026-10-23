@@ -542,3 +542,152 @@ def test_data_version_is_frozen_inside_a_read_transaction(
 
     assert inside_before == inside_after
     assert outside_after != inside_before
+
+
+# --- the connection comes from the DAL (Step 5) ---------------------------
+#
+# `readonly_database_connection` used to call `sqlite3.connect` itself and
+# now opens through `dal.open_connection(readonly=True)`. These pin the
+# connection it hands back to the state the private copy produced --
+# measured on that copy at master `f957bde` before it was replaced -- so the
+# migration is shown to be behaviour-preserving rather than assumed to be.
+
+
+def test_readonly_connection_state_matches_the_pre_dal_factory(
+    tmp_path: Path,
+) -> None:
+    """Every connection property an audit can observe, pinned at once.
+
+    Values measured on the private factory before migration: query_only
+    1, busy_timeout 30000 (installed by ``timeout=30.0``, not by a
+    pragma), isolation_level None, sqlite3.Row rows, no open transaction.
+    The read-only path must *not* touch foreign_keys, journal_mode or
+    synchronous: a read-only audit that changed connection settings the
+    writable factory owns would be reading under a different regime than
+    the one it reports on.
+    """
+    database = tmp_path / "guard.db"
+    build_database(database)
+
+    with readonly_database_connection(database) as connection:
+        def pragma(name: str):
+            return connection.execute(f"PRAGMA {name}").fetchone()[0]
+
+        assert pragma("query_only") == 1
+        assert pragma("busy_timeout") == 30000
+        assert pragma("foreign_keys") == 0
+        assert pragma("journal_mode") == "wal"
+        assert pragma("synchronous") == 2  # FULL: SQLite's default, untouched
+        assert connection.isolation_level is None
+        assert connection.row_factory is sqlite3.Row
+        assert connection.in_transaction is False
+
+        row = connection.execute("SELECT id, name FROM widgets").fetchone()
+        assert row["id"] == 1
+
+
+def test_readonly_connection_refuses_writes_with_query_only_turned_off(
+    tmp_path: Path,
+) -> None:
+    """`mode=ro` is the layer that survives a pragma being switched off.
+
+    `query_only` is per-connection and any code holding the connection can
+    clear it. If the DAL path ever dropped the URI flag, this write would
+    succeed and the main-file bytes would change.
+    """
+    database = tmp_path / "guard.db"
+    build_database(database)
+    before = database.read_bytes()
+
+    with readonly_database_connection(database) as connection:
+        connection.execute("PRAGMA query_only = OFF")
+
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("DELETE FROM widgets")
+
+    assert database.read_bytes() == before
+
+
+def test_a_directory_is_refused_before_sqlite_is_touched(
+    tmp_path: Path,
+) -> None:
+    """Same refusal, same message, as the private factory gave."""
+    directory = tmp_path / "not-a-database"
+    directory.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="Database does not exist"):
+        with readonly_database_connection(directory):
+            pass
+
+    assert list(directory.iterdir()) == []
+
+
+def test_readonly_connection_is_closed_on_exit_and_on_error(
+    tmp_path: Path,
+) -> None:
+    """The close is the one thing this wrapper still owns itself."""
+    database = tmp_path / "guard.db"
+    build_database(database)
+
+    with readonly_database_connection(database) as connection:
+        pass
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with readonly_database_connection(database) as failing:
+            raise RuntimeError("boom")
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        failing.execute("SELECT 1")
+
+
+def test_readonly_connection_opens_through_the_dal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The factory is the DAL's, requested read-only.
+
+    A spy rather than a source grep: it proves the call happens with
+    ``readonly=True`` on the path every audit takes, not merely that the
+    name appears in the file.
+    """
+    from comic_automation.database import dal, read_guards
+
+    calls: list[tuple[object, dict]] = []
+    real_open = dal.open_connection
+
+    def spy(database_path, **kwargs):
+        calls.append((database_path, kwargs))
+        return real_open(database_path, **kwargs)
+
+    monkeypatch.setattr(read_guards, "open_connection", spy)
+
+    database = tmp_path / "guard.db"
+    build_database(database)
+
+    read_consistent_snapshot(database, count_widgets)
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"readonly": True}
+
+
+def test_read_guards_is_no_longer_a_sanctioned_connect_site() -> None:
+    """A raw connect returning to read_guards.py must trip the guard.
+
+    The allowlist entry was removed with the migration. If someone
+    re-adds both a connect call and an entry, this is the test that says
+    the migration was undone.
+    """
+    from comic_automation.database import dal
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    assert (
+        "comic_automation/database/read_guards.py"
+        not in dal.SANCTIONED_CONNECT_SITES
+    )
+    assert (
+        "comic_automation/database/read_guards.py"
+        not in dal.find_connect_sites(repo_root)
+    )
