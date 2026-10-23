@@ -26,11 +26,15 @@ Sources, in the §3.1 precedence order:
 1. ``human_decision`` -- an injected `HumanDecisionSource`. The decision
    manifest (``docs/series_identity_decision_manifest.md``) is not built,
    so the default is `NO_HUMAN_DECISIONS`. A human decision overrides every
-   lower source, including one that conflicts with it; two human decisions
-   that disagree leave the field unresolved.
+   lower source, including one that conflicts with it. Two human decisions
+   that disagree are a persistent conflict (`_human_conflicts`): the field
+   is unresolved, the archive is not renamable, its family is refused, and
+   the conflicting values never classify a ``v<N>`` token.
 2. ``comicinfo`` -- ``Series``/``Volume``/``Number``/``Year``, counted only
-   when the document is internally consistent (`ComicInfoFacts.usable`)
-   and is not the watcher's injected template (`is_injected_template`).
+   when the document is internally consistent and the field is not one the
+   watcher's injected template restated from the filename
+   (`ComicInfoFacts.authoritative`). Editing an unrelated field of an
+   injected template does not promote its injected fields.
 3. ``folder_context`` (and, for the version field, ``version_family``) --
    the resolved series folder, sibling runs that are numbered consistently,
    and established version families.
@@ -53,7 +57,7 @@ A bare ``v<N>`` in a current filename may be a volume or a version.
 `VTokenClassification` records which, and name evidence alone never
 decides:
 
-* **volume** when usable ComicInfo ``Volume`` equals N, or when the folder
+* **volume** when authoritative ComicInfo ``Volume`` equals N, or when the folder
   forms a volume run whose page content shows different books
   (`_volume_run`);
 * **version** only when the archive is a member of an established version
@@ -69,12 +73,17 @@ Version families (§4.2)
 
 A family needs affirmative evidence, independent of page overlap: the same
 decided series and the same resolved primary number (or a human decision
-declaring the family), the same edition set (absent counts as a value), and
-at least one version-marked member. Page content is never family evidence.
+declaring the family), the same edition set and the same ComicInfo
+``LanguageISO`` (absent counts as a value for both), the same unrecognised
+name tags (a tag the vocabulary does not know may be an unsupported
+variant), no member with conflicting human decisions, and at least one
+version-marked member. Page content is never family evidence.
 It is, however, a gate: §4.5 says incomparable inventories are never a
 version, so a family whose members do not all carry a comparable ordered
 signature under the current ordering contract (``CONTENT_SIGNATURE_VERSION``
-with a resolved order and at least one page) is reported ``incomparable``
+with a resolved order, at least one page, a non-empty digest for every
+page, and a stored inventory whose row count and indexes match its
+signature) is reported ``incomparable``
 and classifies nothing. A legacy signature can therefore never put an
 archive into a family.
 
@@ -86,7 +95,8 @@ Renamability
 
 An archive is renamable only when its series and its primary number are
 resolved (§3.1), where the primary number is ``number`` when any source
-offers one and otherwise ``volume``. This module also refuses an archive
+offers one and otherwise ``volume``. Any conflicting human decision also
+blocks it. This module also refuses an archive
 whose name carries an unresolved ``v<N>`` token: that token is a volume or a
 version, both of which the canonical name must keep, and renaming without
 it would discard the only record of it. That last rule is this module's
@@ -121,6 +131,7 @@ from comic_automation.database.read_guards import (
     ConsistentSnapshot,
     read_consistent_snapshot,
 )
+from scripts.cbz_canonical_name import EDITION_WORDS
 from scripts.cbz_routing import series_key
 
 
@@ -159,20 +170,18 @@ FAMILY_ESTABLISHED = "established"
 FAMILY_REFUSED = "refused"
 FAMILY_INCOMPARABLE = "incomparable"
 
-# The edition vocabulary is open question 4 of the design (§8). These are
-# the §2.1 examples only, normalized so spelling variants compare equal.
-# Extending the list is a vocabulary decision, not a code change to make
-# casually: any word added here can split a family that was one before.
-PROVISIONAL_EDITION_WORDS: Mapping[str, str] = {
-    "uncensored": "uncensored",
-    "decensored": "uncensored",
-    "colored": "colored",
-    "coloured": "colored",
-    "english": "english",
-}
-# The decensor marker. Two members differing only by it are a decensor
+# The edition vocabulary is the step-3 formatter's closed list
+# (`scripts.cbz_canonical_name.EDITION_WORDS`, provisional per design §8
+# question 4), so resolution and formatting can never disagree about what
+# an edition is. Matching here is case-insensitive and yields the canonical
+# spelling. No aliases are added: "Colored" and "Colorized" stay distinct
+# because their equivalence is undecided, and a spelling outside the list
+# ("Coloured") is not silently folded into one inside it -- it is left as
+# an unrecognised tag, which refuses a family rather than vanishing.
+EDITION_VOCABULARY: tuple[str, ...] = EDITION_WORDS
+# The decensor markers. Members differing only by these are a decensor
 # pair, which §4.5 says is never a version.
-DECENSOR_EDITION = "uncensored"
+DECENSOR_EDITIONS = frozenset({"Uncensored", "Decensored"})
 
 YEAR_MIN = 1900
 YEAR_MAX = 2100
@@ -186,18 +195,29 @@ YEAR_MAX = 2100
 # filename parse*. Such a document restates the filename; counting it as
 # level-2 evidence would let the filename decide a field through the back
 # door. It is recognized by the template's fingerprint, not by its text,
-# because filling it changes the text:
+# because filling it changes the text.
 #
-# * the Komga provenance stamp, SourceMihon == "Komga", which the template
-#   writes and the routing config already treats as circular provenance;
-# * the Tachiyomi elements the template carries, present and empty;
-# * every template field the watcher does not fill, still empty;
-# * no element outside the template plus the fields the injectors write.
+# A document is **template-derived** when it carries the Komga provenance
+# stamp (SourceMihon == "Komga", which the template writes and the routing
+# config already treats as circular provenance) and both Tachiyomi elements
+# the template carries. It is a **pristine** template when, in addition,
+# every template field the watcher does not fill is still empty and no
+# element lies outside the template plus the fields the injectors write.
 #
-# A human who edited the injected document (added a Writer, a Summary, any
-# element the template lacks) has turned it into real metadata, and it
-# counts again. `tests/test_field_resolution.py` pins these sets against the
-# real templates, so a template change that drifts from them fails a test.
+# Editing a template-derived document does not launder it. A Writer filled
+# in, or a Tags element added, says nothing about whether Series, Number or
+# Volume were ever corrected: those still restate the filename parse. So a
+# template-derived document's injector-written fields keep their injected
+# origin (`ComicInfoFacts.uncertain_fields`) and are filename-grade
+# candidates, never deciding evidence. Only fields the injectors never write
+# (Year, LanguageISO, ...) can count from an edited template. A field-specific
+# human decision, or independent folder evidence, still resolves the
+# uncertain ones in the ordinary way.
+#
+# The cost, accepted on review: a genuine Mihon export from a Komga source
+# carries the same stamp and is treated as template-derived too.
+# `tests/test_field_resolution.py` pins these sets against the real
+# templates, so a template change that drifts from them fails a test.
 TEMPLATE_ELEMENTS = frozenset({
     "Title",
     "Series",
@@ -230,10 +250,13 @@ TEMPLATE_EMPTY_ELEMENTS = frozenset({
 })
 TEMPLATE_PROVENANCE_ELEMENT = "SourceMihon"
 TEMPLATE_PROVENANCE_VALUE = "komga"
+TEMPLATE_MARKER_ELEMENTS = frozenset({"PublishingStatusTachiyomi", "Categories"})
 
 # ComicInfo fields read here. Count and Month are read only for the
-# internal-consistency checks.
-_COMICINFO_FIELDS = ("Series", "Volume", "Number", "Year", "Count", "Month")
+# internal-consistency checks; LanguageISO is family identity (§4.2).
+_COMICINFO_FIELDS = (
+    "Series", "Volume", "Number", "Year", "Count", "Month", "LanguageISO",
+)
 
 
 # --- numbers and years -----------------------------------------------------
@@ -290,15 +313,29 @@ class Evidence:
     """One source's statement about one field.
 
     ``value`` is the comparison form (normalized number, raw series text).
-    ``detail`` says where it came from, for the review section.
+    ``display`` is the spelling as the source wrote it (``12.50``, ``003``),
+    so the formatter receives the source's spelling rather than the
+    comparison key: `normalize_number` drops trailing fractional zeros,
+    which the step-3 formatter deliberately preserves. ``detail`` says where
+    it came from, for the review section.
     """
 
     source: str
     value: str
     detail: str
+    display: str | None = None
+
+    @property
+    def display_value(self) -> str:
+        return self.value if self.display is None else self.display
 
     def as_dict(self) -> dict[str, str]:
-        return {"source": self.source, "value": self.value, "detail": self.detail}
+        return {
+            "source": self.source,
+            "value": self.value,
+            "display": self.display_value,
+            "detail": self.detail,
+        }
 
 
 @dataclass(frozen=True)
@@ -310,6 +347,11 @@ class FieldResolution:
     resolved one carries its corroboration. ``reason`` is a short code:
     ``resolved``, ``human_conflict``, ``conflict``, ``filename_candidate_only``
     or ``no_evidence``.
+
+    ``display_value`` is the deciding evidence's own spelling of ``value``.
+    When several deciding sources agree on the value but spell it
+    differently (``12.50`` and ``12.5``), the highest-precedence source's
+    spelling is reported, and every spelling stays in ``evidence``.
     """
 
     field: str
@@ -317,6 +359,7 @@ class FieldResolution:
     source: str | None
     evidence: tuple[Evidence, ...]
     reason: str
+    display_value: str | None = None
 
     @property
     def resolved(self) -> bool:
@@ -331,6 +374,7 @@ class FieldResolution:
             "field": self.field,
             "resolved": self.resolved,
             "value": self.value,
+            "display_value": self.display_value,
             "source": self.source,
             "reason": self.reason,
             "evidence": [item.as_dict() for item in self.evidence],
@@ -385,6 +429,7 @@ NO_HUMAN_DECISIONS: HumanDecisionSource = StaticHumanDecisions()
 COMICINFO_ABSENT = "absent"
 COMICINFO_USABLE = "usable"
 COMICINFO_TEMPLATE = "injected_template"
+COMICINFO_EDITED_TEMPLATE = "edited_template"
 COMICINFO_INCONSISTENT = "inconsistent"
 
 
@@ -392,37 +437,54 @@ COMICINFO_INCONSISTENT = "inconsistent"
 class ComicInfoFacts:
     """What an archive's ComicInfo.xml may contribute, and why.
 
-    ``status`` is ``absent``, ``usable``, ``injected_template`` or
-    ``inconsistent``. Only ``usable`` contributes evidence; the other
-    statuses keep their ``reasons`` for the review section. ``fields``
-    holds the raw stripped text of the read fields, whatever the status.
+    ``status`` is ``absent``, ``usable``, ``injected_template`` (pristine),
+    ``edited_template`` or ``inconsistent``. ``fields`` holds the raw
+    stripped text of the read fields, whatever the status.
+
+    ``uncertain_fields`` are fields whose origin is the injector's filename
+    parse: every read field of a pristine template, and the
+    injector-written ones (`TEMPLATE_INJECTOR_WRITES`) of an edited one.
+    `authoritative` is the one test of whether a field is level-2 evidence.
     """
 
     status: str
     fields: Mapping[str, str] = field(default_factory=dict)
     reasons: tuple[str, ...] = ()
+    uncertain_fields: frozenset[str] = frozenset()
 
     @property
     def usable(self) -> bool:
         return self.status == COMICINFO_USABLE
+
+    def authoritative(self, name: str) -> bool:
+        """True when field ``name`` counts as ComicInfo evidence."""
+        return (
+            self.status in (COMICINFO_USABLE, COMICINFO_EDITED_TEMPLATE)
+            and name in self.fields
+            and name not in self.uncertain_fields
+        )
 
 
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def is_injected_template(root: ElementTree.Element) -> bool:
-    """True when ``root`` is the watcher's template, filled or not.
-
-    See the comment above `TEMPLATE_ELEMENTS` for the fingerprint and why
-    a filled template is still the template.
-    """
+def _children(root: ElementTree.Element) -> dict[str, list[str]]:
     children: dict[str, list[str]] = {}
     for child in root:
         children.setdefault(_local_name(child.tag), []).append(
             (child.text or "").strip()
         )
+    return children
 
+
+def is_template_derived(root: ElementTree.Element) -> bool:
+    """True when ``root`` started life as the injected template.
+
+    The Komga provenance stamp plus both Tachiyomi marker elements, whatever
+    else has been edited since. See the comment above `TEMPLATE_ELEMENTS`.
+    """
+    children = _children(root)
     provenance = children.get(TEMPLATE_PROVENANCE_ELEMENT)
     if (
         provenance is None
@@ -430,6 +492,18 @@ def is_injected_template(root: ElementTree.Element) -> bool:
         or provenance[0].casefold() != TEMPLATE_PROVENANCE_VALUE
     ):
         return False
+    return TEMPLATE_MARKER_ELEMENTS <= set(children)
+
+
+def is_injected_template(root: ElementTree.Element) -> bool:
+    """True when ``root`` is the watcher's template, filled but unedited.
+
+    See the comment above `TEMPLATE_ELEMENTS` for the fingerprint and why
+    a filled template is still the template.
+    """
+    if not is_template_derived(root):
+        return False
+    children = _children(root)
     if not set(children) <= TEMPLATE_ELEMENTS | TEMPLATE_INJECTOR_WRITES:
         return False
     for name in TEMPLATE_EMPTY_ELEMENTS:
@@ -454,7 +528,9 @@ def comicinfo_facts(documents: Sequence[str | bytes]) -> ComicInfoFacts:
     * a numeric ``Number`` greater than a numeric ``Count``.
 
     The template check runs on a consistent document, so the reported
-    reason for a template is always "template", never a side effect.
+    reason for a template is always "template", never a side effect. A
+    pristine template contributes nothing; an edited one contributes only
+    the fields the injectors never write (``uncertain_fields``).
     """
     if not documents:
         return ComicInfoFacts(status=COMICINFO_ABSENT)
@@ -526,6 +602,19 @@ def comicinfo_facts(documents: Sequence[str | bytes]) -> ComicInfoFacts:
                 "watcher-injected ComicInfo template: its values restate "
                 "the filename parse",
             ),
+            uncertain_fields=frozenset(fields),
+        )
+    if is_template_derived(root):
+        uncertain = frozenset(fields) & TEMPLATE_INJECTOR_WRITES
+        return ComicInfoFacts(
+            status=COMICINFO_EDITED_TEMPLATE,
+            fields=fields,
+            reasons=(
+                "edited copy of the injected ComicInfo template: "
+                f"{', '.join(sorted(uncertain)) or 'no read field'} still "
+                "restate the filename parse",
+            ),
+            uncertain_fields=uncertain,
         )
     return ComicInfoFacts(status=COMICINFO_USABLE, fields=fields)
 
@@ -570,8 +659,23 @@ _VOLUME_WORD_RE = re.compile(
     rf"(?<![A-Za-z])vol(?:ume)?\.?\s*({_NUMBER_TEXT})", re.IGNORECASE
 )
 _V_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+)(?![A-Za-z0-9.])", re.IGNORECASE)
-_WORD_RE = re.compile(r"[A-Za-z]+")
+_EDITION_RE = re.compile(
+    r"(?<![A-Za-z])("
+    + "|".join(
+        re.escape(word).replace(r"\ ", r"\s+")
+        for word in sorted(EDITION_VOCABULARY, key=len, reverse=True)
+    )
+    + r")(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_EDITION_BY_FOLD = {word.casefold(): word for word in EDITION_VOCABULARY}
+_TAG_YEAR_RE = re.compile(r"\d{4}")
+_TAG_VERSION_RE = re.compile(r"v\d+", re.IGNORECASE)
 _SERIES_TRIM = " \t-_.,~"
+
+
+def _fold(text: str) -> str:
+    return " ".join(text.split()).casefold()
 
 
 @dataclass(frozen=True)
@@ -582,7 +686,15 @@ class NameTokens:
     (volume or version) is open. ``version_markers`` are bracketed ``[vN]``
     tokens, which are never volumes. ``volume_words`` are ``Vol.``/
     ``Volume`` tokens. ``chapters`` and ``issues`` are ``ch.``/``#``
-    numbers. All numbers are in `normalize_number` form.
+    numbers. All numbers are in `normalize_number` form; ``spellings``
+    maps each normalized number back to the first spelling the name used.
+
+    ``editions`` are `EDITION_VOCABULARY` words, in canonical spelling.
+    ``other_tags`` is everything else the name says that is not series,
+    number, year, version or edition: bracket contents (``[Judas]``,
+    ``(Digital)``) and leftover text after the numbering. It cannot tell a
+    scanlator tag from an unsupported variant, so a version family whose
+    members differ in it is refused rather than guessed (§4.2).
     """
 
     filename: str
@@ -594,6 +706,8 @@ class NameTokens:
     version_markers: tuple[str, ...]
     years: tuple[str, ...]
     editions: frozenset[str]
+    other_tags: frozenset[str] = frozenset()
+    spellings: tuple[tuple[str, str], ...] = ()
 
     @property
     def primary_numbers(self) -> tuple[tuple[str, str], ...]:
@@ -616,6 +730,10 @@ class NameTokens:
         caught later, when its classification sees volume evidence too.
         """
         return bool(self.v_tokens or self.version_markers)
+
+    def spelling(self, value: str) -> str:
+        """The name's own spelling of normalized number ``value``."""
+        return dict(self.spellings).get(value, value)
 
 
 def parse_name_tokens(filename: str) -> NameTokens:
@@ -640,35 +758,62 @@ def parse_name_tokens(filename: str) -> NameTokens:
         if year is not None
     )
     editions = frozenset(
-        PROVISIONAL_EDITION_WORDS[word.casefold()]
-        for word in _WORD_RE.findall(stem)
-        if word.casefold() in PROVISIONAL_EDITION_WORDS
+        _EDITION_BY_FOLD[_fold(match.group(1))]
+        for match in _EDITION_RE.finditer(stem)
     )
+
+    # Bracket contents that are not a year, a version marker or an edition
+    # word: scanlator tags, source tags, or a variant the vocabulary does
+    # not know. Kept, so a family can refuse members that differ in them.
+    other_tags: set[str] = set()
+    for match in _BRACKET_GROUP_RE.finditer(stem):
+        content = _fold(match.group(0)[1:-1])
+        if not content or _TAG_YEAR_RE.fullmatch(content):
+            continue
+        if _TAG_VERSION_RE.fullmatch(content) and match.group(0)[0] == "[":
+            continue
+        if content in _EDITION_BY_FOLD:
+            continue
+        other_tags.add(content)
 
     # Bracket groups are scanlator tags, years, editions and version
     # markers, all captured above. Numbers inside them are not this book's
     # numbering, so they are blanked before the number tokens are read.
     body = _BRACKET_GROUP_RE.sub(" ", stem)
 
+    spans: list[tuple[int, int]] = []
+    spellings: dict[str, str] = {}
+
     def numbers(regex: re.Pattern[str]) -> tuple[tuple[int, str], ...]:
-        return tuple(
-            (match.start(), normalize_number(match.group(1)) or "")
-            for match in regex.finditer(body)
-        )
+        found = []
+        for match in regex.finditer(body):
+            value = normalize_number(match.group(1)) or ""
+            spellings.setdefault(value, " ".join(match.group(1).split()))
+            spans.append(match.span())
+            found.append((match.start(), value))
+        return tuple(found)
 
     chapters = numbers(_CHAPTER_RE)
     issues = numbers(_ISSUE_RE)
     volume_words = numbers(_VOLUME_WORD_RE)
-    v_tokens = tuple(
-        (match.start(), _normalize_one(match.group(1)))
-        for match in _V_TOKEN_RE.finditer(body)
-    )
+    v_tokens = numbers(_V_TOKEN_RE)
     starts = [
         start
         for start, _ in chapters + issues + volume_words + v_tokens
     ]
     prefix = body[: min(starts)] if starts else body
     series = " ".join(prefix.split()).strip(_SERIES_TRIM) or None
+
+    # Text after the numbering that is neither a number token nor an
+    # edition word ("ch. 1 Colourised") could be a variant too.
+    if starts:
+        rest = list(body)
+        for start, end in spans:
+            rest[start:end] = " " * (end - start)
+        leftover = _EDITION_RE.sub(" ", "".join(rest)[min(starts):])
+        leftover = " ".join(leftover.split()).strip(_SERIES_TRIM)
+        if leftover:
+            other_tags.add(_fold(leftover))
 
     return NameTokens(
         filename=filename,
@@ -680,6 +825,8 @@ def parse_name_tokens(filename: str) -> NameTokens:
         version_markers=version_markers,
         years=years,
         editions=editions,
+        other_tags=frozenset(other_tags),
+        spellings=tuple(sorted(spellings.items())),
     )
 
 
@@ -695,6 +842,12 @@ class PageEvidence:
     comparable: a ``"1"`` row ordered ties by physical member order, so its
     page sequence proves nothing (`page_hashing.CONTENT_SIGNATURE_VERSION`).
 
+    Every page keeps its slot in ``page_digests``: a page with no digest is
+    an empty string there, never dropped, so an incomplete inventory cannot
+    pass as a shorter complete one. ``inventory_problem`` is set by the
+    stored-row loader when the rows disagree with their signature (row
+    count, or page indexes not contiguous from 0).
+
     This is nomination-grade evidence (§4.3): stored rows are not bound to
     the current bytes. Step 5 re-derives from the file before anything is
     compared for supersession.
@@ -704,6 +857,7 @@ class PageEvidence:
     algorithm_version: str
     order_resolved: bool
     page_digests: tuple[str, ...]
+    inventory_problem: str | None = None
 
     @property
     def comparable(self) -> bool:
@@ -718,10 +872,14 @@ class PageEvidence:
                 f"legacy ordering contract {self.algorithm_version!r} "
                 f"(current {CONTENT_SIGNATURE_VERSION!r})"
             )
+        if self.inventory_problem is not None:
+            return f"incomplete inventory: {self.inventory_problem}"
         if not self.order_resolved:
             return "page order unresolved (duplicate member names)"
         if not self.page_digests:
             return "no image pages"
+        if any(not digest for digest in self.page_digests):
+            return "incomplete inventory: a page has an empty or missing digest"
         return None
 
     @classmethod
@@ -741,7 +899,7 @@ def _read_page_evidence(
     evidence: dict[int, PageEvidence] = {}
     for archive_id in archive_ids:
         signature = connection.execute(
-            "SELECT algorithm, algorithm_version FROM "
+            "SELECT algorithm, algorithm_version, page_count FROM "
             "archive_content_signatures WHERE archive_id = ?",
             (archive_id,),
         ).fetchone()
@@ -749,7 +907,7 @@ def _read_page_evidence(
             continue
         rows = connection.execute(
             """
-            SELECT ap.entry_name, ph.digest
+            SELECT ap.page_index, ap.entry_name, ph.digest
             FROM archive_pages AS ap
             LEFT JOIN page_hashes AS ph
               ON ph.page_id = ap.id
@@ -760,20 +918,30 @@ def _read_page_evidence(
             """,
             (PAGE_HASH_ALGORITHM, PAGE_HASH_ALGORITHM_VERSION, archive_id),
         ).fetchall()
-        names = Counter(row[0] for row in rows)
-        digests = tuple(row[1] for row in rows)
+        names = Counter(row[1] for row in rows)
+        indexes = [int(row[0]) for row in rows]
+        # The signature records how many pages it was computed over. A
+        # missing page row would otherwise leave a shorter sequence that
+        # looks complete, and a gap in page_index means the same thing.
+        if len(rows) != int(signature[2]):
+            problem: str | None = (
+                f"{len(rows)} page rows but the signature records "
+                f"{int(signature[2])} pages"
+            )
+        elif indexes != list(range(len(rows))):
+            problem = "page indexes are not contiguous from 0"
+        else:
+            problem = None
         evidence[archive_id] = PageEvidence(
             algorithm=signature[0],
             algorithm_version=signature[1],
             # Raw-name duplicates are the stored form of an unresolved
-            # order (page_hashing._STORED_DUPLICATE_ENTRY_NAMES_SQL), and a
-            # page without an exact digest is an incomplete inventory.
-            # Either makes the sequence non-comparable.
-            order_resolved=(
-                all(count == 1 for count in names.values())
-                and all(digest is not None for digest in digests)
-            ),
-            page_digests=tuple(digest for digest in digests if digest),
+            # order (page_hashing._STORED_DUPLICATE_ENTRY_NAMES_SQL).
+            order_resolved=all(count == 1 for count in names.values()),
+            # A missing (NULL) or empty digest keeps its slot as "" and
+            # makes the evidence incomparable; it is never filtered out.
+            page_digests=tuple(row[2] or "" for row in rows),
+            inventory_problem=problem,
         )
     return evidence
 
@@ -845,6 +1013,11 @@ class FamilyMember:
     (human decision or ComicInfo only). Whether a token is a version is what
     the family decides, so a volume derived from that token cannot be
     evidence for or against the family.
+
+    ``language`` is the authoritative ComicInfo ``LanguageISO`` (casefolded)
+    or None. ``other_tags`` are `NameTokens.other_tags`. ``human_conflicts``
+    names every decision field (`FIELDS` and `DECISION_FAMILY`) on which this
+    archive's human decisions disagree; any of them refuses the family.
     """
 
     archive_key: str
@@ -855,6 +1028,9 @@ class FamilyMember:
     pages: PageEvidence | None
     family_decision: str | None = None
     volume: FieldResolution | None = None
+    language: str | None = None
+    other_tags: frozenset[str] = frozenset()
+    human_conflicts: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -901,18 +1077,30 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
       a non-empty `series_key`) and a resolved primary number (equal), and no two
       members have different known volumes;
     * same edition set, absent counting as a value; a difference only in
-      the decensor marker is a decensor pair, never a version (§4.5);
+      the decensor markers is a decensor pair, never a version (§4.5);
+    * same language, absent counting as a value;
+    * the same unrecognised tags: a tag the vocabulary does not know may be
+      an unsupported variant, so a difference refuses rather than being
+      read as absence;
+    * no member with conflicting human decisions -- a conflict persists and
+      refuses, it never falls back to automatic grouping;
     * at least one version-marked member, or the human family decision.
     """
     keys = tuple(member.archive_key for member in members)
+    conflicts = [
+        f"{member.archive_key} has conflicting human decisions on "
+        f"{', '.join(sorted(member.human_conflicts))}"
+        for member in members
+        if member.human_conflicts
+    ]
     if len(members) < 2:
         return FamilyEvidence(
             status=FAMILY_REFUSED,
             members=keys,
-            reasons=("a version family needs at least two members",),
+            reasons=("a version family needs at least two members", *conflicts),
         )
 
-    reasons: list[str] = []
+    reasons: list[str] = list(conflicts)
     evidence: list[str] = []
 
     decisions = {member.family_decision for member in members}
@@ -952,7 +1140,7 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
         differing = frozenset.union(*edition_sets) - frozenset.intersection(
             *edition_sets
         )
-        if differing == {DECENSOR_EDITION}:
+        if differing <= DECENSOR_EDITIONS:
             reasons.append(
                 "censored and uncensored members are a decensor pair, "
                 "never versions"
@@ -964,6 +1152,20 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
             )
     else:
         evidence.append(f"same editions {sorted(next(iter(edition_sets)))}")
+
+    languages = {member.language for member in members}
+    if len(languages) > 1:
+        reasons.append(
+            "members have different languages "
+            f"{sorted(language or 'absent' for language in languages)}"
+        )
+    tag_sets = {member.other_tags for member in members}
+    if len(tag_sets) > 1:
+        reasons.append(
+            "members carry different unrecognised tags "
+            f"{sorted(sorted(tags) for tags in tag_sets)} "
+            "(possibly an unsupported variant)"
+        )
 
     if not human_family:
         if any(member.version_marked for member in members):
@@ -1142,7 +1344,12 @@ def _resolve(
     if human:
         if len({same(item.value) for item in human}) == 1:
             return FieldResolution(
-                field_name, human[0].value, SOURCE_HUMAN, ordered, "resolved"
+                field_name,
+                human[0].value,
+                SOURCE_HUMAN,
+                ordered,
+                "resolved",
+                human[0].display_value,
             )
         return FieldResolution(field_name, None, None, ordered, "human_conflict")
 
@@ -1159,6 +1366,7 @@ def _resolve(
                 deciding[0].source,
                 ordered,
                 "resolved",
+                deciding[0].display_value,
             )
         return FieldResolution(field_name, None, None, ordered, "conflict")
 
@@ -1180,9 +1388,34 @@ def _human_evidence(
         if field_name in (FIELD_NUMBER, FIELD_VOLUME, FIELD_VERSION):
             value = normalize_number(value) or value
         found.append(
-            Evidence(SOURCE_HUMAN, value, f"decision {decision.record_id}")
+            Evidence(
+                SOURCE_HUMAN,
+                value,
+                f"decision {decision.record_id}",
+                display=decision.value,
+            )
         )
     return found
+
+
+def _human_conflicts(decisions: Sequence[HumanDecision]) -> frozenset[str]:
+    """Every decision field on which ``decisions`` disagree.
+
+    Compared in each field's comparison form (`series_key` for series,
+    `normalize_number` for numbers), so two receipts spelling one decision
+    differently agree. A conflict is a state that persists: it blocks
+    readiness, refuses the archive's family, and stops human evidence from
+    classifying a ``v<N>`` token. It never decays into "no decision".
+    """
+    conflicted = set()
+    for name in (*FIELDS, DECISION_FAMILY):
+        values = {
+            series_key(item.value) if name == FIELD_SERIES else item.value
+            for item in _human_evidence(decisions, name)
+        }
+        if len(values) > 1:
+            conflicted.add(name)
+    return frozenset(conflicted)
 
 
 # --- per-archive output ----------------------------------------------------
@@ -1212,7 +1445,8 @@ class ArchiveResolution:
     """Every field of one archive, the ``v<N>`` verdicts, and renamability.
 
     ``renamable`` is False when the series or the primary number is
-    unresolved, or a ``v<N>`` token is unresolved; ``review`` then names
+    unresolved, a ``v<N>`` token is unresolved, or any human decisions
+    conflict; ``review`` then names
     each blocking reason, and the unresolved fields carry their candidates.
     ``notes`` are non-blocking diagnostics, such as why a ComicInfo was
     ignored.
@@ -1272,14 +1506,32 @@ class FolderResolution:
 def _comicinfo_evidence(
     comicinfo: ComicInfoFacts, name: str, normalize: Callable[[str], str | None]
 ) -> list[Evidence]:
-    if not comicinfo.usable or name not in comicinfo.fields:
+    if name not in comicinfo.fields:
         return []
     raw = comicinfo.fields[name]
     value = normalize(raw)
+    if not comicinfo.authoritative(name):
+        if comicinfo.status in (COMICINFO_TEMPLATE, COMICINFO_EDITED_TEMPLATE):
+            # Injector-written: it restates the filename parse, so it is a
+            # filename-grade candidate, shown in review, never deciding.
+            return [
+                Evidence(
+                    SOURCE_FILENAME,
+                    value or raw,
+                    f"ComicInfo <{name}>{raw} from the injected template "
+                    "(filename-derived)",
+                    display=raw,
+                )
+            ]
+        return []
     # A present but unparseable value (Number "Special") is still evidence:
     # dropping it would let a lower source decide a field ComicInfo has
     # spoken to. Kept raw, it can only agree with an identical raw value.
-    return [Evidence(SOURCE_COMICINFO, value or raw, f"ComicInfo <{name}>{raw}")]
+    return [
+        Evidence(
+            SOURCE_COMICINFO, value or raw, f"ComicInfo <{name}>{raw}", display=raw
+        )
+    ]
 
 
 def _classify_v_token(
@@ -1291,6 +1543,7 @@ def _classify_v_token(
     comicinfo_volume: str | None,
     run_volume: str | None,
     in_family: bool,
+    human_conflict: bool = False,
 ) -> VTokenClassification:
     """Classify one ``v<N>`` token under §3.2.
 
@@ -1305,7 +1558,19 @@ def _classify_v_token(
     human volume decision included: it is the canonical *version* token
     (§2.1), and a volume that happens to equal N is a coincidence of
     numbers, not a statement about the token.
+
+    ``human_conflict`` is True when this archive's human volume or version
+    decisions disagree. The token is then unresolved outright: matching it
+    against one member of a conflicting set would pick a side.
     """
+    if human_conflict:
+        return VTokenClassification(
+            value=value,
+            bracketed=bracketed,
+            classification=V_UNRESOLVED,
+            evidence=(),
+            reason="conflicting human volume/version decisions",
+        )
     volume_why: list[str] = []
     version_why: list[str] = []
     if not bracketed and value in human_volumes:
@@ -1400,10 +1665,16 @@ def resolve_folder(
                     SOURCE_FOLDER,
                     number_run.values[key],
                     "consistently numbered siblings",
+                    display=token.spelling(number_run.values[key]),
                 )
             )
         evidence += [
-            Evidence(SOURCE_FILENAME, value, f"filename {kind}")
+            Evidence(
+                SOURCE_FILENAME,
+                value,
+                f"filename {kind}",
+                display=token.spelling(value),
+            )
             for kind, value in token.primary_numbers
         ]
         number[key] = _resolve(FIELD_NUMBER, evidence)
@@ -1416,29 +1687,43 @@ def resolve_folder(
         ]
         year[key] = _resolve(FIELD_YEAR, evidence)
 
-    # Version-family candidates: same decided series, same number, same
-    # editions. Partitioning by edition first means an edition variant is
-    # simply never a co-member; `establish_family` still checks editions,
-    # for callers that assemble members themselves. A human family
-    # decision groups by its family id instead.
+    # Version-family candidates: same decided series and same number. They
+    # are deliberately *not* partitioned by edition, language or tag: a
+    # member differing in those is then a co-member that refuses the family
+    # in `establish_family`, with the difference named for review, instead
+    # of silently dropping out. A single agreed human family decision groups
+    # by its family id. Conflicting family decisions are not "no decision":
+    # the archive joins every family it was declared into *and* its work
+    # group, and its conflict refuses each of them. An archive with some
+    # other conflict and no group still gets a (refused) verdict of its own.
     groups: dict[tuple, list[ArchiveFacts]] = {}
     family_decisions: dict[str, str | None] = {}
+    conflicts = {
+        a.archive_key: _human_conflicts(human[a.archive_key]) for a in archives
+    }
     for archive in archives:
         key = archive.archive_key
-        declared = [d.value for d in human[key] if d.field == DECISION_FAMILY]
-        family_decisions[key] = declared[0] if len(set(declared)) == 1 else None
+        declared = {d.value for d in human[key] if d.field == DECISION_FAMILY}
+        family_decisions[key] = (
+            next(iter(declared)) if len(declared) == 1 else None
+        )
+        group_keys: list[tuple] = []
         if family_decisions[key] is not None:
-            group_key: tuple = ("human", family_decisions[key])
-        elif series[key].resolved and number[key].resolved:
-            group_key = (
-                "work",
-                series_key(series[key].value or ""),
-                number[key].value,
-                tokens[key].editions,
-            )
+            group_keys.append(("human", family_decisions[key]))
         else:
-            continue
-        groups.setdefault(group_key, []).append(archive)
+            group_keys += [("human", value) for value in sorted(declared)]
+            if series[key].resolved and number[key].resolved:
+                group_keys.append(
+                    (
+                        "work",
+                        series_key(series[key].value or ""),
+                        number[key].value,
+                    )
+                )
+        if not group_keys and conflicts[key]:
+            group_keys.append(("conflicted", key))
+        for group_key in group_keys:
+            groups.setdefault(group_key, []).append(archive)
 
     # The volume known without the v<N> tokens, for the family's
     # different-volumes refusal (see FamilyMember).
@@ -1466,12 +1751,22 @@ def resolve_folder(
                     pages=m.pages,
                     family_decision=family_decisions[m.archive_key],
                     volume=work_volume[m.archive_key],
+                    language=(
+                        m.comicinfo.fields["LanguageISO"].casefold()
+                        if m.comicinfo.authoritative("LanguageISO")
+                        else None
+                    ),
+                    other_tags=tokens[m.archive_key].other_tags,
+                    human_conflicts=conflicts[m.archive_key],
                 )
                 for m in members
             ]
         )
         families.append(verdict)
         for member in members:
+            # Only an archive with conflicting family decisions sits in
+            # several groups, and its conflict refuses every one of them, so
+            # whichever verdict lands last is a refusal.
             family_of[member.archive_key] = verdict
 
     results: list[ArchiveResolution] = []
@@ -1482,9 +1777,10 @@ def resolve_folder(
         in_family = family is not None and family.established
         comicinfo_volume = (
             normalize_number(archive.comicinfo.fields.get("Volume"))
-            if archive.comicinfo.usable
+            if archive.comicinfo.authoritative("Volume")
             else None
         )
+        token_conflict = bool(conflicts[key] & {FIELD_VOLUME, FIELD_VERSION})
         human_volumes = {e.value for e in _human_evidence(human[key], FIELD_VOLUME)}
         human_versions = {
             e.value for e in _human_evidence(human[key], FIELD_VERSION)
@@ -1502,6 +1798,7 @@ def resolve_folder(
                 comicinfo_volume=comicinfo_volume,
                 run_volume=volume_run.values.get(key),
                 in_family=in_family,
+                human_conflict=token_conflict,
             )
             for value, bracketed in candidates
         ]
@@ -1516,6 +1813,7 @@ def resolve_folder(
                     SOURCE_FOLDER,
                     volume_run.values[key],
                     "volume run of different books",
+                    display=token.spelling(volume_run.values[key]),
                 )
             )
         evidence += [
@@ -1565,6 +1863,8 @@ def resolve_folder(
                 )
         else:
             review.append("no primary number from any source")
+        for name in sorted(conflicts[key]):
+            review.append(f"conflicting human decisions on {name}")
         for item in classifications:
             if item.classification == V_UNRESOLVED:
                 review.append(
@@ -1574,7 +1874,7 @@ def resolve_folder(
         notes = (
             (f"ComicInfo ignored: {'; '.join(archive.comicinfo.reasons)}",)
             if archive.comicinfo.status
-            in (COMICINFO_TEMPLATE, COMICINFO_INCONSISTENT)
+            in (COMICINFO_TEMPLATE, COMICINFO_EDITED_TEMPLATE, COMICINFO_INCONSISTENT)
             else ()
         )
 
