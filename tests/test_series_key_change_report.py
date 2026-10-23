@@ -72,7 +72,7 @@ def test_an_unaffected_library_reports_nothing_and_exits_zero(tmp_path, capsys):
     assert report_mod.main(["--root", str(root)]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["counts"] == {"directories": 2, "changed": 0, "merges": 0,
-                             "empty_keys": 0, "splits": 0}
+                             "empty_keys": 0, "splits": 0, "excluded": 0}
 
 
 def test_a_changed_library_exits_one(tmp_path, capsys):
@@ -136,3 +136,18 @@ def test_empty_new_keys_are_listed_but_never_merged(tmp_path):
     assert report["counts"]["merges"] == 0
     assert sorted(r["name"] for r in report["empty_keys"]) == ["Uncensored_", "_decensored"]
     assert {r["name"] for r in report["changed"]} == {"_decensored", "Uncensored_"}
+
+
+def test_non_series_directories_are_excluded_from_comparison_but_listed(tmp_path):
+    # Codex's counterexample on #114: '.stfolder' keys to 'stfolder', so
+    # without the SeriesIndex exclusion it "merged" with stfolder_Uncensored
+    # although the real index has no collision there.
+    from scripts.cbz_routing import NON_SERIES_DIRECTORIES
+    root = _library(tmp_path, ".stfolder", "stfolder_Uncensored", "Berserk")
+    report = report_mod.build_report([root])
+    assert ".stfolder" in NON_SERIES_DIRECTORIES
+    assert report["counts"]["merges"] == 0
+    assert report["counts"]["excluded"] == 1
+    assert report["excluded"] == [{"root": str(root), "name": ".stfolder"}]
+    assert ".stfolder" in report["roots"][0]["names"]
+    assert all(r["name"] != ".stfolder" for r in report["changed"])
