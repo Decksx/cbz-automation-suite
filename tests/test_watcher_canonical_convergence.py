@@ -736,3 +736,164 @@ def test_a_canonical_arrival_meets_its_legacy_named_copy_end_to_end(
     assert sorted(p.name for p in (library / "Berserk").iterdir()) == ["Berserk v1 #003.cbz"]
     expected = incoming_size if survivor_size is None else survivor_size
     assert _payload_size(library / "Berserk" / "Berserk v1 #003.cbz") == expected
+
+
+# ---------------------------------------------------------------------------
+# AI-decensor originals follow their own archive (PR #121 review, round 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ai_watch(tmp_path, monkeypatch):
+    """A tmp watch folder routed to a tmp Comix library with AI decensoring
+    on, every external step stubbed: run_ai_decensor copies the archive to a
+    tmp originals folder (no Camelia process), and archive_backup -- the
+    offload of an original -- only records what it was given. The real
+    archive_completed_ai_backups runs, wrapped so each call's pairs are
+    captured too."""
+    watch_root = tmp_path / "incoming"
+    library = tmp_path / "library" / "Comix"
+    originals = tmp_path / "originals"
+    for folder in (watch_root, library, originals):
+        folder.mkdir(parents=True)
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(watch_root))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(library))
+    monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", True)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
+
+    backup_of: dict[str, Path] = {}
+
+    def fake_ai(path, destination):
+        backup = originals / f"{len(backup_of)}-{path.name}"
+        backup.write_bytes(path.read_bytes())
+        backup_of[path.name] = backup
+        return backup
+
+    offloaded: list[tuple[Path, str]] = []
+    calls: list[tuple[list[tuple[Path, Path]], Path | None]] = []
+    real_complete = watcher.archive_completed_ai_backups
+
+    def recording_complete(processed, landed):
+        calls.append((list(processed), landed))
+        real_complete(processed, landed)
+
+    monkeypatch.setattr(watcher, "run_ai_decensor", fake_ai)
+    monkeypatch.setattr(watcher, "archive_completed_ai_backups", recording_complete)
+    monkeypatch.setattr(
+        watcher,
+        "archive_backup",
+        lambda backup, root, series: offloaded.append((backup, series)) or backup,
+    )
+    return watch_root, library, backup_of, offloaded, calls
+
+
+def test_a_refused_loose_placeholder_keeps_its_ai_original(ai_watch):
+    """Codex's round-2 probe, plus a fallback rename. In one mixed-directory
+    pass a placeholder is refused (two editions) and stays in the import
+    folder, while an accepted placeholder is fallback-renamed and moves.
+    The accepted sibling's landed folder must not count as a receipt for
+    the refused archive: only the accepted original is offloaded, keyed by
+    the archive's renamed path; the refused archive and its original stay."""
+    watch_root, library, backup_of, offloaded, calls = ai_watch
+    drop = watch_root / "Berserk Ch. 4"
+    _make_cbz(drop / "volvox_Chapter (Colored) (Uncensored).cbz", 400)
+    _make_cbz(drop / "Other_Chapter (2019).cbz", 300)
+    _make_cbz(drop / "Other" / "Other Ch. 1.cbz", 100)
+
+    watcher.process_and_move_directory(drop)
+
+    refused = drop / "volvox Chapter (Colored) (Uncensored).cbz"
+    accepted_backup = backup_of["Other Chapter (2019).cbz"]
+    refused_backup = backup_of[refused.name]
+    assert refused.is_file()
+    assert refused_backup.is_file()
+    assert (library / "Berserk" / "Berserk ch. 4 (2019).cbz").is_file()
+
+    offloaded_backups = [backup for backup, _series in offloaded]
+    assert accepted_backup in offloaded_backups
+    assert refused_backup not in offloaded_backups
+    assert ("Berserk", ) == tuple(s for b, s in offloaded if b == accepted_backup)
+
+    (parent_pairs, landed), = [c for c in calls if c[1] and c[1].name == "Berserk"]
+    assert parent_pairs == [(drop / "Berserk ch. 4 (2019).cbz", accepted_backup)]
+
+
+def test_the_probe_layout_offloads_only_the_routed_original(ai_watch):
+    """Codex's probe as written: an accepted non-placeholder beside a refused
+    placeholder in a "Series Special" drop."""
+    watch_root, library, backup_of, offloaded, calls = ai_watch
+    drop = watch_root / "Series Special Ch. 4"
+    _make_cbz(drop / "volvox_Chapter (2019).cbz", 400)
+    _make_cbz(drop / "Series Special Ch. 5.cbz", 500)
+    _make_cbz(drop / "Other" / "Other Ch. 1.cbz", 100)
+
+    watcher.process_and_move_directory(drop)
+
+    assert (drop / "volvox Chapter (2019).cbz").is_file()
+    offloaded_backups = {backup for backup, _series in offloaded}
+    assert backup_of["Series Special Ch. 5.cbz"] in offloaded_backups
+    assert backup_of["volvox Chapter (2019).cbz"] not in offloaded_backups
+    assert backup_of["volvox Chapter (2019).cbz"].is_file()
+
+
+def test_a_refused_directory_offloads_nothing(ai_watch):
+    watch_root, library, backup_of, offloaded, calls = ai_watch
+    arrival = watch_root / "Berserk Ch. 4"
+    _make_cbz(arrival / "volvox_Chapter (Colored) (Uncensored).cbz", 400)
+    _make_cbz(arrival / "Berserk Ch. 4 extra.cbz", 300)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert offloaded == []
+    assert all(landed is None for _pairs, landed in calls)
+    assert all(backup.is_file() for backup in backup_of.values())
+    assert len(list(arrival.glob("*.cbz"))) == 2
+
+
+def test_an_all_refused_loose_pass_offloads_nothing_of_its_own(ai_watch):
+    watch_root, library, backup_of, offloaded, calls = ai_watch
+    drop = watch_root / "Berserk Ch. 4"
+    _make_cbz(drop / "volvox_Chapter (Colored) (Uncensored).cbz", 400)
+    _make_cbz(drop / "Other" / "Other Ch. 1.cbz", 100)
+
+    watcher.process_and_move_directory(drop)
+
+    assert [backup for backup, _ in offloaded] == [backup_of["Other Ch. 1.cbz"]]
+    assert backup_of["volvox Chapter (Colored) (Uncensored).cbz"].is_file()
+
+
+def test_an_all_success_directory_still_offloads_its_originals(ai_watch):
+    """Control: with nothing refused, every original of a routed directory is
+    offloaded, the fallback-renamed one included."""
+    watch_root, library, backup_of, offloaded, calls = ai_watch
+    arrival = watch_root / "Berserk Ch. 4"
+    _make_cbz(arrival / "volvox_Chapter (2019).cbz", 400)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert (library / "Berserk" / "Berserk ch. 4 (2019).cbz").is_file()
+    assert offloaded == [(backup_of["volvox Chapter (2019).cbz"], "Berserk")]
+
+
+def test_ai_backup_pairs_follow_a_fallback_rename_and_stay_when_unrouted(tmp_path):
+    """Unit view of the two helpers: a pair is re-keyed to the renamed path,
+    and with a landed folder an archive still in import keeps its original."""
+    old = tmp_path / "volvox Chapter (2019).cbz"
+    new = tmp_path / "Berserk ch. 4 (2019).cbz"
+    stays = tmp_path / "volvox Chapter (Colored).cbz"
+    stays.write_bytes(b"x")
+    raw_old, raw_stays = tmp_path / "raw1.cbz", tmp_path / "raw2.cbz"
+    parsed = {
+        new: cbz_core.ParsedComicName(raw_old, new.name, "s", "s", None, None),
+        stays: cbz_core.ParsedComicName(raw_stays, stays.name, "s", "s", None, None),
+    }
+    origins = {old: raw_old, stays: raw_stays}
+    pairs = [(old, tmp_path / "b1"), (stays, tmp_path / "b2")]
+
+    rekeyed = watcher._rekey_ai_backups(pairs, origins, parsed)
+    assert rekeyed == [(new, tmp_path / "b1"), (stays, tmp_path / "b2")]
+    assert watcher._routed_ai_backups(rekeyed, tmp_path) == [(new, tmp_path / "b1")]
+    assert watcher._routed_ai_backups(rekeyed, None) == rekeyed
