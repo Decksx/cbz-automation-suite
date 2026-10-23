@@ -1243,10 +1243,49 @@ the artifact itself (`verify_backup`), before any write:
 8. **Preimage.** Classifying the backup's own legacy rows reproduces the
    plan's classification exactly: the counts, every class list, the
    order-stable bases, the re-inventory list and the location diagnostics.
-9. It did not change while it was being verified.
+9. Nothing committed to it, and it was not replaced, while it was being
+   verified.
 
-Under the write lock, apply checks again that the backup file is still
-present and unchanged.
+**The backup window.** The first version compared only the backup's
+main-file size and mtime under the lock. Codex showed on #117 that this
+does not prove the SQLite artifact unchanged. A WAL-mode commit to the
+backup made after verification lands in `-wal` and leaves those fields
+identical. In the probe, a commit deleted both planned signatures from the
+backup, and apply still relabelled them and passed postflight. The guard is
+now `BackupWindow`:
+
+- **One held connection.** `verify_backup` opens one read-only connection
+  to the backup (`mode=ro` plus `query_only`). It keeps that connection
+  open until apply ends and closes it on every path, refusals included.
+- **The first reading.** The connection's `PRAGMA data_version` is read
+  outside any read transaction, before the preimage read.
+- **Where it is checked.** The reading must be unchanged at three points:
+  - after the preimage read;
+  - after the live `BEGIN IMMEDIATE`;
+  - as the last statement before the live `COMMIT`.
+
+  `data_version` counts commits by other connections, WAL-only ones
+  included.
+- **What a change does.** A change before the lock refuses the apply with
+  nothing written. A change while planned rows are processed rolls back
+  every relabel in the transaction.
+- **The replacement check.** The file fingerprint (`st_dev`, `st_ino`,
+  size, mtime) is compared at the same three points, for a different
+  failure. It notices the backup being moved, deleted or replaced, which a
+  connection that still holds the old file would not see as a commit. It
+  is a replacement check only, not evidence about the backup's content.
+- **Checked window.** From the first `data_version` reading in
+  `verify_backup` to the final check just before the live `COMMIT`.
+- **Remaining non-atomic limit.** The live database's lock does not lock
+  the backup. A commit to the backup after the final check, while the live
+  `COMMIT` itself is executing, is not detected. That interval holds no
+  reads or writes by this tool. Do not run writers against the backup
+  file.
+- **Windows measurement.** Measured on 2026-10-22 on the Windows temp
+  volume of the development checkout: `os.replace` of a database held open
+  by a read-only connection fails with `PermissionError` (WinError 32). The
+  replacement-check test therefore simulates a new file id instead of
+  moving the file. This has not been measured on the production volumes.
 
 - **What the preimage check guarantees.** Apply relabels a row only when
   the live basis equals the plan basis. The preimage check makes that plan
