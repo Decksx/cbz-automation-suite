@@ -730,15 +730,20 @@ def sanitize_without_markers(text: str, rules: set[str] = ALL_RULES) -> str:
 #                       written [vN] with no padding
 #   (Edition)           a whole EDITION_WORDS entry in round brackets, any
 #                       case; written in the list's spelling
+#   [Colored]           the one square-bracket edition word promoted to its
+#                       round-bracket token (David, 2026-10-23): a whole
+#                       _SQUARE_EDITION_WORDS entry, any case, written
+#                       (Colored); one token even when (Colored) is there too
 #   any bracket holding an uncensored/decensored word
 #                       written (Uncensored)/(Decensored), the formatter's
 #                       edition token, wherever preserve_decensor_markers
 #                       would have kept the bare word
 #
 # Deliberately not kept, pending a decision (see the PR): [2019] and (v2)
-# (not the canonical bracket for that token), [English] and other square-
-# bracket edition words (the scanlation-tag convention, where nearly every
-# release carries [English]), and bracketed SPECIAL_WORDS such as (Omnibus),
+# (not the canonical bracket for that token), [English], [Colorized] and
+# the other square-bracket edition words outside _SQUARE_EDITION_WORDS (the
+# scanlation-tag convention, where nearly every release carries [English]),
+# and bracketed SPECIAL_WORDS such as (Omnibus),
 # which the grammar writes bare after the series with no bracket to keep.
 # A bare v<N> outside brackets is never a token here: name evidence alone
 # never makes it a volume or a version (§3.2); it stays in the text as is.
@@ -750,6 +755,15 @@ _EDITION_BY_FOLD = {word.casefold(): word for word in EDITION_WORDS}
 # at import, means EDITION_WORDS and _DECENSOR_MARKER_RE have drifted apart.
 _DECENSOR_EDITION = {
     marker: _EDITION_BY_FOLD[marker] for marker in ("uncensored", "decensored")
+}
+# Square-bracket words promoted to their round-bracket edition token, an
+# explicit allowlist: David decided [Colored] only (2026-10-23), so
+# [Colorized], [English] and every other square-bracket tag stay dropped.
+# The decensor words need no entry: _DECENSOR_MARKER_RE already promotes them
+# from any bracket. Spellings come from EDITION_WORDS (a KeyError at import
+# means the two lists have drifted apart).
+_SQUARE_EDITION_WORDS = {
+    word: _EDITION_BY_FOLD[word] for word in ("colored",)
 }
 _DECENSOR_TOKEN_RE = re.compile(
     r"\((" + "|".join(re.escape(w) for w in _DECENSOR_EDITION.values()) + r")\)"
@@ -804,6 +818,8 @@ def extract_display_tokens(source: str) -> DisplayTokens:
             version = _DISPLAY_VERSION_RE.fullmatch(inner)
             if version:
                 add(versions, int(version.group(1)))
+            elif inner.casefold() in _SQUARE_EDITION_WORDS:
+                add(editions, _SQUARE_EDITION_WORDS[inner.casefold()])
         for marker in _DECENSOR_MARKER_RE.finditer(bracket):
             add(editions, _DECENSOR_EDITION[marker.group(0).casefold()])
     return DisplayTokens(tuple(years), tuple(editions), tuple(versions))
