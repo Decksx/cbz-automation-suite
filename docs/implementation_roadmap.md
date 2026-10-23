@@ -1506,6 +1506,49 @@ Use property-based tests for inexpensive invariants:
 Add crash and fault-injection tests around job acquisition, hash saves,
 database commits, archive replacement, quarantine moves, and recovery.
 
+**Progress, 2026-10-22 (branch `test/step8-corpus-and-properties`, off
+`f957bde`, merged with `657e129`).** Tests only; no production code
+changed.
+
+- *Entry count.* `high_entry_count` (20,000 empty image members, plain
+  ZIP) is now in the corpus: the sub-ceiling side of
+  `archive_limits.MAX_ARCHIVE_ENTRIES` (50,000, #110). The corpus pins that
+  its count is below the cap and that inspection admits it. The over-cap
+  refusal is not duplicated in the corpus; `tests/test_archive_limits.py`
+  builds an archive one entry over the shipped ceiling, and
+  `CORPUS_GAPS["excessive_entries"]` says so. Lowering the cap to 20,001 or
+  below fails the corpus pin by design.
+- *Property tests* (`tests/test_step8_invariant_properties.py`) cover
+  invariants 1, 2, 4, 6, 7 and 10 of the list above. `hypothesis` is not
+  installed or declared, so they are seeded standard-library generators:
+  reproducible, with no shrinking. Not covered: 3 (no `idempotency_key`
+  exists to test, per the Step 6 row), 5 (archive identity is path-keyed
+  by design today, so a move mints a new identity; the bytes side is
+  already pinned by the corpus), 8 and 9 (not attempted in this slice).
+- *Fault injection* now covers hash saves (a fault at the final write of
+  `ArchiveHashRepository.save` leaves all five tables unchanged) and job
+  acquisition (a fault at `claim_next`'s update consumes no attempt and
+  releases the write lock). Quarantine moves are still unverified.
+- **Two invariants are false on master**, recorded as strict `xfail` tests
+  that turn into failures when fixed, and not fixed here:
+  1. `series_key` is not idempotent. A marker word glued to a character
+     that a later step turns into a separator survives the first pass:
+     `"_decensored"` -> `"decensored"` -> `""`. Consequence:
+     `Berserk_Uncensored` keys to `berserk uncensored` but
+     `Berserk Uncensored` keys to `berserk`, which is a series split. U+0130 (`İ`, which lowercases to
+     `i` + U+0307) produces the same failure, so converting only `_` first
+     does not fix all of it. A simulated fix like that was measured to
+     clear the three underscore cases and not the randomized property.
+  2. Page order is not deterministic when two image names share a natural
+     key (`a.png`/`A.png`, `01.png`/`1.png`, `p1.png`/`p01.png`). The sort
+     is stable, so physical member order decides, and the content
+     signature differs between two packings of the same pages.
+
+  Also probed and not pinned: `cbz_core.sanitize`, `clean_filename` and
+  `clean_directory_name` are not idempotent (`"Batman].cC"` ->
+  `"Batman.cC"` -> `""`). Whether the sanitizer should be a fixpoint is an
+  open decision, so no test asserts either answer.
+
 ### Step 9 — Maintain a lightweight decisions log
 
 Continue using the existing file:

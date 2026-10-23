@@ -30,6 +30,7 @@ from comic_automation.archive import (
     UnsupportedArchiveFormatError,
     inspect_archive,
 )
+from comic_automation.archive import archive_limits
 from comic_automation.archive.inspection import UnsafeArchiveContentError
 from comic_automation.archive.page_hashing import calculate_page_hashes
 from comic_automation.archive.perceptual_hashing import (
@@ -213,6 +214,7 @@ def test_the_corpus_covers_every_required_shape() -> None:
         "unicode_paths",
         "unsafe_members",
         "many_entries",
+        "high_entry_count",
     }
 
     assert required <= set(gc.CASES_BY_NAME)
@@ -513,6 +515,51 @@ def test_many_entries_inspects_without_special_casing(
     assert result.page_count == 120
 
 
+def test_high_entry_count_is_accepted_under_the_entry_cap(
+    tmp_path: Path,
+) -> None:
+    """20,000 entries sits below the cap, and inspection admits it.
+
+    Asserts both halves, so neither can drift unnoticed: the fixture's
+    entry count really is below `archive_limits.MAX_ARCHIVE_ENTRIES`, and
+    inspection then lists every member and reports each as a page. The
+    other side of the boundary -- one entry over the shipped ceiling is
+    refused -- belongs to `tests/test_archive_limits.py`
+    (`test_the_real_entry_ceiling_refuses_an_archive_one_entry_over`) and
+    is not duplicated here.
+
+    If the cap is lowered to or below this fixture, this fails, and that is
+    the intended signal rather than a regression to patch over.
+    """
+    result = inspect_archive(gc.build_case("high_entry_count", tmp_path))
+
+    assert gc.HIGH_ENTRY_COUNT + 1 < archive_limits.MAX_ARCHIVE_ENTRIES
+    assert result.entry_count == gc.HIGH_ENTRY_COUNT + 1  # + ComicInfo
+    assert result.page_count == gc.HIGH_ENTRY_COUNT
+
+
+def test_high_entry_count_is_large_in_count_only(tmp_path: Path) -> None:
+    """The case isolates entry count from every other resource axis.
+
+    Every page member is empty, so the declared uncompressed total is zero
+    and the size cap can never be what decides this fixture's fate; the
+    archive is plain ZIP rather than ZIP64, and it stays small on disk.
+    """
+    path = gc.build_case("high_entry_count", tmp_path)
+
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+
+    pages = [info for info in infos if info.filename != gc.COMIC_INFO]
+
+    assert len(pages) == gc.HIGH_ENTRY_COUNT
+    assert {info.file_size for info in pages} == {0}
+    assert len(infos) < 0xFFFF  # below the ZIP64 entry-count threshold
+    assert path.stat().st_size < 4 * 1024 * 1024
+    # And it really is extreme relative to the control.
+    assert gc.HIGH_ENTRY_COUNT >= 100 * 120
+
+
 def test_non_cbz_suffix_is_rejected_before_reading(tmp_path: Path) -> None:
     path = gc.build_case("ordinary", tmp_path)
     renamed = path.with_suffix(".zip")
@@ -643,6 +690,7 @@ def test_the_corpus_records_what_it_does_not_cover() -> None:
     is otherwise indistinguishable from an overlooked one.
     """
     assert "excessive_entries" in gc.CORPUS_GAPS
+    assert "excessive_entries" not in gc.CASES_BY_NAME
     assert "control" in gc.CASES_BY_NAME["many_entries"].tags
     assert "limits" not in gc.CASES_BY_NAME["many_entries"].tags
 
