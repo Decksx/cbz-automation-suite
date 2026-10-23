@@ -575,19 +575,38 @@ code takes. They are open to review.
    not itself David's decision, and presence alone does not establish
    accuracy.
 
-   Under the rule, B's usable ComicInfo must also cover A's:
-   - Every element populated in A's document must be populated in B's.
-     Populated means non-whitespace text, any attribute, or any populated
-     descendant. Free text such as Notes and Summary counts by presence.
-   - **`Pages`:** every `Page` that A populates must appear in B with the
-     same `Image` index and at least the same attribute names. A `Page`
-     with no index, a duplicated index, or nested content cannot be
-     matched confidently, so it goes to review.
-   - **Other structured elements:** B must carry A's populated shape
-     (child paths and attribute names).
-   - Values may differ.
+   The mechanism is deliberately narrow; it is not an XML merger. Only
+   these shapes in A's document can certify coverage, and values may
+   differ in all of them:
+   - **Simple top-level element:** no attributes, no children, and text
+     that is non-blank after strip. It is covered when B has the same
+     element with non-blank text. Free text such as Notes and Summary
+     counts the same way.
+   - **`Pages`**, in this shape only:
+     - `Pages` has no attributes and no non-blank text;
+     - its children are only `Page` elements;
+     - each `Page` has no children, no text and no tail, and an `Image`
+       attribute that is a non-negative decimal integer, unique within
+       `Pages`.
 
-   An empty `<ComicInfo/>` therefore never replaces a filled one.
+     It is covered when every A `Page` attribute other than `Image` with a
+     non-blank value is also non-blank on B's `Page` with the same `Image`
+     index. B's `Pages` must be in the same supported shape.
+   - **An element whose content is blank** (blank text, no attributes, no
+     children) needs no cover. Neither does a blank `Page` attribute.
+
+   **Everything else in A refuses the drop** with "unsupported ComicInfo
+   shape: <path>" and goes to review:
+   - any other element with attributes or children;
+   - non-blank tail text anywhere;
+   - text or attributes on `Pages`, or on the root;
+   - a missing, blank, invalid or duplicate `Image` index;
+   - a repeated `Pages`;
+   - nesting deeper than `MAX_COMICINFO_DEPTH` (8).
+
+   The scan is iterative and stops at the depth bound, so a deeply nested
+   older document is a family-local refusal that cannot stop the folder.
+   An empty `<ComicInfo/>` never replaces a filled one.
 
    **When A's ComicInfo is inconsistent but well-formed**, it is still
    inventoried from its XML, including a field that holds contradictory
