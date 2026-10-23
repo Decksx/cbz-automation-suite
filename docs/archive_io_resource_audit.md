@@ -16,6 +16,135 @@ as it was at audit time, not as it is now.
 
 ## Resolution log
 
+### Implemented 2026-10-22 — archive-wide limits, member names, encryption
+
+Roadmap Step 7's remaining low-risk items. New module
+`comic_automation/archive/archive_limits.py`; one validator,
+`validate_archive_members()`, runs on the central directory (`infolist()`)
+immediately after the archive is opened and before any member is read. It
+raises `UnsafeArchiveError` (a `ValueError`, so the sanitizer-style
+`OSError` retry and the `RuntimeError` → `archive_unreadable` branch both
+leave it alone) carrying a reason code that is also the job
+`failure_category`:
+
+| Reason code | Check | Limit |
+| --- | --- | --- |
+| `archive_too_many_entries` | central-directory records, directories included | `MAX_ARCHIVE_ENTRIES = 50_000` |
+| `archive_too_large` | sum of declared `file_size` | `MAX_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES` = 16 GiB |
+| `archive_unsafe_member_path` | leading `/` or `\` (incl. UNC), drive letter (`C:`), any exact `..` component under either separator | — |
+| `archive_encrypted` | general-purpose flag bit 0 or bit 6 | — |
+
+Wired in at four boundaries:
+
+| Boundary | On refusal |
+| --- | --- |
+| `inspection.inspect_cbz` | raises `UnsafeArchiveContentError` (an `ArchiveInspectionError`); `InspectArchiveHandler` maps it to `PermanentJobError(category=<reason>)`. Encryption is **not** raised here: inspection still reports `status="encrypted"`, as before |
+| `page_hashing.calculate_page_hashes` | `PermanentJobError(category=<reason>)` |
+| `perceptual_hashing.calculate_perceptual_hashes` | `PermanentJobError(category=<reason>)`; V1 decoding/DCT/digest semantics untouched |
+| `cbz_library_maintenance.write_comicinfo` | broad handler: rewrite abandoned, original byte-identical, temp removed, `False` returned |
+
+**Encrypted handling, traced.** Measured on `master` = `f957bde` with a
+synthetic archive whose second member carries flag bit 0:
+`inspect_archive(verify_crc=True)` raised a bare `RuntimeError` ("password
+required") out of `testzip()`, which the handler does not categorize, so the
+worker recorded a retryable `unclassified_error`; `calculate_page_hashes`
+and `calculate_perceptual_hashes` each failed as `archive_unreadable`. Now
+inspection skips the CRC pass for an encrypted archive and reports
+`crc_verified=False`, and both hashing modules fail as `archive_encrypted`
+before opening a member. `write_comicinfo` already returned `False` via
+its broad handler; the validator only refuses earlier with a clearer
+message (bypassing that check fails no test, for that reason).
+`cbz_sanitizer._write_cbz_with_comicinfo` was traced by reading only: the
+`RuntimeError` falls into its `except Exception` branch, is logged, and the
+rewrite is abandoned without retry.
+
+**Still open, measured:** the ComicInfo-only readers are not covered.
+`cbz_library_maintenance.read_comicinfo` on an archive whose
+`ComicInfo.xml` carries flag bit 0 raised `RuntimeError: File
+'ComicInfo.xml' is encrypted, password required for extraction` out of the
+function (measured 2026-10-22 on this branch; it catches only
+`BadZipFile`/`OSError`). The sanitizer's ComicInfo-only reads
+(`process_comicinfo`, `_process_comicinfo_with_core`, the
+`process_cbz_file` prefetch, `_patch_comicinfo_for_range`) catch the same
+pair and were not traced.
+
+**The caps are admission checks on declared metadata, not a memory or
+decompression bound.** *(Corrected 2026-10-22 after review of PR #110. The
+first version of this entry claimed "a declared-size cap is a real bound
+here", on the strength of an understated size failing CRC. That
+measurement left the CRC unpatched; the archive's author controls the CRC
+too, so the claim was false.)* Measured on CPython 3.11.3: a
+1,000,000-byte deflated member declared as 1,000 bytes with its CRC-32 set
+to the first 1,000 bytes passes the validator at a 1,000-byte ceiling, and
+`ZipFile.read` returns 1,000 bytes successfully while the decompressor
+produced the whole 1,000,000 (`ZipExtFile._read1` slices to the declared
+length only after decompressing; tracemalloc peak above 900,000 bytes).
+`test_the_size_cap_does_not_bound_decompressor_work` pins this limitation.
+What a reader retains from `read(info)` is at most the declared size; the
+transient decompressor allocation is not bounded.
+
+**Still open: a decompression/allocation budget.** Bounded per-member
+decompression (or a `compress_size` ratio check) is deliberately not
+implemented in this change and remains a roadmap Step 7 item.
+
+**Duplicate-name reads in `write_comicinfo`, fixed.** It read each member
+with `zin.read(info.filename)`, which for duplicate names returns the last
+record of that name every time: three `page.bin` records of 0, 0 and 1,000
+bytes passed a 1,000-byte ceiling, the rewrite materialized 3,000 bytes, and
+its output failed the same validator. It now reads by `ZipInfo`. Duplicate
+names themselves are still accepted; a policy for them stays open.
+`cbz_sanitizer._write_cbz_with_comicinfo` has the same by-name read and is
+not changed (see "Deliberately not done").
+
+**Encrypted directory records, fixed.** Inspection judged encryption over
+file records only, while `testzip()` opens every record: flag bit 0 (or 6)
+on a `folder/` record plus an ordinary page left `encrypted=False`, and
+`verify_crc=True` then raised a bare `RuntimeError` (`NotImplementedError`
+for bit 6) that the worker would record as a retryable
+`unclassified_error`. Encryption is now judged over every record.
+
+**What the limits are calibrated on: nothing.** Both values are ceilings
+chosen to sit far above any plausible comic archive, not a measured
+distribution. No query of the production database or the library was made
+(both are off limits to this work). Lowering either requires that
+measurement first, recorded with numerator, denominator and population.
+
+**Name rule, measured.** Only an exact `..` component is treated as
+traversal. On this Windows host, `os.path.abspath` resolves
+`base/sub/../x.png` to `base/x.png` but keeps `...`, `.. `, `. .`, `....`
+and ` ..` as literal components, so those are accepted.
+
+Tests: `tests/test_archive_limits.py` (62 after the review fixes). Three pins of the old
+pass-through behaviour were replaced, as their docstrings asked:
+`test_unsafe_member_names_are_preserved_not_rejected` →
+`test_unsafe_member_names_are_rejected_by_inspection`,
+`test_a_rewrite_preserves_unsafe_member_names_verbatim` →
+`test_a_rewrite_refuses_unsafe_member_names_and_leaves_the_original`, and
+the corpus-metadata test now expects the refusal for the `unsafe_members`
+case. Every check and every call site was bypassed in turn and the targeted
+tests failed by name (16 bypasses, 1–12 failures each).
+
+**Deliberately not done (this change, on the scope set for it):**
+
+- `cbz_sanitizer._write_cbz_with_comicinfo` is **not** guarded. The
+  sanitizer has no `comic_automation` import and keeps a defensive fallback
+  so it still runs when invoked by path, where the repository root is not on
+  `sys.path` (`scripts/cbz_workflows.py`, `_python_command`). A hard import
+  would break that mode; a soft one would let the guard vanish silently.
+  It is also a `mixed`-ending file. Its pass-through comment still
+  describes it correctly.
+- `scripts/cbz_watcher.py` has its own whole-archive ComicInfo rewrite
+  (outside this audit's six components); not guarded, not audited.
+- `scripts/cbz_compilation_resolver.py` remains unaudited.
+- Decompression/allocation budget (see above), streaming rewrite,
+  duplicate-member-name policy, nested archives, processing
+  timeout, temporary-disk budget, and NTFS alternate-data-stream names
+  (`page.png:stream`) are not covered by the validator. Rejecting `:` would
+  refuse legitimate archives built on non-Windows hosts.
+- New categories are not added to `perceptual_failure_audit`'s stable
+  buckets (they report as `unclassified`, as `page_image_too_large` already
+  does) nor to any quarantine category list.
+
 ### Implemented 2026-07-31
 
 All four items below come from Section 3, "Small, low-risk improvements". Each
@@ -163,6 +292,10 @@ path are architectural".
 Everything in Section 5, "Deferred work", is untouched:
 `scripts/cbz_compilation_resolver.py` has still had no I/O audit; and
 encrypted-archive handling is still untraced end-to-end.
+**[PARTIALLY RESOLVED 2026-10-22 for encrypted-archive handling — traced
+and fixed for the page-reading paths, ComicInfo-only readers still open;
+see "Implemented 2026-10-22". `cbz_compilation_resolver.py` is still
+unaudited.]**
 
 The SMB-specific behavior claims throughout this document no longer rest on
 code inspection alone — see "Validated 2026-08-02". Note that the document
@@ -224,7 +357,8 @@ maliciously inconsistent ZIP metadata. No size limit exists for page/image
 entries, but none are ever read by this module in the first place.
 
 **Entry-count / decoded-pixel limits.** No cap on entry count — `infolist()`
-is iterated in full — but this is classification-only (filename suffix
+is iterated in full **[RESOLVED 2026-10-22 — `MAX_ARCHIVE_ENTRIES`, see
+"Implemented 2026-10-22"]** — but this is classification-only (filename suffix
 checks), not decoding, so cost is O(entries) with no decompression. No
 image decoding happens in this file at all, so no pixel limit applies here.
 
@@ -321,9 +455,11 @@ streamed in fixed-size chunks, an unbounded/large page cannot cause an
 unbounded single-allocation memory spike the way a `.read()`-based
 materialization would; the streaming design substitutes for an explicit cap
 here, though a cap on total bytes read per archive is still absent.
+**[RESOLVED 2026-10-22 — declared-total cap
+`MAX_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES`, see "Implemented 2026-10-22"]**
 
 **Entry-count / decoded-pixel limits.** No cap on the number of image
-entries hashed per archive. No image decoding occurs in this module (it
+entries hashed per archive. **[RESOLVED 2026-10-22 — `MAX_ARCHIVE_ENTRIES`.]** No image decoding occurs in this module (it
 hashes raw bytes, not decoded pixels), so no pixel limit applies.
 
 **ZIP-slip / path validation.** Not applicable — nothing is extracted to
@@ -404,7 +540,7 @@ arbitrarily large declared or actual size is read into memory in one call
 with no pre-flight guard.
 
 **Entry-count / decoded-pixel limits.** No cap exists on the number of pages
-processed per archive. Pixel-count protection relies entirely on Pillow's
+processed per archive. **[RESOLVED 2026-10-22 — `MAX_ARCHIVE_ENTRIES`.]** Pixel-count protection relies entirely on Pillow's
 built-in default `Image.MAX_IMAGE_PIXELS` — no override of this constant
 exists anywhere in the codebase (confirmed by search). In the installed
 Pillow implementation, that value is the warning threshold; images above
@@ -744,6 +880,10 @@ steps.
   XML entry. This is the default code path for any ComicInfo update,
   compilation-range patch, or title repair — not an edge case — and has no
   size guard.
+  **[PARTIALLY RESOLVED 2026-10-22 — `write_comicinfo` now refuses an
+  archive declaring more than 16 GiB or 50,000 entries before
+  materializing. The materialization itself is unchanged, and
+  `_write_cbz_with_comicinfo` has no guard.]**
 - **No pre-read size check in `perceptual_hashing.py`.**
   **[RESOLVED 2026-07-31 — see Resolution log item 2.]**
   `calculate_perceptual_hashes` calls `archive.read(entry)` for each page
@@ -782,6 +922,9 @@ steps.
 - **Unsanitized entry-name pass-through.**
   **[DOCUMENTED 2026-07-31 — in-code comments added at both sites; the
   pass-through behavior itself is unchanged by design.]**
+  **[RESOLVED 2026-10-22 for `write_comicinfo` only — absolute,
+  drive-qualified and `..` names are now refused. `_write_cbz_with_comicinfo`
+  is unchanged; see "Implemented 2026-10-22", "Deliberately not done".]**
   Both `scripts/` files copy
   original `ZipInfo.filename` values unchanged into rewritten archives, with
   no `".."`/traversal validation. Not an active vulnerability in these two
@@ -865,6 +1008,11 @@ steps.
   `inspection.py`'s `encrypted` detection flag (`flag_bits & 0x1`) — whether
   any downstream component ever attempts to read pages from an encrypted CBZ,
   and what happens if so, was not traced end-to-end.
+  **[PARTIALLY RESOLVED 2026-10-22 — traced through inspection, both
+  hashing modules and both whole-archive rewrites; the ComicInfo-only
+  readers remain open (`read_comicinfo` measured to raise). See
+  "Implemented 2026-10-22". `cbz_watcher.py` and
+  `cbz_compilation_resolver.py` were not traced.]**
 - SMB-specific behavior claims in this audit (rename atomicity, sharing-
   violation exception types) are based on the exception-handling code
   already written for that environment, not on independently reproduced SMB
