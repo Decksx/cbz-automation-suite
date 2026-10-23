@@ -3,7 +3,9 @@
 Steps 2, 3 and 5 of the re-certification plan in
 ``docs/engineering_decisions.md`` ("Page order breaks natural-key ties on the
 raw name; duplicate names are unresolved"). Step 4, the re-inventory of the
-archives this tool refuses, is a separate operator action and is not here.
+archives this tool refuses, is a separate operator action and is not here;
+the plan's ``reinventory_archive_ids`` is a *proposed* population for it,
+never a launch.
 
 ``CONTENT_SIGNATURE_VERSION`` moved from ``"1"`` (natural key, ties left in
 physical member order) to ``"2"`` (ties broken on the raw name). Every
@@ -12,6 +14,11 @@ whose stored image names have *no* natural-key tie and *no* repeat, the two
 contracts order the names identically, so the stored digest already *is* the
 version-``"2"`` digest; relabelling it loses nothing and recomputes nothing.
 This tool finds those rows and relabels only them.
+
+The supported transition is exactly ``"1" -> "2"``. Both ends are literals,
+and every mode refuses to run if the writer's ``CONTENT_SIGNATURE_VERSION``
+is not ``"2"``: the argument above is about those two orderings and no
+others, so a later bump needs its own argument, not this tool.
 
 Three modes
 -----------
@@ -22,28 +29,54 @@ Three modes
     also opens ``mode=ro`` + ``query_only``). Classifies every
     ``ordered-page-sha256`` / version-``"1"`` signature into exactly one of
     ``stale``, ``unresolved``, ``tied``, ``inconsistent`` or ``order_stable``
-    (precedence in that order) and writes a JSON plan carrying a digest over
-    its canonical bytes.
+    (precedence in that order) and writes a JSON plan whose digest covers
+    its canonical body, including the target binding and the plan time.
 
 ``apply``
     Requires the plan file, ``--expect-digest``, ``--expect-count`` and a
-    verified ``backup_cli`` report for the same database. The plan is
-    refused *entirely* if its recomputed digest, the expected digest, or the
-    expected count disagree. Otherwise one ``BEGIN IMMEDIATE`` transaction
-    (`dal.transaction`) re-classifies each planned archive from the rows as
-    they are *inside that transaction* and relabels it only if the result is
-    still ``order_stable`` with exactly the planned basis. A row that moved
-    is skipped and reported, never relabelled. A row already at version
-    ``"2"`` with the planned basis is reported ``already_recertified``, so a
-    re-run is a no-op. Only ``archive_content_signatures.algorithm_version``
-    and ``updated_at`` change; page rows, page hashes and perceptual rows are
-    not written.
+    ``backup_cli`` report. Refused *entirely*, before any write, unless the
+    plan verifies (`read_plan`), is bound to this database
+    (`verify_target`), and the reported backup is a real, distinct, intact
+    preimage of the plan taken after it (`verify_backup`). Then one
+    ``BEGIN IMMEDIATE`` transaction (`dal.transaction`) re-checks the target
+    and the backup file under the lock, re-classifies each planned archive
+    from the rows as they are *inside that transaction*, and relabels it
+    only if the result is still ``order_stable`` with exactly the planned
+    basis. A row that moved is skipped and reported, never relabelled. A row
+    already at version ``"2"`` with the planned basis is reported
+    ``already_recertified``, so a re-run is a no-op. Only
+    ``archive_content_signatures.algorithm_version`` and ``updated_at``
+    change; page rows, page hashes and perceptual rows are not written.
 
 ``postflight``
     Read-only, same snapshot guard. Reports `signature_evidence_counts`
-    (population: every signature row, any location state), the
-    current-location-scoped classification of the legacy rows that remain,
-    and the planned order-stable archives still at version ``"1"``.
+    (population: every signature row, any location state) and the
+    classification of the legacy rows that remain. Given a plan, it first
+    verifies the plan and its target binding, then proves the outcome of
+    *each* planned row: present, this algorithm, version ``"2"``, still
+    order-stable with the approved basis. Anything else is named and fails.
+
+Bindings
+--------
+
+**Target.** The plan body records the target database's identity: its
+normalised real path and its file identity (``st_dev``, ``st_ino``; on
+Windows the volume serial number and NTFS file index). Apply and planned
+postflight recompute it from ``--database`` and refuse on any difference.
+Alias policy: any spelling that resolves to the same real path *and* the same
+file is accepted (relative paths, case, ``..``, symlinks and junctions all
+resolve). A hard link (another real path) is refused, as is a copy, a SQLite
+backup clone or any file at another path. Restore policy: restoring a backup
+over the target replaces the file, which changes its file identity, so a
+restored database is refused and must be re-planned. A filesystem that
+reports no file identity (``st_ino == 0``) is refused rather than trusted on
+path alone. ``PRAGMA data_version`` is per connection and is not used as an
+identity.
+
+**Backup.** Backup creation stays the operator's
+(``python -m comic_automation.database.backup_cli``). Apply verifies the
+artifact the report names, not the report's word for it: see
+`verify_backup` for the checks and the freshness and rerun policy.
 
 Provenance -- what a relabel certifies, and what it does not
 ------------------------------------------------------------
@@ -63,6 +96,13 @@ recomputed from the stored page sha256 rows. It does **not** satisfy design
 says nothing about live bytes. Perceptual rows are retained because their
 binding -- ``page_hashes.page_id`` to an ``archive_pages`` row whose
 ``(page_index, entry_name)`` is unchanged -- is untouched by a relabel.
+
+Location references are diagnostics, not provenance. A signature or page row
+whose ``location_id`` names *another archive's* location is ``inconsistent``.
+One that names a non-current location of the same archive (a relocation), or
+none at all, is order-stable if everything else holds -- a move does not
+change the recorded order -- and the difference is reported in
+``location_diagnostics``.
 """
 
 from __future__ import annotations
@@ -70,8 +110,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from itertools import groupby
@@ -95,12 +137,11 @@ from comic_automation.database.read_guards import (
 )
 
 
-PLAN_FORMAT = "content-signature-recertify/1"
+PLAN_FORMAT = "content-signature-recertify/2"
+# The one supported transition. Literals, not the writer's constant: a
+# relabel to "2" is justified only by the "1"-versus-"2" ordering argument.
 LEGACY_VERSION = "1"
-# The version this tool relabels to. Pinned to the module constant so a
-# future bump cannot silently turn this into a "1" -> "3" relabel: the order
-# argument below is about "1" versus "2" specifically.
-TARGET_VERSION = CONTENT_SIGNATURE_VERSION
+TARGET_VERSION = "2"
 
 STALE = "stale"
 UNRESOLVED = "unresolved"
@@ -109,6 +150,11 @@ INCONSISTENT = "inconsistent"
 ORDER_STABLE = "order_stable"
 # Precedence: the first class that applies wins, so every row is in one.
 CLASSES = (STALE, UNRESOLVED, TIED, INCONSISTENT, ORDER_STABLE)
+# The plan keys a backup must reproduce to be this plan's preimage.
+CLASSIFICATION_KEYS = (
+    "counts", "order_stable", "tied", "unresolved", "inconsistent", "stale",
+    "reinventory_archive_ids", "location_diagnostics",
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -122,27 +168,88 @@ PROVENANCE = (
     "archive_content_signatures.source_modified_time_ns = "
     "file_locations.modified_time_ns for the archive's single is_current = 1 "
     "location. That equality is a diagnostic, not proof that the stored page "
-    "rows describe the live bytes. Re-certification certifies the recorded "
-    "order only: the stored entry names sort identically under ordering "
-    "contracts 1 and 2, and the stored digest equals the version-2 digest "
-    "recomputed from the stored page sha256 rows. It does not satisfy "
-    "full-file/member validation for authoritative supersession."
+    "rows describe the live bytes. Location references are diagnostics too. "
+    "Re-certification certifies the recorded order only: the stored entry "
+    "names sort identically under ordering contracts 1 and 2, and the stored "
+    "digest equals the version-2 digest recomputed from the stored page "
+    "sha256 rows. It does not satisfy full-file/member validation for "
+    "authoritative supersession."
 )
 
 POPULATION_REQUIREMENT = (
     "signature_evidence_counts counts every archive_content_signatures row, "
-    "whatever its location state. The postflight condition is scoped: no "
-    "order_stable legacy row may remain for a current location, and no "
-    "planned order_stable archive may remain at version 1, including one "
-    "apply skipped because it drifted into another class. Rows classified "
-    "stale, unresolved, tied or "
-    "inconsistent stay legacy (excluded from comparison) until step 4's "
-    "operator-approved re-inventory rewrites them."
+    "whatever its location state. The planned postflight condition is per "
+    "row: every planned order_stable archive must hold an ordered-page-sha256 "
+    "version-2 signature that is still order_stable with the approved basis; "
+    "a missing row, another algorithm or version, a drifted basis, or a row "
+    "still at version 1 (including one apply skipped) is named and fails. No "
+    "order_stable legacy row may remain for a current location. Rows "
+    "classified stale, unresolved, tied or inconsistent stay legacy "
+    "(excluded from comparison) until step 4's separately authorised "
+    "re-inventory rewrites them; reinventory_archive_ids is a proposal."
 )
 
 
 class PlanRefusedError(RuntimeError):
-    """The plan, its digest or its count disagree; nothing was written."""
+    """The plan, its target or its backup disagree; nothing was written."""
+
+
+def require_supported_transition() -> None:
+    """Refuse to run unless the writer's contract is the supported target.
+
+    Checked by every mode, so a future ``CONTENT_SIGNATURE_VERSION`` bump
+    turns this tool off instead of turning it into a "1" -> "3" relabel.
+    """
+    if CONTENT_SIGNATURE_VERSION != TARGET_VERSION:
+        raise PlanRefusedError(
+            f"This tool supports only {LEGACY_VERSION} -> {TARGET_VERSION}; "
+            f"the writer's contract is now {CONTENT_SIGNATURE_VERSION!r}."
+        )
+
+
+# --- file identity --------------------------------------------------------
+
+# Indirection so a test can simulate a filesystem without file identity.
+_stat = os.stat
+
+
+def file_identity(path: str | Path) -> dict:
+    """Portable identity of a database file: real path plus file id.
+
+    Raises `PlanRefusedError` when the file is missing or the filesystem
+    reports no file identity (``st_ino == 0``): a path alone cannot tell a
+    restored or replaced file from the one that was planned.
+    """
+    real = os.path.realpath(str(path))
+    try:
+        stat = _stat(real)
+    except OSError as error:
+        raise PlanRefusedError(f"Cannot stat {path}: {error}") from error
+    if not int(stat.st_ino):
+        raise PlanRefusedError(
+            f"{path}: the filesystem reports no file identity (st_ino 0); "
+            "refusing to bind on the path alone."
+        )
+    return {
+        "path": os.path.normcase(real),
+        "st_dev": int(stat.st_dev),
+        "st_ino": int(stat.st_ino),
+    }
+
+
+def verify_target(body: dict, database: str | Path) -> dict:
+    """Refuse unless ``database`` is the file the plan was made for."""
+    actual = file_identity(database)
+    if body.get("target") != actual:
+        raise PlanRefusedError(
+            f"Plan target {body.get('target')!r} is not {database} "
+            f"({actual!r}). A copy, clone, hard link or restored file is a "
+            "different database; re-plan against it."
+        )
+    return actual
+
+
+# --- classification -------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -151,14 +258,17 @@ class Classification:
 
     ``basis`` is everything apply re-derives and compares before it writes:
     any field that differs means the stored state is not the one planned.
+    ``diagnostics`` are location differences that do not affect the class.
     """
 
     archive_id: int
+    algorithm: str
     algorithm_version: str
     cls: str
     reason: str
     basis: dict | None
     detail: tuple[str, ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
 
 def _names_digest(names: Sequence[str]) -> str:
@@ -193,20 +303,25 @@ def classify(
 ) -> Classification:
     """Classify one signature from stored rows alone.
 
-    ``signature`` is its ``archive_content_signatures`` row; ``locations``
-    its ``is_current = 1`` ``file_locations`` rows; ``pages`` its
-    ``archive_pages`` rows ordered by ``page_index``, each carrying the
-    exact sha256 ``digest`` (None when that page has no sha256 row).
+    ``signature`` is its ``archive_content_signatures`` row joined to the
+    location it references (``signature_location_archive_id``,
+    ``signature_location_is_current``); ``locations`` its ``is_current = 1``
+    ``file_locations`` rows; ``pages`` its ``archive_pages`` rows ordered by
+    ``page_index``, each with the exact sha256 ``digest`` (None when absent)
+    and the archive owning its ``location_id`` (``location_archive_id``).
 
-    The version label is *not* consulted: callers decide which versions they
-    accept, so apply can recognise a row it already relabelled.
+    Neither the algorithm nor the version label is consulted: callers decide
+    which they accept, so apply and postflight can recognise a row that was
+    already relabelled -- or one that changed algorithm since the plan.
     """
     archive_id = int(signature["archive_id"])
+    algorithm = str(signature["algorithm"])
     version = str(signature["algorithm_version"])
 
-    def result(cls: str, reason: str, detail=(), basis=None) -> Classification:
+    def result(cls, reason, detail=(), basis=None, diagnostics=()):
         return Classification(
-            archive_id, version, cls, reason, basis, tuple(detail)
+            archive_id, algorithm, version, cls, reason, basis,
+            tuple(detail), tuple(diagnostics),
         )
 
     # Stale first: a row not bound to the current location's recorded
@@ -246,6 +361,21 @@ def classify(
     if tied:
         return result(TIED, "natural_key_tie", tied)
 
+    # A reference to another archive's location means these rows are not
+    # what they claim to be about; no diagnostic can paper over that.
+    if (
+        signature["location_id"] is not None
+        and signature["signature_location_archive_id"] is not None
+        and int(signature["signature_location_archive_id"]) != archive_id
+    ):
+        return result(INCONSISTENT, "signature_location_foreign")
+    if any(
+        page["location_archive_id"] is not None
+        and int(page["location_archive_id"]) != archive_id
+        for page in pages
+    ):
+        return result(INCONSISTENT, "page_location_foreign")
+
     # The stored inventory must be the basis the stored digest claims, or a
     # relabel would certify a digest nobody can reproduce from the rows.
     if len(pages) != int(signature["page_count"]):
@@ -265,6 +395,22 @@ def classify(
     if recomputed != str(signature["digest"]):
         return result(INCONSISTENT, "digest_not_reproducible")
 
+    # Same-archive location differences: a relocation or a nulled reference.
+    # Reported, never promoted to provenance, and not a change of order.
+    diagnostics = []
+    if signature["location_id"] is None:
+        diagnostics.append("signature_location_null")
+    elif signature["signature_location_archive_id"] is None:
+        diagnostics.append("signature_location_dangling")
+    elif int(signature["location_id"]) != int(location["id"]):
+        diagnostics.append("signature_location_not_current")
+    if any(
+        page["location_id"] is None
+        or int(page["location_id"]) != int(location["id"])
+        for page in pages
+    ):
+        diagnostics.append("page_location_not_current")
+
     return result(
         ORDER_STABLE,
         "no_tie_no_repeat",
@@ -278,20 +424,31 @@ def classify(
                 signature["source_modified_time_ns"]
             ),
             "current_location_id": int(location["id"]),
+            "signature_location_id": (
+                None if signature["location_id"] is None
+                else int(signature["location_id"])
+            ),
             "entry_names_sha256": _names_digest(names),
+            "location_diagnostics": diagnostics,
         },
+        diagnostics=diagnostics,
     )
 
 
-_SIGNATURE_COLUMNS = """
-    acs.id, acs.archive_id, acs.algorithm, acs.algorithm_version,
-    acs.digest, acs.page_count, acs.source_file_size,
-    acs.source_modified_time_ns
+_SIGNATURE_SELECT = """
+    SELECT acs.id, acs.archive_id, acs.location_id, acs.algorithm,
+           acs.algorithm_version, acs.digest, acs.page_count,
+           acs.source_file_size, acs.source_modified_time_ns,
+           sl.archive_id AS signature_location_archive_id
+    FROM archive_content_signatures AS acs
+    LEFT JOIN file_locations AS sl ON sl.id = acs.location_id
 """
 
 _PAGES_SQL = """
-    SELECT ap.archive_id, ap.page_index, ap.entry_name, ph.digest
+    SELECT ap.archive_id, ap.page_index, ap.entry_name, ap.location_id,
+           pl.archive_id AS location_archive_id, ph.digest
     FROM archive_pages AS ap
+    LEFT JOIN file_locations AS pl ON pl.id = ap.location_id
     LEFT JOIN page_hashes AS ph
       ON ph.page_id = ap.id
      AND ph.algorithm = ?
@@ -313,8 +470,8 @@ def classify_legacy(connection: sqlite3.Connection) -> list[Classification]:
         "WHERE algorithm = ? AND algorithm_version = ?"
     )
     signatures = connection.execute(
-        f"SELECT {_SIGNATURE_COLUMNS} FROM archive_content_signatures AS acs "
-        "WHERE acs.algorithm = ? AND acs.algorithm_version = ? "
+        _SIGNATURE_SELECT
+        + "WHERE acs.algorithm = ? AND acs.algorithm_version = ? "
         "ORDER BY acs.archive_id",
         params,
     ).fetchall()
@@ -347,15 +504,15 @@ def classify_legacy(connection: sqlite3.Connection) -> list[Classification]:
 def classify_archive(
     connection: sqlite3.Connection, archive_id: int
 ) -> Classification | None:
-    """Classify one archive's signature as stored now, whatever its version.
+    """Classify one archive's signature as stored now, any algorithm/version.
 
-    None when the archive has no signature of this algorithm. Used by apply
-    inside its write transaction, so what it sees is what the UPDATE acts on.
+    None when the archive has no signature row at all
+    (``archive_content_signatures.archive_id`` is UNIQUE). Used by apply
+    inside its write transaction, so what it sees is what the UPDATE acts on,
+    and by planned postflight.
     """
     signature = connection.execute(
-        f"SELECT {_SIGNATURE_COLUMNS} FROM archive_content_signatures AS acs "
-        "WHERE acs.archive_id = ? AND acs.algorithm = ?",
-        (archive_id, CONTENT_SIGNATURE_ALGORITHM),
+        _SIGNATURE_SELECT + "WHERE acs.archive_id = ?", (archive_id,)
     ).fetchone()
     if signature is None:
         return None
@@ -372,6 +529,27 @@ def classify_archive(
     return classify(signature, locations, pages)
 
 
+def planned_outcome(found: Classification | None, planned: dict) -> str:
+    """Name the state of one planned row relative to its approved basis.
+
+    ``recertified`` is the success outcome; ``legacy_as_planned`` means it is
+    still exactly the approved preimage. Everything else is drift, named.
+    """
+    if found is None:
+        return "missing"
+    if found.algorithm != CONTENT_SIGNATURE_ALGORITHM:
+        return f"algorithm_{found.algorithm}"
+    if found.cls != ORDER_STABLE:
+        return f"now_{found.cls}:{found.reason}"
+    if found.basis != planned:
+        return "basis_changed"
+    if found.algorithm_version == TARGET_VERSION:
+        return "recertified"
+    if found.algorithm_version == LEGACY_VERSION:
+        return "legacy_as_planned"
+    return f"version_{found.algorithm_version}"
+
+
 # --- plan -----------------------------------------------------------------
 
 
@@ -386,11 +564,17 @@ def plan_digest(body: dict) -> str:
     return hashlib.sha256(canonical_bytes(body)).hexdigest()
 
 
-def build_plan_body(classifications: Sequence[Classification]) -> dict:
-    """The digested part of a plan: classes, lists and counts, nothing else.
+def build_plan_body(
+    classifications: Sequence[Classification],
+    *,
+    target: dict | None = None,
+    planned_at_ns: int | None = None,
+) -> dict:
+    """The digested part of a plan: binding, time, classes, lists, counts.
 
-    Snapshot readings (data_version, the database path) are kept out of the
-    body, so two plans over the same rows have the same digest.
+    ``target`` and ``planned_at_ns`` are inside the digest, so the approval
+    covers *which* database and *when*; data_version readings stay out
+    because they are per-connection numbers, not identities.
     """
     by_class: dict[str, list[Classification]] = {cls: [] for cls in CLASSES}
     for item in classifications:
@@ -411,11 +595,16 @@ def build_plan_body(classifications: Sequence[Classification]) -> dict:
         for cls in (TIED, UNRESOLVED, INCONSISTENT)
         for item in by_class[cls]
     )
+    diagnostics = Counter(
+        d for item in by_class[ORDER_STABLE] for d in item.diagnostics
+    )
     return {
         "plan_format": PLAN_FORMAT,
         "algorithm": CONTENT_SIGNATURE_ALGORITHM,
         "from_version": LEGACY_VERSION,
         "to_version": TARGET_VERSION,
+        "target": target,
+        "planned_at_ns": planned_at_ns,
         "provenance": PROVENANCE,
         "population_requirement": POPULATION_REQUIREMENT,
         "counts": {
@@ -428,21 +617,30 @@ def build_plan_body(classifications: Sequence[Classification]) -> dict:
         "unresolved": listing(UNRESOLVED),
         "inconsistent": listing(INCONSISTENT),
         "stale": listing(STALE),
-        # Step 4's population: archives whose digest must be recomputed from
-        # bytes. Stale rows are not in it; they take the ordinary rehash path.
+        # Proposed population for step 4, which is separately authorised:
+        # archives whose digest must be recomputed from bytes. Stale rows
+        # are not in it; they take the ordinary rehash path.
         "reinventory_archive_ids": reinventory,
+        "location_diagnostics": dict(sorted(diagnostics.items())),
     }
 
 
 def make_plan(database: str | Path) -> dict:
     """Plan from one WAL-aware read-only snapshot. Writes nothing."""
+    require_supported_transition()
+    # Taken before the read, so a backup whose file is at least this new was
+    # necessarily written after the snapshot the plan describes began.
+    planned_at_ns = time.time_ns()
+    target = file_identity(database)
     snapshot = read_consistent_snapshot(
         database,
         classify_legacy,
         context="content signature re-certification plan",
         integrity_check=quick_check,
     )
-    body = build_plan_body(snapshot.result)
+    body = build_plan_body(
+        snapshot.result, target=target, planned_at_ns=planned_at_ns
+    )
     return {
         "plan": body,
         "plan_digest": plan_digest(body),
@@ -453,65 +651,55 @@ def make_plan(database: str | Path) -> dict:
     }
 
 
-# --- apply ----------------------------------------------------------------
+# --- reading a plan back ----------------------------------------------------
 
 
-def _check_backup_report(database: Path, backup_report: Path) -> None:
-    """Refuse unless a verified backup_cli report names this database.
-
-    The backup is the operator's (``python -m
-    comic_automation.database.backup_cli``); this only refuses an apply that
-    cannot point at one, so "backup before apply" is checked, not trusted.
-    """
-    try:
-        report = json.loads(Path(backup_report).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise PlanRefusedError(f"Unreadable backup report: {error}") from error
-    if report.get("verified") is not True:
-        raise PlanRefusedError(
-            f"Backup report {backup_report} is not verified."
-        )
-    source = report.get("source_database")
-    if not source or not output_guards.same_file(source, database):
-        raise PlanRefusedError(
-            f"Backup report {backup_report} is for {source!r}, not {database}."
-        )
-
-
-def load_plan(
-    plan_path: str | Path, *, expect_digest: str, expect_count: int
-) -> dict:
-    """Read a plan back and refuse it unless every number agrees.
+def read_plan(plan_path: str | Path) -> tuple[dict, str]:
+    """Read a plan and refuse it unless it is intact and this tool's.
 
     The digest is recomputed over the body as read, never taken from the
-    file, so an edited list cannot ride under its original digest.
+    file, so an edited list cannot ride under its original digest. Shared by
+    apply and planned postflight. Returns the body and its digest.
     """
+    require_supported_transition()
     try:
         document = json.loads(Path(plan_path).read_text(encoding="utf-8"))
         body = document["plan"]
         recorded = document["plan_digest"]
+        recomputed = plan_digest(body)
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise PlanRefusedError(f"Unreadable plan {plan_path}: {error}") from error
 
-    recomputed = plan_digest(body)
     if recomputed != recorded:
         raise PlanRefusedError(
             f"Plan digest mismatch: file records {recorded}, body hashes to "
             f"{recomputed}. The plan was edited after it was written."
         )
+    if (
+        not isinstance(body, dict)
+        or body.get("plan_format") != PLAN_FORMAT
+        or body.get("algorithm") != CONTENT_SIGNATURE_ALGORITHM
+        or body.get("from_version") != LEGACY_VERSION
+        or body.get("to_version") != TARGET_VERSION
+        or not isinstance(body.get("order_stable"), list)
+        or not isinstance(body.get("planned_at_ns"), int)
+    ):
+        raise PlanRefusedError(
+            "Plan was written for another format, algorithm or version pair, "
+            "or is missing its order_stable list or plan time."
+        )
+    return body, recomputed
+
+
+def load_plan(
+    plan_path: str | Path, *, expect_digest: str, expect_count: int
+) -> dict:
+    """`read_plan`, then refuse unless the operator's numbers agree."""
+    body, recomputed = read_plan(plan_path)
     if recomputed != expect_digest:
         raise PlanRefusedError(
             f"--expect-digest {expect_digest} does not match the plan "
             f"({recomputed})."
-        )
-    if (
-        body.get("plan_format") != PLAN_FORMAT
-        or body.get("algorithm") != CONTENT_SIGNATURE_ALGORITHM
-        or body.get("from_version") != LEGACY_VERSION
-        or body.get("to_version") != TARGET_VERSION
-    ):
-        raise PlanRefusedError(
-            "Plan was written for another format, algorithm or version pair."
         )
     planned = body["order_stable"]
     if len(planned) != expect_count:
@@ -520,6 +708,159 @@ def load_plan(
             f"{len(planned)} order-stable row(s)."
         )
     return body
+
+
+# --- backup -----------------------------------------------------------------
+
+
+def _user_table_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    names = [
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+    ]
+    return {
+        name: int(connection.execute(
+            'SELECT COUNT(*) FROM "' + name.replace('"', '""') + '"'
+        ).fetchone()[0])
+        for name in names
+    }
+
+
+def _backup_fingerprint(path: str) -> dict:
+    stat = _stat(path)
+    return {
+        "st_dev": int(stat.st_dev),
+        "st_ino": int(stat.st_ino),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def verify_backup(
+    database: str | Path, body: dict, backup_report: str | Path
+) -> dict:
+    """Prove the reported backup is this plan's recoverable preimage.
+
+    The report is only a pointer; every claim is checked on the artifact.
+
+    1. The report parses, says ``verified: true`` with every check true,
+       and its ``source_database`` is the plan's target (same file identity).
+    2. The artifact it names exists, is a file, and is **not** the live
+       database by any alias: not the same real path, not the same file id
+       (catches hard links), and not one of its WAL/SHM sidecars.
+    3. It is the file the report describes: size and mtime equal the
+       report's ``backup_size_bytes`` / ``backup_modified_time_ns``, and its
+       user-table row counts equal ``backup_table_counts``.
+    4. Opened read-only through `read_consistent_snapshot`, its
+       ``PRAGMA quick_check`` is ``ok``.
+    5. **Freshness:** its mtime is at or after the plan's ``planned_at_ns``,
+       so it was written after the planned snapshot began.
+    6. **Preimage:** classifying the backup's own legacy rows reproduces the
+       plan's classification exactly (`CLASSIFICATION_KEYS`) -- so it holds
+       the approved pre-apply state of every row apply may change.
+    7. It did not change while being verified.
+
+    Rerun policy: the same plan and backup may be re-applied (the backup is
+    still the preimage of the planned rows, and apply is idempotent). A new
+    plan needs a new backup, because check 5 compares against that plan's
+    time. Returns the artifact fingerprint for the under-lock re-check.
+    """
+    try:
+        report = json.loads(Path(backup_report).read_text(encoding="utf-8"))
+        backup = str(report["backup_database"])
+        source = str(report["source_database"])
+        checks = report["checks"]
+        recorded_size = int(report["backup_size_bytes"])
+        recorded_mtime = int(report["backup_modified_time_ns"])
+        recorded_counts = dict(report["backup_table_counts"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise PlanRefusedError(
+            f"Unreadable backup report {backup_report}: {error}"
+        ) from error
+
+    if (
+        report.get("verified") is not True
+        or not isinstance(checks, dict)
+        or not checks
+        or not all(value is True for value in checks.values())
+    ):
+        raise PlanRefusedError(f"Backup report {backup_report} is not verified.")
+    if file_identity(source) != body["target"]:
+        raise PlanRefusedError(
+            f"Backup report {backup_report} is for {source!r}, not the plan "
+            "target."
+        )
+
+    if not Path(backup).is_file():
+        raise PlanRefusedError(f"Backup artifact {backup} does not exist.")
+    # One check covers every alias: `same_file` compares the normalised real
+    # path (spelling, case, "..", symlinks, junctions) and then
+    # os.path.samefile (hard links, same file id), against the database and
+    # both derivations of its WAL/SHM sidecars.
+    file_identity(backup)  # refuses a filesystem without file identity
+    if any(
+        output_guards.same_file(backup, target)
+        for target, _ in output_guards.protected_database_paths(str(database))
+    ):
+        raise PlanRefusedError(
+            f"Backup artifact {backup} is the live database or one of its "
+            "aliases or sidecars."
+        )
+
+    before = _backup_fingerprint(backup)
+    if (before["size"], before["mtime_ns"]) != (recorded_size, recorded_mtime):
+        raise PlanRefusedError(
+            f"Backup artifact {backup} is not the file the report verified "
+            f"(size/mtime {before['size']}/{before['mtime_ns']}, report "
+            f"{recorded_size}/{recorded_mtime})."
+        )
+    if before["mtime_ns"] < int(body["planned_at_ns"]):
+        raise PlanRefusedError(
+            f"Backup artifact {backup} predates the plan; take a new backup "
+            "after planning."
+        )
+
+    def read(connection: sqlite3.Connection) -> dict:
+        return {
+            "counts": _user_table_counts(connection),
+            "classified": build_plan_body(classify_legacy(connection)),
+        }
+
+    try:
+        snapshot = read_consistent_snapshot(
+            backup, read, context="backup preimage verification",
+            integrity_check=quick_check,
+        )
+    except PlanRefusedError:
+        raise
+    except Exception as error:
+        raise PlanRefusedError(
+            f"Backup artifact {backup} failed verification: {error}"
+        ) from error
+
+    if snapshot.result["counts"] != recorded_counts:
+        raise PlanRefusedError(
+            f"Backup artifact {backup} row counts differ from its report."
+        )
+    classified = snapshot.result["classified"]
+    differing = [
+        key for key in CLASSIFICATION_KEYS if classified[key] != body[key]
+    ]
+    if differing:
+        raise PlanRefusedError(
+            f"Backup artifact {backup} is not this plan's preimage: "
+            f"{', '.join(differing)} differ."
+        )
+    if _backup_fingerprint(backup) != before:
+        raise PlanRefusedError(
+            f"Backup artifact {backup} changed during verification."
+        )
+    return {"path": backup, **before}
+
+
+# --- apply ----------------------------------------------------------------
 
 
 def apply_plan(
@@ -532,9 +873,10 @@ def apply_plan(
 ) -> dict:
     """Relabel the planned order-stable rows that are still exactly as planned.
 
-    Refusals (`PlanRefusedError`) happen before the database is opened for
-    writing. Per-row drift is not a refusal: that row is skipped and named,
-    the others proceed, all inside one transaction.
+    Refusals (`PlanRefusedError`) happen before anything is written: the
+    plan, target and backup checks run first, and the two cheap ones are
+    repeated under the write lock. Per-row drift is not a refusal: that row
+    is skipped and named, the others proceed, all inside one transaction.
     """
     database = Path(database)
     if not database.is_file():
@@ -542,7 +884,8 @@ def apply_plan(
     body = load_plan(
         plan_path, expect_digest=expect_digest, expect_count=expect_count
     )
-    _check_backup_report(database, Path(backup_report))
+    verify_target(body, database)
+    backup = verify_backup(database, body, backup_report)
 
     relabelled: list[int] = []
     already: list[int] = []
@@ -551,40 +894,33 @@ def apply_plan(
     connection = open_connection(database)
     try:
         with transaction(connection):
+            # Under the lock: the target is still the planned file, and the
+            # verified backup is still there, unchanged. Raising here rolls
+            # back a transaction that has written nothing.
+            verify_target(body, database)
+            try:
+                still = _backup_fingerprint(backup["path"])
+            except OSError:
+                still = None
+            if still != {k: v for k, v in backup.items() if k != "path"}:
+                raise PlanRefusedError(
+                    f"Backup artifact {backup['path']} moved or changed "
+                    "after verification."
+                )
+
             for planned in body["order_stable"]:
                 archive_id = int(planned["archive_id"])
                 # Re-derived inside the write lock: the plan is a claim about
                 # an earlier snapshot, and only this read is what the UPDATE
                 # will act on.
-                now = classify_archive(connection, archive_id)
-                if now is None:
-                    skipped.append(
-                        {"archive_id": archive_id, "reason": "signature_missing"}
-                    )
-                    continue
-                if now.cls != ORDER_STABLE:
-                    skipped.append(
-                        {
-                            "archive_id": archive_id,
-                            "reason": f"now_{now.cls}:{now.reason}",
-                        }
-                    )
-                    continue
-                if now.basis != planned:
-                    skipped.append(
-                        {"archive_id": archive_id, "reason": "basis_changed"}
-                    )
-                    continue
-                if now.algorithm_version == TARGET_VERSION:
+                outcome = planned_outcome(
+                    classify_archive(connection, archive_id), planned
+                )
+                if outcome == "recertified":
                     already.append(archive_id)
                     continue
-                if now.algorithm_version != LEGACY_VERSION:
-                    skipped.append(
-                        {
-                            "archive_id": archive_id,
-                            "reason": f"version_{now.algorithm_version}",
-                        }
-                    )
+                if outcome != "legacy_as_planned":
+                    skipped.append({"archive_id": archive_id, "reason": outcome})
                     continue
                 cursor = connection.execute(
                     """
@@ -615,6 +951,7 @@ def apply_plan(
     return {
         "plan_digest": expect_digest,
         "planned": expect_count,
+        "backup": backup,
         "relabelled": relabelled,
         "already_recertified": already,
         "skipped": skipped,
@@ -632,32 +969,34 @@ def apply_plan(
 
 
 def postflight(database: str | Path, body: dict | None = None) -> dict:
-    """Read-only evidence counts after apply, with their populations named.
+    """Read-only evidence counts and, given a plan, per-row outcomes.
 
-    ``passed`` needs both scoped conditions: no current-location
-    order-stable legacy row remains, and no planned order-stable archive is
-    still at version "1". Remaining stale/unresolved/tied/inconsistent rows
-    do not fail it; they are step 4's population and are counted.
+    With a plan, ``body`` must already have passed `read_plan` (apply and the
+    CLI both ensure it); its target is verified here before any read.
+    ``passed`` needs every planned row to be ``recertified`` and no
+    order-stable legacy row to remain. Remaining stale, unresolved, tied and
+    inconsistent rows do not fail it; they are step 4's proposed population
+    and are counted.
     """
-    planned = [] if body is None else [
-        int(item["archive_id"]) for item in body["order_stable"]
-    ]
+    require_supported_transition()
+    if body is not None:
+        verify_target(body, database)
+    planned = [] if body is None else list(body["order_stable"])
 
     def read(connection: sqlite3.Connection) -> dict:
-        remaining = classify_legacy(connection)
-        still_legacy = []
-        for archive_id in planned:
-            row = connection.execute(
-                "SELECT algorithm_version FROM archive_content_signatures "
-                "WHERE archive_id = ? AND algorithm = ?",
-                (archive_id, CONTENT_SIGNATURE_ALGORITHM),
-            ).fetchone()
-            if row is not None and str(row[0]) == LEGACY_VERSION:
-                still_legacy.append(archive_id)
         return {
             "counts": signature_evidence_counts(connection),
-            "remaining": remaining,
-            "still_legacy": still_legacy,
+            "remaining": classify_legacy(connection),
+            "outcomes": [
+                {
+                    "archive_id": int(item["archive_id"]),
+                    "outcome": planned_outcome(
+                        classify_archive(connection, int(item["archive_id"])),
+                        item,
+                    ),
+                }
+                for item in planned
+            ],
         }
 
     snapshot = read_consistent_snapshot(
@@ -669,7 +1008,8 @@ def postflight(database: str | Path, body: dict | None = None) -> dict:
     remaining = snapshot.result["remaining"]
     by_class = Counter(item.cls for item in remaining)
     scoped = {cls: by_class.get(cls, 0) for cls in CLASSES}
-    still_legacy = snapshot.result["still_legacy"]
+    outcomes = snapshot.result["outcomes"]
+    failed = [o for o in outcomes if o["outcome"] != "recertified"]
     return {
         "signature_evidence_counts": snapshot.result["counts"],
         "signature_evidence_counts_population": (
@@ -680,8 +1020,16 @@ def postflight(database: str | Path, body: dict | None = None) -> dict:
             "version-1 rows; every class but stale is bound to its current "
             "location's recorded size/mtime"
         ),
-        "planned_order_stable_still_legacy": still_legacy,
-        "passed": scoped[ORDER_STABLE] == 0 and not still_legacy,
+        "planned_outcomes": outcomes,
+        "planned_outcome_counts": dict(
+            sorted(Counter(o["outcome"] for o in outcomes).items())
+        ),
+        "planned_failures": failed,
+        "planned_order_stable_still_legacy": [
+            o["archive_id"] for o in outcomes
+            if o["outcome"] == "legacy_as_planned"
+        ],
+        "passed": scoped[ORDER_STABLE] == 0 and not failed,
         "population_requirement": POPULATION_REQUIREMENT,
         **snapshot.report_fields(),
     }
@@ -741,7 +1089,10 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--expect-count", type=int, required=True)
     apply.add_argument(
         "--backup-report", type=Path, required=True,
-        help="Verified backup_cli JSON report for this database.",
+        help=(
+            "backup_cli JSON report for a backup of this database taken "
+            "after the plan; the backup file itself is verified."
+        ),
     )
     apply.add_argument("--json-out", type=Path, default=None)
 
@@ -790,10 +1141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         body = None
         if args.plan is not None:
-            document = json.loads(args.plan.read_text(encoding="utf-8"))
-            body = document["plan"]
-            if plan_digest(body) != document["plan_digest"]:
-                raise PlanRefusedError("Plan digest mismatch.")
+            body, _ = read_plan(args.plan)
         output = postflight(args.database, body)
         if args.json_out is not None:
             _write_new_json(args.json_out, output)
