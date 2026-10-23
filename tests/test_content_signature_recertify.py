@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import time
 import warnings
 from pathlib import Path
 
@@ -138,10 +140,20 @@ def _rows(db: Path, sql: str, params=()) -> list[tuple]:
         return [tuple(r) for r in connection.execute(sql, params)]
 
 
+_BACKUPS = iter(range(1, 10_000))
+
+
 def _backup(tmp_path: Path, db: Path) -> Path:
-    report = tmp_path / "backup.json"
-    run_backup(database=db, backup=tmp_path / "backup.db", json_output=report)
+    """A genuine verified backup_cli backup of `db`, under a fresh name."""
+    n = next(_BACKUPS)
+    report = tmp_path / f"backup{n}.json"
+    run_backup(database=db, backup=tmp_path / f"backup{n}.db",
+               json_output=report)
     return report
+
+
+def _report(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _write_plan(tmp_path: Path, db: Path) -> tuple[Path, dict]:
@@ -151,15 +163,41 @@ def _write_plan(tmp_path: Path, db: Path) -> tuple[Path, dict]:
     return path, document
 
 
+def _plan_and_backup(tmp_path: Path, db: Path) -> tuple[Path, dict, Path]:
+    """Plan, then back up: the order the freshness rule requires."""
+    plan_path, document = _write_plan(tmp_path, db)
+    return plan_path, document, _backup(tmp_path, db)
+
+
 def _apply(tmp_path, db, plan_path, document, **overrides):
+    """Apply `document`; without a report, take a backup now (after it)."""
+    if "backup_report" not in overrides:
+        overrides["backup_report"] = _backup(tmp_path, db)
     arguments = dict(
         expect_digest=document["plan_digest"],
         expect_count=document["plan"]["counts"]["order_stable"],
-        backup_report=_backup(tmp_path, db)
-        if "backup_report" not in overrides else overrides.pop("backup_report"),
     )
     arguments.update(overrides)
     return rc.apply_plan(db, plan_path, **arguments)
+
+
+def _redigest(plan_path: Path, document: dict) -> None:
+    """Write `document` back with a digest recomputed over its edited body.
+
+    Simulates a *valid-looking* plan, so the guard under test is the one
+    that refuses it rather than the digest check.
+    """
+    document["plan_digest"] = rc.plan_digest(document["plan"])
+    plan_path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _clone(source: Path, destination: Path) -> Path:
+    """A SQLite-backup-API copy: same rows, different file."""
+    with sqlite3.connect(source) as src, sqlite3.connect(destination) as dst:
+        src.backup(dst)
+    src.close()
+    dst.close()
+    return destination
 
 
 def _version(db: Path, archive_id: int) -> str:
@@ -341,6 +379,74 @@ def test_ordered_signature_digest_matches_calculate_page_hashes(
         p.digest for p in result.pages) == result.content_digest
 
 
+
+
+# --- location references are diagnostics, foreign ones are inconsistent ---
+
+
+def _relocate(connection, archive_id: int) -> int:
+    """Move the archive's current location to a new row, same size/mtime.
+
+    The signature and page rows keep pointing at the old, now non-current
+    location -- what a relocation leaves behind.
+    """
+    old = connection.execute(
+        "SELECT path, file_size, modified_time_ns FROM file_locations "
+        "WHERE archive_id = ? AND is_current = 1", (archive_id,)).fetchone()
+    connection.execute("UPDATE file_locations SET is_current = 0 "
+                       "WHERE archive_id = ?", (archive_id,))
+    return int(connection.execute(
+        "INSERT INTO file_locations (archive_id, path, file_size, "
+        "modified_time_ns) VALUES (?, ?, ?, ?)",
+        (archive_id, old[0] + ".moved", old[1], old[2])).lastrowid)
+
+
+def test_a_relocation_alone_stays_order_stable_with_diagnostics(library):
+    db, ids = library
+    with database_connection(db) as connection:
+        new_location = _relocate(connection, ids["stable"])
+    body = rc.make_plan(db)["plan"]
+    planned = {b["archive_id"]: b for b in body["order_stable"]}
+    basis = planned[ids["stable"]]
+    assert basis["current_location_id"] == new_location
+    assert basis["location_diagnostics"] == [
+        "signature_location_not_current", "page_location_not_current"]
+    assert body["location_diagnostics"] == {
+        "page_location_not_current": 1, "signature_location_not_current": 1}
+    assert planned[ids["stable2"]]["location_diagnostics"] == []
+
+
+def test_a_null_signature_location_is_a_diagnostic(library):
+    db, ids = library
+    with database_connection(db) as connection:
+        connection.execute("UPDATE archive_content_signatures SET location_id "
+                           "= NULL WHERE archive_id = ?", (ids["stable"],))
+    planned = {b["archive_id"]: b
+               for b in rc.make_plan(db)["plan"]["order_stable"]}
+    assert planned[ids["stable"]]["location_diagnostics"] == [
+        "signature_location_null"]
+
+
+@pytest.mark.parametrize(
+    "table, reason",
+    [("archive_content_signatures", "signature_location_foreign"),
+     ("archive_pages", "page_location_foreign")],
+)
+def test_a_reference_to_another_archives_location_is_inconsistent(
+    library, table, reason
+) -> None:
+    db, ids = library
+    with database_connection(db) as connection:
+        foreign = connection.execute(
+            "SELECT id FROM file_locations WHERE archive_id = ?",
+            (ids["stable2"],)).fetchone()[0]
+        connection.execute(f"UPDATE {table} SET location_id = ? "
+                           "WHERE archive_id = ?", (foreign, ids["stable"]))
+    body = rc.make_plan(db)["plan"]
+    assert {"archive_id": ids["stable"], "reason": reason,
+            "names": []} in body["inconsistent"]
+
+
 # --- plan is read-only ----------------------------------------------------
 
 
@@ -376,16 +482,39 @@ def test_plan_is_rejected_when_another_connection_commits_mid_read(
         rc.make_plan(db)
 
 
-def test_the_plan_digest_is_over_canonical_bytes_and_repeatable(
-    library,
-) -> None:
+def test_the_plan_digest_covers_binding_time_and_classification(library):
+    """Canonical bytes; the target and plan time are inside the digest."""
     db, _ = library
     first, second = rc.make_plan(db), rc.make_plan(db)
-    assert first["plan_digest"] == second["plan_digest"]
     assert first["plan_digest"] == hashlib.sha256(json.dumps(
         first["plan"], sort_keys=True, separators=(",", ":"),
         ensure_ascii=True).encode("ascii")).hexdigest()
+    assert first["plan"]["target"] == rc.file_identity(db)
+    assert isinstance(first["plan"]["planned_at_ns"], int)
     assert "data_version_before" not in first["plan"]
+    # Two runs differ only by their plan time.
+    a, b = dict(first["plan"]), dict(second["plan"])
+    a.pop("planned_at_ns"), b.pop("planned_at_ns")
+    assert a == b
+
+
+# --- the 1 -> 2 transition is pinned --------------------------------------
+
+
+def test_every_mode_refuses_if_the_writer_moves_past_version_2(
+    library, tmp_path, monkeypatch
+) -> None:
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    monkeypatch.setattr(rc, "CONTENT_SIGNATURE_VERSION", "3")
+    before = _dump(db)
+    with pytest.raises(rc.PlanRefusedError, match="1 -> 2"):
+        rc.make_plan(db)
+    with pytest.raises(rc.PlanRefusedError, match="1 -> 2"):
+        _apply(tmp_path, db, plan_path, document, backup_report=report)
+    with pytest.raises(rc.PlanRefusedError, match="1 -> 2"):
+        rc.postflight(db)
+    assert _dump(db) == before
 
 
 # --- apply ----------------------------------------------------------------
@@ -407,11 +536,7 @@ def test_apply_relabels_exactly_the_order_stable_rows(library, tmp_path):
 def test_a_relabelled_row_is_comparable_with_a_fresh_version_2_save(
     library, tmp_path
 ) -> None:
-    """Positive control: after relabel, the gated reader groups it.
-
-    The same pages stored fresh under "2" and relabelled from "1" must
-    form one duplicate group -- the relabel produced canonical evidence.
-    """
+    """Positive control: after relabel, the gated reader groups it."""
     db, ids = library
     copy = tmp_path / "copy" / "stable.cbz"
     copy.parent.mkdir()
@@ -448,39 +573,35 @@ def test_page_rows_and_perceptual_rows_are_untouched(library, tmp_path):
         before)
 
 
-def test_apply_twice_is_idempotent(library, tmp_path):
+def test_apply_twice_with_the_same_plan_and_backup_is_idempotent(
+    library, tmp_path
+) -> None:
+    """Rerun policy: the original backup is still the preimage."""
     db, ids = library
-    plan_path, document = _write_plan(tmp_path, db)
-    _apply(tmp_path, db, plan_path, document)
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    _apply(tmp_path, db, plan_path, document, backup_report=report)
     after_first = _dump(db)
 
-    second = rc.apply_plan(
-        db, plan_path, expect_digest=document["plan_digest"],
-        expect_count=2, backup_report=tmp_path / "backup.json",
-    )
+    second = _apply(tmp_path, db, plan_path, document, backup_report=report)
     assert second["relabelled"] == []
     assert second["already_recertified"] == [ids["stable"], ids["stable2"]]
     assert second["skipped"] == []
+    assert second["postflight"]["passed"] is True
     assert _dump(db) == after_first
 
 
 @pytest.mark.parametrize(
     "change",
-    [
-        {"expect_digest": "0" * 64},
-        {"expect_count": 1},
-        {"expect_count": 3},
-    ],
+    [{"expect_digest": "0" * 64}, {"expect_count": 1}, {"expect_count": 3}],
 )
 def test_apply_refuses_entirely_on_digest_or_count_mismatch(
     library, tmp_path, change
 ) -> None:
     db, _ = library
-    plan_path, document = _write_plan(tmp_path, db)
-    backup = _backup(tmp_path, db)
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
     before = _dump(db)
     with pytest.raises(rc.PlanRefusedError):
-        _apply(tmp_path, db, plan_path, document, backup_report=backup,
+        _apply(tmp_path, db, plan_path, document, backup_report=report,
                **change)
     assert _dump(db) == before
 
@@ -488,121 +609,31 @@ def test_apply_refuses_entirely_on_digest_or_count_mismatch(
 def test_apply_refuses_a_plan_edited_after_it_was_written(library, tmp_path):
     """The digest is recomputed from the body, not read from the file."""
     db, ids = library
-    plan_path, document = _write_plan(tmp_path, db)
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
     document["plan"]["order_stable"].append(
         dict(document["plan"]["order_stable"][0], archive_id=ids["tied"]))
-    document["plan"]["counts"]["order_stable"] = 3
     plan_path.write_text(json.dumps(document), encoding="utf-8")
     before = _dump(db)
     with pytest.raises(rc.PlanRefusedError, match="edited"):
-        _apply(tmp_path, db, plan_path, document, expect_count=3)
-    assert _dump(db) == before
-
-
-def test_apply_refuses_a_plan_for_another_version_pair(library, tmp_path):
-    db, _ = library
-    plan_path, document = _write_plan(tmp_path, db)
-    document["plan"]["to_version"] = "3"
-    document["plan_digest"] = rc.plan_digest(document["plan"])
-    plan_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(rc.PlanRefusedError, match="version"):
-        _apply(tmp_path, db, plan_path, document,
-               expect_digest=document["plan_digest"])
-
-
-@pytest.mark.parametrize("problem", ["missing", "unverified", "other_db"])
-def test_apply_refuses_without_a_verified_backup_of_this_database(
-    library, tmp_path, problem
-) -> None:
-    db, _ = library
-    plan_path, document = _write_plan(tmp_path, db)
-    report = _backup(tmp_path, db)
-    if problem == "missing":
-        report = tmp_path / "no-such-report.json"
-    else:
-        data = json.loads(report.read_text(encoding="utf-8"))
-        if problem == "unverified":
-            data["verified"] = False
-        else:
-            data["source_database"] = str(tmp_path / "other.db")
-        report.write_text(json.dumps(data), encoding="utf-8")
-    before = _dump(db)
-    with pytest.raises(rc.PlanRefusedError):
-        _apply(tmp_path, db, plan_path, document, backup_report=report)
+        _apply(tmp_path, db, plan_path, document, expect_count=3,
+               backup_report=report)
     assert _dump(db) == before
 
 
 @pytest.mark.parametrize(
-    "drift, reason",
-    [
-        # A renamed page: still untied, digest still reproducible by name,
-        # so only the recorded names digest betrays it.
-        ("UPDATE archive_pages SET entry_name = '3.png' "
-         "WHERE archive_id = :a AND entry_name = '2.png'", "basis_changed"),
-        # The current location's recorded metadata moved: now stale.
-        ("UPDATE file_locations SET file_size = file_size + 7 "
-         "WHERE archive_id = :a", "now_stale:source_metadata_differs"),
-        # Signature and location moved together: still bound, but not to
-        # the metadata the plan certified.
-        ("UPDATE archive_content_signatures SET source_modified_time_ns = 5 "
-         "WHERE archive_id = :a", None),
-        # A repeat introduced after planning.
-        ("UPDATE archive_pages SET entry_name = '1.png' "
-         "WHERE archive_id = :a AND entry_name = '2.png'",
-         "now_unresolved:repeated_entry_name"),
-        # The page sha256 rows no longer reproduce the digest.
-        ("UPDATE page_hashes SET digest = '00' || substr(digest, 3) "
-         "WHERE algorithm = 'sha256' AND page_id IN (SELECT id FROM "
-         "archive_pages WHERE archive_id = :a)",
-         "now_inconsistent:digest_not_reproducible"),
-        # Re-inventoried (or relabelled elsewhere) under another digest.
-        ("UPDATE archive_content_signatures SET algorithm_version = '2', "
-         "digest = '00' || substr(digest, 3) WHERE archive_id = :a",
-         "now_inconsistent:digest_not_reproducible"),
-        ("DELETE FROM archive_content_signatures WHERE archive_id = :a",
-         "signature_missing"),
-    ],
+    "field, value",
+    [("to_version", "3"), ("from_version", "0"), ("plan_format", "x/1"),
+     ("algorithm", "other"), ("planned_at_ns", None)],
 )
-def test_a_row_that_drifted_after_planning_is_skipped_not_relabelled(
-    library, tmp_path, drift, reason
+def test_apply_refuses_a_plan_for_another_format_or_transition(
+    library, tmp_path, field, value
 ) -> None:
-    """Re-verified per row inside the write transaction; others proceed."""
-    db, ids = library
-    plan_path, document = _write_plan(tmp_path, db)
-    with database_connection(db) as connection:
-        connection.execute(drift, {"a": ids["stable"]})
-        if reason is None:
-            connection.execute(
-                "UPDATE file_locations SET modified_time_ns = 5 "
-                "WHERE archive_id = ?", (ids["stable"],))
-            reason = "basis_changed"
-    version_before = _rows(db, "SELECT algorithm_version FROM "
-                               "archive_content_signatures WHERE archive_id"
-                               " = ?", (ids["stable"],))
-    result = _apply(tmp_path, db, plan_path, document)
-
-    assert result["skipped"] == [{"archive_id": ids["stable"],
-                                  "reason": reason}]
-    assert result["relabelled"] == [ids["stable2"]]
-    assert _rows(db, "SELECT algorithm_version FROM archive_content_signatures"
-                     " WHERE archive_id = ?", (ids["stable"],)) == (
-        version_before)
-
-
-def test_a_row_at_an_unknown_version_with_the_planned_basis_is_skipped(
-    library, tmp_path
-) -> None:
-    """Neither legacy nor current: not this tool's to relabel."""
-    db, ids = library
-    plan_path, document = _write_plan(tmp_path, db)
-    with database_connection(db) as connection:
-        connection.execute("UPDATE archive_content_signatures SET "
-                           "algorithm_version = '7' WHERE archive_id = ?",
-                           (ids["stable"],))
-    result = _apply(tmp_path, db, plan_path, document)
-    assert result["skipped"] == [{"archive_id": ids["stable"],
-                                  "reason": "version_7"}]
-    assert _version(db, ids["stable"]) == "7"
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    document["plan"][field] = value
+    _redigest(plan_path, document)
+    with pytest.raises(rc.PlanRefusedError, match="another format"):
+        _apply(tmp_path, db, plan_path, document, backup_report=report)
 
 
 def test_apply_refuses_an_unreadable_plan(library, tmp_path) -> None:
@@ -611,7 +642,381 @@ def test_apply_refuses_an_unreadable_plan(library, tmp_path) -> None:
     plan_path.write_text("{not json", encoding="utf-8")
     with pytest.raises(rc.PlanRefusedError, match="Unreadable plan"):
         rc.apply_plan(db, plan_path, expect_digest="0" * 64, expect_count=0,
-                      backup_report=_backup(tmp_path, db))
+                      backup_report=tmp_path / "unused.json")
+
+
+# --- target binding -------------------------------------------------------
+
+
+def test_a_plan_for_one_database_is_refused_on_a_clone(library, tmp_path):
+    """Codex's probe: A's plan, a backup-API clone B with its own backup."""
+    db, ids = library
+    plan_path, document = _write_plan(tmp_path, db)
+    clone = _clone(db, tmp_path / "clone.db")
+    clone_report = _backup(tmp_path, clone)
+    before = _dump(clone)
+    with pytest.raises(rc.PlanRefusedError, match="different database"):
+        rc.apply_plan(clone, plan_path, expect_digest=document["plan_digest"],
+                      expect_count=2, backup_report=clone_report)
+    assert _dump(clone) == before
+    assert _version(db, ids["stable"]) == "1"
+
+
+def test_a_restored_target_is_a_different_database(library, tmp_path):
+    """Restore policy: replacing the file changes its identity; re-plan."""
+    db, _ = library
+    plan_path, document = _write_plan(tmp_path, db)
+    clone = _clone(db, tmp_path / "restore.db")
+    os.replace(clone, db)
+    with pytest.raises(rc.PlanRefusedError, match="different database"):
+        _apply(tmp_path, db, plan_path, document)
+
+
+def test_an_altered_target_binding_is_refused(library, tmp_path):
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    document["plan"]["target"]["st_ino"] += 1
+    _redigest(plan_path, document)
+    before = _dump(db)
+    with pytest.raises(rc.PlanRefusedError, match="different database"):
+        _apply(tmp_path, db, plan_path, document, backup_report=report,
+               expect_digest=document["plan_digest"])
+    assert _dump(db) == before
+
+
+def test_a_hard_link_to_the_target_is_refused(library, tmp_path):
+    """Alias policy: a hard link is another real path, so not accepted."""
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    link = tmp_path / "link.db"
+    os.link(db, link)
+    with pytest.raises(rc.PlanRefusedError, match="different database"):
+        rc.apply_plan(link, plan_path, expect_digest=document["plan_digest"],
+                      expect_count=2, backup_report=report)
+
+
+def test_an_alias_spelling_of_the_same_file_is_accepted(library, tmp_path):
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    (tmp_path / "sub").mkdir()
+    alias = Path(str(tmp_path / "sub" / ".." / db.name).upper())
+    result = rc.apply_plan(alias, plan_path,
+                           expect_digest=document["plan_digest"],
+                           expect_count=2, backup_report=report)
+    assert result["relabelled"] == [ids["stable"], ids["stable2"]]
+
+
+def test_a_filesystem_without_file_identity_is_refused(
+    library, monkeypatch
+) -> None:
+    db, _ = library
+    real = os.stat
+
+    def no_ino(path, *args, **kwargs):
+        stat = real(path, *args, **kwargs)
+        return os.stat_result((stat.st_mode, 0, *tuple(stat)[2:]))
+
+    monkeypatch.setattr(rc, "_stat", no_ino)
+    with pytest.raises(rc.PlanRefusedError, match="no file identity"):
+        rc.make_plan(db)
+
+
+def test_the_target_is_rechecked_under_the_write_lock(
+    library, tmp_path, monkeypatch
+) -> None:
+    """The file is swapped after verification and before BEGIN IMMEDIATE."""
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    real = rc.verify_backup
+
+    def then_swap(database, body, backup_report):
+        verified = real(database, body, backup_report)
+        os.replace(_clone(db, tmp_path / "swap.db"), db)
+        return verified
+
+    monkeypatch.setattr(rc, "verify_backup", then_swap)
+    with pytest.raises(rc.PlanRefusedError, match="different database"):
+        _apply(tmp_path, db, plan_path, document, backup_report=report)
+    assert {_version(db, i) for i in (1, 2)} == {"1"}
+
+
+def test_postflight_with_a_plan_refuses_another_database(library, tmp_path):
+    db, _ = library
+    _, document = _write_plan(tmp_path, db)
+    clone = _clone(db, tmp_path / "clone.db")
+    with pytest.raises(rc.PlanRefusedError, match="different database"):
+        rc.postflight(clone, document["plan"])
+
+
+# --- backup artifact ------------------------------------------------------
+
+
+def _edit_report(report: Path, **changes) -> Path:
+    data = _report(report)
+    data.update(changes)
+    report.write_text(json.dumps(data), encoding="utf-8")
+    return report
+
+
+def _refused(tmp_path, db, plan_path, document, report, match):
+    before = _dump(db)
+    with pytest.raises(rc.PlanRefusedError, match=match):
+        _apply(tmp_path, db, plan_path, document, backup_report=report)
+    assert _dump(db) == before
+
+
+def test_a_report_without_any_backup_artifact_is_refused(library, tmp_path):
+    """Codex's probe: two fields and no backup ever created."""
+    db, _ = library
+    plan_path, document = _write_plan(tmp_path, db)
+    report = tmp_path / "fake.json"
+    report.write_text(json.dumps(
+        {"verified": True, "source_database": str(db)}), encoding="utf-8")
+    _refused(tmp_path, db, plan_path, document, report, "Unreadable backup")
+
+
+def test_a_missing_report_is_refused(library, tmp_path):
+    db, _ = library
+    plan_path, document = _write_plan(tmp_path, db)
+    _refused(tmp_path, db, plan_path, document, tmp_path / "none.json",
+             "Unreadable backup")
+
+
+def test_a_moved_backup_artifact_is_refused(library, tmp_path):
+    """Codex's probe: a genuine report whose backup was moved away."""
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    backup = Path(_report(report)["backup_database"])
+    os.replace(backup, tmp_path / "elsewhere.db")
+    _refused(tmp_path, db, plan_path, document, report, "does not exist")
+
+
+def test_a_backup_moved_after_verification_is_refused_under_the_lock(
+    library, tmp_path, monkeypatch
+) -> None:
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    real = rc.verify_backup
+
+    def then_move(database, body, backup_report):
+        verified = real(database, body, backup_report)
+        os.replace(verified["path"], tmp_path / "gone.db")
+        return verified
+
+    monkeypatch.setattr(rc, "verify_backup", then_move)
+    _refused(tmp_path, db, plan_path, document, report, "after verification")
+
+
+@pytest.mark.parametrize("field", ["verified", "checks"])
+def test_an_unverified_report_is_refused(library, tmp_path, field):
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    if field == "verified":
+        _edit_report(report, verified=False)
+    else:
+        checks = _report(report)["checks"]
+        checks[next(iter(checks))] = False
+        _edit_report(report, checks=checks)
+    _refused(tmp_path, db, plan_path, document, report, "not verified")
+
+
+def test_a_backup_of_another_database_is_refused(library, tmp_path):
+    db, _ = library
+    plan_path, document = _write_plan(tmp_path, db)
+    other = _clone(db, tmp_path / "other.db")
+    _refused(tmp_path, db, plan_path, document, _backup(tmp_path, other),
+             "not the plan target")
+
+
+@pytest.mark.parametrize("alias", ["same", "spelling", "hardlink", "wal"])
+def test_the_live_database_cannot_pose_as_its_own_backup(
+    library, tmp_path, alias
+) -> None:
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    if alias == "same":
+        fake = db
+    elif alias == "spelling":
+        (tmp_path / "s").mkdir()
+        fake = Path(str(tmp_path / "s" / ".." / db.name).upper())
+    elif alias == "hardlink":
+        fake = tmp_path / "hard.db"
+        os.link(db, fake)
+    else:
+        fake = Path(str(db) + "-wal")
+
+    def point_report_at_fake() -> None:
+        stat = os.stat(fake)
+        _edit_report(report, backup_database=str(fake),
+                     backup_size_bytes=stat.st_size,
+                     backup_modified_time_ns=stat.st_mtime_ns)
+
+    if alias != "wal":
+        point_report_at_fake()
+        _refused(tmp_path, db, plan_path, document, report, "live database")
+        return
+    # The WAL exists only while a connection holds the database open, so the
+    # refusal is checked with one open (the last close would remove it).
+    with database_connection(db) as holder:
+        holder.execute("PRAGMA user_version")
+        assert fake.is_file()
+        point_report_at_fake()
+        with pytest.raises(rc.PlanRefusedError, match="live database"):
+            _apply(tmp_path, db, plan_path, document, backup_report=report)
+    assert _version(db, 1) == "1"
+
+
+def test_a_backup_file_changed_after_its_report_is_refused(library, tmp_path):
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    with database_connection(Path(_report(report)["backup_database"])) as c:
+        c.execute("INSERT INTO archive_files (file_size) VALUES (1)")
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    _refused(tmp_path, db, plan_path, document, report,
+             "not the file the report verified")
+
+
+def test_a_backup_whose_rows_differ_from_its_report_is_refused(
+    library, tmp_path
+) -> None:
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    counts = _report(report)["backup_table_counts"]
+    counts["archive_files"] += 1
+    _edit_report(report, backup_table_counts=counts)
+    _refused(tmp_path, db, plan_path, document, report, "row counts")
+
+
+def test_a_backup_taken_before_the_plan_is_stale(library, tmp_path):
+    db, _ = library
+    report = _backup(tmp_path, db)
+    plan_path, document = _write_plan(tmp_path, db)
+    _refused(tmp_path, db, plan_path, document, report, "predates the plan")
+
+
+def test_a_fresh_backup_of_another_state_is_not_the_preimage(
+    library, tmp_path
+) -> None:
+    """Taken after the plan, but the rows it holds are not the planned ones."""
+    db, ids = library
+    plan_path, document = _write_plan(tmp_path, db)
+    with database_connection(db) as connection:
+        connection.execute("UPDATE archive_pages SET entry_name = '3.png' "
+                           "WHERE archive_id = ? AND entry_name = '2.png'",
+                           (ids["stable"],))
+    _refused(tmp_path, db, plan_path, document, _backup(tmp_path, db),
+             "not this plan's preimage")
+
+
+def test_a_backup_edited_in_place_is_not_the_preimage(library, tmp_path):
+    """Size and mtime restored to the report's: only content betrays it."""
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    data = _report(report)
+    backup = Path(data["backup_database"])
+    with database_connection(backup) as c:
+        c.execute("UPDATE archive_content_signatures SET algorithm_version"
+                  " = '2' WHERE archive_id = ?", (ids["stable"],))
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert backup.stat().st_size == data["backup_size_bytes"]
+    os.utime(backup, ns=(data["backup_modified_time_ns"],
+                         data["backup_modified_time_ns"]))
+    _refused(tmp_path, db, plan_path, document, report,
+             "not this plan's preimage")
+
+
+def test_a_corrupt_backup_is_refused(library, tmp_path):
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    data = _report(report)
+    backup = Path(data["backup_database"])
+    raw = bytearray(backup.read_bytes())
+    # Everything after the header page: same size, unreadable b-trees.
+    raw[4096:] = b"\xff" * (len(raw) - 4096)
+    backup.write_bytes(bytes(raw))
+    os.utime(backup, ns=(data["backup_modified_time_ns"],
+                         data["backup_modified_time_ns"]))
+    _refused(tmp_path, db, plan_path, document, report, "failed verification")
+
+
+def test_a_backup_changed_during_verification_is_refused(
+    library, tmp_path, monkeypatch
+) -> None:
+    db, _ = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    backup = _report(report)["backup_database"]
+    real = rc.classify_legacy
+
+    def touching(connection):
+        result = real(connection)
+        if Path(connection.execute("PRAGMA database_list").fetchone()[2]
+                ).name == Path(backup).name:
+            os.utime(backup, ns=(time.time_ns(), time.time_ns()))
+        return result
+
+    monkeypatch.setattr(rc, "classify_legacy", touching)
+    _refused(tmp_path, db, plan_path, document, report,
+             "changed during verification")
+
+
+# --- per-row drift --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "drift, reason",
+    [
+        ("UPDATE archive_pages SET entry_name = '3.png' "
+         "WHERE archive_id = :a AND entry_name = '2.png'", "basis_changed"),
+        ("UPDATE file_locations SET file_size = file_size + 7 "
+         "WHERE archive_id = :a", "now_stale:source_metadata_differs"),
+        ("UPDATE archive_content_signatures SET source_modified_time_ns = 5 "
+         "WHERE archive_id = :a", None),
+        ("UPDATE archive_pages SET entry_name = '1.png' "
+         "WHERE archive_id = :a AND entry_name = '2.png'",
+         "now_unresolved:repeated_entry_name"),
+        ("UPDATE page_hashes SET digest = '00' || substr(digest, 3) "
+         "WHERE algorithm = 'sha256' AND page_id IN (SELECT id FROM "
+         "archive_pages WHERE archive_id = :a)",
+         "now_inconsistent:digest_not_reproducible"),
+        ("UPDATE archive_content_signatures SET algorithm_version = '2', "
+         "digest = '00' || substr(digest, 3) WHERE archive_id = :a",
+         "now_inconsistent:digest_not_reproducible"),
+        ("UPDATE archive_content_signatures SET algorithm = 'unknown' "
+         "WHERE archive_id = :a", "algorithm_unknown"),
+        ("UPDATE archive_content_signatures SET algorithm_version = '7' "
+         "WHERE archive_id = :a", "version_7"),
+        ("DELETE FROM archive_content_signatures WHERE archive_id = :a",
+         "missing"),
+    ],
+)
+def test_a_row_that_drifted_after_the_backup_is_skipped_not_relabelled(
+    library, tmp_path, drift, reason
+) -> None:
+    """Re-verified per row inside the write transaction; others proceed."""
+    db, ids = library
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
+    with database_connection(db) as connection:
+        connection.execute(drift, {"a": ids["stable"]})
+        if reason is None:
+            # Signature and location moved together: still bound, but not
+            # to the metadata the plan certified.
+            connection.execute(
+                "UPDATE file_locations SET modified_time_ns = 5 "
+                "WHERE archive_id = ?", (ids["stable"],))
+            reason = "basis_changed"
+    stored_before = _rows(db, "SELECT * FROM archive_content_signatures "
+                              "WHERE archive_id = ?", (ids["stable"],))
+    result = _apply(tmp_path, db, plan_path, document, backup_report=report)
+
+    assert result["skipped"] == [{"archive_id": ids["stable"],
+                                  "reason": reason}]
+    assert result["relabelled"] == [ids["stable2"]]
+    assert _rows(db, "SELECT * FROM archive_content_signatures "
+                     "WHERE archive_id = ?", (ids["stable"],)) == stored_before
+    post = result["postflight"]
+    assert post["passed"] is False
+    assert post["planned_failures"] == [{"archive_id": ids["stable"],
+                                         "outcome": reason}]
 
 
 def test_a_relabel_that_touches_no_row_rolls_the_whole_apply_back(
@@ -624,7 +1029,7 @@ def test_a_relabel_that_touches_no_row_rolls_the_whole_apply_back(
     relabel in the same transaction must not survive.
     """
     db, ids = library
-    plan_path, document = _write_plan(tmp_path, db)
+    plan_path, document, report = _plan_and_backup(tmp_path, db)
     with database_connection(db) as connection:
         connection.execute("UPDATE archive_content_signatures SET "
                            "algorithm_version = '2' WHERE archive_id = ?",
@@ -633,12 +1038,13 @@ def test_a_relabel_that_touches_no_row_rolls_the_whole_apply_back(
 
     def lying(connection, archive_id):
         found = real(connection, archive_id)
-        return rc.Classification(found.archive_id, "1", found.cls,
-                                 found.reason, found.basis, found.detail)
+        return rc.Classification(found.archive_id, found.algorithm, "1",
+                                 found.cls, found.reason, found.basis,
+                                 found.detail, found.diagnostics)
 
     monkeypatch.setattr(rc, "classify_archive", lying)
     with pytest.raises(RuntimeError, match="touched 0 rows"):
-        _apply(tmp_path, db, plan_path, document)
+        _apply(tmp_path, db, plan_path, document, backup_report=report)
     assert _version(db, ids["stable"]) == "1"
 
 
@@ -655,11 +1061,14 @@ def test_postflight_names_its_populations_and_passes_after_apply(
     assert before["passed"] is False
     assert before["planned_order_stable_still_legacy"] == [
         ids["stable"], ids["stable2"]]
+    assert before["planned_outcome_counts"] == {"legacy_as_planned": 2}
 
-    result = _apply(tmp_path, db, plan_path, document)
-    after = result["postflight"]
+    after = _apply(tmp_path, db, plan_path, document)["postflight"]
     assert after["passed"] is True
-    assert after["planned_order_stable_still_legacy"] == []
+    assert after["planned_outcomes"] == [
+        {"archive_id": ids["stable"], "outcome": "recertified"},
+        {"archive_id": ids["stable2"], "outcome": "recertified"}]
+    assert after["planned_failures"] == []
     # All rows, any location state: two relabelled, three still legacy.
     assert after["signature_evidence_counts"] == {
         "comparable": 2, "legacy_ordering_version": 3,
@@ -675,37 +1084,60 @@ def test_postflight_names_its_populations_and_passes_after_apply(
             "signature_evidence_counts"]
 
 
-def test_postflight_fails_while_a_skipped_planned_row_is_still_legacy(
+@pytest.mark.parametrize(
+    "mutation, outcome",
+    [
+        # Codex's probe: both planned rows moved to an unknown algorithm.
+        ("UPDATE archive_content_signatures SET algorithm = 'unknown' "
+         "WHERE archive_id = :a", "algorithm_unknown"),
+        ("UPDATE archive_content_signatures SET algorithm_version = '9' "
+         "WHERE archive_id = :a", "version_9"),
+        ("DELETE FROM archive_content_signatures WHERE archive_id = :a",
+         "missing"),
+        ("UPDATE archive_pages SET entry_name = '3.png' "
+         "WHERE archive_id = :a AND entry_name = '2.png'", "basis_changed"),
+        ("UPDATE archive_content_signatures SET algorithm_version = '1' "
+         "WHERE archive_id = :a", "legacy_as_planned"),
+    ],
+)
+def test_planned_postflight_names_and_fails_every_unexpected_outcome(
+    library, tmp_path, mutation, outcome
+) -> None:
+    """After a successful apply, any later change to a planned row fails."""
+    db, ids = library
+    plan_path, document = _write_plan(tmp_path, db)
+    _apply(tmp_path, db, plan_path, document)
+    with database_connection(db) as connection:
+        connection.execute(mutation, {"a": ids["stable"]})
+    report = rc.postflight(db, document["plan"])
+    assert report["passed"] is False
+    assert report["planned_failures"] == [{"archive_id": ids["stable"],
+                                           "outcome": outcome}]
+    assert rc.main(["postflight", "--database", str(db), "--plan",
+                    str(plan_path)]) == rc.EXIT_INCOMPLETE
+
+
+def test_planned_postflight_fails_when_every_planned_row_went_unknown(
     library, tmp_path
 ) -> None:
+    """The exact reviewed counterexample, before any apply."""
     db, ids = library
     plan_path, document = _write_plan(tmp_path, db)
     with database_connection(db) as connection:
-        connection.execute("UPDATE archive_pages SET entry_name = '3.png' "
-                           "WHERE archive_id = ? AND entry_name = '2.png'",
-                           (ids["stable"],))
-    after = _apply(tmp_path, db, plan_path, document)["postflight"]
-    assert after["planned_order_stable_still_legacy"] == [ids["stable"]]
-    assert after["legacy_rows_by_class"]["order_stable"] == 1
-    assert after["passed"] is False
+        connection.execute("UPDATE archive_content_signatures SET algorithm "
+                           "= 'unknown' WHERE archive_id IN (?, ?)",
+                           (ids["stable"], ids["stable2"]))
+    assert rc.main(["postflight", "--database", str(db), "--plan",
+                    str(plan_path)]) == rc.EXIT_INCOMPLETE
 
 
-def test_postflight_fails_for_a_planned_row_that_drifted_into_another_class(
-    library, tmp_path
-) -> None:
-    """Scoped counts alone would pass: the row is now stale, not stable.
-
-    Only the per-plan check sees that a planned archive stayed legacy.
-    """
-    db, ids = library
+def test_planned_postflight_refuses_an_edited_plan(library, tmp_path):
+    db, _ = library
     plan_path, document = _write_plan(tmp_path, db)
-    with database_connection(db) as connection:
-        connection.execute("UPDATE file_locations SET file_size = 1 "
-                           "WHERE archive_id = ?", (ids["stable"],))
-    after = _apply(tmp_path, db, plan_path, document)["postflight"]
-    assert after["legacy_rows_by_class"]["order_stable"] == 0
-    assert after["planned_order_stable_still_legacy"] == [ids["stable"]]
-    assert after["passed"] is False
+    document["plan"]["order_stable"] = []
+    plan_path.write_text(json.dumps(document), encoding="utf-8")
+    assert rc.main(["postflight", "--database", str(db), "--plan",
+                    str(plan_path)]) == rc.EXIT_REFUSED
 
 
 def test_postflight_without_a_plan_uses_the_current_location_scope(library):
@@ -719,7 +1151,7 @@ def test_postflight_without_a_plan_uses_the_current_location_scope(library):
 # --- CLI ------------------------------------------------------------------
 
 
-def test_cli_plan_apply_postflight_round_trip(library, tmp_path, capsys):
+def test_cli_plan_apply_postflight_round_trip(library, tmp_path):
     db, _ = library
     plan = tmp_path / "cli-plan.json"
     assert rc.main(["plan", "--database", str(db), "--json-out",
@@ -731,6 +1163,7 @@ def test_cli_plan_apply_postflight_round_trip(library, tmp_path, capsys):
                   "--backup-report", str(backup)]
 
     assert rc.main(apply_args + ["--expect-count", "1"]) == rc.EXIT_REFUSED
+    assert rc.main(apply_args + ["--expect-count", "2"]) == rc.EXIT_OK
     assert rc.main(apply_args + ["--expect-count", "2"]) == rc.EXIT_OK
     assert rc.main(["postflight", "--database", str(db), "--plan",
                     str(plan)]) == rc.EXIT_OK
@@ -757,11 +1190,12 @@ def test_cli_exits_incomplete_when_apply_skips_a_row(library, tmp_path):
     plan = tmp_path / "cli-plan.json"
     rc.main(["plan", "--database", str(db), "--json-out", str(plan)])
     document = json.loads(plan.read_text(encoding="utf-8"))
+    report = _backup(tmp_path, db)
     with database_connection(db) as connection:
         connection.execute("UPDATE file_locations SET file_size = 1 "
                            "WHERE archive_id = ?", (ids["stable"],))
     assert rc.main([
         "apply", "--database", str(db), "--plan", str(plan),
         "--expect-digest", document["plan_digest"], "--expect-count", "2",
-        "--backup-report", str(_backup(tmp_path, db)),
+        "--backup-report", str(report),
     ]) == rc.EXIT_INCOMPLETE
