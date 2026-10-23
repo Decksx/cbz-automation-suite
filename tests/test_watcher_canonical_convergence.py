@@ -57,7 +57,8 @@ _TOKENS = [
     "[", "]", "(", ")", "[Judas]", "(Digital)", "[Group]", "(2019)", "(1989)",
     "[2019]", "(201)", "[v2]", "[V02]", "(v2)", "v2", "v01", "[v0]",
     "(Uncensored)", "[Uncensored]", "(DECENSORED)", "[Group Uncensored]",
-    "uncensored", "(Colored)", "(colored)", "(English)", "[English]",
+    "uncensored", "(Colored)", "(colored)", "[Colored]", "[colored]",
+    "[Colorized]", "(English)", "[English]",
     "(Special Edition)", "(Omnibus)", ".cC", ".com", "x.co", "www.", "&amp;",
     "&amp", "&#1", "#", "#3", "G1234", " G5678", "Ch.", "Ch. 5", "ch. 1",
     "Chapter", "Vol", "Vol. 2", "scans", "Scanlations", "/", ":", "?", "|",
@@ -236,7 +237,7 @@ def test_group_and_source_tags_are_still_dropped_from_the_display_name():
 
 @pytest.mark.parametrize(
     "token",
-    ["[2019]", "(201)", "(v2)", "[v0]", "[English]", "(Omnibus)", "[Colored]"],
+    ["[2019]", "(201)", "(v2)", "[v0]", "[English]", "(Omnibus)", "[Colorized]"],
 )
 def test_near_miss_tokens_are_dropped_as_before(token):
     """Only the exact canonical shapes are kept. A square-bracket year, a
@@ -244,6 +245,77 @@ def test_near_miss_tokens_are_dropped_as_before(token):
     convention) and bracketed special words are dropped as they were before
     §5.5 -- see the section comment in cbz_core for why each is held."""
     assert cbz_core.sanitize_display(f"Book {token}") == "Book"
+
+
+# [Colored] is the one square-bracket edition word promoted to its
+# round-bracket token (David, 2026-10-23). [Colorized], [English] and every
+# other square-bracket tag are still dropped.
+
+
+@pytest.mark.parametrize(
+    ("raw", "display"),
+    [
+        ("Book [Colored] [Group]", "Book (Colored)"),
+        ("Book [colored]", "Book (Colored)"),
+        ("Book [COLORED]", "Book (Colored)"),
+        ("Book [English] [Colored]", "Book (Colored)"),
+        ("Book [English]", "Book"),
+        ("Book (Colored) [Colored]", "Book (Colored)"),
+        ("Book [Colored] (colored)", "Book (Colored)"),
+        ("Book [Colorized]", "Book"),
+        ("Book [Colored Scans]", "Book"),
+    ],
+)
+def test_square_colored_becomes_the_colored_edition_token(raw, display):
+    assert cbz_core.sanitize_display(raw) == display
+    assert cbz_core.sanitize_display(display) == display
+    parsed = cbz_core.parse_comic_name(
+        Path("Book") / f"{raw}.cbz", rules=NO_TRANSLATE, display_tokens=True
+    )
+    assert parsed.filename == f"{display}.cbz"
+    again = cbz_core.parse_comic_name(
+        Path("Book") / parsed.filename, rules=NO_TRANSLATE, display_tokens=True
+    )
+    assert again.filename == parsed.filename
+
+
+def test_square_colored_yields_exactly_one_edition_token():
+    """One (Colored) on the first pass, not only after the display fixpoint
+    loop folds a duplicate away: the fallback formatter reads these tokens
+    once and would refuse two editions as conflicting."""
+    tokens = cbz_core.extract_display_tokens("Book (Colored) [Colored] [colored]")
+    assert tokens.editions == ("Colored",)
+    source = "Book (Colored) [Colored]"
+    assert cbz_core.append_display_tokens("Book", source) == "Book (Colored)"
+    assert (
+        watcher._fallback_display_stem("Berserk", "4", "Chapter (Colored) [Colored]")
+        == "Berserk ch. 4 (Colored)"
+    )
+
+
+def test_square_edition_allowlist_is_colored_only():
+    """David decided [Colored] only: no Colorized, no English."""
+    assert dict(cbz_core._SQUARE_EDITION_WORDS) == {"colored": "Colored"}
+    assert set(cbz_core._SQUARE_EDITION_WORDS.values()) <= set(EDITION_WORDS)
+
+
+def test_square_colored_display_agrees_with_format_canonical_name():
+    parsed = cbz_core.parse_comic_name(
+        Path("Book/Book [Colored].cbz"), rules=NO_TRANSLATE, display_tokens=True
+    )
+    assert parsed.filename == format_canonical_name(
+        CanonicalFields(series="Book", edition="Colored")
+    )
+
+
+def test_square_colored_is_still_stripped_for_identity():
+    name = "Berserk [Colored]"
+    assert cbz_core.sanitize(name) == "Berserk"
+    assert cbz_core.clean_directory_name(name) == "Berserk"
+    assert series_key(cbz_core.clean_directory_name(name)) == series_key("Berserk")
+    legacy = cbz_core.parse_comic_name(Path(f"{name}/{name} Ch. 1.cbz"), rules=NO_TRANSLATE)
+    assert legacy.filename == "Berserk Ch. 1.cbz"
+    assert legacy.series == "Berserk"
 
 
 def test_identity_cleaning_still_strips_every_bracket():
@@ -414,6 +486,28 @@ def test_bracketed_group_tag_still_resolves_to_the_existing_series(watch):
         "Berserk Ch. 5 (2019).cbz",
     ]
     assert _payload_size(existing / "Berserk Ch. 5 (2019).cbz") == 200
+
+
+def test_square_colored_arrival_end_to_end(watch):
+    """A [Colored] arrival merges into the existing "Berserk" folder (identity
+    strips the bracket) and lands as "(Colored)" (display promotes it), while
+    its [English] and [Group] tags are dropped."""
+    watch_root, library = watch
+    existing = library / "Berserk"
+    _make_cbz(existing / "Berserk Ch. 4.cbz", 100)
+
+    arrival = watch_root / "Berserk [Colored]"
+    _make_cbz(arrival / "[Group] Berserk Ch. 5 [English] [Colored].cbz", 200)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert sorted(p.name for p in library.iterdir()) == ["Berserk"]
+    assert sorted(p.name for p in existing.iterdir()) == [
+        "Berserk Ch. 4.cbz",
+        "Berserk Ch. 5 (Colored).cbz",
+    ]
+    assert _payload_size(existing / "Berserk Ch. 5 (Colored).cbz") == 200
+    assert not list(watch_root.rglob("*.cbz"))
 
 
 def test_fallback_naming_end_to_end_keeps_every_display_token(watch):
