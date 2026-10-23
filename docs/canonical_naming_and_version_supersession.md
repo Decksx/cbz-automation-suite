@@ -8,10 +8,13 @@ live file is renamed, moved, or removed by this document. Tracks issue
 - **Second draft:** `826c827`, which answered the first review (version
   family, current-byte provenance, dependency-aware drift, recovery,
   version labels).
-- **This revision** answers the re-review: receipt-backed ownership,
-  recovery at every durable boundary including the DB commit, and phased
-  family validation with journal-aware resume. It also closes the bracket
-  question and leaves the Syncthing block-reuse claim unmeasured.
+- **Third draft:** `a3a54b9`. It answered the re-review: receipt-backed
+  ownership, recovery at every durable boundary, and phased family
+  validation.
+- **This revision** answers the third review. Locking is now an OS-held
+  shared-scope lock instead of an O_EXCL file with takeover. Recovery now
+  works on an action-level frontier, so a completed step's destination is
+  history, not a current-state check.
 
 ## Operator requirements
 
@@ -358,15 +361,24 @@ byte-identical** to the source.
 
 **Ownership and quiescence.** A run is an **attempt** with a unique id.
 
-- **The attempt lock:** one lock file, `O_EXCL`-created, holding the
-  attempt id and pid. Mutators and the watcher are quiesced for the target
-  library roots, using the existing series-lock and operator-mode
-  mechanisms.
-- **Recovery and undo reacquire** the attempt lock and re-verify quiescence
-  before touching anything. A crashed process no longer holds its lock.
-  - **A stale lock** is taken over only after its pid is proven dead, and
-    the takeover is journalled.
-  - **A live other holder** stops recovery.
+- **The scope lock.** This follows the #103 precedent. There is one
+  **OS-held exclusive lock** on a single stable path per target scope,
+  `<library-root>\.cbz-canonical-naming.lock`. It is shared by **every**
+  rename attempt, recovery and undo on that root.
+  - **Taking it:** the lock is a non-blocking exclusive byte-range lock
+    (`LockFileEx`, `msvcrt.locking`), held for the whole run. A process that
+    cannot take it refuses; it never waits indefinitely.
+  - **The OS releases it** when the holder exits or crashes. So there is no
+    stale-lock takeover, nothing ever unlinks the lock file, and a successor
+    can never have its lock removed by another recoverer's earlier
+    liveness check.
+  - **Owner metadata** (attempt id, pid, start time) lives in a separate
+    owner file, written only **after** the lock is held. It is informational
+    and never consulted for exclusion.
+- **Quiescence.** While holding the scope lock, mutators and the watcher
+  are quiesced for the target library roots, using the existing series-lock
+  and operator-mode mechanisms. Recovery and undo take the same scope lock
+  and re-verify quiescence before touching anything.
 
 **Journal.** The journal is an append-only file per attempt. Each record
 carries the attempt id, the action id and a sequence number, and is fsynced.
@@ -397,10 +409,32 @@ protocol.
    itself records whether this step's update has landed.
 5. **`confirmed`** (journal). Fsynced.
 
-**Recovery matrix.** For each step of each incomplete action, recovery reads
-three things: the journal's last record for the step, the presence and
-fresh content of source and destination, and the DB marker row with the
-current path rows.
+**Recovery works on the action's frontier.** Recovery never validates a
+completed step's destination as if it were current. A later step may
+legitimately have moved the file and the row on. So recovery runs per
+**action**:
+
+1. **Validate the chain.** Read the action's ordered steps from the plan.
+   For each step, read its journal receipts and its DB marker. The chain
+   must be a **prefix-closed** sequence:
+   - every step before the frontier has `done`, a DB marker and `confirmed`,
+     in order;
+   - no step after the frontier has any receipt or marker.
+
+   Any gap, reordering, or receipt beyond the frontier **refuses**.
+2. **Treat completed predecessors as history.** They are proven by their
+   receipts and markers. Their destinations and postimages are **not**
+   required to still exist, because the successor step consumed them.
+3. **Find the latest proven location.**
+   - **Normally** it is the last completed step's destination.
+   - **For an action with no completed step**, it is the source.
+   - **If the frontier step itself has `done`**, it is the frontier step's
+     destination.
+4. **Validate that location** with fresh content, matching the action's
+   source strong identity (renames never change bytes), plus the DB rows.
+5. **Recover only the frontier step**, using the matrix below. The step's
+   source is the previous location, and its destination is its own target.
+   Contradictory or unlisted states **refuse**.
 
 | Journal | DB marker | Filesystem (fresh content check) | Resolution |
 |---|---|---|---|
@@ -415,22 +449,36 @@ current path rows.
 | `done` / `confirmed` | present | path rows match neither preimage nor postimage, or are partial | refuse; operator |
 | `confirmed` | present | destination intended identity | complete; nothing to do |
 
-**Repeated recovery** is idempotent: each resolution only advances to the
-next row of the matrix, and re-running recovery on a fully resolved attempt
-does nothing.
+**Repeated recovery** is idempotent. Each resolution advances the
+frontier by at most one record and re-derives it from scratch on the next
+run, so re-running recovery on a resolved attempt does nothing.
 
-**Case-only renames** are recovered step by step. The temp step's
-destination is the owned temp name, so its DB postimage is the temp path.
-A crash between the two steps therefore leaves a consistent row (path =
-temp) that the second step's CAS then moves on.
+**Case-only renames** are a two-step action, old → temp → new.
+
+- **Crash after the second move.** Suppose step 1 is complete and step 2
+  has `done` but no marker. The frontier is step 2 and the latest proven
+  location is `new`. Recovery verifies the bytes at `new` and that the DB
+  row is still at **temp**, which is step 2's preimage. It then runs step 2's
+  DB transaction.
+- **Crash after step 2's DB commit**, before its `confirmed` record. The
+  bytes are at `new`, the row is at `new`, and the marker is present.
+  Recovery writes `confirmed`.
+- **In neither case** is step 1's temp destination required to still
+  exist.
 
 **Quarantine moves** use the same protocol, with the quarantine path as the
 destination.
 
-**Undo** is a new attempt, with its own lock and journal, that replays
-confirmed steps in reverse through the same protocol. Each reverse step
-requires the forward step's `confirmed` receipt, fresh content verification
-at the forward destination, and the DB postimage. Anything else is refused.
+**Undo** is a new attempt, under the same scope lock, with its own journal.
+It plans the **reverse action chain** of a fully confirmed forward action,
+for example new → temp → old for a case-only rename, and runs it through the
+same step protocol and frontier recovery.
+
+- **Its precondition** is the forward action's complete confirmed chain,
+  plus fresh content and DB rows at the forward action's final location.
+- **An interrupted undo** is recovered from its own frontier, exactly like a
+  forward action.
+- **Anything else** is refused.
 
 **Volumes and quarantine.** Renames never cross volumes. Supersession
 removals are owned moves into a dated quarantine on the same volume.
@@ -557,7 +605,14 @@ Apply, drift and recovery:
 - `test_repeated_recovery_is_idempotent`
 - `test_location_and_pairing_updates_commit_atomically`
 - `test_case_only_temp_step_has_its_own_db_postimage_and_undo`
-- `test_recovery_reacquires_the_lock_and_refuses_a_live_holder`
+- `test_recovery_takes_the_scope_lock_and_refuses_while_it_is_held`
+- `test_two_recoverers_cannot_both_hold_the_scope_lock`
+- `test_the_lock_is_released_by_process_exit_without_any_unlink`
+- `test_case_only_crash_after_second_move_recovers_from_the_frontier`
+- `test_case_only_crash_after_second_db_commit_before_confirmation`
+- `test_repeated_recovery_from_either_case_only_crash_is_idempotent`
+- `test_a_gap_or_receipt_beyond_the_frontier_refuses`
+- `test_interrupted_undo_chain_recovers_from_its_frontier`
 - `test_a_new_family_whose_keeper_needs_renaming_validates_in_phases`
 - `test_crash_after_the_first_of_several_dependant_quarantines_resumes`
 
