@@ -898,7 +898,7 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
       has nothing to be a version *of*;
     * same work: either every member carries the same human family
       decision, or every member has a resolved series (equal under
-      `series_key`) and a resolved primary number (equal), and no two
+      a non-empty `series_key`) and a resolved primary number (equal), and no two
       members have different known volumes;
     * same edition set, absent counting as a value; a difference only in
       the decensor marker is a decensor pair, never a version (§4.5);
@@ -922,8 +922,15 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
     else:
         if not all(member.series.resolved for member in members):
             reasons.append("a member's series is unresolved")
-        elif len({series_key(m.series.value or "") for m in members}) != 1:
+        elif len(
+            series_keys := {series_key(m.series.value or "") for m in members}
+        ) != 1:
             reasons.append("members have different series")
+        elif series_keys == {""}:
+            # A title made only of words series_key strips ("Uncensored")
+            # keys to "", which SeriesIndex excludes as no identity at all.
+            # Equal empty keys say nothing about being the same series.
+            reasons.append("members' series key is empty (no identity)")
         else:
             evidence.append("same decided series")
         if not all(member.number.resolved for member in members):
