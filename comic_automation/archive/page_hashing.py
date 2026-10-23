@@ -182,6 +182,76 @@ def order_page_entries(members: Iterable[zipfile.ZipInfo]) -> PageOrder:
     )
 
 
+def hash_ordered_pages(
+    archive: zipfile.ZipFile,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> tuple[tuple[PageContentHash, ...], PageOrder]:
+    """Admit ``archive`` and hash its image members in page order.
+
+    The one exact page-hashing pass, shared by `calculate_page_hashes` (which
+    opens a path) and the supersession evaluator (which opens the held bytes
+    it has already bound to a full-file sha256), so the two can never hash or
+    order pages differently. ``archive`` may be backed by a path or by an
+    in-memory buffer; nothing here looks at the file system.
+
+    Raises `UnsafeArchiveError` from the admission check and whatever
+    ``zipfile`` raises for a corrupt member; the caller maps those.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1.")
+
+    members = archive.infolist()
+    # Archive-wide limits, member names and encryption, checked on
+    # the central directory before the first member is opened. An
+    # encrypted member would otherwise surface from archive.open()
+    # as a bare RuntimeError and be filed as archive_unreadable.
+    validate_archive_members(members)
+    order = order_page_entries(members)
+    pages: list[PageContentHash] = []
+
+    # Each digest is computed from, and recorded with, the entry
+    # whose name it is stored under: the index positions a page but
+    # never selects which bytes its digest describes.
+    for page_index, entry in enumerate(order.entries):
+        digest = hashlib.sha256()
+        bytes_read = 0
+
+        with archive.open(entry, mode="r") as stream:
+            while chunk := stream.read(chunk_size):
+                digest.update(chunk)
+                bytes_read += len(chunk)
+
+        pages.append(
+            PageContentHash(
+                page_index=page_index,
+                entry_name=entry.filename,
+                entry_size=int(entry.file_size),
+                compressed_size=int(entry.compress_size),
+                crc32=int(entry.CRC),
+                digest=digest.hexdigest(),
+                bytes_read=bytes_read,
+            )
+        )
+
+    return tuple(pages), order
+
+
+def ordered_content_digest(pages: Iterable[PageContentHash]) -> str:
+    """The ordered content signature over ``pages`` (already in page order).
+
+    The 8-byte big-endian page count, then each page sha256's raw bytes.
+    """
+    page_list = list(pages)
+    signature = hashlib.sha256()
+    signature.update(len(page_list).to_bytes(8, "big"))
+
+    for page in page_list:
+        signature.update(bytes.fromhex(page.digest))
+
+    return signature.hexdigest()
+
+
 def calculate_page_hashes(
     path: str | Path,
     *,
@@ -199,41 +269,10 @@ def calculate_page_hashes(
         )
 
     before = archive_path.stat()
-    pages: list[PageContentHash] = []
 
     try:
         with zipfile.ZipFile(archive_path, mode="r") as archive:
-            members = archive.infolist()
-            # Archive-wide limits, member names and encryption, checked on
-            # the central directory before the first member is opened. An
-            # encrypted member would otherwise surface from archive.open()
-            # as a bare RuntimeError and be filed as archive_unreadable.
-            validate_archive_members(members)
-            order = order_page_entries(members)
-
-            # Each digest is computed from, and recorded with, the entry
-            # whose name it is stored under: the index positions a page but
-            # never selects which bytes its digest describes.
-            for page_index, entry in enumerate(order.entries):
-                digest = hashlib.sha256()
-                bytes_read = 0
-
-                with archive.open(entry, mode="r") as stream:
-                    while chunk := stream.read(chunk_size):
-                        digest.update(chunk)
-                        bytes_read += len(chunk)
-
-                pages.append(
-                    PageContentHash(
-                        page_index=page_index,
-                        entry_name=entry.filename,
-                        entry_size=int(entry.file_size),
-                        compressed_size=int(entry.compress_size),
-                        crc32=int(entry.CRC),
-                        digest=digest.hexdigest(),
-                        bytes_read=bytes_read,
-                    )
-                )
+            pages, order = hash_ordered_pages(archive, chunk_size=chunk_size)
     except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
         raise PermanentJobError(
             f"Invalid or corrupt CBZ archive: {archive_path}",
@@ -262,15 +301,9 @@ def calculate_page_hashes(
             f"Archive changed while hashing pages: {archive_path}"
         )
 
-    signature = hashlib.sha256()
-    signature.update(len(pages).to_bytes(8, "big"))
-
-    for page in pages:
-        signature.update(bytes.fromhex(page.digest))
-
     return ArchivePageHashes(
-        pages=tuple(pages),
-        content_digest=signature.hexdigest(),
+        pages=pages,
+        content_digest=ordered_content_digest(pages),
         image_bytes=sum(page.bytes_read for page in pages),
         source_file_size=int(after.st_size),
         source_modified_time_ns=int(after.st_mtime_ns),
