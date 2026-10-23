@@ -30,7 +30,19 @@ from comic_automation.jobs import (
 PAGE_HASH_ALGORITHM = "sha256"
 PAGE_HASH_ALGORITHM_VERSION = "1"
 CONTENT_SIGNATURE_ALGORITHM = "ordered-page-sha256"
-CONTENT_SIGNATURE_VERSION = "1"
+# The version names the *ordering contract* the signature was computed
+# under, because the digest is over pages in order and two orderings of the
+# same members give different digests -- or, worse, the same digest for
+# different archives. "1" ordered by the natural key alone and left ties to
+# physical member order; "2" breaks ties on the raw name (`page_order_key`).
+# A "1" row and a "2" row are not comparable: archive A packed a.png=X,
+# A.png=Y stores X,Y under "1", archive B packed a.png=Y, A.png=X stores X,Y
+# under "2", and the digests collide although the archives differ. Readers
+# that group or align on ordered content accept only the current version
+# (`comparable_ordered_signature_sql`); older rows are legacy diagnostics
+# until re-certified or re-inventoried (docs/engineering_decisions.md).
+# The per-page sha256 (PAGE_HASH_ALGORITHM_VERSION) is unchanged.
+CONTENT_SIGNATURE_VERSION = "2"
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 _NATURAL_PART_RE = re.compile(r"(\d+)")
 
@@ -281,6 +293,84 @@ _STORED_DUPLICATE_ENTRY_NAMES_SQL = """
 """
 
 
+def comparable_ordered_signature_sql(alias: str) -> str:
+    """SQL condition: signature row ``alias`` is canonical ordered evidence.
+
+    True only when the row was computed by this algorithm under the current
+    ordering contract (``CONTENT_SIGNATURE_VERSION``) *and* its archive's
+    stored page order is resolved (no duplicated raw ``entry_name``). Every
+    reader that groups archives by ``archive_content_signatures.digest`` or
+    aligns their pages by ``page_index`` must apply it, so a legacy-order
+    row, a row of unknown provenance, or an unresolved order can never be
+    presented as evidence. Those rows are diagnostics; see
+    `signature_evidence_counts`.
+
+    The values are this module's own constants, inlined as literals, and
+    ``alias`` must be a plain identifier, so nothing caller-supplied reaches
+    the SQL text.
+    """
+    if not alias.isidentifier():
+        raise ValueError(f"Not an SQL alias: {alias!r}")
+
+    duplicates = _STORED_DUPLICATE_ENTRY_NAMES_SQL.format(
+        archive_id=f"{alias}.archive_id"
+    )
+    return (
+        f"{alias}.algorithm = '{CONTENT_SIGNATURE_ALGORITHM}' "
+        f"AND {alias}.algorithm_version = '{CONTENT_SIGNATURE_VERSION}' "
+        f"AND NOT EXISTS ({duplicates})"
+    )
+
+
+def signature_evidence_counts(connection: sqlite3.Connection) -> dict:
+    """How many stored signatures are, and are not, comparable evidence.
+
+    Read-only diagnostics for the readers that exclude non-comparable rows,
+    so an exclusion is counted rather than silent:
+
+    * ``comparable`` -- current algorithm and version, resolved order;
+    * ``legacy_ordering_version`` -- this algorithm under an older ordering
+      contract, awaiting re-certification or re-inventory;
+    * ``unknown_algorithm`` -- any other algorithm name;
+    * ``unresolved_page_order`` -- current version, but duplicated raw
+      image names, so the order is not an answer.
+
+    Counted over every signature row, whatever its location state; the
+    readers apply their own location and staleness rules on top.
+    """
+    duplicates = _STORED_DUPLICATE_ENTRY_NAMES_SQL.format(
+        archive_id="acs.archive_id"
+    )
+    row = connection.execute(
+        f"""
+        SELECT
+            SUM(CASE WHEN acs.algorithm = ? AND acs.algorithm_version = ?
+                      AND NOT EXISTS ({duplicates}) THEN 1 ELSE 0 END),
+            SUM(CASE WHEN acs.algorithm = ? AND acs.algorithm_version != ?
+                     THEN 1 ELSE 0 END),
+            SUM(CASE WHEN acs.algorithm != ? THEN 1 ELSE 0 END),
+            SUM(CASE WHEN acs.algorithm = ? AND acs.algorithm_version = ?
+                      AND EXISTS ({duplicates}) THEN 1 ELSE 0 END)
+        FROM archive_content_signatures AS acs
+        """,
+        (
+            CONTENT_SIGNATURE_ALGORITHM,
+            CONTENT_SIGNATURE_VERSION,
+            CONTENT_SIGNATURE_ALGORITHM,
+            CONTENT_SIGNATURE_VERSION,
+            CONTENT_SIGNATURE_ALGORITHM,
+            CONTENT_SIGNATURE_ALGORITHM,
+            CONTENT_SIGNATURE_VERSION,
+        ),
+    ).fetchone()
+    return {
+        "comparable": int(row[0] or 0),
+        "legacy_ordering_version": int(row[1] or 0),
+        "unknown_algorithm": int(row[2] or 0),
+        "unresolved_page_order": int(row[3] or 0),
+    }
+
+
 class ArchivePageHashRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
@@ -315,7 +405,9 @@ class ArchivePageHashRepository:
             # and the perceptual worker recomputes them. Carrying them
             # across by entry_name is not implemented. A content signature
             # stored under the old order is replaced only when its archive
-            # is re-saved; nothing here recomputes signatures in bulk.
+            # is re-saved; nothing here recomputes signatures in bulk. Until
+            # then its algorithm_version ("1") marks it as legacy, and the
+            # comparison readers refuse it as evidence.
             self.connection.execute(
                 "DELETE FROM archive_pages WHERE archive_id = ?",
                 (archive_id,),
@@ -539,12 +631,14 @@ class ArchivePageHashRepository:
         # means byte-for-byte identical page sequences, i.e. the same
         # comic content even if the container files differ.
         #
-        # Archives with an unresolved page order are left out before
-        # grouping: their signature depends on physical member order, so
-        # two of them sharing one is not evidence of the same sequence.
-        unresolved = _STORED_DUPLICATE_ENTRY_NAMES_SQL.format(
-            archive_id="acs.archive_id"
-        )
+        # Only canonical evidence is grouped: the current ordering version
+        # (a legacy-order row can collide with a current one for different
+        # archives) and a resolved page order (an unresolved signature
+        # depends on physical member order, so two of them sharing one is
+        # not evidence of the same sequence). Grouping by algorithm and
+        # version alone would not be enough: it keeps versions apart but
+        # still reports legacy-vs-legacy groups as duplicates.
+        comparable = comparable_ordered_signature_sql("acs")
         rows = self.connection.execute(
             f"""
             SELECT
@@ -558,7 +652,7 @@ class ArchivePageHashRepository:
             JOIN file_locations AS fl
               ON fl.archive_id = acs.archive_id
              AND fl.is_current = 1
-            WHERE NOT EXISTS ({unresolved})
+            WHERE {comparable}
             GROUP BY
                 acs.algorithm,
                 acs.algorithm_version,
