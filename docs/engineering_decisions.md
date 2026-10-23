@@ -993,18 +993,45 @@ still fully inventoried -- same-named members keep physical order only
 because each page needs an index -- but its order, and its content
 signature, carry no authority. The stored form needs no schema change:
 two `archive_pages` rows of one archive with the same `entry_name`.
-Consumers that act on it today:
+Duplicate *non-image* names do not make the page order unresolved;
+whether they block a supersession comparison is §4.1/§4.4 work.
 
-- `ArchivePageHashRepository.duplicate_content_groups` excludes such
-  archives before grouping; `unresolved_page_order_archive_ids` lists them.
-- `scripts/cbz_library_maintenance._archive_content_fingerprint`, the
-  deletion guard, returns `None` for them, isolating the archive.
+**The ordering contract is versioned.** `CONTENT_SIGNATURE_VERSION` moved
+from `"1"` (natural key, ties in physical order) to `"2"` (ties on the raw
+name). Without the bump, old-order and new-order rows were
+indistinguishable and could collide for different archives: A packed
+`a.png`=X, `A.png`=Y stores X,Y under the old rule; B packed `a.png`=Y,
+`A.png`=X stores X,Y under the new one. The per-page sha256 version and
+the V1 perceptual algorithms and versions are unchanged.
 
-Deliberately **not** gated yet, and open: `content_duplicate_audit`, the
-pairwise `near_duplicate` comparison (which aligns pages by `page_index`),
-and any future supersession evaluator (§4.1 item 4). Duplicate *non-image*
-names do not make the page order unresolved; whether they block a
-supersession comparison is §4.1/§4.4 work.
+**One gate for every ordered-content reader.**
+`page_hashing.comparable_ordered_signature_sql(alias)` is true only for the
+current algorithm and version *and* a resolved stored order. Every reader
+that groups on `archive_content_signatures.digest` or aligns pages by
+`page_index` applies it:
+
+- `ArchivePageHashRepository.duplicate_content_groups`;
+- `content_duplicate_audit.collect_duplicate_groups` (its version is now
+  taken from `page_hashing`, not hardcoded), with `run_audit` reporting
+  what was excluded under `excluded_signatures`;
+- `NearDuplicateRepository.load_fingerprints`, which previously checked
+  neither the signature algorithm nor its version, so no legacy or
+  unresolved archive is aligned, scored or written as a candidate.
+
+`page_hashing.signature_evidence_counts` counts rows as `comparable`,
+`legacy_ordering_version`, `unknown_algorithm` or `unresolved_page_order`;
+the excluded classes are diagnostics, never evidence. The in-memory
+deletion guard (`scripts/cbz_library_maintenance._archive_content_fingerprint`)
+computes a fresh current-version result and returns `None` when
+`order_resolved` is false. `unresolved_page_order_archive_ids` lists the
+stored unresolved archives.
+
+Not gated, because they are not ordered-content readers in production:
+`dal.ContentSignatureRepository.archives_sharing_digest` /
+`duplicate_digests` have no production caller (tests only, under their own
+`ordered-page` algorithm name); perceptual eligibility, classification and
+relocation repair read a signature's presence, page count or source
+metadata, never its digest or order.
 
 **Digests stay with their member.** `ArchivePageHashRepository.save`
 deletes and reinserts the whole inventory, writing each row and its sha256
@@ -1014,14 +1041,51 @@ rows on `(page_index, entry_name)`, never on the index alone, so rows
 stored under the old order are refused (the existing source-drift error)
 instead of receiving another member's dhash/phash.
 
-**What a deployment leaves stale.** Nothing recomputes stored data. An
-archive holding tied names keeps the rows and content signature written
-under the old order until it is re-saved; any `ordered-page-sha256`
-signature computed under the old order must be recomputed before it is
-compared. The signature algorithm version was not bumped, so a stale and a
-fresh signature are not distinguishable by their columns. Re-saving an
-archive cascades away its perceptual rows (they are not carried across by
-`entry_name`), so a re-inventory of affected archives also costs a V1
-perceptual recompute for them. The re-inventory itself is an operator
-action against production and was not run. The V1 per-page digest
-semantics are unchanged: only which index a page occupies moved.
+**What a deployment leaves stale.** Nothing recomputes stored data, and
+`enqueue_missing` deliberately does not look at the version: re-enqueueing
+every version-`"1"` row would re-inventory the whole library, and each
+re-save cascades away that archive's perceptual rows (they are not carried
+across by `entry_name`), throwing away the V1 backfill. So from deployment
+until the plan below is run, **every existing signature is legacy** and the
+duplicate report, the content audit and near-duplicate generation return
+nothing for it. That is the honest state: those rows were computed under an
+ordering contract this code no longer vouches for.
+
+### Re-certification and re-inventory plan (operator-gated, not run)
+
+Nothing here has been run against production. Each step is a guarded,
+report-first operation of its own: dry run, expected count plus snapshot
+digest, backup before apply, and David's approval.
+
+1. **Identify legacy rows.** `archive_content_signatures` with
+   `algorithm = 'ordered-page-sha256'` and `algorithm_version = '1'`
+   (`signature_evidence_counts()['legacy_ordering_version']`).
+2. **Classify each, read-only, from stored rows.** Only rows still bound
+   to current bytes are candidates (signature source size/mtime equal the
+   current location's). Then, over the archive's stored
+   `archive_pages.entry_name` values:
+   - **order-stable:** no two names tie on `_natural_key` and no name
+     repeats. The old and new orders of those names are identical, so the
+     stored digest *is* the version-`"2"` digest;
+   - **tied:** some names tie on the natural key. The stored order may
+     differ from the new one; the digest must be recomputed;
+   - **unresolved:** some name repeats. It stays unresolved under any
+     version and is excluded either way;
+   - **stale:** not bound to current bytes. Ordinary rehash path.
+3. **Re-certify order-stable rows in place:** set `algorithm_version` to
+   `'2'` after re-checking, in the same transaction, that the stored names
+   and source metadata still match the classification. No file is read,
+   no page row changes, perceptual rows are kept.
+4. **Re-inventory tied (and unresolved) rows:** run `hash_archive_pages`
+   for each. This rewrites page rows and the signature under version
+   `"2"`, cascades their perceptual rows away, and requires the perceptual
+   worker to recompute V1 hashes for exactly those archives. Their count is
+   the cost to report before approval.
+5. **Postflight:** `signature_evidence_counts` shows no
+   `legacy_ordering_version` rows for current locations, and the content
+   audit is re-run for review.
+
+Steps 2 and 3 need a tool that does not exist yet; this PR provides only
+the gate and the counts. The re-inventory itself is an operator action
+against production. The V1 per-page digest semantics are unchanged: only
+which index a page occupies moved.
