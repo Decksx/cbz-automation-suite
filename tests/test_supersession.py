@@ -695,6 +695,28 @@ def test_an_oversized_image_index_is_refused_without_stopping_the_folder(
     assert _family(result, folder, "Series ch. 2 v1.cbz").status == sv.FAMILY_SUPERSESSION
 
 
+@pytest.mark.parametrize("field", ["Count", "Month", "Year"])
+def test_an_oversized_comicinfo_number_cannot_stop_the_folder(tmp_path, database, field):
+    """PR #123: step 4's `comicinfo_facts` used to raise on a 5000-digit
+    Count or Month, which `evaluate_folder` reaches for every archive.
+
+    The hostile document is now inconsistent (ignored as evidence), and an
+    unrelated family in the same folder still supersedes.
+    """
+    hostile = _ci().replace(
+        b"</ComicInfo>", f"<{field}>{_HUGE_INDEX.decode()}</{field}></ComicInfo>".encode()
+    )
+    folder = tmp_path / "huge-field" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": hostile})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": hostile})
+    _book(folder, "Series ch. 2 v1.cbz", [P3])
+    _book(folder, "Series ch. 2 v2.cbz", [P3, P4])
+
+    result = _evaluate(folder, database)
+    assert _family(result, folder, "Series ch. 2 v1.cbz").status == sv.FAMILY_SUPERSESSION
+    assert _family(result, folder, "Series ch. 1 v1.cbz").status == sv.FAMILY_SUPERSESSION
+
+
 def test_a_six_digit_image_index_is_supported(tmp_path, database):
     """Control at the bound: six digits (999999) still match and cover."""
     older = _with(b'<Pages><Page Image="999999" Bookmark="Important"/></Pages>')
