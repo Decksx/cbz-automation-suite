@@ -83,7 +83,9 @@ of A may be dropped only when the caller passes
 ``accept_comicinfo_drop=True`` (operator acceptance, default off); the drop
 is then listed, not silent, and is allowed only when B carries its own
 usable ComicInfo.xml -- well-formed, consistent, not the bare injected
-template (§8 question 6, the conservative reading). Otherwise the relation is downgraded to review,
+template -- that covers every field A's fills (David's #111 decision:
+more comprehensive metadata may replace old, by field coverage, otherwise
+review). Otherwise the relation is downgraded to review,
 listing A's unique members. The **index map** from A's pages to B's is the
 greedy left-to-right walk over B, written into the relation.
 
@@ -135,10 +137,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from comic_automation.archive.archive_limits import UnsafeArchiveError
 from comic_automation.archive.field_resolution import (
+    COMICINFO_ABSENT,
     COMICINFO_EDITED_TEMPLATE,
+    COMICINFO_INCONSISTENT,
     COMICINFO_USABLE,
     FAMILY_ESTABLISHED,
     FAMILY_INCOMPARABLE,
@@ -616,8 +621,8 @@ def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
     Usable means `comicinfo_facts` classifies its ComicInfo member(s) as
     ``usable`` or ``edited_template``: absent, unparseable, contradictory
     (including differing duplicate documents) and the pristine injected
-    template are not. How many fields it must cover is a design decision
-    still open; an empty ``<ComicInfo/>`` is well-formed and counts.
+    template are not. Usability alone does not discharge a drop; the keeper
+    must also cover the dropped document's fields (`comicinfo_fields_missing`).
     """
     return comicinfo_facts(archive.comicinfo_documents).status in (
         COMICINFO_USABLE,
@@ -625,29 +630,81 @@ def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
     )
 
 
+def _nonempty_comicinfo_elements(documents: Sequence[bytes]) -> frozenset[str]:
+    """Local names of every top-level ComicInfo element with non-empty text.
+
+    Every element counts, free text (Notes, Summary) included, by presence
+    only. Called on documents `comicinfo_facts` has already accepted as
+    parseable and consistent, so duplicate members are byte-identical and
+    the first stands for all.
+    """
+    root = ElementTree.fromstring(documents[0])
+    return frozenset(
+        child.tag.rsplit("}", 1)[-1]
+        for child in root
+        if (child.text or "").strip()
+    )
+
+
+def comicinfo_fields_missing(
+    older: DerivedArchive, newer: DerivedArchive
+) -> tuple[str, ...] | None:
+    """The fields of ``older``'s ComicInfo that ``newer``'s does not cover.
+
+    David's decision on #111: more accurate or more comprehensive metadata
+    may replace old metadata, applied mechanically by field coverage,
+    otherwise review. So every element non-empty in ``older``'s document
+    must be non-empty in ``newer``'s; values may differ, since the newer
+    may be the more accurate. Returns () when covered, the sorted missing
+    names otherwise, and None when ``newer`` has no usable ComicInfo at all.
+
+    An ``older`` ComicInfo that is itself unusable as a document --
+    unparseable or internally inconsistent -- has no fields to cover, so a
+    usable keeper covers it. A template-derived ``older`` document parses
+    and is held to coverage like any other.
+    """
+    if not keeper_comicinfo_is_usable(newer):
+        return None
+    older_facts = comicinfo_facts(older.comicinfo_documents)
+    if older_facts.status in (COMICINFO_ABSENT, COMICINFO_INCONSISTENT):
+        return ()
+    covered = _nonempty_comicinfo_elements(newer.comicinfo_documents)
+    needed = _nonempty_comicinfo_elements(older.comicinfo_documents)
+    return tuple(sorted(needed - covered))
+
+
 def _payload(
     older: DerivedArchive, newer: DerivedArchive, accept_comicinfo_drop: bool
-) -> tuple[tuple[NonImageMember, ...], tuple[NonImageMember, ...]]:
-    """(unique, accepted drops): ``older``'s non-image members not in ``newer``."""
+) -> tuple[tuple[NonImageMember, ...], tuple[NonImageMember, ...], str | None]:
+    """(unique, accepted drops, why a ComicInfo drop was refused).
+
+    ``unique`` and the drops are ``older``'s non-image members missing from
+    ``newer``. §8 question 6: with the operator's flag, an older ComicInfo
+    may be dropped only when the archive that supersedes it carries a
+    usable ComicInfo of its own that covers every field the older one
+    fills (`comicinfo_fields_missing`). Otherwise the older metadata is
+    unique payload and the relation goes to review.
+    """
     missing = Counter(older.non_image) - Counter(newer.non_image)
-    # §8 question 6: a ComicInfo may be dropped only when the archive that
-    # supersedes it carries its own, and that one is usable metadata:
-    # well-formed, internally consistent and not the bare injected template
-    # (`field_resolution.comicinfo_facts`). Otherwise the only readable
-    # metadata could be discarded for an unusable document.
-    newer_has_comicinfo = keeper_comicinfo_is_usable(newer)
     unique: list[NonImageMember] = []
     dropped: list[NonImageMember] = []
+    refusal: str | None = None
+    coverage = (
+        comicinfo_fields_missing(older, newer) if accept_comicinfo_drop else None
+    )
     for member in sorted(missing.elements(), key=lambda m: (m.name, m.sha256)):
-        if (
-            accept_comicinfo_drop
-            and newer_has_comicinfo
-            and _is_comicinfo(member.name)
-        ):
-            dropped.append(member)
-        else:
-            unique.append(member)
-    return tuple(unique), tuple(dropped)
+        if accept_comicinfo_drop and _is_comicinfo(member.name):
+            if coverage == ():
+                dropped.append(member)
+                continue
+            refusal = (
+                "the newer archive has no usable ComicInfo.xml of its own"
+                if coverage is None
+                else "the newer archive's ComicInfo.xml does not cover "
+                f"{list(coverage)}"
+            )
+        unique.append(member)
+    return tuple(unique), tuple(dropped), refusal
 
 
 def compare_pair(
@@ -707,12 +764,13 @@ def compare_pair(
         )
     is_prefix = newer.page_digests[: len(older.page_digests)] == older.page_digests
     relation = REL_PREFIX if is_prefix else REL_SUBSEQUENCE
-    unique, dropped = _payload(older, newer, accept_comicinfo_drop)
+    unique, dropped, refusal = _payload(older, newer, accept_comicinfo_drop)
     if unique:
         return Relation(
             older_key, newer_key, relation, OUTCOME_REVIEW,
             "non-image payload unique to the older archive blocks supersession: "
-            + ", ".join(m.name for m in unique),
+            + ", ".join(m.name for m in unique)
+            + (f" (ComicInfo drop refused: {refusal})" if refusal else ""),
             index_map=index_map,
             unique_non_image=unique,
             accepted_comicinfo_drops=dropped,
