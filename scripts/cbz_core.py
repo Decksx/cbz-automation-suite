@@ -637,6 +637,11 @@ def _to_fixpoint(step, text: str) -> str:
     lowers (length, non-space count), and ``2 * len(text) + 2`` passes always
     suffice. Exceeding the bound means some rule broke that argument; it
     raises rather than return a value that is not a fixpoint.
+
+    The argument is about the cleaning rules this module passes in
+    (``_sanitize_pass``, ``_sanitize_core``, the filename and directory
+    passes). It is not a guarantee for an arbitrary *step*: translation, for
+    one, is never run inside this loop.
     """
     limit = 2 * len(text) + 2
     for _ in range(limit):
@@ -690,7 +695,8 @@ def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
     A single pass was not (``"Batman].cC"`` -> ``"Batman.cC"`` -> ``""``,
     design §5.5), so the pass is repeated to its fixpoint; see
     :func:`_to_fixpoint`. Inputs that one pass already left stable clean
-    exactly as before.
+    exactly as before; inputs that a single pass did not settle now clean to
+    their fixpoint, for every caller of this module, not only the watcher.
 
     This is the **identity** cleaner: series-folder lookup and every caller
     outside the watcher's display path use it, so ``Berserk [Judas]`` still
@@ -952,8 +958,10 @@ def clean_directory_name(name: str, rules: set[str] = ALL_RULES) -> str:
     :func:`sanitize` plus stripping of leading/trailing ``#`` and a dangling
     ``part``/``v``/``ch`` stub. Repeated to a fixpoint: stripping one stub
     can expose another (``"Foo ch v"``). Brackets are always stripped here,
-    display tokens included -- series folders keep today's names (§5.5 is
-    about archive names; the design does not name folder display names).
+    display tokens included: the bracket policy for folder names is
+    unchanged (§5.5 is about archive names; the design does not name folder
+    display names). A name a single pass did not settle now cleans to its
+    fixpoint.
     """
     return _to_fixpoint(lambda n: _clean_directory_name_pass(n, rules), name)
 
@@ -1218,10 +1226,12 @@ def parse_comic_name(
     keeps the canonical display tokens of design §5.5 -- ``(YYYY)``,
     ``[vN]``, ``(Edition)`` -- and is a fixpoint of this function. Every
     other field, ``stem`` and ``series`` included, is computed exactly as
-    without it, so ComicInfo, chapter and volume extraction and every other
-    caller are unchanged. The default stays ``False`` because the library
+    without it, so ComicInfo and chapter and volume extraction keep their
+    bracket policy. The default stays ``False`` because the library
     maintenance and sanitizer CLIs use this function on files already in the
-    library, which this change must not rename.
+    library, and the display tokens are for arrivals only. Those callers do
+    see the fixpoint change in :func:`sanitize` for inputs a single pass did
+    not settle.
     """
     raw_series = infer_series_name(path, library_root=library_root)
     series = clean_directory_name(raw_series, rules)
