@@ -959,9 +959,49 @@ def test_a_decided_series_ending_in_the_word_keeps_it_as_series_text():
         assert result.fields["series"].value == "Super Special"
         assert result.family.established
         assert result.renamable
-    assert fr.effective_specials(frozenset({"Special"}), "Super Special") == frozenset()
-    assert fr.effective_specials(frozenset({"Omnibus"}), "Series") == {"Omnibus"}
-    assert fr.effective_specials(frozenset({"Omnibus"}), None) == {"Omnibus"}
+    title = parse_name_tokens("Super Special #001.cbz")
+    assert fr.effective_specials(title, "Super Special") == frozenset()
+    omnibus = parse_name_tokens("Series Omnibus #001.cbz")
+    assert fr.effective_specials(omnibus, "Series") == {"Omnibus"}
+    assert fr.effective_specials(omnibus, None) == {"Omnibus"}
+
+
+@pytest.mark.parametrize("marker", ["Special", "Omnibus", "Extra"])
+def test_an_extra_marker_after_a_title_ending_in_it_is_kept(marker):
+    """PR #119 revision 3 (Codex ``comic119_suffix_probe``).
+
+    In the series "Super <marker>", ``Super <marker> <marker> #001`` is the
+    full title plus a separate marker occurrence, while ``Super <marker>
+    #001`` is the title alone. A rule that only asks whether the decided
+    series ends in the word drops both and makes them one family; the
+    occurrence-aware rule keeps the first marker and refuses.
+    """
+    series = f"Super {marker}"
+    names = (f"{series} {marker} #001 [v1].cbz", f"{series} #001 [v2].cbz")
+    extra = parse_name_tokens(names[0])
+    assert (extra.series, extra.specials) == (series, {marker})
+    assert fr.effective_specials(extra, series) == {marker}
+    assert fr.effective_specials(parse_name_tokens(names[1]), series) == frozenset()
+
+    results = _resolve(
+        *(_archive(n, info=_ci(series=series), pages=_pages("p1")) for n in names)
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("special/collection markers" in r for r in result.family.reasons)
+        assert not result.renamable
+
+
+def test_a_title_containing_a_special_word_is_not_affected():
+    """Control: Special/Extra inside the decided title, no slot word."""
+    names = ("The Special Ones #003 [v1].cbz", "The Special Ones #003 [v2].cbz")
+    results = _resolve(
+        *(
+            _archive(n, info=_ci(series="The Special Ones", number="3"), pages=_pages("p1"))
+            for n in names
+        )
+    )
+    assert all(r.family.established and r.renamable for r in results.values())
 
 
 def test_special_edition_is_an_edition_not_the_special_word():
