@@ -63,13 +63,14 @@ strict xfails are now ordinary passing tests. The fix holds for *unique*
 names only: identical names cannot be ordered and are reported as
 unresolved instead, which ``tests/test_page_order_tie_break.py`` covers.
 
-Also probed, not pinned: ``cbz_core.sanitize``, ``clean_filename`` and
-``clean_directory_name`` are not idempotent either. Minimal examples from
-the same generator: ``"Batman].cC"`` -> ``"Batman.cC"`` -> ``""`` (removing
-the stray bracket exposes something the URL rule then strips) and
-``"&amp#1"``, where each pass unescapes one more level. Whether the
-sanitizer is meant to be a fixpoint is a decision this slice does not
-make, so no test asserts either answer.
+Also probed here, and not pinned here: ``cbz_core.sanitize``,
+``clean_filename`` and ``clean_directory_name`` were not idempotent either.
+Minimal examples from the same generator: ``"Batman].cC"`` ->
+``"Batman.cC"`` -> ``""`` (removing the stray bracket exposes something the
+URL rule then strips) and ``"&amp#1"``, where each pass unescapes one more
+level. Design §5.5 then decided the sanitizer must be a fixpoint, and step 3
+part B made it one; ``tests/test_watcher_canonical_convergence.py`` pins
+both examples and the property.
 
 No production database, no live library, no network. Every fixture is
 synthetic and lives under ``tmp_path``.
