@@ -444,6 +444,10 @@ def _archive_content_fingerprint(cbz_path: Path) -> str | None:
     whatsoever and delete one of them -- deletion justified by the *absence* of
     evidence, which is the same defect the guard exists to prevent.
     `content_duplicate_audit` excludes `page_count = 0` for the same reason.
+
+    Returns None, for the same reason, when two image members share a raw
+    name: their relative order is physical position, not page order
+    (`page_hashing.order_page_entries`), so the digest is not evidence.
     """
     try:
         result = calculate_page_hashes(cbz_path)
@@ -452,6 +456,16 @@ def _archive_content_fingerprint(cbz_path: Path) -> str | None:
         return None
     if not result.pages:
         log.debug("No image pages to fingerprint in %s", cbz_path)
+        return None
+    if not result.order_resolved:
+        # Duplicate image member names: the order among them, and so the
+        # digest, is physical-order noise. Two archives sharing it prove
+        # nothing, so the archive is isolated rather than grouped.
+        log.debug(
+            "Unresolved page order (duplicate names %s) in %s",
+            list(result.duplicate_entry_names),
+            cbz_path,
+        )
         return None
     return result.content_digest
 
