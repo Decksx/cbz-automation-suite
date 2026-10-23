@@ -5,10 +5,13 @@ live file is renamed, moved, or removed by this document. Tracks issue
 #111. Author: claude-lead. Reviewer: codex-lead.
 
 - **First draft:** `de4c757`.
-- **This revision** answers codex-lead's review of that head. It covers
-  five contracts: version-family evidence, current-byte provenance,
-  dependency-aware drift, owned durable recovery, and verified version
-  labels. It also makes two source corrections.
+- **Second draft:** `826c827`, which answered the first review (version
+  family, current-byte provenance, dependency-aware drift, recovery,
+  version labels).
+- **This revision** answers the re-review: receipt-backed ownership,
+  recovery at every durable boundary including the DB commit, and phased
+  family validation with journal-aware resume. It also closes the bracket
+  question and leaves the Syncthing block-reuse claim unmeasured.
 
 ## Operator requirements
 
@@ -23,11 +26,9 @@ All from David, 2026-10-22, in the terminal and recorded on #111 and #112:
 - **The version designation is kept**, written **`[vN]`** (approved). For
   example `Series Name ch. 1 (2019) [v3].cbz`. It can never be read as the
   `v01` volume token.
-- **Bracket stripping and canonical tokens.** David asked for the import
-  sanitizer to stop stripping brackets. Because the same cleaned name drives
-  series matching on import, this design keeps bracket stripping for
-  **identity matching** but preserves canonical tokens in the **display**
-  name. The details are in §5.5 and are pending David's confirmation on #112.
+- **Brackets.** Bracket stripping stays for identity matching, while the
+  display name preserves the canonical tokens (§5.5). Confirmed by David on
+  2026-10-22.
 
 ## Non-goals
 
@@ -310,74 +311,126 @@ precedent for ownership and journalling.
 `apply` requires `--plan`, `--expect-digest`, `--expect-renames` and
 `--expect-families`. David approves that exact digest.
 
-### 5.3 Dependency-aware revalidation
+### 5.3 Dependency-aware revalidation, in phases
 
 Per-row skipping is unsafe for supersession. If keeper B drifts or vanishes
-while A passes its own check, quarantining A would lose pages. So:
+while A passes its own check, quarantining A would lose pages. **The unit of
+action is a family**, and any failure blocks the whole family, whatever the
+run-wide drift fraction. A family runs in three phases:
 
-- **The unit of action is a family**, not a row. Before any removal in a
-  family, `apply` revalidates, in one pass:
-  - the keeper's strong identity and presence at its expected
-    post-rename path;
-  - every candidate's strong identity;
-  - each approved relation, by re-deriving the sequences from the bytes;
-  - that the keeper is not itself scheduled for quarantine by another unit.
-- **Any failure blocks the whole family.** A drifted, missing or
-  unverifiable keeper blocks all its dependants, whatever the run-wide drift
-  fraction.
-- **When to revalidate:** immediately before the family's first action,
-  after every lock wait, and again at each batch boundary.
-- **An ordinary rename** is its own unit, revalidated against its source
-  strong identity.
-- **Ordering inside a family:** the keeper's rename (if any) is applied and
-  confirmed before any dependant is quarantined. An interruption between
-  them leaves the family resumable, never half-quarantined against a keeper
-  that never landed.
-- **A run-wide drift fraction** still stops the run early. It is an
-  additional stop, never a substitute for per-family revalidation.
+1. **Initial validation.** This happens before any action in the family.
+   Every member, keeper included, is checked at its **approved current
+   location** against its strong identity. Each approved relation is
+   re-derived from the bytes. The check also confirms that no other unit
+   schedules the keeper for quarantine.
+2. **Keeper rename.** This applies only if the plan renames the keeper. It
+   is performed and **confirmed** (§5.4) before anything else. Then the
+   keeper is **freshly validated at its resulting path**: its strong
+   identity, and its sequence re-derived.
+3. **Dependant quarantines.** Before each quarantine, the keeper is
+   re-validated at its current path and the candidate at its current
+   location.
+
+**Revalidation also happens** after every lock wait and at each batch
+boundary.
+
+**On resume** (§5.4), each member is validated at its **journal-proven
+current location**:
+- the approved path when no owned action has moved it;
+- the confirmed destination when one has, including an already-owned
+  quarantine location.
+
+Members are not required to still sit at their original paths. A family
+whose journal shows dependants already quarantined continues with the
+remaining ones only after re-validating the keeper.
+
+**Ordinary renames** are single-member units, validated against the source
+strong identity. A run-wide drift fraction still stops the run early, as an
+**additional** stop and never a substitute.
 
 ### 5.4 Owned, durable recovery
 
-**Ownership.** A run is an **attempt** with a unique id. Mutations are
-exclusive while it runs: there is one attempt lock, and the watcher and the
-other mutators are quiesced for the target library roots, using the
-existing series-lock and operator-mode mechanisms.
+This follows the accepted staging design #103 §B4: **content equality is
+not ownership**. A destination is this attempt's only when the attempt holds
+a **durable receipt** for that step **and** fresh content verification
+agrees. Without the receipt, an existing destination is **ambiguous even if
+byte-identical** to the source.
 
-**Journal.** The journal is an append-only file, one per attempt, written
-with `fsync` per record. A file journal and a SQLite row cannot share a
-transaction, so the protocol is ordered and idempotent instead. For each
-action:
+**Ownership and quiescence.** A run is an **attempt** with a unique id.
 
-1. **Intent record:** the attempt id, the action id, the source strong
-   identity, and the old, temp (if any), new or quarantine paths, with
-   expected bytes. Fsynced.
-2. **Filesystem step** with `os.rename`, which on Windows **refuses an
-   existing destination**. That refusal is the execution-time occupancy
-   check, never `os.replace`. A case-only rename is two steps: old → owned
-   temp `<new>.<attempt>.tmp`, then temp → new. Each step has its own intent
-   and done records.
-3. **Done record** for the filesystem step. Fsynced.
-4. **Database update** (`file_locations` and any pairing record) as a
-   **conditional** update, `UPDATE … WHERE path = <old> AND <identity
-   matches>`. It must affect exactly one row, otherwise it stops.
-5. **Confirmed record.** Fsynced.
+- **The attempt lock:** one lock file, `O_EXCL`-created, holding the
+  attempt id and pid. Mutators and the watcher are quiesced for the target
+  library roots, using the existing series-lock and operator-mode
+  mechanisms.
+- **Recovery and undo reacquire** the attempt lock and re-verify quiescence
+  before touching anything. A crashed process no longer holds its lock.
+  - **A stale lock** is taken over only after its pid is proven dead, and
+    the takeover is journalled.
+  - **A live other holder** stops recovery.
 
-**Recovery** walks each incomplete action and **verifies ownership by
-content**: the full-file hash at the destination must equal the intent's
-source strong identity.
+**Journal.** The journal is an append-only file per attempt. Each record
+carries the attempt id, the action id and a sequence number, and is fsynced.
+A file journal and a SQLite transaction cannot be one transaction, so the
+database carries its own durable marker.
 
-| State found | Resolution |
-|---|---|
-| source present, destination absent | not done; may be retried |
-| destination present **with the intended identity**, source absent | filesystem step done; finish the database update and confirm |
-| destination present with **any other identity** | a foreign occupant: stop, never touch it |
-| both present, or neither | stop for the operator |
+**The step protocol.** It runs per filesystem step. A case-only rename has
+two steps, old → `<new>.<attempt>.tmp` → new, and each step runs the whole
+protocol.
 
-The same matrix covers the temp step of a case-only rename and quarantine
-moves.
+1. **`intent`** (journal). Contents: the source path and strong identity;
+   the destination path; the action kind (rename, temp, or quarantine).
+   Fsynced.
+2. **Filesystem step:** `os.rename(src, dst)`. On Windows this **refuses an
+   existing destination**, which is the execution-time occupancy check;
+   `os.replace` is never used.
+3. **`done` receipt** (journal). Fsynced. This is the ownership receipt for
+   the destination.
+4. **Database transaction.** In **one** SQLite transaction:
+   - a conditional update of the `file_locations` row and of any pairing
+     record (§5.6), each matched on its stable id **and** its preimage path
+     (`WHERE id = ? AND path = <old>`), each required to affect exactly one
+     row;
+   - an insert of a `rename_attempt_steps` row keyed by `(attempt_id,
+     action_id, step)`, carrying the preimage and postimage paths.
 
-**Undo** replays confirmed actions in reverse, with the same ownership
-verification. It refuses foreign occupants and drifted files.
+   The marker row commits atomically with the path updates. So the database
+   itself records whether this step's update has landed.
+5. **`confirmed`** (journal). Fsynced.
+
+**Recovery matrix.** For each step of each incomplete action, recovery reads
+three things: the journal's last record for the step, the presence and
+fresh content of source and destination, and the DB marker row with the
+current path rows.
+
+| Journal | DB marker | Filesystem (fresh content check) | Resolution |
+|---|---|---|---|
+| none | — | — | nothing to do |
+| `intent` only | absent | source present with the intended identity, destination absent | not done. **Re-verify the source** identity; retry, or abandon |
+| `intent` only | absent | source changed | refuse; operator |
+| `intent` only | absent | destination present (any content), source absent | **ambiguous**: no receipt, so even identical bytes are not owned. Operator |
+| `intent` only | absent | both present, or neither | operator |
+| `done` | absent | destination present, intended identity; source absent | owned. Run step 4 (the preimage CAS still matches) |
+| `done` | absent | destination missing or changed | refuse; operator |
+| `done` | present | destination present, intended identity | DB already committed. Verify the postimage rows; write `confirmed` |
+| `done` / `confirmed` | present | path rows match neither preimage nor postimage, or are partial | refuse; operator |
+| `confirmed` | present | destination intended identity | complete; nothing to do |
+
+**Repeated recovery** is idempotent: each resolution only advances to the
+next row of the matrix, and re-running recovery on a fully resolved attempt
+does nothing.
+
+**Case-only renames** are recovered step by step. The temp step's
+destination is the owned temp name, so its DB postimage is the temp path.
+A crash between the two steps therefore leaves a consistent row (path =
+temp) that the second step's CAS then moves on.
+
+**Quarantine moves** use the same protocol, with the quarantine path as the
+destination.
+
+**Undo** is a new attempt, with its own lock and journal, that replays
+confirmed steps in reverse through the same protocol. Each reverse step
+requires the forward step's `confirmed` receipt, fresh content verification
+at the forward destination, and the DB postimage. Anything else is refused.
 
 **Volumes and quarantine.** Renames never cross volumes. Supersession
 removals are owned moves into a dated quarantine on the same volume.
@@ -391,17 +444,16 @@ Nothing is deleted, and retention is David's decision.
 - **The formatter must be a fixpoint.** `cbz_core.sanitize` and its
   `clean_*` helpers were probed as non-idempotent
   (`"Batman].cC"` → `"Batman.cC"` → `""`).
-- **Brackets, per David's request.** The `"brackets"` rule
-  (`_BRACKET_RE = \[[^\]]*\]|\([^)]*\)`) removes `(2019)`, `(Uncensored)`
-  and `[v3]`. Proposed (pending David's confirmation):
-  - Bracket stripping stays for **identity matching**. Otherwise
-    `Berserk [Judas]` would miss the existing `Berserk` folder and split
-    the series.
-  - The **display** name preserves canonical tokens: `(YYYY)`, `[vN]`, and
+- **Brackets, confirmed by David on 2026-10-22** (PR #112 comment, hive
+  #2175). The `"brackets"` rule (`_BRACKET_RE = \[[^\]]*\]|\([^)]*\)`):
+  - **Stays for identity matching.** Otherwise `Berserk [Judas]` would miss
+    the existing `Berserk` folder and split the series.
+  - **The display name preserves canonical tokens:** `(YYYY)`, `[vN]`, and
     the §2.1 edition list.
-  - Scanlator and source tags (`[Group]`, `(Digital)`) are still dropped.
-  - Tested by an arrival tagged `[Group]` still resolving to the existing
-    series.
+  - **Scanlator and source tags** (`[Group]`, `(Digital)`) are still
+    dropped.
+  - **Tested** by an arrival tagged `[Group]` still resolving to the
+    existing series.
 
 ### 5.6 Other interactions
 
@@ -414,8 +466,13 @@ Nothing is deleted, and retention is David's decision.
   step 4 of §5.4. A rename must never orphan it.
 - **Syncthing / #108.** Renames change the paths #108 maps, so the #108
   preview is generated **after** renames from fresh evidence, never reused.
-  Syncthing's ability to reuse blocks for renamed files is to be
-  **confirmed** by #108's own preview and verifier, not assumed here.
+  - **Block reuse is unmeasured.** Whether Syncthing reuses blocks for
+    renamed files, and how much it writes, is a **performance expectation
+    only**.
+  - **#108 cannot measure it.** #108's read-only filesystem contract
+    verifies logical paths and bytes, not block reuse or disk-write volume.
+  - **Who measures it.** If the claim ever matters for a decision, it needs
+    a separate measurement with its own owner. Nothing here relies on it.
 
 ## 6. Order of work
 
@@ -493,6 +550,16 @@ Apply, drift and recovery:
 - `test_quarantine_move_crash_at_each_boundary_resolves`
 - `test_db_update_is_conditional_and_stops_unless_one_row`
 - `test_undo_reverses_confirmed_actions_and_refuses_drifted_files`
+- `test_foreign_identical_target_without_receipt_is_ambiguous`
+- `test_crash_after_rename_before_done_receipt_is_ambiguous`
+- `test_a_changed_source_is_refused_before_retry`
+- `test_crash_after_db_commit_before_confirmation_recovers_from_the_marker`
+- `test_repeated_recovery_is_idempotent`
+- `test_location_and_pairing_updates_commit_atomically`
+- `test_case_only_temp_step_has_its_own_db_postimage_and_undo`
+- `test_recovery_reacquires_the_lock_and_refuses_a_live_holder`
+- `test_a_new_family_whose_keeper_needs_renaming_validates_in_phases`
+- `test_crash_after_the_first_of_several_dependant_quarantines_resumes`
 
 ## 8. Open questions
 
@@ -501,7 +568,6 @@ Apply, drift and recovery:
 2. **Quarantine retention** for superseded versions (§5.4).
 3. **Komga.** Is a read-progress reset acceptable, once measured (§5.6)?
 4. **Closed lists.** The specials and edition vocabularies (§2.1, §2.2).
-5. **Brackets.** Does David confirm the identity/display split of §5.5, or
-   want bracket stripping fully off despite the series-split risk?
+5. ~~Brackets~~: **closed** on 2026-10-22. David confirmed the §5.5 split.
 6. **Dropping ComicInfo.** May a superseded member's ComicInfo.xml be
    dropped when the keeper carries its own (§4.4)?
