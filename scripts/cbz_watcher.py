@@ -38,28 +38,53 @@ from scripts.cbz_lock_order import (
 try:
     from scripts.cbz_core import (
         ParsedComicName,
+        append_display_tokens,
         clean_directory_name,
         clean_filename,
+        decensor_tokens_as_words,
+        display_tokens_for,
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
         normalise_archive_key,
         parse_comic_name,
+        sanitize_without_markers,
         series_base_name,
         update_comicinfo_xml,
     )
 except ModuleNotFoundError:
     from cbz_core import (  # type: ignore[no-redef]
         ParsedComicName,
+        append_display_tokens,
         clean_directory_name,
         clean_filename,
+        decensor_tokens_as_words,
+        display_tokens_for,
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
         normalise_archive_key,
         parse_comic_name,
+        sanitize_without_markers,
         series_base_name,
         update_comicinfo_xml,
+    )
+
+# The canonical formatter (design §5.5): fallback names are formatted by it,
+# not assembled here, so arrivals and the canonical-naming plan cannot drift.
+try:
+    from scripts.cbz_canonical_name import (
+        CANONICAL_EXTENSION,
+        CanonicalFields,
+        CanonicalNameError,
+        format_canonical_name,
+    )
+except ModuleNotFoundError:
+    from cbz_canonical_name import (  # type: ignore[no-redef]
+        CANONICAL_EXTENSION,
+        CanonicalFields,
+        CanonicalNameError,
+        format_canonical_name,
     )
 
 # ─────────────────────────────────────────────
@@ -824,7 +849,10 @@ def process_cbz_file(
     # parse_comic_name runs the full normalisation pipeline:
     #   sanitize → strip leading nums → normalize_stem → normalise_number_tokens
     # This is the single authoritative source for filename and ComicInfo fields.
-    parsed   = parse_comic_name(cbz_path)
+    # display_tokens: the new name keeps (YYYY), [vN] and edition tokens while
+    # group/source tags are still dropped (design §5.5); ComicInfo fields and
+    # the series identity are computed exactly as before.
+    parsed   = parse_comic_name(cbz_path, display_tokens=True)
     new_name = override_name if override_name is not None else parsed.filename
 
     if new_name != cbz_path.name:
@@ -982,15 +1010,28 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     Treats files that differ only by spacing or punctuation as the same book
     (e.g. "Series Ch.1" and "Series Ch. 1"), so the merge keeps one copy instead
     of letting both cosmetic variants survive. Returns None when none match.
+
+    A ``(Uncensored)``/``(Decensored)`` display token compares as the bare word
+    that every name before design §5.5 carried, so a decensored re-arrival
+    still meets its earlier copy. The other display tokens -- year, version,
+    edition -- stay in the key on purpose: a match here moves the incoming
+    bytes under the *existing* name, and a [v3] stored as "... [v2]" would be
+    a wrong version label (§4.6). Differing tokens therefore land side by side
+    for the supersession plan to judge, rather than replace each other here.
     """
     if not target_dir.is_dir():
         return None
-    key = normalise_archive_key(stem)
+    key = _archive_collision_key(stem)
     for existing in target_dir.iterdir():
         if existing.is_file() and existing.suffix.lower() in {".cbz", ".cbr"}:
-            if normalise_archive_key(existing.stem) == key:
+            if _archive_collision_key(existing.stem) == key:
                 return existing
     return None
+
+
+def _archive_collision_key(stem: str) -> str:
+    """The book-identity key ``_find_archive_collision`` compares."""
+    return normalise_archive_key(decensor_tokens_as_words(stem))
 
 
 # A stem is a "placeholder" name — carrying no information of its own — when
@@ -1007,15 +1048,59 @@ _PLACEHOLDER_STEM_RE = re.compile(
 )
 
 
+def _fallback_display_stem(
+    series_name: str, chapter: str | None, source_stem: str
+) -> str:
+    """The stem a fallback-named archive gets, via the canonical formatter.
+
+    The fields are the resolved series folder and the chapter number the
+    enclosing folder implied -- folder context, the third source in design
+    §3.1, not name evidence -- plus the display tokens of the archive's own
+    name (``source_stem``): its ``(YYYY)``, ``(Edition)`` and ``[vN]``.
+
+    A ``[vN]`` is passed as the version because §4.6 allows a label taken
+    from the archive's *own* name when the marker is unambiguous, and the
+    bracketed form is the one spelling that can never read as a volume. A
+    bare ``v<N>`` is never a token, so it can never arrive here as either.
+
+    When the formatter refuses -- two years, editions or versions, a series
+    name that ends in a name token, a reserved or over-long name -- the
+    pre-§5.5 name (``"<series> Ch. <n>"`` or the bare series) is kept, with
+    the tokens appended so none is lost. Nothing is guessed to make the
+    fields fit.
+    """
+    legacy = f"{series_name} Ch. {chapter}" if chapter else series_name
+    # A decensor word the folder name already carries is not repeated as an
+    # edition: the rule append_display_tokens and preserve_decensor_markers
+    # apply, taken from the same function.
+    tokens = display_tokens_for(series_name, source_stem)
+    editions = tokens.editions
+    if len(tokens.years) <= 1 and len(editions) <= 1 and len(tokens.versions) <= 1:
+        try:
+            name = format_canonical_name(CanonicalFields(
+                series=series_name,
+                chapter=chapter,
+                year=tokens.years[0] if tokens.years else None,
+                edition=editions[0] if editions else None,
+                version=tokens.versions[0] if tokens.versions else None,
+            ))
+        except CanonicalNameError:
+            pass
+        else:
+            return name[: -len(CANONICAL_EXTENSION)]
+    return append_display_tokens(legacy, source_stem)
+
+
 def _apply_fallback_naming(
     parsed_by_path: dict[Path, ParsedComicName],
     series_name: str,
     dir_number: str | None,
 ) -> None:
     """Rename placeholder-named files (see ``_PLACEHOLDER_STEM_RE``) to the
-    resolved series name, appending the chapter number implied by the
-    enclosing directory (``dir_number``, from ``_resolve_series_dir_name``)
-    when one was found.
+    resolved series name, with the chapter number implied by the enclosing
+    directory (``dir_number``, from ``_resolve_series_dir_name``) when one was
+    found. The name comes from the canonical formatter
+    (``_fallback_display_stem``): ``Series ch. 4 (2019) (Uncensored) [v2]``.
 
     Without this, files that arrive with an uninformative, group-generic name
     and no chapter number of their own (e.g. every release from a given
@@ -1023,17 +1108,28 @@ def _apply_fallback_naming(
     different issues, silently colliding — and one being discarded — when
     their directories are later merged into the same series folder.
 
+    A placeholder is recognised on the cleaned stem as before, or on the
+    archive name with every bracketed block removed, so a display token such
+    as ``(Uncensored)`` cannot hide one. ``dir_number`` is always a chapter
+    here: a folder named with a volume (``v3``, ``Vol. 3``) makes
+    ``parsed.volume`` non-empty, and those archives are skipped, as before.
+
     Mutates *parsed_by_path* in place so later lookups by the caller see the
     renamed path.
     """
     for cbz, parsed in list(parsed_by_path.items()):
         if not cbz.exists() or parsed.chapter or parsed.volume:
             continue
-        if not _PLACEHOLDER_STEM_RE.match(parsed.stem):
+        if not (
+            _PLACEHOLDER_STEM_RE.match(parsed.stem)
+            or _PLACEHOLDER_STEM_RE.match(sanitize_without_markers(cbz.stem))
+        ):
             continue
 
+        # The ComicInfo title keeps the pre-§5.5 form; only the file name
+        # carries the display tokens (see ParsedComicName).
         new_stem = f"{series_name} Ch. {dir_number}" if dir_number else series_name
-        new_name = new_stem + cbz.suffix
+        new_name = _fallback_display_stem(series_name, dir_number, cbz.stem) + cbz.suffix
         if new_name == cbz.name:
             continue
 
@@ -1065,6 +1161,11 @@ def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
     numbering was known, see ``_apply_fallback_naming``) as "Ch. 1" so both chapters
     end up with distinct, stable names instead of one being liable to collide with —
     and be silently discarded in favour of — the other.
+
+    The "Ch. 1" name is formatted like every fallback name
+    (``_fallback_display_stem``), so a backfilled first chapter and the
+    fallback-named second one share one spelling. This renames only what it
+    renamed before; only the target spelling changed.
     """
     if not dest_dir.is_dir():
         return
@@ -1074,7 +1175,9 @@ def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
             continue
         if normalise_archive_key(existing.stem) != bare_key:
             continue
-        target = existing.with_name(f"{series_name} Ch. 1{existing.suffix}")
+        target = existing.with_name(
+            _fallback_display_stem(series_name, "1", existing.stem) + existing.suffix
+        )
         if target.exists():
             return
         existing.rename(target)
