@@ -928,15 +928,20 @@ def test_a_special_word_outside_the_slot_is_series_text(filename, series):
 
 
 def test_the_slot_still_recognises_a_trailing_special():
+    """A trailing run of vocabulary words is kept whole as candidates; the
+    decided series says how much of it is title text."""
     tokens = parse_name_tokens("Series Omnibus Special #001.cbz")
-    assert (tokens.series, tokens.specials) == ("Series Omnibus", {"Special"})
+    assert tokens.series == "Series"
+    assert tokens.marker_run == (("special", "Omnibus"), ("special", "Special"))
+    assert fr.effective_markers(tokens, "Series Omnibus").specials == {"Special"}
+    assert fr.effective_markers(tokens, "Series").specials == {"Omnibus", "Special"}
     assert parse_name_tokens("Series One-shot.cbz").specials == {"One-shot"}
 
 
 def test_a_bare_edition_phrase_does_not_hide_the_special_slot():
-    """The canonical order is series, special, numbering, then edition; a
-    bare edition phrase before the number is blanked so it neither joins
-    the series text nor takes the slot from a real special."""
+    """A bare edition phrase before the number is a candidate in the
+    trailing run, not deleted: it neither joins the series text by default
+    nor hides a special slot before it."""
     tokens = parse_name_tokens("Series Omnibus Special Edition #001.cbz")
     assert tokens.editions == {"Special Edition"}
     assert (tokens.series, tokens.specials) == ("Series", {"Omnibus"})
@@ -960,10 +965,10 @@ def test_a_decided_series_ending_in_the_word_keeps_it_as_series_text():
         assert result.family.established
         assert result.renamable
     title = parse_name_tokens("Super Special #001.cbz")
-    assert fr.effective_specials(title, "Super Special") == frozenset()
+    assert fr.effective_markers(title, "Super Special").specials == frozenset()
     omnibus = parse_name_tokens("Series Omnibus #001.cbz")
-    assert fr.effective_specials(omnibus, "Series") == {"Omnibus"}
-    assert fr.effective_specials(omnibus, None) == {"Omnibus"}
+    assert fr.effective_markers(omnibus, "Series").specials == {"Omnibus"}
+    assert fr.effective_markers(omnibus, None).specials == {"Omnibus"}
 
 
 @pytest.mark.parametrize("marker", ["Special", "Omnibus", "Extra"])
@@ -979,9 +984,11 @@ def test_an_extra_marker_after_a_title_ending_in_it_is_kept(marker):
     series = f"Super {marker}"
     names = (f"{series} {marker} #001 [v1].cbz", f"{series} #001 [v2].cbz")
     extra = parse_name_tokens(names[0])
-    assert (extra.series, extra.specials) == (series, {marker})
-    assert fr.effective_specials(extra, series) == {marker}
-    assert fr.effective_specials(parse_name_tokens(names[1]), series) == frozenset()
+    assert extra.series == "Super"
+    assert extra.marker_run == (("special", marker), ("special", marker))
+    assert fr.effective_markers(extra, series).specials == {marker}
+    plain = parse_name_tokens(names[1])
+    assert fr.effective_markers(plain, series).specials == frozenset()
 
     results = _resolve(
         *(_archive(n, info=_ci(series=series), pages=_pages("p1")) for n in names)
@@ -1002,6 +1009,263 @@ def test_a_title_containing_a_special_word_is_not_affected():
         )
     )
     assert all(r.family.established and r.renamable for r in results.values())
+
+
+# --- the title/marker boundary (PR #119 revision 4) ---------------------------
+
+
+def test_a_title_that_is_an_edition_word_keeps_its_special_slot():
+    """Codex probe: #118 formats ``English Omnibus #001 [v1]`` and
+    ``English #001 [v2]``. With ComicInfo Series "English" the first is an
+    Omnibus; "English" is title text, never deleted as an edition."""
+    from scripts.cbz_canonical_name import CanonicalFields, format_canonical_name
+
+    names = (
+        format_canonical_name(CanonicalFields("English", special="Omnibus", issue=1, version=1)),
+        format_canonical_name(CanonicalFields("English", issue=1, version=2)),
+    )
+    assert names == ("English Omnibus #001 [v1].cbz", "English #001 [v2].cbz")
+    first = parse_name_tokens(names[0])
+    assert (first.series, first.marker_run) == ("English", (("special", "Omnibus"),))
+    assert first.editions == frozenset()
+    results = _resolve(
+        *(_archive(n, info=_ci(series="English"), pages=_pages("p1")) for n in names)
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert not result.renamable
+
+
+def test_a_legacy_title_that_is_an_edition_word_keeps_its_special_slot():
+    names = ("English Omnibus ch1 v1.cbz", "English ch1 v2.cbz")
+    assert not any(parse_name_tokens(n).canonical for n in names)
+    results = _resolve(
+        *(_archive(n, info=_ci(series="English"), pages=_pages("p1")) for n in names)
+    )
+    assert all(r.family.status == fr.FAMILY_REFUSED for r in results.values())
+
+
+def test_an_edition_word_inside_a_title_is_title_text():
+    tokens = parse_name_tokens("English Lessons ch1.cbz")
+    assert (tokens.series, tokens.editions, tokens.marker_run) == (
+        "English Lessons", frozenset(), ()
+    )
+
+
+def test_a_title_ending_in_an_edition_word_is_not_an_edition_difference():
+    """Edition counterpart of the "Super Special" control: in the series
+    "Big English", ``Big English #001 [v1]`` carries no English edition, so
+    it is one family with ``Big #001 [v2]``. The family uses the placed
+    reading, not the name-only one."""
+    names = ("Big English #001 [v1].cbz", "Big #001 [v2].cbz")
+    assert parse_name_tokens(names[0]).editions == {"English"}  # name-only
+    results = _resolve(
+        *(_archive(n, info=_ci(series="Big English"), pages=_pages("p1")) for n in names)
+    )
+    assert all(r.family.established and r.renamable for r in results.values())
+
+
+def test_an_edition_after_the_numbering_is_a_marker():
+    """After the numbering the title has ended, so a bare edition word
+    there is a marker: an Uncensored v1 is a decensor pair with a plain v2,
+    not its version."""
+    tokens = parse_name_tokens("Series ch. 1 Uncensored v1.cbz")
+    assert tokens.fixed_editions == {"Uncensored"} and tokens.other_tags == set()
+    results = _resolve(
+        _archive("Series ch. 1 Uncensored v1.cbz", info=_ci(), pages=_pages("p1")),
+        _archive("Series ch. 1 v2.cbz", info=_ci(), pages=_pages("p1")),
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("decensor pair" in r for r in result.family.reasons)
+
+
+def test_an_unplaceable_marker_run_is_refused_for_review():
+    """No split of ``Series Omnibus`` equals the decided series "Berserk",
+    so whether Omnibus is a marker cannot be established: it is kept, the
+    family is refused, and the archive goes to review."""
+    names = ("Series Omnibus #001 [v1].cbz", "Series Omnibus #001 [v2].cbz")
+    results = _resolve(
+        *(_archive(n, info=_ci(series="Berserk"), pages=_pages("p1")) for n in names)
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("title text or markers" in r for r in result.family.reasons)
+        assert any("title text or markers" in r for r in result.review)
+        assert not result.renamable
+
+
+def test_marker_comparison_does_not_strip_decensor_words():
+    """`title_key` keeps "Uncensored", so "Series Uncensored" decided as
+    the series "Series" reads the word as a marker, not title text."""
+    tokens = parse_name_tokens("Series Uncensored #001.cbz")
+    reading = fr.effective_markers(tokens, "Series")
+    assert reading.editions == {"Uncensored"} and reading.ambiguity is None
+    assert fr.effective_markers(tokens, "Series Uncensored").editions == frozenset()
+
+
+# The formatter round-trip matrix. Series include every vocabulary word as a
+# title; the formatter refuses titles ending in a special word ("Omnibus",
+# "Super Special"), and those combinations are skipped and counted.
+_MATRIX_SERIES = (
+    "Series", *fr.EDITION_VOCABULARY, *fr.SPECIAL_VOCABULARY,
+    "Super Special", "The Special Ones", "Extra Life",
+)
+_MATRIX_NUMBERING = {
+    "issue": {"issue": 1},
+    "chapter": {"chapter": 1},
+    "volume+issue": {"volume": 1, "issue": 1},
+}
+
+
+def _matrix():
+    """{(series, numbering): {(special, edition, version): name}}, skipped."""
+    from scripts.cbz_canonical_name import (
+        CanonicalFields,
+        CanonicalNameError,
+        format_canonical_name,
+    )
+
+    names: dict = {}
+    skipped = 0
+    for series in _MATRIX_SERIES:
+        for numbering, numbers in _MATRIX_NUMBERING.items():
+            for special in (None, *fr.SPECIAL_VOCABULARY):
+                for edition in (None, *fr.EDITION_VOCABULARY):
+                    for version in (1, 2):
+                        try:
+                            name = format_canonical_name(CanonicalFields(
+                                series, special=special, edition=edition,
+                                version=version, **numbers,
+                            ))
+                        except CanonicalNameError:
+                            skipped += 1
+                            continue
+                        names.setdefault((series, numbering), {})[
+                            (special, edition, version)
+                        ] = name
+    return names, skipped
+
+
+_NAMES, _SKIPPED = _matrix()
+
+
+def test_the_formatter_matrix_size_is_recorded():
+    """20 series x 9 specials x 9 editions x 3 numberings x 2 versions =
+    9720 combinations; the formatter refuses the 9 series ending in a
+    special word (8 SPECIAL_WORDS and "Super Special"), 4374 in all."""
+    accepted = sum(len(v) for v in _NAMES.values())
+    assert (accepted, _SKIPPED) == (5346, 4374)
+    assert {series for series, _ in _NAMES} == {
+        "Series", *fr.EDITION_VOCABULARY, "The Special Ones", "Extra Life",
+    }
+
+
+def test_every_formatter_name_round_trips_through_the_tokens():
+    """(a) The candidates recover the formatter's series, special, edition,
+    number and version for every accepted name, through both readings."""
+    for (series, numbering), variants in _NAMES.items():
+        for (special, edition, version), name in variants.items():
+            tokens = parse_name_tokens(name)
+            assert tokens.canonical, name
+            legacy = fr._legacy_tokens(name)
+            for field in (
+                "series", "marker_run", "fixed_editions", "chapters", "issues",
+                "v_tokens", "volume_words", "version_markers", "other_tags",
+                "chapter_spellings", "issue_spellings", "v_token_spellings",
+            ):
+                assert getattr(legacy, field) == getattr(tokens, field), (name, field)
+            reading = fr.effective_markers(tokens, series)
+            assert reading.ambiguity is None, name
+            assert reading.specials == ({special} if special else set()), name
+            assert reading.editions == ({edition} if edition else set()), name
+            assert tokens.version_markers == (str(version),), name
+            if numbering == "chapter":
+                assert (tokens.chapters, tokens.issues) == (("1",), ()), name
+            else:
+                assert (tokens.issues, tokens.chapters) == (("1",), ()), name
+            assert tokens.v_tokens == (("1",) if numbering == "volume+issue" else ())
+
+
+def _matrix_pair(series, numbering, first, second):
+    info = {"Volume": "1"} if numbering == "volume+issue" else {}
+    names = (first, second)
+    return _resolve(
+        *(_archive(n, info=_ci(series=series, **info), pages=_pages("p1")) for n in names)
+    )
+
+
+def test_formatter_pairs_differing_in_special_or_edition_are_refused():
+    """(b) Through comicinfo_facts + resolve_folder with ComicInfo Series
+    equal to the decided series: identical markers establish a family;
+    a pair differing in special or edition is refused.
+
+    Exhaustive for identical pairs and for every variant against the
+    unmarked baseline in both directions; other differing pairs are a
+    seeded sample of 2000. Identical volume+issue pairs establish but go to
+    review: the bare v01 has volume (ComicInfo) and version (family)
+    evidence, which §3.2 leaves unresolved. Identical pairs for the titles
+    "Uncensored" and "Decensored" are refused outright: `series_key`
+    strips those words, so the title has no identity key.
+    """
+    import random
+
+    rng = random.Random(119)
+    counts = {
+        "identical": 0, "baseline": 0, "sampled": 0, "review": 0, "empty_key": 0,
+    }
+    differing: list = []
+    for (series, numbering), variants in _NAMES.items():
+        keys = sorted({(s, e) for s, e, _ in variants}, key=repr)
+        for special, edition in keys:
+            results = _matrix_pair(
+                series, numbering,
+                variants[(special, edition, 1)], variants[(special, edition, 2)],
+            )
+            counts["identical"] += 1
+            if series in ("Uncensored", "Decensored"):
+                # series_key strips these words, so the title has no
+                # identity key at all and no family can be established.
+                for result in results.values():
+                    assert result.family.status == fr.FAMILY_REFUSED
+                    assert "members' series key is empty (no identity)" in (
+                        result.family.reasons
+                    )
+                counts["empty_key"] += 1
+            else:
+                for result in results.values():
+                    assert result.family.established, result.filename
+                    if numbering == "volume+issue":
+                        assert not result.renamable
+                        counts["review"] += 1
+                    else:
+                        assert result.renamable, result.filename
+            if (special, edition) != (None, None):
+                for a, b in (((special, edition), (None, None)),
+                             ((None, None), (special, edition))):
+                    results = _matrix_pair(
+                        series, numbering, variants[(*a, 1)], variants[(*b, 2)]
+                    )
+                    counts["baseline"] += 1
+                    assert all(
+                        r.family.status == fr.FAMILY_REFUSED for r in results.values()
+                    ), (series, numbering, a, b)
+            differing += [
+                (series, numbering, (special, edition), other)
+                for other in keys
+                if other != (special, edition)
+            ]
+    for series, numbering, a, b in rng.sample(differing, 2000):
+        variants = _NAMES[(series, numbering)]
+        results = _matrix_pair(series, numbering, variants[(*a, 1)], variants[(*b, 2)])
+        counts["sampled"] += 1
+        assert all(
+            r.family.status == fr.FAMILY_REFUSED for r in results.values()
+        ), (series, numbering, a, b)
+    assert counts == {
+        "identical": 2673, "baseline": 5280, "sampled": 2000,
+        "review": 1458, "empty_key": 486,
+    }
 
 
 def test_special_edition_is_an_edition_not_the_special_word():
