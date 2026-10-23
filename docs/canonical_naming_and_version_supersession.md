@@ -555,11 +555,19 @@ code takes. They are open to review.
    family until it has been inventoried.
 2. **Rows that are not comparable evidence are stale**, even when their
    digests match the bytes. This covers legacy ordering contract `"1"`, an
-   unresolved stored order, and an incomplete inventory.
+   unresolved stored order, and an incomplete inventory. The refusal
+   reason says the rows fail the required contract. It does not claim
+   their bytes differ, which is a separate reason.
 3. **Dropping ComicInfo (§8 question 6, conservative reading).** With
    `accept_comicinfo_drop` (default off), A's ComicInfo.xml may be dropped
-   only when B carries its own ComicInfo.xml. Otherwise the relation goes
-   to review as before. An accepted drop is listed in the relation.
+   only when B carries its own **usable** ComicInfo.xml. Usable means
+   `field_resolution.comicinfo_facts` reads it as `usable` or
+   `edited_template`. A missing, malformed or contradictory document (for
+   example two differing ComicInfo members) does not qualify, and nor does
+   the bare injected template. Otherwise the relation goes to review as
+   before. An accepted drop is listed in the relation. How many fields the
+   replacement must cover is still a design decision; an empty
+   `<ComicInfo/>` is well-formed and currently qualifies.
 4. **Payload identity.** The non-image payload is compared by exact raw
    member name and sha256, as a multiset. A credits file moved into a
    subfolder therefore blocks supersession.
@@ -575,6 +583,7 @@ code takes. They are open to review.
 8. **No ComicInfo version label yet.** §4.6 allows a label from the keeper's
    own ComicInfo. ComicInfo has no standard version element and step 4 reads
    none, so that route never fires and such a label is held for a decision.
+   A held label must stay a separate rename gate in the later planner.
 9. **A bare `v<N>` is the keeper's own marker** once step 4 has classified
    it as a version through the established family and the version field is
    resolved, that is, uncontradicted.
@@ -586,20 +595,36 @@ code takes. They are open to review.
     transitive. So the cycle guard, the missing-direct-relation guard and
     the two-established-families guard raise
     `InconsistentRelationsError`, and are proven only by tests that inject
-    relations.
-12. **Memory bound.** An archive of at most `max_held_bytes` (512 MiB by
-    default) is held in one buffer, and its sequence is derived from exactly
-    the hashed bytes. A larger archive is streamed:
-    - stat it and hash it;
-    - derive its members from the path, with the same `hash_ordered_pages`
-      pass;
-    - hash it and stat it again.
+    relations. They rest on three assumptions, which must hold for the
+    guards to stay unreachable:
+    - page counts strictly increase along every edge;
+    - containment and the payload rule are transitive;
+    - step 4's grouping gives no archive two established families.
+12. **Memory bound and binding.** The full-file hash, the pages, the
+    non-image members and the ComicInfo always come from one byte source
+    that the evaluation owns, never from separate reads of the library
+    file.
+    - **At most `max_held_bytes`** (512 MiB by default), that source is one
+      in-memory buffer.
+    - **Larger archives** are copied into a private temp file, and the hash
+      is taken over the copy stream. Everything is then derived from the
+      copy alone. The copy and its fresh `mkdtemp` directory are deleted
+      afterwards.
+    - **Writes.** The copy path writes temp files under `temp_dir` (default
+      the system temp directory), never a library file.
+    - **Failure.** If the copy cannot be made (no space, an I/O error, or
+      larger than an optional `max_copy_bytes`), the archive is unresolved,
+      "too large to bind", and is never comparable.
+    - **After-check.** Either way the library file is re-hashed at the end.
+      A difference makes the archive unresolved. Equality means the
+      evaluated bytes were the file's bytes when evaluation ended, so step
+      7's recheck of the recorded hash rechecks the evaluated content.
 
-    Any difference in hash or stat makes the archive unresolved. **Residual
-    window:** in the streamed path a change that is made after the first
-    hash, and fully reverted before the second, goes undetected. Fully
-    reverted means the bytes, size, mtime and file identity are all
-    restored. Step 7 revalidates against the recorded hash either way.
+    A change made and reverted during derivation therefore cannot pair one
+    revision's hash with another revision's pages. That was possible in the
+    earlier streamed design, refused in the #123 review. The copy is
+    protected by ownership (an `O_EXCL` file in a private directory), not
+    by an OS lock.
 13. **Scope of failure.** One unreadable, corrupt or refused archive makes
     its own family unresolved. It does not stop the folder. Only an
     inconsistent relation set (item 11) or a concurrent database commit
