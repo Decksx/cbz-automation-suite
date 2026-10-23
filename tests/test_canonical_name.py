@@ -312,7 +312,7 @@ def test_internal_dots_and_whitespace_runs():
 
 
 @pytest.mark.parametrize(
-    "series", ["CON", "con", "Prn", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9", "COM0", "COM¹", "Con. Smith", "NUL.x"]
+    "series", ["CON", "con", "Prn", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9", "COM0", "COM¹", "Con. Smith", "Con . Smith", "NUL.x"]
 )
 def test_reserved_device_names_are_refused(series):
     """Device names are reserved with or without an extension and in any case;
@@ -517,6 +517,13 @@ def test_case_only_collisions_are_reported():
     (collision,) = find_canonical_collisions(items)
     assert [src for src, _ in collision.entries] == ["x", "y", "z"]
     assert collision.key == "batman #001.cbz"
+
+
+def test_collisions_fold_case_beyond_ascii():
+    # casefold, not lower: "Straße" and "STRASSE" are reported together so
+    # the helper can over-report to review but never under-report.
+    found = find_canonical_collisions([("a", F("Straße")), ("b", F("STRASSE"))])
+    assert [c.entries for c in found] == [(("a", "Straße.cbz"), ("b", "STRASSE.cbz"))]
 
 
 def test_no_collision_without_duplicates():
