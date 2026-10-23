@@ -981,6 +981,55 @@ def restore_ai_decensor_backups(processed: list[tuple[Path, Path]]) -> None:
                 pass
 
 
+def _rekey_ai_backups(
+    ai_backups: list[tuple[Path, Path]],
+    origins: dict[Path, Path],
+    parsed_by_path: dict,
+) -> list[tuple[Path, Path]]:
+    """Re-key ``(archive, original)`` pairs to each archive's current path.
+
+    The pairs are recorded under the path ``process_cbz_file`` returned;
+    ``_apply_fallback_naming`` may rename the archive after that. *origins*
+    maps each pre-fallback path to its ``ParsedComicName.original_path``,
+    which a fallback rename carries over unchanged, so the pair follows its
+    archive instead of pointing at a name that no longer exists.
+    """
+    current = {
+        getattr(parsed, "original_path", path): path
+        for path, parsed in parsed_by_path.items()
+    }
+    return [
+        (current.get(origins.get(archive, archive), archive), backup)
+        for archive, backup in ai_backups
+    ]
+
+
+def _routed_ai_backups(
+    ai_backups: list[tuple[Path, Path]], landed: Path | None
+) -> list[tuple[Path, Path]]:
+    """The originals whose **own** archive routed, for offloading.
+
+    A non-None *landed* says some archive of the directory landed; it is no
+    receipt for any particular one. In the mixed-directory branch a refused
+    placeholder stays in the import folder while its accepted siblings move,
+    so each original is completed only if its own archive has left the
+    import folder. The rest stay on C: with their archive, for the deferred
+    retry. With *landed* None nothing routed and every pair is passed on,
+    so ``archive_completed_ai_backups`` reports them all as kept.
+    """
+    if landed is None:
+        return list(ai_backups)
+    routed = []
+    for archive, backup in ai_backups:
+        if archive.exists():
+            log.warning(
+                f"    AI original kept on C: for deferred '{archive.name}': {backup}"
+            )
+        else:
+            routed.append((archive, backup))
+    return routed
+
+
 def archive_completed_ai_backups(processed: list[tuple[Path, Path]], landed: Path | None) -> None:
     """Offload originals only after the whole directory was routed successfully."""
     if not processed:
@@ -1973,8 +2022,14 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 # chapter that reuses a scanlator's generic filename collides
                 # under the same name and one is silently discarded during
                 # _move_cbz_dir's merge.
+                origins = {
+                    path: getattr(parsed, "original_path", path)
+                    for path, parsed in parsed_by_path.items()
+                }
                 refused = set(_apply_fallback_naming(
                     parsed_by_path, series_name, dir_number) or ())
+                ai_backups = _rekey_ai_backups(
+                    ai_decensor_backups, origins, parsed_by_path)
 
                 if refused and not has_nested_comic_dirs:
                     # A refused placeholder kept its generic name. Moving the
@@ -2012,7 +2067,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                                            target_name=series_name,
                                            chapter_number=dir_number)
                     _note_move(series_name, dest_folder, landed)
-            archive_completed_ai_backups(ai_decensor_backups, landed)
+            archive_completed_ai_backups(_routed_ai_backups(ai_backups, landed), landed)
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
             # nothing was mutated, the arrival is still in the watch folder,
