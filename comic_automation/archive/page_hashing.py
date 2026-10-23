@@ -5,6 +5,8 @@ import re
 import sqlite3
 import zipfile
 import zlib
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,15 +48,33 @@ class PageContentHash:
 
 @dataclass(frozen=True)
 class ArchivePageHashes:
+    """Exact page inventory and ordered content signature of one archive.
+
+    ``duplicate_entry_names`` lists the raw image member names that occur
+    more than once (see `order_page_entries`). When it is non-empty the page
+    order is *unresolved*: every page is still inventoried, but the order
+    among same-named members, and so ``content_digest``, depends on physical
+    member order and proves nothing when compared with another archive.
+    Comparison consumers must check ``order_resolved`` before trusting
+    ``content_digest``. It defaults to empty, so a result built by hand for
+    an archive with unique names means what it always meant.
+    """
+
     pages: tuple[PageContentHash, ...]
     content_digest: str
     image_bytes: int
     source_file_size: int
     source_modified_time_ns: int
+    duplicate_entry_names: tuple[str, ...] = ()
 
     @property
     def page_count(self) -> int:
         return len(self.pages)
+
+    @property
+    def order_resolved(self) -> bool:
+        """False when duplicate image member names leave the order open."""
+        return not self.duplicate_entry_names
 
 
 def _natural_key(value: str) -> tuple[tuple[int, object], ...]:
@@ -62,6 +82,91 @@ def _natural_key(value: str) -> tuple[tuple[int, object], ...]:
         (1, int(part)) if part.isdigit() else (0, part.casefold())
         for part in _NATURAL_PART_RE.split(value.replace("\\", "/"))
         if part
+    )
+
+
+def page_order_key(
+    name: str,
+) -> tuple[tuple[tuple[int, object], ...], str]:
+    """Sort key for one image member: the natural key, then the raw name.
+
+    The natural key alone ties on names that differ only in case or in zero
+    padding (``a.png``/``A.png``, ``01.png``/``1.png``, ``p1.png``/
+    ``p01.png``). ``sorted`` is stable, so before this tie-break the
+    physically earlier member won, and re-packing the same pages in another
+    order changed the content signature. The raw name breaks every tie
+    between *distinct* names, so for an archive whose image names are unique
+    the order is a function of the names alone (design
+    ``docs/canonical_naming_and_version_supersession.md`` §1.2).
+
+    The raw comparison is by code point: locale-free and fixed, which is all
+    a tie-break needs. Which of two tied names comes first is arbitrary but
+    never varies (``"A.png" < "a.png"``, ``"01.png" < "1.png"``).
+
+    Changing this key changes the content signature of every archive that
+    holds tied names. Signatures stored under the old key are replaced only
+    when that archive is re-saved; see `ArchivePageHashRepository.save`.
+    """
+    return (_natural_key(name), name)
+
+
+def is_page_member(entry: zipfile.ZipInfo) -> bool:
+    """True for a non-directory member with an image extension."""
+    return (
+        not entry.is_dir()
+        and Path(entry.filename).suffix.casefold() in IMAGE_EXTENSIONS
+    )
+
+
+@dataclass(frozen=True)
+class PageOrder:
+    """An archive's image members in page order, and whether that is an answer.
+
+    ``entries`` are the image members sorted by `page_order_key`.
+    ``duplicate_names`` are the raw names held by more than one image
+    member, sorted by code point. Identical names cannot be ordered by name,
+    so when it is non-empty the order is **unresolved**: same-named members
+    keep their physical order only because an index has to be assigned, and
+    that placement carries no authority. ``resolved`` is the flag to test.
+    """
+
+    entries: tuple[zipfile.ZipInfo, ...]
+    duplicate_names: tuple[str, ...]
+
+    @property
+    def resolved(self) -> bool:
+        return not self.duplicate_names
+
+
+def order_page_entries(members: Iterable[zipfile.ZipInfo]) -> PageOrder:
+    """The one definition of page order, shared by every reader of it.
+
+    Exact page hashing, perceptual hashing and the source-drift inventory
+    all order pages through this function. They must agree exactly: the
+    perceptual save refuses unless its pages match the stored exact
+    inventory index for index, so a reader with its own sort would report
+    drift on every archive where the two sorts differ.
+
+    Only image members are ordered, so only their names are checked for
+    duplicates; a duplicated ``notes.txt`` does not make the *page order*
+    unresolved. Names are compared raw, so ``a.png`` and ``A.png`` are
+    distinct here even though they would collide when extracted to a
+    case-insensitive filesystem; that is an extraction question, not an
+    ordering one.
+    """
+    entries = tuple(
+        sorted(
+            (entry for entry in members if is_page_member(entry)),
+            key=lambda entry: page_order_key(entry.filename),
+        )
+    )
+    counts = Counter(entry.filename for entry in entries)
+
+    return PageOrder(
+        entries=entries,
+        duplicate_names=tuple(
+            sorted(name for name, count in counts.items() if count > 1)
+        ),
     )
 
 
@@ -92,18 +197,12 @@ def calculate_page_hashes(
             # encrypted member would otherwise surface from archive.open()
             # as a bare RuntimeError and be filed as archive_unreadable.
             validate_archive_members(members)
-            entries = sorted(
-                (
-                    entry
-                    for entry in members
-                    if not entry.is_dir()
-                    and Path(entry.filename).suffix.casefold()
-                    in IMAGE_EXTENSIONS
-                ),
-                key=lambda entry: _natural_key(entry.filename),
-            )
+            order = order_page_entries(members)
 
-            for page_index, entry in enumerate(entries):
+            # Each digest is computed from, and recorded with, the entry
+            # whose name it is stored under: the index positions a page but
+            # never selects which bytes its digest describes.
+            for page_index, entry in enumerate(order.entries):
                 digest = hashlib.sha256()
                 bytes_read = 0
 
@@ -163,7 +262,23 @@ def calculate_page_hashes(
         image_bytes=sum(page.bytes_read for page in pages),
         source_file_size=int(after.st_size),
         source_modified_time_ns=int(after.st_mtime_ns),
+        duplicate_entry_names=order.duplicate_names,
     )
+
+
+# Correlated predicate: true when the archive whose id is the formatted
+# column expression has two stored page rows with the same raw entry_name.
+# That is the stored form of an unresolved page order (`PageOrder`), and it
+# needs no schema change because `archive_pages` already records every
+# image member's raw name. SQLite compares TEXT with BINARY collation unless
+# told otherwise, which is the raw-name equality `order_page_entries` uses.
+_STORED_DUPLICATE_ENTRY_NAMES_SQL = """
+    SELECT 1
+    FROM archive_pages AS dup_ap
+    WHERE dup_ap.archive_id = {archive_id}
+    GROUP BY dup_ap.entry_name
+    HAVING COUNT(*) > 1
+"""
 
 
 class ArchivePageHashRepository:
@@ -186,6 +301,21 @@ class ArchivePageHashRepository:
             # Rehashing replaces the entire page inventory rather than
             # trying to diff it: delete-then-reinsert is simpler and
             # correct even if pages were added, removed, or reordered.
+            #
+            # It is also what keeps a reorder honest. When the page-order
+            # key changes (the raw-name tie-break, design §1.2), a member's
+            # page_index changes, and an upsert keyed on
+            # (archive_id, page_index) would leave the old member's digest
+            # on a row that now names another member. Here each row and its
+            # digest are written together from one PageContentHash, so a
+            # digest is bound to its entry_name by construction.
+            #
+            # The delete cascades to every page_hashes row, perceptual ones
+            # included: re-saving an archive discards its dhash/phash rows
+            # and the perceptual worker recomputes them. Carrying them
+            # across by entry_name is not implemented. A content signature
+            # stored under the old order is replaced only when its archive
+            # is re-saved; nothing here recomputes signatures in bulk.
             self.connection.execute(
                 "DELETE FROM archive_pages WHERE archive_id = ?",
                 (archive_id,),
@@ -382,13 +512,41 @@ class ArchivePageHashRepository:
         # ArchiveHashRepository.enqueue_missing for the reasoning).
         return created
 
+    def unresolved_page_order_archive_ids(self) -> list[int]:
+        """Archives whose stored page order is unresolved, ascending.
+
+        An archive is unresolved when two of its stored page rows carry the
+        same raw ``entry_name`` (see `order_page_entries`). Read-only.
+        """
+        predicate = _STORED_DUPLICATE_ENTRY_NAMES_SQL.format(
+            archive_id="af.id"
+        )
+        return [
+            int(row[0])
+            for row in self.connection.execute(
+                f"""
+                SELECT af.id
+                FROM archive_files AS af
+                WHERE EXISTS ({predicate})
+                ORDER BY af.id
+                """
+            )
+        ]
+
     def duplicate_content_groups(self) -> list[dict]:
         # Group archives (current location only) by content signature
         # algorithm/version/digest/page_count; more than one member
         # means byte-for-byte identical page sequences, i.e. the same
         # comic content even if the container files differ.
+        #
+        # Archives with an unresolved page order are left out before
+        # grouping: their signature depends on physical member order, so
+        # two of them sharing one is not evidence of the same sequence.
+        unresolved = _STORED_DUPLICATE_ENTRY_NAMES_SQL.format(
+            archive_id="acs.archive_id"
+        )
         rows = self.connection.execute(
-            """
+            f"""
             SELECT
                 acs.algorithm,
                 acs.algorithm_version,
@@ -400,6 +558,7 @@ class ArchivePageHashRepository:
             JOIN file_locations AS fl
               ON fl.archive_id = acs.archive_id
              AND fl.is_current = 1
+            WHERE NOT EXISTS ({unresolved})
             GROUP BY
                 acs.algorithm,
                 acs.algorithm_version,
