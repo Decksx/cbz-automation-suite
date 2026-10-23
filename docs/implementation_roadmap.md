@@ -1507,14 +1507,17 @@ Add crash and fault-injection tests around job acquisition, hash saves,
 database commits, archive replacement, quarantine moves, and recovery.
 
 **Progress, 2026-10-22 (branch `test/step8-corpus-and-properties`, off
-`f957bde`).** Tests only; no production code changed.
+`f957bde`, merged with `657e129`).** Tests only; no production code
+changed.
 
-- *Excessive entries.* `excessive_entries` (20,000 empty image members,
-  plain ZIP) is now in the corpus. No entry-count cap exists, so the corpus
-  pins that inspection **accepts** it, and `CORPUS_GAPS["excessive_entries"]`
-  now records the missing guard rather than a missing fixture. The pin is
-  meant to fail when Step 7's cap lands. A cap set above 20,000 would leave
-  the pin passing; raise `EXCESSIVE_ENTRY_COUNT` with the cap.
+- *Entry count.* `high_entry_count` (20,000 empty image members, plain
+  ZIP) is now in the corpus: the sub-ceiling side of
+  `archive_limits.MAX_ARCHIVE_ENTRIES` (50,000, #110). The corpus pins that
+  its count is below the cap and that inspection admits it. The over-cap
+  refusal is not duplicated in the corpus; `tests/test_archive_limits.py`
+  builds an archive one entry over the shipped ceiling, and
+  `CORPUS_GAPS["excessive_entries"]` says so. Lowering the cap to 20,001 or
+  below fails the corpus pin by design.
 - *Property tests* (`tests/test_step8_invariant_properties.py`) cover
   invariants 1, 2, 4, 6, 7 and 10 of the list above. `hypothesis` is not
   installed or declared, so they are seeded standard-library generators:
