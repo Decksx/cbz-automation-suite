@@ -10,8 +10,8 @@ the step-7 plan consumes.
 Nothing here writes to a library file or the database. Each archive is
 read with ``open(path, "rb")``: held in memory when it is at most
 ``max_held_bytes``, otherwise copied into a private temp file that is
-deleted afterwards (the only write this module makes, and never under the
-library), and re-hashed from disk at the end. The database is read only through
+removed afterwards, best-effort, with any leftover logged (the only write
+this module makes, and never under the library), and re-hashed from disk at the end. The database is read only through
 `field_resolution.load_page_evidence`, which goes through the DAL's
 `read_guards.read_consistent_snapshot` (``mode=ro``, ``query_only``,
 ``data_version`` bracketing). The module opens no connection of its own.
@@ -83,9 +83,11 @@ of A may be dropped only when the caller passes
 ``accept_comicinfo_drop=True`` (operator acceptance, default off); the drop
 is then listed, not silent, and is allowed only when B carries its own
 usable ComicInfo.xml -- well-formed, consistent, not the bare injected
-template -- that covers every field A's fills (David's #111 decision:
-more comprehensive metadata may replace old, by field coverage, otherwise
-review). Otherwise the relation is downgraded to review,
+template -- that covers every field A's fills, structured fields
+included (`comicinfo_drop_refusal`). David's #111 permission is that more
+accurate or more comprehensive metadata may replace old; field coverage is
+the proposed, reviewed mechanism under the explicit flag, and it judges
+presence only, never accuracy. Otherwise the relation is downgraded to review,
 listing A's unique members. The **index map** from A's pages to B's is the
 greedy left-to-right walk over B, written into the relation.
 
@@ -126,6 +128,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
 import shutil
 import sqlite3
@@ -141,9 +144,7 @@ from xml.etree import ElementTree
 
 from comic_automation.archive.archive_limits import UnsafeArchiveError
 from comic_automation.archive.field_resolution import (
-    COMICINFO_ABSENT,
     COMICINFO_EDITED_TEMPLATE,
-    COMICINFO_INCONSISTENT,
     COMICINFO_USABLE,
     FAMILY_ESTABLISHED,
     FAMILY_INCOMPARABLE,
@@ -169,6 +170,9 @@ from comic_automation.archive.page_hashing import (
     is_page_member,
 )
 from comic_automation.database.read_guards import ConsistentSnapshot
+
+
+logger = logging.getLogger(__name__)
 
 
 BASIS_EXACT = "sha256"
@@ -397,7 +401,8 @@ def derive_archive(
     * **Private copy** (larger files): the file is copied into a private
       temp file (`_copy_to_private`) and the hash is taken over the copy
       stream; everything is then derived from the copy alone, and the copy
-      and its directory are deleted in a ``finally``. This writes a temp
+      and its directory are removed in a ``finally``, best-effort: a
+      leftover is logged at warning level with its path. This writes a temp
       file under ``temp_dir`` (default: the system temp directory, which
       the caller must not point into a library) and never writes a library
       file. If the copy cannot be made -- no space,
@@ -486,7 +491,15 @@ def derive_archive(
             return unresolved(f"archive could not be read for derivation: {exc}")
     finally:
         if private_dir is not None:
+            # Best-effort: a copy that cannot be removed (a scanner holding
+            # it open, say) must not turn a finished evaluation into an
+            # error, but it must not accumulate silently either.
             shutil.rmtree(private_dir, ignore_errors=True)
+            if private_dir.exists():
+                logger.warning(
+                    "supersession: private copy directory was not removed: %s",
+                    private_dir,
+                )
 
     # The after-check: the evaluated bytes must still be the file's bytes.
     try:
@@ -622,7 +635,7 @@ def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
     ``usable`` or ``edited_template``: absent, unparseable, contradictory
     (including differing duplicate documents) and the pristine injected
     template are not. Usability alone does not discharge a drop; the keeper
-    must also cover the dropped document's fields (`comicinfo_fields_missing`).
+    must also cover the dropped document's fields (`comicinfo_drop_refusal`).
     """
     return comicinfo_facts(archive.comicinfo_documents).status in (
         COMICINFO_USABLE,
@@ -630,47 +643,147 @@ def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
     )
 
 
-def _nonempty_comicinfo_elements(documents: Sequence[bytes]) -> frozenset[str]:
-    """Local names of every top-level ComicInfo element with non-empty text.
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
-    Every element counts, free text (Notes, Summary) included, by presence
-    only. Called on documents `comicinfo_facts` has already accepted as
-    parseable and consistent, so duplicate members are byte-identical and
-    the first stands for all.
-    """
-    root = ElementTree.fromstring(documents[0])
-    return frozenset(
-        child.tag.rsplit("}", 1)[-1]
-        for child in root
-        if (child.text or "").strip()
+
+def _populated(element: ElementTree.Element) -> bool:
+    """Non-whitespace text, any attribute, or any populated descendant."""
+    return (
+        bool((element.text or "").strip())
+        or bool(element.attrib)
+        or any(_populated(child) for child in element)
     )
 
 
-def comicinfo_fields_missing(
-    older: DerivedArchive, newer: DerivedArchive
-) -> tuple[str, ...] | None:
-    """The fields of ``older``'s ComicInfo that ``newer``'s does not cover.
+def _shape(element: ElementTree.Element, path: str) -> set[str]:
+    """Every populated path under ``element``: text, attribute names, children.
 
-    David's decision on #111: more accurate or more comprehensive metadata
-    may replace old metadata, applied mechanically by field coverage,
-    otherwise review. So every element non-empty in ``older``'s document
-    must be non-empty in ``newer``'s; values may differ, since the newer
-    may be the more accurate. Returns () when covered, the sorted missing
-    names otherwise, and None when ``newer`` has no usable ComicInfo at all.
+    ``Foo`` for populated text, ``Foo@x`` for an attribute, ``Foo/Bar`` for a
+    populated child, recursively. Values are not compared, only presence.
+    """
+    shape: set[str] = set()
+    if (element.text or "").strip():
+        shape.add(path)
+    shape |= {f"{path}@{_local(name)}" for name in element.attrib}
+    for child in element:
+        if _populated(child):
+            shape |= _shape(child, f"{path}/{_local(child.tag)}")
+    return shape
 
-    An ``older`` ComicInfo that is itself unusable as a document --
-    unparseable or internally inconsistent -- has no fields to cover, so a
-    usable keeper covers it. A template-derived ``older`` document parses
-    and is held to coverage like any other.
+
+def _page_annotations(
+    pages: ElementTree.Element,
+) -> tuple[dict[str, frozenset[str]], list[str]]:
+    """``Pages``: {Image index: attribute names} per Page, plus problems.
+
+    A populated Page without an ``Image`` index, two Pages with one index,
+    or anything populated in ``Pages`` other than ``Page`` elements cannot
+    be matched confidently; each is returned as a problem.
+    """
+    annotated: dict[str, frozenset[str]] = {}
+    problems: list[str] = []
+    for child in pages:
+        if not _populated(child):
+            continue
+        if _local(child.tag) != "Page":
+            problems.append(f"Pages/{_local(child.tag)} (not a Page)")
+            continue
+        image = child.attrib.get("Image")
+        if image is None:
+            problems.append("Pages/Page without an Image index")
+            continue
+        if image in annotated:
+            problems.append(f"Pages/Page[Image={image}] appears twice")
+            continue
+        if len(child) or (child.text or "").strip():
+            problems.append(f"Pages/Page[Image={image}] has nested content")
+        annotated[image] = frozenset(_local(name) for name in child.attrib)
+    return annotated, problems
+
+
+def _parse_comicinfo(documents: Sequence[bytes]) -> list[ElementTree.Element] | None:
+    """Every ComicInfo document parsed, or None if any does not parse."""
+    roots = []
+    for document in documents:
+        try:
+            roots.append(ElementTree.fromstring(document))
+        except ElementTree.ParseError:
+            return None
+    return roots
+
+
+def _coverage_gaps(
+    older_roots: Sequence[ElementTree.Element], keeper: ElementTree.Element
+) -> list[str]:
+    """What ``older_roots`` fill that ``keeper`` does not carry.
+
+    Top-level elements by name; ``Pages`` by Page ``Image`` index with at
+    least the same attribute names; any other structured element by its
+    populated shape (`_shape`). Presence only: a value that differs is
+    covered, because coverage judges presence, not accuracy.
+    """
+    keeper_top = {
+        _local(child.tag): child for child in keeper if _populated(child)
+    }
+    gaps: list[str] = []
+    for root in older_roots:
+        for child in root:
+            name = _local(child.tag)
+            if not _populated(child):
+                continue
+            mine = keeper_top.get(name)
+            if mine is None:
+                gaps.append(name)
+                continue
+            if name == "Pages":
+                older_pages, problems = _page_annotations(child)
+                keeper_pages, keeper_problems = _page_annotations(mine)
+                gaps += problems + [f"keeper {p}" for p in keeper_problems]
+                for image, attributes in older_pages.items():
+                    if image not in keeper_pages:
+                        gaps.append(f"Pages/Page[Image={image}]")
+                    else:
+                        gaps += [
+                            f"Pages/Page[Image={image}]@{a}"
+                            for a in sorted(attributes - keeper_pages[image])
+                        ]
+                continue
+            gaps += sorted(_shape(child, name) - _shape(mine, name))
+    return sorted(set(gaps))
+
+
+def comicinfo_drop_refusal(older: DerivedArchive, newer: DerivedArchive) -> str | None:
+    """None when ``older``'s ComicInfo may be dropped for ``newer``'s, else why.
+
+    The mechanism behind ``accept_comicinfo_drop``. David's permission on
+    #111 is that more accurate or more comprehensive metadata may replace
+    old metadata; the *mechanism* is the proposed, reviewed field-coverage
+    rule recorded there, and accuracy is never judged automatically.
+    Coverage establishes only that nothing the older document fills is
+    missing from the keeper's; it says nothing about which is accurate.
+
+    * The keeper's ComicInfo must be usable (`keeper_comicinfo_is_usable`).
+    * The older ComicInfo must parse. One that cannot be parsed cannot be
+      inventoried, so it can never certify an empty requirement set: the
+      drop is refused and goes to review.
+    * Every field the older document(s) fill must be carried by the keeper
+      (`_coverage_gaps`), including a field the older document holds twice
+      with contradictory values: inconsistency is not emptiness.
     """
     if not keeper_comicinfo_is_usable(newer):
-        return None
-    older_facts = comicinfo_facts(older.comicinfo_documents)
-    if older_facts.status in (COMICINFO_ABSENT, COMICINFO_INCONSISTENT):
-        return ()
-    covered = _nonempty_comicinfo_elements(newer.comicinfo_documents)
-    needed = _nonempty_comicinfo_elements(older.comicinfo_documents)
-    return tuple(sorted(needed - covered))
+        return "the newer archive has no usable ComicInfo.xml of its own"
+    older_roots = _parse_comicinfo(older.comicinfo_documents)
+    if older_roots is None:
+        return (
+            "the older ComicInfo.xml cannot be parsed, so its fields cannot "
+            "be inventoried"
+        )
+    keeper = ElementTree.fromstring(newer.comicinfo_documents[0])
+    gaps = _coverage_gaps(older_roots, keeper)
+    if gaps:
+        return f"the newer archive's ComicInfo.xml does not cover {gaps}"
+    return None
 
 
 def _payload(
@@ -679,30 +792,21 @@ def _payload(
     """(unique, accepted drops, why a ComicInfo drop was refused).
 
     ``unique`` and the drops are ``older``'s non-image members missing from
-    ``newer``. §8 question 6: with the operator's flag, an older ComicInfo
-    may be dropped only when the archive that supersedes it carries a
-    usable ComicInfo of its own that covers every field the older one
-    fills (`comicinfo_fields_missing`). Otherwise the older metadata is
-    unique payload and the relation goes to review.
+    ``newer``. With the operator's flag (§8 question 6), an older ComicInfo
+    may be dropped only when `comicinfo_drop_refusal` finds no reason not
+    to. Otherwise the older metadata is unique payload and the relation
+    goes to review.
     """
     missing = Counter(older.non_image) - Counter(newer.non_image)
     unique: list[NonImageMember] = []
     dropped: list[NonImageMember] = []
     refusal: str | None = None
-    coverage = (
-        comicinfo_fields_missing(older, newer) if accept_comicinfo_drop else None
-    )
     for member in sorted(missing.elements(), key=lambda m: (m.name, m.sha256)):
         if accept_comicinfo_drop and _is_comicinfo(member.name):
-            if coverage == ():
+            refusal = comicinfo_drop_refusal(older, newer)
+            if refusal is None:
                 dropped.append(member)
                 continue
-            refusal = (
-                "the newer archive has no usable ComicInfo.xml of its own"
-                if coverage is None
-                else "the newer archive's ComicInfo.xml does not cover "
-                f"{list(coverage)}"
-            )
         unique.append(member)
     return tuple(unique), tuple(dropped), refusal
 
