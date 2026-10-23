@@ -89,6 +89,14 @@ signature) is reported ``incomparable``
 and classifies nothing. A legacy signature can therefore never put an
 archive into a family.
 
+Edition and special markers come from the name, and a vocabulary word may
+be title text ("English", "Extra Life") or a marker. No word is deleted
+before that boundary is known: a name #118 could have produced is read by
+its own parser, any name's trailing vocabulary run is kept as candidates,
+and `effective_markers` places the run against the decided series
+occurrence by occurrence. A run it cannot place refuses the family and goes
+to review.
+
 Establishing a family is not supersession. Whether one member's pages are
 a prefix of another's, bound to the current bytes, is step 5.
 
@@ -109,6 +117,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import unicodedata
 import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -133,7 +142,12 @@ from comic_automation.database.read_guards import (
     ConsistentSnapshot,
     read_consistent_snapshot,
 )
-from scripts.cbz_canonical_name import EDITION_WORDS, SPECIAL_WORDS
+from scripts.cbz_canonical_name import (
+    EDITION_WORDS,
+    SPECIAL_WORDS,
+    CanonicalNameError,
+    parse_canonical_name,
+)
 from scripts.cbz_routing import series_key
 
 
@@ -665,6 +679,8 @@ _VOLUME_WORD_RE = re.compile(
     rf"(?<![A-Za-z])vol(?:ume)?\.?\s*({_NUMBER_TEXT})", re.IGNORECASE
 )
 _V_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+)(?![A-Za-z0-9.])", re.IGNORECASE)
+
+
 def _word_alternation_re(words: Iterable[str]) -> re.Pattern[str]:
     """Whole-word, case-insensitive match of any of ``words``, longest first."""
     return re.compile(
@@ -680,20 +696,25 @@ def _word_alternation_re(words: Iterable[str]) -> re.Pattern[str]:
 
 _EDITION_RE = _word_alternation_re(EDITION_VOCABULARY)
 _EDITION_BY_FOLD = {word.casefold(): word for word in EDITION_VOCABULARY}
-_SPECIAL_RE = _word_alternation_re(SPECIAL_VOCABULARY)
-# The special slot: a special word that ends the pre-number prefix, with
-# non-empty series text before it (#118's grammar puts the special
-# immediately after the series and before the numbering).
-_SPECIAL_SLOT_RE = re.compile(
-    r"^(?P<series>.*?[^\s\-_.,~].*?)[\s\-_.,~]+"
-    + _SPECIAL_RE.pattern
-    + r"[\s\-_.,~]*$",
+_SPECIAL_BY_FOLD = {word.casefold(): word for word in SPECIAL_VOCABULARY}
+_SEPARATORS = r"[\s\-_.,~]"
+# One trailing vocabulary phrase (special or edition) at the end of a
+# prefix, with at least one non-separator character before it: the first
+# word of a prefix is always title text, so a run can never consume it.
+_TRAILING_MARKER_RE = re.compile(
+    rf"^(?P<rest>.*?[^\s\-_.,~].*?){_SEPARATORS}+"
+    + _word_alternation_re((*SPECIAL_VOCABULARY, *EDITION_VOCABULARY)).pattern
+    + rf"{_SEPARATORS}*$",
     re.IGNORECASE | re.DOTALL,
 )
-_SPECIAL_BY_FOLD = {word.casefold(): word for word in SPECIAL_VOCABULARY}
 _TAG_YEAR_RE = re.compile(r"\d{4}")
+_BRACKET_CHAR_RE = re.compile(r"[\[\]()]")
 _TAG_VERSION_RE = re.compile(r"v\d+", re.IGNORECASE)
 _SERIES_TRIM = " \t-_.,~"
+_TITLE_KEY_RE = re.compile(r"[^\w\s]|_")
+
+MARKER_SPECIAL = "special"
+MARKER_EDITION = "edition"
 
 
 def _fold(text: str) -> str:
@@ -704,6 +725,18 @@ def _spelling(text: str) -> str:
     return " ".join(text.split())
 
 
+def title_key(text: str) -> str:
+    """Comparison form of a title for the marker-occurrence rule.
+
+    Case, punctuation and underscores fold to spaces, as in `series_key`,
+    but no word is removed: `series_key` drops ``uncensored``, which would
+    make ``Series`` and ``Series Uncensored`` the same *title* and hide
+    which of the two readings a name's prefix supports.
+    """
+    folded = unicodedata.normalize("NFC", text).casefold()
+    return " ".join(_TITLE_KEY_RE.sub(" ", folded).split())
+
+
 @dataclass(frozen=True)
 class NameTokens:
     """What a current filename claims. Every value here is a candidate.
@@ -712,25 +745,31 @@ class NameTokens:
     (volume or version) is open. ``version_markers`` are bracketed ``[vN]``
     tokens, which are never volumes. ``volume_words`` are ``Vol.``/
     ``Volume`` tokens. ``chapters`` and ``issues`` are ``ch.``/``#``
-    numbers. All numbers are in `normalize_number` form.
+    numbers. All numbers are in `normalize_number` form, and each number
+    tuple has a parallel ``*_spellings`` tuple with that occurrence's own
+    text, so a ``Vol. 1.00`` and a ``ch. 1.0`` keep their own spellings.
 
-    Each number tuple has a parallel ``*_spellings`` tuple holding that
-    occurrence's own text (``1.00``, ``012.50``). Spelling travels with the
-    token, never with the value: a ``Vol. 1.00`` and a ``ch. 1.0`` in one
-    name compare equal and keep their own spellings.
+    **Title/marker boundary.** A vocabulary word (`EDITION_VOCABULARY`,
+    `SPECIAL_VOCABULARY`) may be title text ("English", "Extra Life") or a
+    marker, and the name alone cannot always say which. So nothing is
+    deleted before the boundary is known:
 
-    ``editions`` are `EDITION_VOCABULARY` words and ``specials`` are
-    `SPECIAL_VOCABULARY` words, both in canonical spelling. A special is
-    recognised only in #118's special slot: the last word or phrase of the
-    pre-number prefix, with series text before it. So ``Series Omnibus
-    #001`` proposes series ``Series`` with special ``Omnibus`` (and a later
-    ComicInfo ``Series`` cannot erase the marker), while ``Extra Life ch.
-    1``, ``The Special Ones #003`` and ``Extra ch. 1`` are series text whole.
-    Whether a slot word is really the end of the series title is decided
-    against the decided series (`effective_specials`), using
-    ``slot_prefix``: the whole pre-number prefix, series candidate *and*
-    slot word, exactly as the name spelled it. It is set only when a slot
-    special was recognised.
+    * ``fixed_editions``/``fixed_specials`` are unambiguous markers: an
+      edition in brackets or after the numbering, or the edition slot of a
+      canonical name.
+    * ``marker_run`` is the run of vocabulary phrases ending the pre-number
+      prefix (``(kind, canonical word)`` in name order), never including the
+      prefix's first word. Each is title text *or* a marker;
+      `effective_markers` decides which against the decided series.
+    * ``series`` is the prefix without the run, ``slot_prefix`` the whole
+      prefix with it.
+    * ``editions``/``specials`` are the name-only reading (every run word a
+      marker), kept for diagnostics and for callers without a decided series.
+
+    ``canonical`` is True when #118's `parse_canonical_name` accepted the
+    name; its slot boundaries then supply these candidates. They remain
+    candidates: filename-grade evidence, never authority.
+
     ``other_tags`` is everything else the name says that is not series,
     number, year, version, edition or special: bracket contents
     (``[Judas]``, ``(Digital)``) and leftover text after the numbering. It
@@ -754,6 +793,10 @@ class NameTokens:
     issue_spellings: tuple[str, ...] = ()
     volume_word_spellings: tuple[str, ...] = ()
     v_token_spellings: tuple[str, ...] = ()
+    fixed_editions: frozenset[str] = frozenset()
+    fixed_specials: frozenset[str] = frozenset()
+    marker_run: tuple[tuple[str, str], ...] = ()
+    canonical: bool = False
 
     @property
     def primary_numbers(self) -> tuple[tuple[str, str], ...]:
@@ -794,13 +837,130 @@ class NameTokens:
         return bool(self.v_tokens or self.version_markers)
 
 
+def _split_marker_run(prefix: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Split a pre-number prefix into (title candidate, trailing marker run).
+
+    Peels vocabulary phrases off the end, longest first, while title text
+    remains before them. Nothing is deleted: the run is returned for
+    `effective_markers` to place on either side of the boundary.
+    """
+    run: list[tuple[str, str]] = []
+    rest = prefix
+    while (match := _TRAILING_MARKER_RE.match(rest)) is not None:
+        word = _fold(match.group(2))
+        if word in _SPECIAL_BY_FOLD:
+            run.append((MARKER_SPECIAL, _SPECIAL_BY_FOLD[word]))
+        else:
+            run.append((MARKER_EDITION, _EDITION_BY_FOLD[word]))
+        rest = match.group("rest")
+    return rest.strip(_SERIES_TRIM), tuple(reversed(run))
+
+
+def _number_tokens(text: str) -> dict[str, tuple[tuple[int, int, str, str], ...]]:
+    """Every number token in ``text``: (start, end, value, spelling) per kind."""
+    def scan(regex: re.Pattern[str]) -> tuple[tuple[int, int, str, str], ...]:
+        return tuple(
+            (
+                match.start(),
+                match.end(),
+                normalize_number(match.group(1)) or "",
+                _spelling(match.group(1)),
+            )
+            for match in regex.finditer(text)
+        )
+
+    return {
+        "chapters": scan(_CHAPTER_RE),
+        "issues": scan(_ISSUE_RE),
+        "volume_words": scan(_VOLUME_WORD_RE),
+        "v_tokens": scan(_V_TOKEN_RE),
+    }
+
+
+def _number_fields(found: dict[str, tuple[tuple[int, int, str, str], ...]]) -> dict:
+    fields: dict = {}
+    for kind, tokens in found.items():
+        fields[kind] = tuple(value for _, _, value, _ in tokens)
+        fields[f"{kind[:-1]}_spellings"] = tuple(raw for _, _, _, raw in tokens)
+    return fields
+
+
+def _canonical_tokens(filename: str) -> NameTokens | None:
+    """Candidates from #118's own slot boundaries, for a canonical name.
+
+    The name round-trips through `parse_canonical_name`, so the grammar
+    itself says where the series ends and the special, numbering, edition
+    and version slots begin. Numbers are read only from the text after the
+    series and special slot.
+
+    Two limits keep the canonical reading from over-claiming:
+
+    * The formatter accepts almost any free text as a series, so many legacy
+      names parse too, with numbering swallowed into the "series"
+      (``S Vol. 1.00 ch. 1.0`` parses as series ``S Vol. 1.00``). A series
+      holding a number token is not a structural boundary, and such a name
+      takes the legacy reading instead (None here). So does a series
+      holding a bracket (``Berserk [Judas 2021] ch. 1``), whose tag the
+      legacy reading separates out.
+    * The canonical series may itself end in a vocabulary phrase the
+      formatter does not forbid there (``Series Special Edition #001`` is a
+      valid name for the series "Series Special Edition"). That trailing run
+      stays a candidate run like any other, ahead of the special slot, and
+      `effective_markers` places it against the decided series.
+    """
+    try:
+        fields = parse_canonical_name(filename)
+    except CanonicalNameError:
+        return None
+    if any(_number_tokens(fields.series).values()) or _BRACKET_CHAR_RE.search(
+        fields.series
+    ):
+        return None
+    head = fields.series + (f" {fields.special}" if fields.special else "")
+    tail = _EXTENSION_RE.sub("", filename[len(head):])
+    numbers = _number_fields(_number_tokens(_BRACKET_GROUP_RE.sub(" ", tail)))
+    series, run = _split_marker_run(fields.series)
+    if fields.special:
+        run = (*run, (MARKER_SPECIAL, fields.special))
+    edition = frozenset({fields.edition}) if fields.edition else frozenset()
+    return NameTokens(
+        filename=filename,
+        series=series or None,
+        version_markers=(str(fields.version),) if fields.version else (),
+        years=(str(fields.year),) if fields.year else (),
+        editions=edition | {w for kind, w in run if kind == MARKER_EDITION},
+        specials=frozenset(w for kind, w in run if kind == MARKER_SPECIAL),
+        slot_prefix=head if run else None,
+        fixed_editions=edition,
+        marker_run=run,
+        canonical=True,
+        **numbers,
+    )
+
+
 def parse_name_tokens(filename: str) -> NameTokens:
     """Tokenize a current filename into candidate values.
 
-    Deliberately independent of `scripts.cbz_core.parse_comic_name`. That
-    parser treats every ``v<N>`` as a volume (`extract_volume_number`),
-    which is the ambiguity §3.2 forbids, and it can call a translation
-    service. Nothing here is decided by the name; it only proposes.
+    A name #118's formatter could have produced is read by its own parser
+    (`_canonical_tokens`). Any other name goes through the legacy reading
+    below, which is deliberately independent of
+    `scripts.cbz_core.parse_comic_name`: that parser treats every ``v<N>``
+    as a volume (`extract_volume_number`), the ambiguity §3.2 forbids, and
+    it can call a translation service. Nothing here is decided by the name;
+    it only proposes.
+    """
+    canonical = _canonical_tokens(filename)
+    if canonical is not None:
+        return canonical
+    return _legacy_tokens(filename)
+
+
+def _legacy_tokens(filename: str) -> NameTokens:
+    """The reading for names #118's parser does not accept as canonical.
+
+    On every formatter output it agrees with `_canonical_tokens` (the
+    round-trip matrix in the tests checks both readings), so a name does
+    not change meaning by being, or failing to be, exactly canonical.
     """
     stem = _EXTENSION_RE.sub("", filename)
     version_markers = tuple(
@@ -815,14 +975,12 @@ def parse_name_tokens(filename: str) -> NameTokens:
         )
         if year is not None
     )
-    editions = frozenset(
-        _EDITION_BY_FOLD[_fold(match.group(1))]
-        for match in _EDITION_RE.finditer(stem)
-    )
-    # Bracket contents that are not a year, a version marker, an edition or
-    # a special word: scanlator tags, source tags, or a variant the
-    # vocabulary does not know. Kept, so a family can refuse members that
-    # differ in them.
+
+    # Bracket contents: a year, a version marker and an exact edition phrase
+    # are recognised; anything else is a scanlator tag, a source tag, or a
+    # variant the vocabulary does not know, kept so a family can refuse
+    # members that differ in them. A bracketed edition is unambiguous.
+    fixed_editions: set[str] = set()
     other_tags: set[str] = set()
     for match in _BRACKET_GROUP_RE.finditer(stem):
         content = _fold(match.group(0)[1:-1])
@@ -831,80 +989,54 @@ def parse_name_tokens(filename: str) -> NameTokens:
         if _TAG_VERSION_RE.fullmatch(content) and match.group(0)[0] == "[":
             continue
         if content in _EDITION_BY_FOLD:
+            fixed_editions.add(_EDITION_BY_FOLD[content])
             continue
         other_tags.add(content)
 
-    # Bracket groups are scanlator tags, years, editions and version
-    # markers, all captured above. Numbers inside them are not this book's
-    # numbering, so they are blanked before the number tokens are read.
+    # Bracket groups are blanked before number tokens are read: numbers
+    # inside them are not this book's numbering.
     body = _BRACKET_GROUP_RE.sub(" ", stem)
+    found = _number_tokens(body)
+    spans = [(start, end) for tokens in found.values() for start, end, _, _ in tokens]
+    starts = [start for start, _ in spans]
 
-    spans: list[tuple[int, int]] = []
+    # The prefix keeps every word. Its trailing vocabulary run is split off
+    # as candidates, not deleted, so a title that is itself a vocabulary
+    # word ("English", "Special Edition") never loses its special slot.
+    prefix = " ".join((body[: min(starts)] if starts else body).split())
+    series, marker_run = _split_marker_run(prefix)
 
-    def numbers(regex: re.Pattern[str]) -> tuple[tuple[int, str, str], ...]:
-        found = []
-        for match in regex.finditer(body):
-            spans.append(match.span())
-            found.append(
-                (
-                    match.start(),
-                    normalize_number(match.group(1)) or "",
-                    _spelling(match.group(1)),
-                )
-            )
-        return tuple(found)
-
-    chapters = numbers(_CHAPTER_RE)
-    issues = numbers(_ISSUE_RE)
-    volume_words = numbers(_VOLUME_WORD_RE)
-    v_tokens = numbers(_V_TOKEN_RE)
-    starts = [
-        start
-        for start, _, _ in chapters + issues + volume_words + v_tokens
-    ]
-    prefix = body[: min(starts)] if starts else body
-    # Edition phrases are blanked first, so "Special Edition" is an edition
-    # and never also the special word "Special". A special word anywhere
-    # else in the prefix is series text ("Extra Life", "The Special Ones").
-    prefix = " ".join(_EDITION_RE.sub(" ", prefix).split())
-    specials: frozenset[str] = frozenset()
-    slot_prefix: str | None = None
-    slot = _SPECIAL_SLOT_RE.match(prefix)
-    if slot is not None:
-        specials = frozenset({_SPECIAL_BY_FOLD[_fold(slot.group(2))]})
-        slot_prefix = prefix.strip(_SERIES_TRIM)
-        prefix = slot.group("series")
-    series = prefix.strip(_SERIES_TRIM) or None
-
-    # Text after the numbering that is neither a number token nor an
-    # edition word ("ch. 1 Colourised", or a special word out of its slot)
-    # could be a variant too.
+    # After the numbering the title has ended, so an edition phrase there is
+    # unambiguous. Other leftover text is an unrecognised tag; a special
+    # word out of its slot is one too.
     if starts:
         rest = list(body)
         for start, end in spans:
             rest[start:end] = " " * (end - start)
-        leftover = _EDITION_RE.sub(" ", "".join(rest)[min(starts):])
-        leftover = " ".join(leftover.split()).strip(_SERIES_TRIM)
+        leftover = "".join(rest)[min(starts):]
+        fixed_editions |= {
+            _EDITION_BY_FOLD[_fold(match.group(1))]
+            for match in _EDITION_RE.finditer(leftover)
+        }
+        leftover = " ".join(_EDITION_RE.sub(" ", leftover).split())
+        leftover = leftover.strip(_SERIES_TRIM)
         if leftover:
             other_tags.add(_fold(leftover))
 
+    run_editions = {word for kind, word in marker_run if kind == MARKER_EDITION}
+    run_specials = {word for kind, word in marker_run if kind == MARKER_SPECIAL}
     return NameTokens(
         filename=filename,
-        series=series,
-        chapters=tuple(value for _, value, _ in chapters),
-        issues=tuple(value for _, value, _ in issues),
-        volume_words=tuple(value for _, value, _ in volume_words),
-        v_tokens=tuple(value for _, value, _ in v_tokens),
+        series=series or None,
         version_markers=version_markers,
         years=years,
-        editions=editions,
+        editions=frozenset(fixed_editions | run_editions),
         other_tags=frozenset(other_tags),
-        specials=specials,
-        slot_prefix=slot_prefix,
-        chapter_spellings=tuple(raw for _, _, raw in chapters),
-        issue_spellings=tuple(raw for _, _, raw in issues),
-        volume_word_spellings=tuple(raw for _, _, raw in volume_words),
-        v_token_spellings=tuple(raw for _, _, raw in v_tokens),
+        specials=frozenset(run_specials),
+        slot_prefix=prefix.strip(_SERIES_TRIM) if marker_run else None,
+        fixed_editions=frozenset(fixed_editions),
+        marker_run=marker_run,
+        **_number_fields(found),
     )
 
 
@@ -1096,7 +1228,8 @@ class FamilyMember:
     or None. ``other_tags`` are `NameTokens.other_tags`. ``human_conflicts``
     names every decision field (`FIELDS` and `DECISION_FAMILY`) on which this
     archive's human decisions disagree; any of them refuses the family.
-    ``specials`` are `NameTokens.specials`, the special/collection slot.
+    ``specials`` and ``editions`` are the `effective_markers` reading;
+    ``marker_ambiguity`` is its ambiguity, which refuses the family.
     """
 
     archive_key: str
@@ -1111,6 +1244,7 @@ class FamilyMember:
     other_tags: frozenset[str] = frozenset()
     human_conflicts: frozenset[str] = frozenset()
     specials: frozenset[str] = frozenset()
+    marker_ambiguity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1242,6 +1376,11 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
             "members have different languages "
             f"{sorted(language or 'absent' for language in languages)}"
         )
+    reasons += [
+        f"{member.archive_key}: {member.marker_ambiguity}"
+        for member in members
+        if member.marker_ambiguity
+    ]
     special_sets = {member.specials for member in members}
     if any(len(specials) > 1 for specials in special_sets):
         reasons.append(
@@ -1492,32 +1631,69 @@ def _human_evidence(
     return found
 
 
-def effective_specials(
-    tokens: NameTokens, decided_series: str | None
-) -> frozenset[str]:
-    """The special markers that remain once the decided series is known.
+@dataclass(frozen=True)
+class MarkerReading:
+    """An archive's special and edition markers, read against its series.
 
-    A slot word is series text, not a marker, only when *this occurrence*
-    is accounted for by the decided series (human decision, ComicInfo or
-    folder): the name's whole pre-number prefix, series candidate plus slot
-    word (``NameTokens.slot_prefix``), equals the decided series under
-    `series_key`. ``Super Special #001`` in the series "Super Special" is
-    issue #1 of that series. ``Super Special Special #001`` is not: its
-    prefix is the full title *plus* another Special, so that occurrence is a
-    marker even though the title also ends in the word. A suffix match
-    alone cannot tell those apart.
-
-    In every other case the marker stands -- an unresolved series, or a
-    prefix that matches neither reading -- so a doubtful
-    occurrence is kept for review, never dropped.
+    ``ambiguity`` is set when the name's trailing vocabulary run cannot be
+    placed: the decided series matches no split of the prefix into title
+    text and markers. The run is then kept as markers *and* flagged, which
+    refuses the family and blocks readiness -- the run is never dropped.
     """
-    if not tokens.specials or not decided_series or tokens.slot_prefix is None:
-        return tokens.specials
-    # The slot prefix always holds the special word, which series_key keeps,
-    # so its key is never empty and cannot match an empty decided key.
-    if series_key(tokens.slot_prefix) == series_key(decided_series):
-        return frozenset()
-    return tokens.specials
+
+    specials: frozenset[str]
+    editions: frozenset[str]
+    ambiguity: str | None = None
+
+
+def effective_markers(
+    tokens: NameTokens, decided_series: str | None
+) -> MarkerReading:
+    """Place the name's trailing vocabulary run on the title/marker boundary.
+
+    Each run word is title text or a marker. The decided series (human
+    decision, ComicInfo or folder) settles it when exactly one split of the
+    prefix -- the title candidate plus the first *i* run words -- equals the
+    decided series under `title_key`; the remaining run words are markers.
+    ``Super Special #001`` in the series "Super Special" is issue #1 (the
+    word is title text); ``Super Special Special #001`` is the full title
+    plus a separate Special; ``English Omnibus #001`` in the series
+    "English" is an Omnibus. A suffix match alone cannot tell those apart,
+    which is why the whole prefix is compared, occurrence by occurrence.
+
+    With no decided series the run stands as markers. When no split
+    matches, the run stands as markers and ``ambiguity`` is set.
+    """
+    run_specials = {w for kind, w in tokens.marker_run if kind == MARKER_SPECIAL}
+    run_editions = {w for kind, w in tokens.marker_run if kind == MARKER_EDITION}
+    whole = MarkerReading(
+        specials=tokens.fixed_specials | run_specials,
+        editions=tokens.fixed_editions | run_editions,
+    )
+    if not tokens.marker_run or not decided_series:
+        return whole
+    decided = title_key(decided_series)
+    title = [tokens.series or ""]
+    for split in range(len(tokens.marker_run) + 1):
+        if split:
+            title.append(tokens.marker_run[split - 1][1])
+        if title_key(" ".join(title)) == decided:
+            markers = tokens.marker_run[split:]
+            return MarkerReading(
+                specials=tokens.fixed_specials
+                | {w for kind, w in markers if kind == MARKER_SPECIAL},
+                editions=tokens.fixed_editions
+                | {w for kind, w in markers if kind == MARKER_EDITION},
+            )
+    return MarkerReading(
+        specials=whole.specials,
+        editions=whole.editions,
+        ambiguity=(
+            f"cannot tell whether {[w for _, w in tokens.marker_run]} in "
+            f"{tokens.slot_prefix!r} are title text or markers: no reading "
+            f"matches the decided series {decided_series!r}"
+        ),
+    )
 
 
 def _human_conflicts(decisions: Sequence[HumanDecision]) -> frozenset[str]:
@@ -1851,6 +2027,13 @@ def resolve_folder(
         for group_key in group_keys:
             groups.setdefault(group_key, []).append(archive)
 
+    markers = {
+        archive.archive_key: effective_markers(
+            tokens[archive.archive_key], series[archive.archive_key].value
+        )
+        for archive in archives
+    }
+
     # The volume known without the v<N> tokens, for the family's
     # different-volumes refusal (see FamilyMember).
     work_volume = {
@@ -1872,7 +2055,7 @@ def resolve_folder(
                     archive_key=m.archive_key,
                     series=series[m.archive_key],
                     number=number[m.archive_key],
-                    editions=tokens[m.archive_key].editions,
+                    editions=markers[m.archive_key].editions,
                     version_marked=tokens[m.archive_key].version_marked,
                     pages=m.pages,
                     family_decision=family_decisions[m.archive_key],
@@ -1884,10 +2067,8 @@ def resolve_folder(
                     ),
                     other_tags=tokens[m.archive_key].other_tags,
                     human_conflicts=conflicts[m.archive_key],
-                    specials=effective_specials(
-                        tokens[m.archive_key],
-                        series[m.archive_key].value,
-                    ),
+                    specials=markers[m.archive_key].specials,
+                    marker_ambiguity=markers[m.archive_key].ambiguity,
                 )
                 for m in members
             ]
@@ -2003,6 +2184,8 @@ def resolve_folder(
             review.append("no primary number from any source")
         for name in sorted(conflicts[key]):
             review.append(f"conflicting human decisions on {name}")
+        if markers[key].ambiguity:
+            review.append(markers[key].ambiguity)
         for item in classifications:
             if item.classification == V_UNRESOLVED:
                 review.append(
