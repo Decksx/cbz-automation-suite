@@ -896,11 +896,72 @@ def test_matching_special_markers_are_a_family_control(marker):
 
 
 def test_two_special_markers_on_one_member_are_unresolved():
-    names = ("Series Omnibus Special #001 [v1].cbz", "Series Omnibus Special #001 [v2].cbz")
-    results = _resolve(*(_archive(n, info=_ci(), pages=_pages("p1")) for n in names))
+    """The tokenizer has one slot, so only a caller-built member can carry
+    two markers; `establish_family` must still refuse it."""
+    def with_specials(member, specials):
+        return FamilyMember(**{**member.__dict__, "specials": frozenset(specials)})
+
+    verdict = establish_family([
+        with_specials(_member("a"), {"Omnibus", "Special"}),
+        with_specials(_member("b"), {"Omnibus", "Special"}),
+    ])
+    assert verdict.status == fr.FAMILY_REFUSED
+    assert any("more than one special" in r for r in verdict.reasons)
+
+
+@pytest.mark.parametrize(
+    "filename, series",
+    [
+        ("Extra Life ch. 1 [v1].cbz", "Extra Life"),
+        ("The Special Ones #003.cbz", "The Special Ones"),
+        ("Bonus Track ch. 2.cbz", "Bonus Track"),
+        ("Complete Idiot Guide v02.cbz", "Complete Idiot Guide"),
+        ("Extra ch. 1.cbz", "Extra"),
+    ],
+)
+def test_a_special_word_outside_the_slot_is_series_text(filename, series):
+    """Lead probe: a special word is a marker only in #118's slot -- the
+    last word of the pre-number prefix with series text before it."""
+    tokens = parse_name_tokens(filename)
+    assert tokens.series == series
+    assert tokens.specials == frozenset()
+
+
+def test_the_slot_still_recognises_a_trailing_special():
+    tokens = parse_name_tokens("Series Omnibus Special #001.cbz")
+    assert (tokens.series, tokens.specials) == ("Series Omnibus", {"Special"})
+    assert parse_name_tokens("Series One-shot.cbz").specials == {"One-shot"}
+
+
+def test_a_bare_edition_phrase_does_not_hide_the_special_slot():
+    """The canonical order is series, special, numbering, then edition; a
+    bare edition phrase before the number is blanked so it neither joins
+    the series text nor takes the slot from a real special."""
+    tokens = parse_name_tokens("Series Omnibus Special Edition #001.cbz")
+    assert tokens.editions == {"Special Edition"}
+    assert (tokens.series, tokens.specials) == ("Series", {"Omnibus"})
+    plain = parse_name_tokens("Series Special Edition #001.cbz")
+    assert (plain.series, plain.specials) == ("Series", frozenset())
+
+
+def test_a_decided_series_ending_in_the_word_keeps_it_as_series_text():
+    """Lead point 2: in the series "Super Special", ``Super Special #001``
+    is issue #1, not a Special. Its version sibling here is named without
+    the word (``Super #001 [v2]``), so the slot word would differ between
+    the members; because the decided series ends with it, it is series
+    text and the family is not refused over it."""
+    names = ("Super Special #001 [v1].cbz", "Super #001 [v2].cbz")
+    assert parse_name_tokens(names[0]).specials == {"Special"}
+    results = _resolve(
+        *(_archive(n, info=_ci(series="Super Special"), pages=_pages("p1")) for n in names),
+    )
     for result in results.values():
-        assert result.family.status == fr.FAMILY_REFUSED
-        assert any("more than one special" in r for r in result.family.reasons)
+        assert result.fields["series"].value == "Super Special"
+        assert result.family.established
+        assert result.renamable
+    assert fr.effective_specials(frozenset({"Special"}), "Super Special") == frozenset()
+    assert fr.effective_specials(frozenset({"Omnibus"}), "Series") == {"Omnibus"}
+    assert fr.effective_specials(frozenset({"Omnibus"}), None) == {"Omnibus"}
 
 
 def test_special_edition_is_an_edition_not_the_special_word():
