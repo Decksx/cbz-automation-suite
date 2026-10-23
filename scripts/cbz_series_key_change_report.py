@@ -67,11 +67,18 @@ def build_report(roots: list[Path]) -> dict:
     """Compare old and new keys for every immediate subdirectory of *roots*.
 
     * ``changed``: every folder whose key differs under the new rule.
-    * ``merges``: new keys shared by folders whose old keys differed. These
-      are series the old index kept apart and a rebuilt one will join, so
-      they are what David reviews.
+    * ``merges``: new non-empty keys shared by folders whose old keys
+      differed. These are series the old index kept apart and a rebuilt one
+      will join, so they are what David reviews.
+    * ``empty_keys``: folders whose new key is empty (``_decensored``). The
+      series index excludes an empty identity rather than indexing it, so
+      these are listed on their own and are never counted as a merge.
     * ``splits``: old keys whose folders now differ. Not expected from this
       fix; listed so that an unexpected one cannot pass unseen.
+
+    Each root's full, sorted list of observed names is part of the report,
+    and so of its fingerprint. Without it, renaming a folder the fix does
+    not affect would leave the report, and its digest, unchanged.
     """
     absolute = [Path(os.path.abspath(r)) for r in roots]
     if len(absolute) != len(set(absolute)):
@@ -81,7 +88,8 @@ def build_report(roots: list[Path]) -> dict:
     root_rows = []
     for root in absolute:
         names = _directory_names(root)
-        root_rows.append({"root": str(root), "directories": len(names)})
+        root_rows.append({"root": str(root), "directories": len(names),
+                          "names": names})
         for name in names:
             rows.append({"root": str(root), "name": name,
                          "legacy_key": legacy_series_key(name),
@@ -92,8 +100,11 @@ def build_report(roots: list[Path]) -> dict:
     by_new: dict[str, list[dict]] = {}
     by_old: dict[str, list[dict]] = {}
     for r in rows:
-        by_new.setdefault(r["key"], []).append(r)
-        by_old.setdefault(r["legacy_key"], []).append(r)
+        if r["key"]:
+            by_new.setdefault(r["key"], []).append(r)
+        if r["legacy_key"]:
+            by_old.setdefault(r["legacy_key"], []).append(r)
+    empty_keys = [r for r in rows if not r["key"]]
     merges = [{"key": k, "members": members}
               for k, members in sorted(by_new.items())
               if len({m["legacy_key"] for m in members}) > 1]
@@ -105,9 +116,11 @@ def build_report(roots: list[Path]) -> dict:
         "contract": "series-key-change-report-v1",
         "roots": root_rows,
         "counts": {"directories": len(rows), "changed": len(changed),
-                   "merges": len(merges), "splits": len(splits)},
+                   "merges": len(merges), "empty_keys": len(empty_keys),
+                   "splits": len(splits)},
         "changed": changed,
         "merges": merges,
+        "empty_keys": empty_keys,
         "splits": splits,
     }
     report["report_sha256"] = hashlib.sha256(_canonical_bytes(report)).hexdigest()
