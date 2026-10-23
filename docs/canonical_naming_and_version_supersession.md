@@ -601,6 +601,10 @@ code takes. They are open to review.
    - any other element with attributes or children;
    - non-blank tail text anywhere;
    - text or attributes on `Pages`, or on the root;
+   - a root tag that is not exactly the unqualified `ComicInfo`, in A's or
+     B's document. That includes a prefixed `x:ComicInfo`, and a default
+     namespace whose children reset it with `xmlns=""`. A keeper with such
+     a root covers nothing;
    - a missing, blank, invalid (including more than six digits) or
      duplicate `Image` index;
    - any namespaced (`{uri}`-qualified) element or `Page` attribute. Names
