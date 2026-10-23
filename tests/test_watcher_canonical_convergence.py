@@ -490,17 +490,63 @@ def test_a_volume_numbered_folder_is_not_fallback_renamed(watch):
 
 def test_archive_collision_key_maps_only_decensor_tokens_to_words(tmp_path):
     """A decensored re-arrival still meets its pre-§5.5 copy; a different
-    version, year or edition does not, so no bytes land under another
-    version's label."""
+    version or edition does not, so no bytes land under another version's
+    label."""
     (tmp_path / "Book Uncensored.cbz").write_bytes(b"x")
     (tmp_path / "Book Ch. 1 [v2].cbz").write_bytes(b"x")
-    (tmp_path / "Book Ch. 2.cbz").write_bytes(b"x")
     (tmp_path / "Book Ch. 3 (Colored).cbz").write_bytes(b"x")
 
     found = watcher._find_archive_collision(tmp_path, "Book (Uncensored)")
     assert found is not None and found.name == "Book Uncensored.cbz"
     assert watcher._find_archive_collision(tmp_path, "Book Ch. 1 [v3]") is None
-    assert watcher._find_archive_collision(tmp_path, "Book Ch. 2 (2019)") is None
     assert watcher._find_archive_collision(tmp_path, "Book Ch. 3") is None
     found = watcher._find_archive_collision(tmp_path, "Book Ch.1 [v2]")
     assert found is not None and found.name == "Book Ch. 1 [v2].cbz"
+
+
+def test_an_arriving_year_token_still_meets_the_existing_copy(tmp_path):
+    """Every library name predates §5.5 and carries no year, so the year is
+    not part of book identity: X Ch. 5 (2019) is the existing X Ch. 5."""
+    (tmp_path / "X Ch. 5.cbz").write_bytes(b"x")
+    found = watcher._find_archive_collision(tmp_path, "X Ch. 5 (2019)")
+    assert found is not None and found.name == "X Ch. 5.cbz"
+
+
+def test_a_different_version_still_does_not_meet(tmp_path):
+    (tmp_path / "X Ch. 5 [v2].cbz").write_bytes(b"x")
+    assert watcher._find_archive_collision(tmp_path, "X Ch. 5 [v3]") is None
+    assert watcher._find_archive_collision(tmp_path, "X Ch. 5 (2019) [v3]") is None
+
+
+def test_a_different_edition_does_not_meet(tmp_path):
+    (tmp_path / "X Ch. 5.cbz").write_bytes(b"x")
+    assert watcher._find_archive_collision(tmp_path, "X Ch. 5 (Colored)") is None
+
+
+@pytest.mark.parametrize(
+    ("incoming_size", "survivor_size"),
+    [
+        # Larger by more than REPLACEMENT_MIN_GAIN_BYTES: incoming bytes win.
+        (watcher.REPLACEMENT_MIN_GAIN_BYTES + 1000 + 100, None),
+        # Not meaningfully larger: the existing bytes are kept.
+        (100 + 10, 100),
+    ],
+)
+def test_a_year_tagged_arrival_merges_under_the_existing_name(
+    tmp_path, incoming_size, survivor_size
+):
+    """When the year-tagged arrival meets the existing copy, the existing
+    *name* always survives and only one file remains. If the incoming bytes
+    win on size they move in under that name, so the (2019) token is lost
+    from the name -- accepted: the existing name wins, as before §5.5."""
+    src = tmp_path / "incoming"
+    dest = tmp_path / "library"
+    _make_cbz(dest / "X Ch. 5.cbz", 100)
+    _make_cbz(src / "X Ch. 5 (2019).cbz", incoming_size)
+
+    watcher._merge_directories(src, dest)
+
+    assert sorted(p.name for p in dest.iterdir()) == ["X Ch. 5.cbz"]
+    expected = incoming_size if survivor_size is None else survivor_size
+    assert _payload_size(dest / "X Ch. 5.cbz") == expected
+    assert not (src / "X Ch. 5 (2019).cbz").exists()
