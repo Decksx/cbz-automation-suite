@@ -347,12 +347,6 @@ def test_preserve_decensor_markers_is_unchanged():
         ("Berserk", "12.5", "Chapter (1989)", "Berserk ch. 12.5 (1989)"),
         # A decensor word the folder already carries is not repeated.
         ("Berserk Uncensored", "4", "Chapter (Uncensored)", "Berserk Uncensored ch. 4"),
-        # Two editions do not fit the grammar: the pre-§5.5 name, plus tokens.
-        ("Berserk", "4", "Chapter (Colored) (Uncensored)",
-         "Berserk Ch. 4 (Colored) (Uncensored)"),
-        # A series ending in a name token is refused by the formatter (it
-        # would read back as a volume); the pre-§5.5 name is kept.
-        ("Batman v1", "4", "Chapter (2019)", "Batman v1 Ch. 4 (2019)"),
     ],
 )
 def test_fallback_name_comes_from_the_canonical_formatter(series, chapter, source, expected):
@@ -550,3 +544,195 @@ def test_a_year_tagged_arrival_merges_under_the_existing_name(
     expected = incoming_size if survivor_size is None else survivor_size
     assert _payload_size(dest / "X Ch. 5.cbz") == expected
     assert not (src / "X Ch. 5 (2019).cbz").exists()
+
+
+# ---------------------------------------------------------------------------
+# Formatter refusal: no substitute rename, no unsafe merge (PR #121 review)
+# ---------------------------------------------------------------------------
+
+LONG_SERIES = "S" * 195
+
+
+@pytest.mark.parametrize(
+    ("series", "chapter", "source", "reason"),
+    [
+        ("Series Special", "4", "Chapter (2019)", "AmbiguousSeriesNameError"),
+        ("Batman v1", "4", "Chapter (2019)", "AmbiguousSeriesNameError"),
+        (LONG_SERIES, "4", "Chapter (2019)", "NameTooLongError"),
+        ("Berserk", "4", "Chapter (Colored) (Uncensored)", "conflicting tokens"),
+        ("Berserk", "4", "Chapter (2019) (2020)", "conflicting tokens"),
+        ("Berserk", "4", "Chapter [v2] [v3]", "conflicting tokens"),
+    ],
+)
+def test_a_formatter_refusal_is_returned_never_a_substitute_name(
+    series, chapter, source, reason
+):
+    result = watcher._fallback_display_stem(series, chapter, source)
+    assert isinstance(result, watcher.FallbackRefused)
+    assert reason in result.reason
+
+
+@pytest.mark.parametrize(
+    ("series", "source"),
+    [
+        ("Series Special", "Chapter (2019).cbz"),
+        (LONG_SERIES, "Chapter (2019).cbz"),
+        ("Berserk", "Chapter (Colored) (Uncensored).cbz"),
+    ],
+)
+def test_the_real_fallback_caller_keeps_the_name_on_refusal(tmp_path, monkeypatch, series, source):
+    """Codex's probe: _apply_fallback_naming used to rename a refused
+    archive to "Series Special Ch. 4 (2019).cbz" (and a 212-unit name for
+    the long series). It now keeps the current name and reports the path."""
+    monkeypatch.setattr(watcher, "process_comicinfo", lambda *a, **k: None)
+    folder = tmp_path / "arrival"
+    original = folder / source
+    _make_cbz(original, 100)
+    parsed = cbz_core.parse_comic_name(original, rules=NO_TRANSLATE, display_tokens=True)
+    mapping = {original: parsed}
+
+    refused = watcher._apply_fallback_naming(mapping, series, "4")
+
+    assert refused == [original]
+    assert sorted(p.name for p in folder.iterdir()) == [source]
+    assert mapping == {original: parsed}
+
+
+@pytest.mark.parametrize(
+    ("folder", "source"),
+    [
+        ("Series Special Ch. 4", "volvox_Chapter (2019).cbz"),
+        ("Berserk Ch. 4", "volvox_Chapter (Colored) (Uncensored).cbz"),
+    ],
+)
+def test_a_refused_placeholder_is_not_merged_into_the_library(watch, folder, source):
+    """End to end: the refused generic placeholder must not reach the series
+    folder, where the next chapter sharing its name would collide with it.
+    The directory stays in the import folder for review; the library is
+    untouched."""
+    watch_root, library = watch
+    _make_cbz(library / "Berserk" / "Berserk ch. 3.cbz", 100)
+    _make_cbz(library / "Series Special" / "Series Special ch. 3.cbz", 100)
+    before = sorted(str(p.relative_to(library)) for p in library.rglob("*"))
+
+    arrival = watch_root / folder
+    _make_cbz(arrival / source, 400)
+    watcher.process_and_move_directory(arrival)
+
+    assert sorted(str(p.relative_to(library)) for p in library.rglob("*")) == before
+    left = list(watch_root.rglob("*.cbz"))
+    assert len(left) == 1
+    # Still the arrival's own (display-cleaned) name, never a fallback name.
+    assert "ch. 4" not in left[0].name.casefold()
+    assert _payload_size(left[0]) == 400
+
+
+def test_a_refused_loose_placeholder_stays_while_its_siblings_move(watch):
+    """Mixed drop point: loose files beside comic subfolders are moved one by
+    one. A refused placeholder stays behind; the subfolder still moves."""
+    watch_root, library = watch
+    drop = watch_root / "Series Special Ch. 4"
+    _make_cbz(drop / "volvox_Chapter (2019).cbz", 400)
+    _make_cbz(drop / "Other" / "Other Ch. 1.cbz", 100)
+
+    watcher.process_and_move_directory(drop)
+
+    assert (library / "Other" / "Other Ch. 1.cbz").is_file()
+    assert not list((library).rglob("*volvox*"))
+    assert not (library / "Series Special").exists()
+    assert [p.name for p in watch_root.rglob("*.cbz")] == ["volvox Chapter (2019).cbz"]
+
+
+def test_backfill_renames_nothing_when_the_formatter_refuses(watch):
+    """Backfill would name the lone sibling "Series Special ch. 1", which the
+    formatter refuses. It is left as it is; the numbered arrival still lands
+    beside it under a different name, so nothing collides."""
+    watch_root, library = watch
+    _make_cbz(library / "Series Special" / "Series Special.cbz", 100)
+    arrival = watch_root / "Series Special Ch. 2"
+    _make_cbz(arrival / "Series Special Ch. 2.cbz", 200)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert sorted(p.name for p in (library / "Series Special").iterdir()) == [
+        "Series Special Ch. 2.cbz",
+        "Series Special.cbz",
+    ]
+
+
+def test_backfill_control_still_renames_when_the_formatter_accepts(watch):
+    watch_root, library = watch
+    _make_cbz(library / "Berserk" / "Berserk.cbz", 100)
+    arrival = watch_root / "Berserk Ch. 2"
+    _make_cbz(arrival / "Berserk Ch. 2.cbz", 200)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert sorted(p.name for p in (library / "Berserk").iterdir()) == [
+        "Berserk Ch. 2.cbz",
+        "Berserk ch. 1.cbz",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Numeric padding in the collision key (PR #121 review)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("existing", "arriving"),
+    [
+        ("Berserk v1 #003", "Berserk v01 #003 (2019)"),
+        ("Berserk Ch. 1", "Berserk ch. 01"),
+        ("Berserk Vol. 1 #3", "Berserk Vol. 01 #003"),
+        ("Berserk v1-02", "Berserk v01-02"),
+    ],
+)
+def test_cosmetic_padding_does_not_split_one_book(tmp_path, existing, arriving):
+    (tmp_path / f"{existing}.cbz").write_bytes(b"x")
+    found = watcher._find_archive_collision(tmp_path, arriving)
+    assert found is not None and found.stem == existing
+
+
+@pytest.mark.parametrize(
+    ("existing", "arriving"),
+    [
+        ("Berserk v1 #003", "Berserk v02 #003"),
+        ("Berserk v1 #003", "Berserk v01 #030"),
+        ("Berserk v01 #003 [v2]", "Berserk v01 #003 [v3]"),
+        ("Berserk v01 #003", "Berserk v01 #003 (Colored)"),
+        ("Berserk ch. 1", "Berserk ch. 10"),
+        # Same last digit: only the padding zeros may go, never other digits.
+        ("Berserk v1 #003", "Berserk v01 #013"),
+        ("Berserk v1", "Berserk v11"),
+    ],
+)
+def test_padding_normalisation_keeps_real_differences(tmp_path, existing, arriving):
+    (tmp_path / f"{existing}.cbz").write_bytes(b"x")
+    assert watcher._find_archive_collision(tmp_path, arriving) is None
+
+
+@pytest.mark.parametrize(
+    ("incoming_size", "survivor_size"),
+    [
+        (watcher.REPLACEMENT_MIN_GAIN_BYTES + 1000 + 100, None),
+        (100 + 10, 100),
+    ],
+)
+def test_a_canonical_arrival_meets_its_legacy_named_copy_end_to_end(
+    watch, incoming_size, survivor_size
+):
+    """Codex's probe end to end: the arrival keeps its canonical name
+    "Berserk v01 #003 (2019).cbz", the library holds the pre-§5.5 name
+    "Berserk v1 #003.cbz". They are one book: one file remains, under the
+    existing name, holding the incoming bytes only when meaningfully larger."""
+    watch_root, library = watch
+    _make_cbz(library / "Berserk" / "Berserk v1 #003.cbz", 100)
+    arrival = watch_root / "Berserk"
+    _make_cbz(arrival / "Berserk v01 #003 (2019).cbz", incoming_size)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert sorted(p.name for p in (library / "Berserk").iterdir()) == ["Berserk v1 #003.cbz"]
+    expected = incoming_size if survivor_size is None else survivor_size
+    assert _payload_size(library / "Berserk" / "Berserk v1 #003.cbz") == expected
