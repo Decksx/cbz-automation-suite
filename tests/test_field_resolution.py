@@ -384,6 +384,17 @@ def test_inconsistent_comicinfo_is_ignored(documents):
     )
 
 
+@pytest.mark.parametrize(
+    "year, plausible",
+    [("1899", False), ("1066", False), ("1900", True),
+     ("2100", True), ("2101", False)],
+)
+def test_year_bounds_are_enforced_at_both_ends(year, plausible):
+    assert (fr.normalize_year(year) is not None) is plausible
+    status = comicinfo_facts([f"<ComicInfo><Year>{year}</Year></ComicInfo>"]).status
+    assert status == (fr.COMICINFO_USABLE if plausible else fr.COMICINFO_INCONSISTENT)
+
+
 def test_identical_duplicate_comicinfo_members_are_consistent():
     doc = "<ComicInfo><Series>A</Series><Number>1</Number></ComicInfo>"
     assert comicinfo_facts([doc, doc]).status == fr.COMICINFO_USABLE
@@ -727,6 +738,29 @@ def test_family_requirements_are_each_load_bearing():
            "number": FieldResolution("number", None, None, (), "conflict")}
     )
     assert not establish_family([_member("a"), unresolved]).established
+
+
+def test_an_empty_series_key_is_never_the_same_decided_series():
+    """"Uncensored" and "Decensored" both key to "": no identity, no family."""
+    verdict = establish_family([
+        _member("a", series="Uncensored", number="3"),
+        _member("b", series="Decensored", number="3", marked=False),
+    ])
+    assert verdict.status == fr.FAMILY_REFUSED
+    assert "members' series key is empty (no identity)" in verdict.reasons
+
+
+def test_members_with_unresolved_numbers_are_refused():
+    """All-None numbers must not pass as "same number None"."""
+    def unresolved(member: FamilyMember) -> FamilyMember:
+        return FamilyMember(**{
+            **member.__dict__,
+            "number": FieldResolution("number", None, None, (), "conflict"),
+        })
+
+    verdict = establish_family([unresolved(_member("a")), unresolved(_member("b"))])
+    assert verdict.status == fr.FAMILY_REFUSED
+    assert "a member's primary number is unresolved" in verdict.reasons
 
 
 def test_a_human_decision_can_declare_a_family():
