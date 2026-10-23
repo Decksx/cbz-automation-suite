@@ -41,6 +41,15 @@ miss recompressed copies. Byte identity is reported alongside as
 ``archive_sha256`` where available, so a reviewer can see which groups
 are also byte-identical.
 
+Only canonical signatures are grouped
+(``page_hashing.comparable_ordered_signature_sql``): the current
+ordering-contract version, and a resolved page order. A version-"1" row
+ordered tied names by physical position and can share a digest with a
+current row of a *different* archive; an archive with duplicated raw image
+names has no order to compare. Both are left out of every group -- so they
+can never be actionable -- and counted instead under
+``excluded_signatures`` in the report.
+
 Recorded state is not live state
 --------------------------------
 
@@ -97,6 +106,12 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from comic_automation.archive.page_hashing import (
+    CONTENT_SIGNATURE_ALGORITHM,
+    CONTENT_SIGNATURE_VERSION,
+    comparable_ordered_signature_sql,
+    signature_evidence_counts,
+)
 from comic_automation.database.read_guards import (
     DatabaseMutatedError,
     fingerprint_database,
@@ -107,8 +122,10 @@ from comic_automation.database.read_guards import (
 )
 
 # Archives sharing this signature hold identical pages in identical order.
-SIGNATURE_ALGORITHM = "ordered-page-sha256"
-SIGNATURE_VERSION = "1"
+# Taken from the writer rather than restated: a hardcoded copy kept grouping
+# version "1" after the ordering contract moved to "2".
+SIGNATURE_ALGORITHM = CONTENT_SIGNATURE_ALGORITHM
+SIGNATURE_VERSION = CONTENT_SIGNATURE_VERSION
 
 
 def _live_state(
@@ -158,9 +175,13 @@ def collect_duplicate_groups(
 
     Retention is NOT decided here. The audit reports; choosing a keeper is a
     separate, guarded step.
+
+    Only canonical ordered evidence is read (see the module docstring);
+    `signature_evidence_counts` reports what was left out.
     """
+    comparable = comparable_ordered_signature_sql("acs")
     rows = connection.execute(
-        """
+        f"""
         SELECT
             acs.digest            AS signature,
             acs.archive_id        AS archive_id,
@@ -181,13 +202,11 @@ def collect_duplicate_groups(
         LEFT JOIN archive_hashes AS ah
           ON ah.archive_id = acs.archive_id
          AND ah.algorithm = 'sha256'
-        WHERE acs.algorithm = ?
-          AND acs.algorithm_version = ?
+        WHERE {comparable}
           AND acs.digest IS NOT NULL
           AND acs.page_count > 0
         ORDER BY acs.digest, acs.page_count DESC, af.file_size DESC, acs.archive_id
-        """,
-        (SIGNATURE_ALGORITHM, SIGNATURE_VERSION),
+        """
     ).fetchall()
 
     by_signature: dict[str, list[dict]] = {}
@@ -383,8 +402,15 @@ def run_audit(
     fingerprint_before = fingerprint_database(database)
     files_before = fingerprint_database_files(database)
 
-    def read(connection: sqlite3.Connection) -> list[dict]:
-        return collect_duplicate_groups(connection, stat_paths=stat_paths)
+    def read(connection: sqlite3.Connection) -> dict:
+        # Both reads inside one snapshot, so the excluded counts describe
+        # the same database state as the groups they were excluded from.
+        return {
+            "groups": collect_duplicate_groups(
+                connection, stat_paths=stat_paths
+            ),
+            "excluded": signature_evidence_counts(connection),
+        }
 
     snapshot = read_consistent_snapshot(
         database,
@@ -392,7 +418,8 @@ def run_audit(
         context="content duplicate audit",
         integrity_check=quick_check,
     )
-    groups = snapshot.result
+    groups = snapshot.result["groups"]
+    excluded = snapshot.result["excluded"]
 
     # Re-stat after the connection closes: mode=ro plus query_only should make
     # this impossible, and this is the guarantee the audit actually promises.
@@ -424,6 +451,10 @@ def run_audit(
         ),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "summary": summarize(groups),
+        # Diagnostics only. Rows counted here as anything but `comparable`
+        # are in no group; legacy-version rows need re-certification or
+        # re-inventory (docs/engineering_decisions.md) before they count.
+        "excluded_signatures": excluded,
         "groups": groups,
     }
 
@@ -492,6 +523,9 @@ def print_summary(output: dict, top: int = 15) -> None:
         "contain a member not present on disk as recorded"
     )
     print(f"  members by live state: {summary['members_by_live_state']}")
+    excluded = output.get("excluded_signatures")
+    if excluded:
+        print(f"Signature evidence (not grouped unless comparable): {excluded}")
     if not output.get("paths_stat_checked", True):
         print("  NOTE: --no-stat was used; no group can be actionable.")
 

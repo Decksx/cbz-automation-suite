@@ -43,14 +43,11 @@ from comic_automation.archive.hashing import (
     ArchiveHashRepository,
     calculate_archive_hash,
 )
-from comic_automation.archive.inspection import (
-    IMAGE_EXTENSIONS,
-    inspect_archive,
-)
+from comic_automation.archive.inspection import inspect_archive
 from comic_automation.archive.page_hashing import (
     ArchivePageHashRepository,
-    _natural_key,
     calculate_page_hashes,
+    order_page_entries,
 )
 from comic_automation.archive.repository import (
     ArchiveInspectionRepository,
@@ -185,16 +182,11 @@ def _live_inventory(path: Path) -> tuple[FileSnapshot, list[dict]]:
     before = _file_snapshot(path)
 
     with zipfile.ZipFile(path, mode="r") as archive:
-        entries = sorted(
-            (
-                entry
-                for entry in archive.infolist()
-                if not entry.is_dir()
-                and Path(entry.filename).suffix.casefold()
-                in IMAGE_EXTENSIONS
-            ),
-            key=lambda entry: _natural_key(entry.filename),
-        )
+        # The same ordering helper the exact and perceptual hashers use.
+        # This inventory is compared row for row against stored exact rows,
+        # so a local sort that ordered tied names differently would report
+        # drift on archives that have none.
+        entries = order_page_entries(archive.infolist()).entries
 
         inventory = [
             {
