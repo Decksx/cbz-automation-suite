@@ -332,18 +332,80 @@ def _with_text(xml: str, local_name: str, text: str) -> str:
     return ElementTree.tostring(root, encoding="unicode")
 
 
-def test_a_template_a_human_has_edited_counts_again():
-    xml = _with_text(_watcher_filled_template(), "Writer", "Kentaro Miura")
-    assert comicinfo_facts([xml]).status == fr.COMICINFO_USABLE
-
-
-def test_a_template_with_an_element_the_injectors_never_write_counts_again():
+def _with_element(xml: str, local_name: str, text: str) -> str:
+    """``xml`` with a new ``local_name`` element appended."""
     from xml.etree import ElementTree
 
-    root = ElementTree.fromstring(_watcher_filled_template())
-    ElementTree.SubElement(root, "Tags").text = "action"
-    xml = ElementTree.tostring(root, encoding="unicode")
-    assert comicinfo_facts([xml]).status == fr.COMICINFO_USABLE
+    root = ElementTree.fromstring(xml)
+    ElementTree.SubElement(root, local_name).text = text
+    return ElementTree.tostring(root, encoding="unicode")
+
+
+def _edited_writer() -> str:
+    return _with_text(_watcher_filled_template(), "Writer", "A credited writer")
+
+
+def _edited_tags() -> str:
+    return _with_element(_watcher_filled_template(), "Tags", "action")
+
+
+@pytest.mark.parametrize(
+    "edit", [_edited_writer, _edited_tags], ids=["writer", "tags"]
+)
+def test_an_unrelated_edit_does_not_launder_injected_fields(edit):
+    """PR #119 review, finding 1 (Codex probe ``edited_template``).
+
+    The real watcher template, filled by the real watcher path for
+    ``Berserk v03 ch. 7.cbz``, then edited in a field that says nothing
+    about Series/Number/Volume. Those three still restate the filename, so
+    they must stay filename-grade: nothing resolves from ComicInfo, ``v3``
+    is not a volume, and the archive is not renamable on ComicInfo alone.
+    """
+    facts = comicinfo_facts([edit()])
+    assert facts.status == fr.COMICINFO_EDITED_TEMPLATE
+    assert facts.uncertain_fields == {"Series", "Number", "Volume"}
+
+    result = _resolve(_archive("Berserk v03 ch. 7.cbz", info=facts))[
+        "Berserk v03 ch. 7.cbz"
+    ]
+    for name in ("series", "number", "volume"):
+        field = result.fields[name]
+        assert not field.resolved, name
+        assert all(e.source != fr.SOURCE_COMICINFO for e in field.evidence)
+        assert any("injected template" in e.detail for e in field.evidence)
+    assert _v(result, "3").classification == fr.V_UNRESOLVED
+    assert not result.renamable
+
+
+def test_an_edited_template_still_counts_for_fields_the_injectors_never_write():
+    """Control: a Year added to an injected template is real metadata."""
+    xml = _with_element(_edited_writer(), "Year", "1990")
+    facts = comicinfo_facts([xml])
+    assert facts.authoritative("Year")
+    result = _resolve(_archive("Berserk v03 ch. 7.cbz", info=facts))[
+        "Berserk v03 ch. 7.cbz"
+    ]
+    assert result.fields["year"].value == "1990"
+    assert result.fields["year"].source == fr.SOURCE_COMICINFO
+
+
+def test_injected_fields_still_resolve_from_independent_evidence():
+    """Control: folder context or a field-specific human decision resolves
+    an injected field in the ordinary way; the template neither blocks nor
+    decides."""
+    facts = comicinfo_facts([_edited_writer()])
+    results = _resolve(
+        _archive("Berserk ch. 6.cbz"),
+        _archive("Berserk v03 ch. 7.cbz", info=facts),
+        series_folder="Berserk",
+        decisions=StaticHumanDecisions({
+            "Berserk v03 ch. 7.cbz": [HumanDecision("volume", "3", "rec-v")],
+        }),
+    )
+    result = results["Berserk v03 ch. 7.cbz"]
+    assert result.fields["series"].source == fr.SOURCE_FOLDER
+    assert result.fields["volume"].source == fr.SOURCE_HUMAN
+    assert _v(result, "3").classification == fr.V_VOLUME
 
 
 def test_a_non_komga_mihon_export_is_not_the_template():
@@ -675,18 +737,18 @@ def test_different_editions_or_languages_are_not_one_family():
     """§7 named. Colored vs plain, and English vs absent, are refused."""
     colored = establish_family([
         _member("a", editions=()),
-        _member("b", editions=("colored",)),
+        _member("b", editions=("Colored",)),
     ])
     assert colored.status == fr.FAMILY_REFUSED
     assert any("different editions" in r for r in colored.reasons)
 
     language = establish_family([
-        _member("a", editions=("english",)),
+        _member("a", editions=("English",)),
         _member("b", editions=()),
     ])
     assert language.status == fr.FAMILY_REFUSED
 
-    # Through the resolver: the colored copy never joins the plain family.
+    # Through the resolver: the colored copy refuses the plain family.
     results = _resolve(
         _archive("S ch. 1 v1.cbz", pages=_pages("p1")),
         _archive("S ch. 1 v2 (Colored).cbz", pages=_pages("p1", "p2")),
@@ -698,14 +760,250 @@ def test_different_editions_or_languages_are_not_one_family():
         assert results[name].v_tokens[0].classification == fr.V_UNRESOLVED
 
 
+def _ci(series="Series", number="1", **extra: str):
+    """Real ComicInfo XML through `comicinfo_facts`, not hand-built facts."""
+    body = "".join(f"<{k}>{v}</{k}>" for k, v in extra.items())
+    return comicinfo_facts([
+        f"<ComicInfo><Series>{series}</Series><Number>{number}</Number>"
+        f"{body}</ComicInfo>"
+    ])
+
+
+def test_different_comicinfo_languages_refuse_the_family():
+    """PR #119 review, finding 3 (Codex probe ``language``): en vs fr."""
+    results = _resolve(
+        _archive("Series ch. 1 v1.cbz", info=_ci(LanguageISO="en"), pages=_pages("p1")),
+        _archive("Series ch. 1 v2.cbz", info=_ci(LanguageISO="fr"), pages=_pages("p1")),
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("different languages" in r for r in result.family.reasons)
+        assert not result.fields["version"].resolved
+        assert not result.renamable
+
+
+def test_a_language_against_an_absent_language_refuses_the_family():
+    results = _resolve(
+        _archive("Series ch. 1 v1.cbz", info=_ci(LanguageISO="en"), pages=_pages("p1")),
+        _archive("Series ch. 1 v2.cbz", info=_ci(), pages=_pages("p1")),
+    )
+    assert results["Series ch. 1 v2.cbz"].family.status == fr.FAMILY_REFUSED
+
+
+def test_the_same_language_is_a_family_control():
+    results = _resolve(
+        _archive("Series ch. 1 v1.cbz", info=_ci(LanguageISO="en"), pages=_pages("p1")),
+        _archive("Series ch. 1 v2.cbz", info=_ci(LanguageISO="EN"), pages=_pages("p1")),
+    )
+    for result in results.values():
+        assert result.family.established
+        assert result.renamable
+
+
+def test_a_supported_edition_on_one_member_refuses_the_family():
+    """PR #119 review, finding 3 (Codex probe ``supported_edition_ignored``)."""
+    results = _resolve(
+        _archive("Series ch. 1 (Alternate Cover) [v1].cbz", info=_ci(), pages=_pages("p1")),
+        _archive("Series ch. 1 [v2].cbz", info=_ci(), pages=_pages("p1")),
+    )
+    assert parse_name_tokens("Series ch. 1 (Alternate Cover) [v1].cbz").editions == {
+        "Alternate Cover"
+    }
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("different editions" in r for r in result.family.reasons)
+        assert not result.renamable
+
+
+def test_colored_and_colorized_are_not_merged():
+    """Their equivalence is undecided, so they are different editions."""
+    results = _resolve(
+        _archive("Series ch. 1 (Colored) v1.cbz", info=_ci(), pages=_pages("p1")),
+        _archive("Series ch. 1 (Colorized) v2.cbz", info=_ci(), pages=_pages("p1")),
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+
+
+def test_the_edition_vocabulary_is_the_formatters():
+    from scripts.cbz_canonical_name import EDITION_WORDS
+
+    assert fr.EDITION_VOCABULARY == EDITION_WORDS
+    for word in EDITION_WORDS:
+        assert parse_name_tokens(f"S ch. 1 ({word.upper()}).cbz").editions == {word}
+
+
+def test_an_unrecognised_variant_tag_refuses_rather_than_reading_as_absent():
+    """A tag outside the vocabulary may be an unsupported variant."""
+    results = _resolve(
+        _archive("Series ch. 1 (Coloured) v1.cbz", info=_ci(), pages=_pages("p1")),
+        _archive("Series ch. 1 v2.cbz", info=_ci(), pages=_pages("p1")),
+    )
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("unrecognised tags" in r for r in result.family.reasons)
+
+    # Control: the same tag on every member is no difference.
+    results = _resolve(
+        _archive("Series ch. 1 [Judas] v1.cbz", info=_ci(), pages=_pages("p1")),
+        _archive("Series ch. 1 [Judas] v2.cbz", info=_ci(), pages=_pages("p1")),
+    )
+    assert all(r.family.established for r in results.values())
+
+
 def test_decensor_pairs_are_never_versions():
     """§7 named test's family half (the "survive rename" half is step 7)."""
-    verdict = establish_family([
-        _member("a", editions=()),
-        _member("b", editions=("uncensored",)),
-    ])
-    assert verdict.status == fr.FAMILY_REFUSED
-    assert any("decensor pair" in r for r in verdict.reasons)
+    for marker in ("Uncensored", "Decensored"):
+        verdict = establish_family([
+            _member("a", editions=()),
+            _member("b", editions=(marker,)),
+        ])
+        assert verdict.status == fr.FAMILY_REFUSED
+        assert any("decensor pair" in r for r in verdict.reasons)
+    results = _resolve(
+        _archive("Series ch. 1 v1.cbz", info=_ci(), pages=_pages("p1")),
+        _archive("Series ch. 1 v2 (Uncensored).cbz", info=_ci(), pages=_pages("p1")),
+    )
+    assert any("decensor pair" in r for r in results["Series ch. 1 v1.cbz"].family.reasons)
+
+
+# --- human conflicts persist (PR #119 review, finding 2) ---------------------
+
+_PAIR = ("Series ch. 1 v1.cbz", "Series ch. 1 v2.cbz")
+
+
+def _pair(decisions):
+    return _resolve(
+        *(_archive(n, info=_ci(), pages=_pages("p1")) for n in _PAIR),
+        decisions=StaticHumanDecisions(decisions),
+    )
+
+
+def test_conflicting_human_family_decisions_refuse_the_family():
+    """Codex probe ``conflicting_human_families``: A and B for one member.
+
+    The metadata alone would establish the automatic family. The conflict
+    must refuse it, not decay to "no human decision".
+    """
+    results = _pair({_PAIR[0]: [
+        HumanDecision("family", "A", "receipt-A"),
+        HumanDecision("family", "B", "receipt-B"),
+    ]})
+    for name in _PAIR:
+        result = results[name]
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("conflicting human decisions" in r for r in result.family.reasons)
+        assert not result.fields["version"].resolved
+        assert not result.renamable
+    assert "conflicting human decisions on family" in results[_PAIR[0]].review
+
+
+def test_a_conflicted_member_refuses_every_family_it_was_declared_into():
+    """Family A has two agreeing members; a third is declared into A and B.
+
+    Its series and number are unresolved, so it has no automatic work
+    group to fall back into. Family A must still be refused because of it,
+    not established without it.
+    """
+    names = ("Series ch. 1 v1.cbz", "Series ch. 1 v2.cbz", "loose.cbz")
+    results = _resolve(
+        *(_archive(n, info=_ci(), pages=_pages("p1")) for n in names[:2]),
+        _archive(names[2], pages=_pages("p1")),
+        decisions=StaticHumanDecisions({
+            names[0]: [HumanDecision("family", "A", "r1")],
+            names[1]: [HumanDecision("family", "A", "r2")],
+            names[2]: [
+                HumanDecision("family", "A", "r3"),
+                HumanDecision("family", "B", "r4"),
+            ],
+        }),
+    )
+    for name in names:
+        assert results[name].family is not None, name
+        assert results[name].family.status == fr.FAMILY_REFUSED, name
+        assert not results[name].renamable, name
+
+
+def test_repeated_agreeing_family_decisions_still_declare_the_family():
+    results = _pair({
+        _PAIR[0]: [HumanDecision("family", "A", "r1"), HumanDecision("family", "A", "r2")],
+        _PAIR[1]: [HumanDecision("family", "A", "r3")],
+    })
+    assert all(r.family.established and r.renamable for r in results.values())
+
+
+def test_conflicting_human_volume_decisions_never_classify_a_token():
+    """Codex probe ``human_volume_conflict``: volume 1 and 2 for v1."""
+    results = _pair({_PAIR[0]: [
+        HumanDecision("volume", "1", "rec1"),
+        HumanDecision("volume", "2", "rec2"),
+    ]})
+    first = results[_PAIR[0]]
+    assert first.fields["volume"].reason == "human_conflict"
+    assert _v(first, "1").classification == fr.V_UNRESOLVED
+    assert "conflicting human decisions on volume" in first.review
+    assert not first.renamable
+    assert first.family.status == fr.FAMILY_REFUSED
+    assert not results[_PAIR[1]].family.established
+
+
+def test_conflicting_human_version_decisions_never_classify_a_token():
+    results = _pair({_PAIR[0]: [
+        HumanDecision("version", "1", "rec1"),
+        HumanDecision("version", "3", "rec2"),
+    ]})
+    first = results[_PAIR[0]]
+    assert _v(first, "1").classification == fr.V_UNRESOLVED
+    assert not first.renamable
+    assert first.family.status == fr.FAMILY_REFUSED
+
+
+def test_repeated_agreeing_volume_decisions_still_classify():
+    results = _pair({_PAIR[0]: [
+        HumanDecision("volume", "1", "rec1"),
+        HumanDecision("volume", "01", "rec2"),
+    ]})
+    first = results[_PAIR[0]]
+    assert _v(first, "1").classification == fr.V_VOLUME
+    assert first.fields["volume"].source == fr.SOURCE_HUMAN
+    assert first.renamable
+
+
+def test_a_conflict_on_any_field_blocks_readiness():
+    results = _resolve(
+        _archive("Berserk ch. 1.cbz", info=_ci(series="Berserk", number="1")),
+        decisions=StaticHumanDecisions({"Berserk ch. 1.cbz": [
+            HumanDecision("year", "1990", "r1"),
+            HumanDecision("year", "1991", "r2"),
+        ]}),
+    )
+    result = results["Berserk ch. 1.cbz"]
+    assert result.fields["series"].resolved and result.fields["number"].resolved
+    assert "conflicting human decisions on year" in result.review
+    assert not result.renamable
+
+
+# --- display spelling ----------------------------------------------------------
+
+
+def test_the_display_spelling_travels_with_the_comparison_key():
+    """``12.50`` compares equal to ``12.5`` but is displayed as written."""
+    results = _resolve(
+        _archive("S ch. 012.50.cbz", info=_ci(series="S", number="12.50")),
+        _archive("S ch. 13.cbz"),
+        series_folder="S",
+    )
+    number = results["S ch. 012.50.cbz"].fields["number"]
+    assert number.value == "12.5"
+    assert number.source == fr.SOURCE_COMICINFO
+    assert number.display_value == "12.50"
+    assert {e.display_value for e in number.evidence} == {"12.50", "012.50"}
+
+    folder_only = _resolve(
+        _archive("S ch. 012.50.cbz"), _archive("S ch. 13.cbz"), series_folder="S",
+    )["S ch. 012.50.cbz"].fields["number"]
+    assert folder_only.source == fr.SOURCE_FOLDER
+    assert folder_only.display_value == "012.50"
 
 
 def test_overlap_without_family_evidence_is_never_compared():
@@ -784,7 +1082,8 @@ def test_unresolved_series_or_number_is_not_renamable_and_carries_evidence():
     assert any("primary number unresolved" in r for r in result.review)
     data = result.as_dict()
     assert data["fields"]["number"]["evidence"] == [
-        {"source": "filename", "value": "3", "detail": "filename chapter"}
+        {"source": "filename", "value": "3", "display": "3",
+         "detail": "filename chapter"}
     ]
 
 
@@ -945,6 +1244,75 @@ def test_stored_duplicate_names_or_missing_digests_are_not_comparable(
     evidence = load_page_evidence(database, [duplicate_id, missing_id]).result
     assert not evidence[duplicate_id].comparable
     assert not evidence[missing_id].comparable
+
+
+def test_an_empty_digest_is_incomplete_not_a_shorter_sequence():
+    """PR #119 review, finding 4 (Codex probe ``missing_digest``)."""
+    evidence = _pages("", "p1")
+    assert not evidence.comparable
+    assert "empty or missing digest" in evidence.incomparable_reason
+    verdict = establish_family([_member("a", pages=evidence), _member("b")])
+    assert verdict.status == fr.FAMILY_INCOMPARABLE
+    # Control: the same sequence with every digest present is comparable.
+    assert _pages("p0", "p1").comparable
+    assert establish_family([_member("a"), _member("b")]).established
+
+
+def _mutate(database: Path, sql: str, params: tuple) -> None:
+    with database_connection(database) as connection:
+        connection.execute(sql, params)
+        connection.commit()
+
+
+def test_a_stored_empty_digest_keeps_its_slot_and_is_refused(database, tmp_path):
+    """Codex probe ``stored_empty_digest``: two pages, one digest set to ''."""
+    archive_id = _seed_pages(
+        database, _cbz(tmp_path / "book.cbz", {"1.png": b"a", "2.png": b"b"})
+    )
+    control = load_page_evidence(database, [archive_id]).result[archive_id]
+    assert control.comparable and len(control.page_digests) == 2
+
+    _mutate(
+        database,
+        "UPDATE page_hashes SET digest = '' WHERE page_id = (SELECT id FROM "
+        "archive_pages WHERE archive_id = ? AND page_index = 0)",
+        (archive_id,),
+    )
+    loaded = load_page_evidence(database, [archive_id]).result[archive_id]
+    assert len(loaded.page_digests) == 2          # never silently shortened
+    assert loaded.page_digests[0] == ""
+    assert not loaded.comparable
+
+
+def test_a_missing_page_row_does_not_pass_as_complete(database, tmp_path):
+    """The signature records the page count; a deleted row must show."""
+    archive_id = _seed_pages(
+        database,
+        _cbz(tmp_path / "book.cbz", {"1.png": b"a", "2.png": b"b", "3.png": b"c"}),
+    )
+    _mutate(
+        database,
+        "DELETE FROM archive_pages WHERE archive_id = ? AND page_index = 2",
+        (archive_id,),
+    )
+    loaded = load_page_evidence(database, [archive_id]).result[archive_id]
+    assert loaded.inventory_problem == "2 page rows but the signature records 3 pages"
+    assert not loaded.comparable
+
+
+def test_non_contiguous_page_indexes_are_incomplete(database, tmp_path):
+    archive_id = _seed_pages(
+        database, _cbz(tmp_path / "book.cbz", {"1.png": b"a", "2.png": b"b"})
+    )
+    _mutate(
+        database,
+        "UPDATE archive_pages SET page_index = 5 WHERE archive_id = ? "
+        "AND page_index = 1",
+        (archive_id,),
+    )
+    loaded = load_page_evidence(database, [archive_id]).result[archive_id]
+    assert loaded.inventory_problem == "page indexes are not contiguous from 0"
+    assert not loaded.comparable
 
 
 def test_load_page_evidence_rejects_a_concurrent_commit(database, tmp_path):
