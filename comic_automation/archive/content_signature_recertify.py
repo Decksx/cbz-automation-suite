@@ -39,10 +39,12 @@ Three modes
     (`verify_target`), and the reported backup is a real, distinct, intact
     preimage of the plan taken after it (`verify_backup`). Then one
     ``BEGIN IMMEDIATE`` transaction (`dal.transaction`) re-checks the target
-    and the backup file under the lock, re-classifies each planned archive
-    from the rows as they are *inside that transaction*, and relabels it
-    only if the result is still ``order_stable`` with exactly the planned
-    basis. A row that moved is skipped and reported, never relabelled. A row
+    and the backup window (`BackupWindow`) under the lock, re-classifies
+    each planned archive from the rows as they are *inside that
+    transaction*, relabels it only if the result is still ``order_stable``
+    with exactly the planned basis, and checks the backup window once more
+    as the last step before COMMIT. A row that moved is skipped and
+    reported, never relabelled. A row
     already at version ``"2"`` with the planned basis is reported
     ``already_recertified``, so a re-run is a no-op. Only
     ``archive_content_signatures.algorithm_version`` and ``updated_at``
@@ -76,7 +78,12 @@ identity.
 **Backup.** Backup creation stays the operator's
 (``python -m comic_automation.database.backup_cli``). Apply verifies the
 artifact the report names, not the report's word for it: see
-`verify_backup` for the checks and the freshness and rerun policy.
+`verify_backup` for the checks and the freshness and rerun policy. The
+backup is then held open read-only from verification until just before the
+live COMMIT, and its ``PRAGMA data_version`` must not move across that
+window (`BackupWindow`), so a WAL-only commit to the backup -- which leaves
+the main file's size and mtime unchanged -- refuses the apply or rolls back
+every relabel. The main-file fingerprint is only a replacement check.
 
 Provenance -- what a relabel certifies, and what it does not
 ------------------------------------------------------------
@@ -132,6 +139,7 @@ from comic_automation.archive.page_hashing import (
 )
 from comic_automation.database.dal import open_connection, transaction
 from comic_automation.database.read_guards import (
+    data_version,
     quick_check,
     read_consistent_snapshot,
 )
@@ -729,6 +737,14 @@ def _user_table_counts(connection: sqlite3.Connection) -> dict[str, int]:
 
 
 def _backup_fingerprint(path: str) -> dict:
+    """File identity and main-file size/mtime of the backup.
+
+    A *replacement* check only: it notices the backup being moved, deleted
+    or swapped for another file. It is **not** evidence that the SQLite
+    database inside is unchanged -- a WAL-mode commit lands in ``-wal`` and
+    leaves every field here identical. Content changes are detected by
+    `BackupWindow`'s ``PRAGMA data_version`` readings.
+    """
     stat = _stat(path)
     return {
         "st_dev": int(stat.st_dev),
@@ -738,9 +754,65 @@ def _backup_fingerprint(path: str) -> dict:
     }
 
 
+class BackupWindow:
+    """The verified backup, held open from verification to the live commit.
+
+    One read-only connection (``mode=ro`` + ``query_only``) to the backup is
+    opened by `verify_backup` and kept until apply finishes. ``PRAGMA
+    data_version`` on it is sampled outside any read transaction *before*
+    the preimage read, and is then required to be unchanged at every
+    `check`: after that read, after the live ``BEGIN IMMEDIATE`` and as the
+    last statement before the live ``COMMIT``. ``data_version`` counts
+    commits by *other* connections, including WAL-only ones that leave the
+    main file's size and mtime identical, so an unchanged reading proves
+    nothing committed to the backup between the first reading and the last.
+
+    The file fingerprint is checked alongside it, for a different failure:
+    a backup moved, deleted or replaced by another file, which a connection
+    already holding the old file would not see as a commit.
+
+    Remaining non-atomic limit: the live database's lock does not lock the
+    backup, so a commit to the backup *after* the final check and before
+    the live COMMIT returns is not detected. That interval contains no reads
+    and no writes of this tool, only the COMMIT itself.
+    """
+
+    def __init__(self, path: str, connection: sqlite3.Connection,
+                 data_version_value: int, fingerprint: dict) -> None:
+        self.path = path
+        self.connection = connection
+        self.data_version = data_version_value
+        self.fingerprint = fingerprint
+
+    def check(self, stage: str) -> None:
+        """Refuse if the backup was committed to or replaced since verification."""
+        try:
+            current = _backup_fingerprint(self.path)
+        except OSError:
+            current = None
+        if current != self.fingerprint:
+            raise PlanRefusedError(
+                f"Backup artifact {self.path} moved or was replaced {stage}."
+            )
+        now = data_version(self.connection)
+        if now != self.data_version:
+            raise PlanRefusedError(
+                f"Backup artifact {self.path} was committed to {stage} "
+                f"(data_version {self.data_version} -> {now}); it may no "
+                "longer hold the approved preimage."
+            )
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def describe(self) -> dict:
+        return {"path": self.path, "data_version": self.data_version,
+                **self.fingerprint}
+
+
 def verify_backup(
     database: str | Path, body: dict, backup_report: str | Path
-) -> dict:
+) -> BackupWindow:
     """Prove the reported backup is this plan's recoverable preimage.
 
     The report is only a pointer; every claim is checked on the artifact.
@@ -753,19 +825,23 @@ def verify_backup(
     3. It is the file the report describes: size and mtime equal the
        report's ``backup_size_bytes`` / ``backup_modified_time_ns``, and its
        user-table row counts equal ``backup_table_counts``.
-    4. Opened read-only through `read_consistent_snapshot`, its
+    4. Opened read-only, inside one deferred read transaction, its
        ``PRAGMA quick_check`` is ``ok``.
     5. **Freshness:** its mtime is at or after the plan's ``planned_at_ns``,
        so it was written after the planned snapshot began.
     6. **Preimage:** classifying the backup's own legacy rows reproduces the
        plan's classification exactly (`CLASSIFICATION_KEYS`) -- so it holds
        the approved pre-apply state of every row apply may change.
-    7. It did not change while being verified.
+    7. Nothing committed to it, and it was not replaced, during the read
+       (the first `BackupWindow.check`).
+
+    Returns the open `BackupWindow`; the caller must `close` it. On any
+    refusal the connection is closed here.
 
     Rerun policy: the same plan and backup may be re-applied (the backup is
     still the preimage of the planned rows, and apply is idempotent). A new
     plan needs a new backup, because check 5 compares against that plan's
-    time. Returns the artifact fingerprint for the under-lock re-check.
+    time.
     """
     try:
         report = json.loads(Path(backup_report).read_text(encoding="utf-8"))
@@ -822,42 +898,58 @@ def verify_backup(
             "after planning."
         )
 
-    def read(connection: sqlite3.Connection) -> dict:
-        return {
-            "counts": _user_table_counts(connection),
-            "classified": build_plan_body(classify_legacy(connection)),
-        }
-
+    # The read_guards sequence, on a connection that stays open afterwards:
+    # data_version outside and before the read transaction, one deferred
+    # read transaction for quick_check and every read, END, and from then on
+    # BackupWindow.check compares against the first reading.
     try:
-        snapshot = read_consistent_snapshot(
-            backup, read, context="backup preimage verification",
-            integrity_check=quick_check,
-        )
-    except PlanRefusedError:
-        raise
+        connection = open_connection(backup, readonly=True)
     except Exception as error:
         raise PlanRefusedError(
             f"Backup artifact {backup} failed verification: {error}"
         ) from error
+    window = BackupWindow(backup, connection, data_version(connection), before)
+    try:
+        try:
+            connection.execute("BEGIN")
+            try:
+                integrity = quick_check(connection)
+                if integrity != "ok":
+                    raise PlanRefusedError(
+                        f"Backup artifact {backup} failed quick_check: "
+                        f"{integrity}"
+                    )
+                counts = _user_table_counts(connection)
+                classified = build_plan_body(classify_legacy(connection))
+            finally:
+                try:
+                    connection.execute("END")
+                except sqlite3.DatabaseError:
+                    pass
+        except PlanRefusedError:
+            raise
+        except Exception as error:
+            raise PlanRefusedError(
+                f"Backup artifact {backup} failed verification: {error}"
+            ) from error
 
-    if snapshot.result["counts"] != recorded_counts:
-        raise PlanRefusedError(
-            f"Backup artifact {backup} row counts differ from its report."
-        )
-    classified = snapshot.result["classified"]
-    differing = [
-        key for key in CLASSIFICATION_KEYS if classified[key] != body[key]
-    ]
-    if differing:
-        raise PlanRefusedError(
-            f"Backup artifact {backup} is not this plan's preimage: "
-            f"{', '.join(differing)} differ."
-        )
-    if _backup_fingerprint(backup) != before:
-        raise PlanRefusedError(
-            f"Backup artifact {backup} changed during verification."
-        )
-    return {"path": backup, **before}
+        if counts != recorded_counts:
+            raise PlanRefusedError(
+                f"Backup artifact {backup} row counts differ from its report."
+            )
+        differing = [
+            key for key in CLASSIFICATION_KEYS if classified[key] != body[key]
+        ]
+        if differing:
+            raise PlanRefusedError(
+                f"Backup artifact {backup} is not this plan's preimage: "
+                f"{', '.join(differing)} differ."
+            )
+        window.check("during verification")
+    except BaseException:
+        window.close()
+        raise
+    return window
 
 
 # --- apply ----------------------------------------------------------------
@@ -873,10 +965,17 @@ def apply_plan(
 ) -> dict:
     """Relabel the planned order-stable rows that are still exactly as planned.
 
-    Refusals (`PlanRefusedError`) happen before anything is written: the
-    plan, target and backup checks run first, and the two cheap ones are
-    repeated under the write lock. Per-row drift is not a refusal: that row
-    is skipped and named, the others proceed, all inside one transaction.
+    Refusals (`PlanRefusedError`) happen before anything is committed: the
+    plan, target and backup checks run first; the target and the backup
+    window are re-checked after the live write lock is taken, and the backup
+    window once more as the last step before COMMIT, so a backup commit while
+    rows are processed rolls every relabel back. Per-row drift is not a
+    refusal: that row is skipped and named, the others proceed, all inside
+    one transaction.
+
+    The checked backup window runs from the first ``data_version`` reading
+    in `verify_backup` to the final `BackupWindow.check` just before the
+    live COMMIT; see `BackupWindow` for the interval it cannot cover.
     """
     database = Path(database)
     if not database.is_file():
@@ -885,73 +984,75 @@ def apply_plan(
         plan_path, expect_digest=expect_digest, expect_count=expect_count
     )
     verify_target(body, database)
-    backup = verify_backup(database, body, backup_report)
+    window = verify_backup(database, body, backup_report)
 
     relabelled: list[int] = []
     already: list[int] = []
     skipped: list[dict] = []
 
-    connection = open_connection(database)
     try:
-        with transaction(connection):
-            # Under the lock: the target is still the planned file, and the
-            # verified backup is still there, unchanged. Raising here rolls
-            # back a transaction that has written nothing.
-            verify_target(body, database)
-            try:
-                still = _backup_fingerprint(backup["path"])
-            except OSError:
-                still = None
-            if still != {k: v for k, v in backup.items() if k != "path"}:
-                raise PlanRefusedError(
-                    f"Backup artifact {backup['path']} moved or changed "
-                    "after verification."
-                )
+        connection = open_connection(database)
+        try:
+            with transaction(connection):
+                # Under the lock: the target is still the planned file, and
+                # nothing has committed to or replaced the verified backup.
+                # Raising here rolls back a transaction that wrote nothing.
+                verify_target(body, database)
+                window.check("after the live write lock was taken")
 
-            for planned in body["order_stable"]:
-                archive_id = int(planned["archive_id"])
-                # Re-derived inside the write lock: the plan is a claim about
-                # an earlier snapshot, and only this read is what the UPDATE
-                # will act on.
-                outcome = planned_outcome(
-                    classify_archive(connection, archive_id), planned
-                )
-                if outcome == "recertified":
-                    already.append(archive_id)
-                    continue
-                if outcome != "legacy_as_planned":
-                    skipped.append({"archive_id": archive_id, "reason": outcome})
-                    continue
-                cursor = connection.execute(
-                    """
-                    UPDATE archive_content_signatures
-                    SET algorithm_version = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND archive_id = ?
-                      AND algorithm = ? AND algorithm_version = ?
-                    """,
-                    (
-                        TARGET_VERSION,
-                        int(planned["signature_id"]),
-                        archive_id,
-                        CONTENT_SIGNATURE_ALGORITHM,
-                        LEGACY_VERSION,
-                    ),
-                )
-                if cursor.rowcount != 1:
-                    # Unreachable while the re-check above holds the lock;
-                    # if it ever fires, the whole apply rolls back.
-                    raise RuntimeError(
-                        f"Relabel of archive {archive_id} touched "
-                        f"{cursor.rowcount} rows."
+                for planned in body["order_stable"]:
+                    archive_id = int(planned["archive_id"])
+                    # Re-derived inside the write lock: the plan is a claim
+                    # about an earlier snapshot, and only this read is what
+                    # the UPDATE will act on.
+                    outcome = planned_outcome(
+                        classify_archive(connection, archive_id), planned
                     )
-                relabelled.append(archive_id)
+                    if outcome == "recertified":
+                        already.append(archive_id)
+                        continue
+                    if outcome != "legacy_as_planned":
+                        skipped.append(
+                            {"archive_id": archive_id, "reason": outcome}
+                        )
+                        continue
+                    cursor = connection.execute(
+                        """
+                        UPDATE archive_content_signatures
+                        SET algorithm_version = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND archive_id = ?
+                          AND algorithm = ? AND algorithm_version = ?
+                        """,
+                        (
+                            TARGET_VERSION,
+                            int(planned["signature_id"]),
+                            archive_id,
+                            CONTENT_SIGNATURE_ALGORITHM,
+                            LEGACY_VERSION,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        # Unreachable while the re-check above holds the
+                        # lock; if it ever fires, the whole apply rolls back.
+                        raise RuntimeError(
+                            f"Relabel of archive {archive_id} touched "
+                            f"{cursor.rowcount} rows."
+                        )
+                    relabelled.append(archive_id)
+
+                # Last statement before COMMIT: a backup commit made while
+                # the rows above were processed rolls all of them back.
+                window.check("while planned rows were processed")
+        finally:
+            connection.close()
     finally:
-        connection.close()
+        window.close()
 
     return {
         "plan_digest": expect_digest,
         "planned": expect_count,
-        "backup": backup,
+        "backup": window.describe(),
         "relabelled": relabelled,
         "already_recertified": already,
         "skipped": skipped,
