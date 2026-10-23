@@ -71,7 +71,8 @@ def test_an_unaffected_library_reports_nothing_and_exits_zero(tmp_path, capsys):
     root = _library(tmp_path, "Berserk", "Attack on Titan")
     assert report_mod.main(["--root", str(root)]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["counts"] == {"directories": 2, "changed": 0, "merges": 0, "splits": 0}
+    assert out["counts"] == {"directories": 2, "changed": 0, "merges": 0,
+                             "empty_keys": 0, "splits": 0}
 
 
 def test_a_changed_library_exits_one(tmp_path, capsys):
@@ -112,3 +113,26 @@ def test_the_fingerprint_binds_the_observed_names(tmp_path):
     (tmp_path / "lib" / "Extra").mkdir()
     b = report_mod.build_report([tmp_path / "lib"])
     assert a["report_sha256"] != b["report_sha256"]
+
+
+def test_renaming_an_unaffected_folder_changes_the_fingerprint(tmp_path):
+    # Codex's probe on #114: a same-count rename of a folder the fix does
+    # not touch must not produce an identical report.
+    root = _library(tmp_path, "Attack on Titan", "Berserk_Uncensored")
+    before = report_mod.build_report([root])
+    (root / "Attack on Titan").rename(root / "One Piece")
+    after = report_mod.build_report([root])
+    assert before["counts"] == after["counts"]
+    assert before["changed"] == after["changed"]
+    assert before["report_sha256"] != after["report_sha256"]
+    assert after["roots"][0]["names"] == ["Berserk_Uncensored", "One Piece"]
+
+
+def test_empty_new_keys_are_listed_but_never_merged(tmp_path):
+    # SeriesIndex excludes an empty identity, so two folders that both key
+    # to "" are not one series and must not be reported as joining.
+    root = _library(tmp_path, "_decensored", "Uncensored_", "Berserk")
+    report = report_mod.build_report([root])
+    assert report["counts"]["merges"] == 0
+    assert sorted(r["name"] for r in report["empty_keys"]) == ["Uncensored_", "_decensored"]
+    assert {r["name"] for r in report["changed"]} == {"_decensored", "Uncensored_"}
