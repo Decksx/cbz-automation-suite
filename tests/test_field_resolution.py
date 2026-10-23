@@ -851,6 +851,72 @@ def test_an_unrecognised_variant_tag_refuses_rather_than_reading_as_absent():
     assert all(r.family.established for r in results.values())
 
 
+def test_different_group_tags_refuse_the_family_for_review():
+    """Codex probe ``different_group_tags``: the confirmed conservative rule.
+
+    ``[A]`` vs ``[B]`` may be scanlator tags rather than variants; refusing
+    is an accepted false negative, and the tags stay in the reason.
+    """
+    names = ("Series ch. 1 [A] v1.cbz", "Series ch. 1 [B] v2.cbz")
+    results = _resolve(*(_archive(n, info=_ci(), pages=_pages("p1")) for n in names))
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("['a'], ['b']" in r for r in result.family.reasons)
+
+
+@pytest.mark.parametrize("marker", ["Omnibus", "Compilation", "Special", "One-shot"])
+def test_a_special_marker_on_one_member_refuses_the_family(marker):
+    """PR #119 round 2, finding 1 (Codex probe ``known_special``).
+
+    Same ComicInfo Series and Number on both, comparable pages, version
+    markers: only the formatter's special slot tells an Omnibus #1 from an
+    ordinary #1. The marker must survive ComicInfo resolving the series to
+    plain "Series", and refuse the family.
+    """
+    names = (f"Series {marker} #001 [v1].cbz", "Series #001 [v2].cbz")
+    tokens = parse_name_tokens(names[0])
+    assert tokens.specials == {marker}
+    assert tokens.series == "Series" and tokens.other_tags == set()
+
+    results = _resolve(*(_archive(n, info=_ci(), pages=_pages("p1")) for n in names))
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("special/collection markers" in r for r in result.family.reasons)
+        assert not result.fields["version"].resolved
+        assert not result.renamable
+
+
+@pytest.mark.parametrize("marker", ["Omnibus", "One-shot"])
+def test_matching_special_markers_are_a_family_control(marker):
+    names = (f"Series {marker} #001 [v1].cbz", f"Series {marker.upper()} #001 [v2].cbz")
+    results = _resolve(*(_archive(n, info=_ci(), pages=_pages("p1")) for n in names))
+    for result in results.values():
+        assert result.family.established
+        assert result.renamable
+
+
+def test_two_special_markers_on_one_member_are_unresolved():
+    names = ("Series Omnibus Special #001 [v1].cbz", "Series Omnibus Special #001 [v2].cbz")
+    results = _resolve(*(_archive(n, info=_ci(), pages=_pages("p1")) for n in names))
+    for result in results.values():
+        assert result.family.status == fr.FAMILY_REFUSED
+        assert any("more than one special" in r for r in result.family.reasons)
+
+
+def test_special_edition_is_an_edition_not_the_special_word():
+    tokens = parse_name_tokens("Series #001 (Special Edition) [v1].cbz")
+    assert tokens.editions == {"Special Edition"}
+    assert tokens.specials == frozenset()
+
+
+def test_the_special_vocabulary_is_the_formatters():
+    from scripts.cbz_canonical_name import SPECIAL_WORDS
+
+    assert fr.SPECIAL_VOCABULARY == SPECIAL_WORDS
+    for word in SPECIAL_WORDS:
+        assert parse_name_tokens(f"S {word.lower()} #1.cbz").specials == {word}
+
+
 def test_decensor_pairs_are_never_versions():
     """§7 named test's family half (the "survive rename" half is step 7)."""
     for marker in ("Uncensored", "Decensored"):
@@ -1004,6 +1070,42 @@ def test_the_display_spelling_travels_with_the_comparison_key():
     )["S ch. 012.50.cbz"].fields["number"]
     assert folder_only.source == fr.SOURCE_FOLDER
     assert folder_only.display_value == "012.50"
+
+
+def test_equal_valued_volume_and_chapter_keep_their_own_spellings():
+    """PR #119 round 2, finding 2 (Codex probe ``same_numeric_value...``).
+
+    ``Vol. 1.00`` and ``ch. 1.0`` compare equal; each field must still get
+    its own token's spelling, in the evidence, in the serialised output,
+    and in what #118's formatter emits.
+    """
+    from scripts.cbz_canonical_name import CanonicalFields, format_canonical_name
+
+    names = ("S Vol. 1.00 ch. 1.0.cbz", "S Vol. 2 ch. 2.00.cbz")
+    results = _resolve(
+        *(_archive(n, pages=_pages(str(i))) for i, n in enumerate(names)),
+        series_folder="S",
+    )
+    expected = {
+        names[0]: ("1", "1.00", "1", "1.0", "S v01.00 ch. 1.0.cbz"),
+        names[1]: ("2", "2", "2", "2.00", "S v02 ch. 2.00.cbz"),
+    }
+    for name, (vol, vol_raw, num, num_raw, formatted) in expected.items():
+        result = results[name]
+        assert result.renamable
+        volume, number = result.fields["volume"], result.fields["number"]
+        assert (volume.value, volume.display_value) == (vol, vol_raw)
+        assert (number.value, number.display_value) == (num, num_raw)
+        data = result.as_dict()["fields"]
+        assert data["volume"]["display_value"] == vol_raw
+        assert {e["display"] for e in data["volume"]["evidence"]} == {vol_raw}
+        assert data["number"]["display_value"] == num_raw
+        assert {e["display"] for e in data["number"]["evidence"]} == {num_raw}
+        assert format_canonical_name(CanonicalFields(
+            series=result.fields["series"].value,
+            volume=volume.display_value,
+            chapter=number.display_value,
+        )) == formatted
 
 
 def test_overlap_without_family_evidence_is_never_compared():
