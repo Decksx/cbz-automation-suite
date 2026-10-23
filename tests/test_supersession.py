@@ -375,7 +375,8 @@ def test_a_unique_non_image_member_blocks_supersession(tmp_path, database):
 
 
 def test_dropping_comicinfo_needs_the_operator_flag(tmp_path, database):
-    """A's own ComicInfo.xml blocks by default and is listed when accepted.
+    """A's own ComicInfo.xml blocks by default; accepted, it is listed, and
+    only when the newer archive carries its own ComicInfo.xml.
 
     The flag covers ComicInfo.xml only: a unique notes.txt still blocks with
     the flag on.
@@ -402,6 +403,19 @@ def test_dropping_comicinfo_needs_the_operator_flag(tmp_path, database):
     (relation,) = family.relations
     assert [m.name for m in relation.accepted_comicinfo_drops] == ["ComicInfo.xml"]
     assert relation.unique_non_image == ()
+
+    # §8 question 6: the flag drops A's ComicInfo only when B has its own.
+    folder = tmp_path / "keeper-without-comicinfo" / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": _ci(notes="first scan")})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2])
+    family = _family(
+        _evaluate(folder, database, accept_comicinfo_drop=True), folder,
+        "Series ch. 1 v1.cbz",
+    )
+    assert family.status == sv.FAMILY_REVIEW
+    (relation,) = family.relations
+    assert [m.name for m in relation.unique_non_image] == ["ComicInfo.xml"]
+    assert relation.accepted_comicinfo_drops == ()
 
     folder = build("accepted-plus-notes", {"notes.txt": b"n"})
     family = _family(
@@ -607,6 +621,82 @@ def test_a_file_changed_during_evaluation_is_unresolved(folder, database, monkey
     # an archive with no image pages.
     assert any("no page evidence" in r for r in family.reasons)
     assert not any("no image pages" in r for r in family.reasons)
+
+
+def _without_snapshot_or_mode(result) -> dict:
+    data = result.as_dict()
+    data.pop("snapshot")
+    for archive in data["archives"]:
+        archive.pop("read_mode")
+    return data
+
+
+def test_the_streaming_path_matches_the_buffered_path(folder, database):
+    """An archive above ``max_held_bytes`` is streamed, with the same result.
+
+    The cap boundary is inclusive: an archive of exactly the cap is held.
+    """
+    v1 = _book(folder, "Series ch. 1 v1.cbz", [P1, P2],
+               {"ComicInfo.xml": _ci(), "notes.txt": b"n"})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2, P3],
+          {"ComicInfo.xml": _ci(), "notes.txt": b"n"})
+    ids = _seed_all(database, folder)
+
+    buffered = _evaluate(folder, database, ids)
+    streamed = _evaluate(folder, database, ids, max_held_bytes=1)
+
+    assert {a.derived.read_mode for a in buffered.archives} == {sv.READ_BUFFERED}
+    assert {a.derived.read_mode for a in streamed.archives} == {sv.READ_STREAMED}
+    assert _without_snapshot_or_mode(streamed) == _without_snapshot_or_mode(buffered)
+    assert _family(streamed, folder, v1.name).status == sv.FAMILY_SUPERSESSION
+
+    size = v1.stat().st_size
+    assert derive_archive(v1, max_held_bytes=size).read_mode == sv.READ_BUFFERED
+    assert derive_archive(v1, max_held_bytes=size - 1).read_mode == sv.READ_STREAMED
+    assert derive_archive(v1, max_held_bytes=size - 1) == replace(
+        derive_archive(v1, max_held_bytes=size), read_mode=sv.READ_STREAMED
+    )
+
+
+@pytest.mark.parametrize("change", ["rewritten-same-stat", "touched"])
+def test_a_streamed_file_changed_during_derivation_is_unresolved(
+    folder, database, monkeypatch, change
+):
+    """The streaming path re-hashes and re-stats after deriving the members.
+
+    ``rewritten-same-stat`` changes the bytes but restores size and mtime
+    (in place, same file identity): only the second hash can see it.
+    ``touched`` changes only the mtime: only the stat comparison can see
+    it, because the members were read from the path rather than from the
+    hashed bytes.
+    """
+    v1 = _book(folder, "Series ch. 1 v1.cbz", [P1, b"AAAA"])
+    _book(folder, "Series ch. 1 v2.cbz", [P1, b"AAAA", P3])
+    ids = _seed_all(database, folder)
+    stat = v1.stat()
+    real = sv.hash_ordered_pages
+    calls = []
+
+    def hash_then_change(archive, **kwargs):
+        result = real(archive, **kwargs)
+        if not calls:
+            if change == "rewritten-same-stat":
+                _book(folder, v1.name, [P1, b"BBBB"])
+                os.utime(v1, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                assert v1.stat().st_size == stat.st_size
+            else:
+                os.utime(v1, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        calls.append(1)
+        return result
+
+    monkeypatch.setattr(sv, "hash_ordered_pages", hash_then_change)
+    result = _evaluate(folder, database, ids, max_held_bytes=1)
+    member = _archive(result, folder, v1.name)
+    assert member.derived.read_mode == sv.READ_STREAMED
+    assert member.derived.problem.startswith("file changed during evaluation")
+    if change == "touched":
+        assert "mtime_ns" in member.derived.problem
+    assert _family(result, folder, v1.name).status == sv.FAMILY_UNRESOLVED
 
 
 def test_duplicate_member_names_make_the_archive_unresolved(folder, database):
