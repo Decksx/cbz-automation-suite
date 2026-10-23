@@ -40,11 +40,14 @@ try:
         ParsedComicName,
         clean_directory_name,
         clean_filename,
+        decensor_tokens_as_words,
+        display_tokens_for,
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
         normalise_archive_key,
         parse_comic_name,
+        sanitize_without_markers,
         series_base_name,
         update_comicinfo_xml,
     )
@@ -53,13 +56,33 @@ except ModuleNotFoundError:
         ParsedComicName,
         clean_directory_name,
         clean_filename,
+        decensor_tokens_as_words,
+        display_tokens_for,
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
         normalise_archive_key,
         parse_comic_name,
+        sanitize_without_markers,
         series_base_name,
         update_comicinfo_xml,
+    )
+
+# The canonical formatter (design §5.5): fallback names are formatted by it,
+# not assembled here, so arrivals and the canonical-naming plan cannot drift.
+try:
+    from scripts.cbz_canonical_name import (
+        CANONICAL_EXTENSION,
+        CanonicalFields,
+        CanonicalNameError,
+        format_canonical_name,
+    )
+except ModuleNotFoundError:
+    from cbz_canonical_name import (  # type: ignore[no-redef]
+        CANONICAL_EXTENSION,
+        CanonicalFields,
+        CanonicalNameError,
+        format_canonical_name,
     )
 
 # ─────────────────────────────────────────────
@@ -824,7 +847,10 @@ def process_cbz_file(
     # parse_comic_name runs the full normalisation pipeline:
     #   sanitize → strip leading nums → normalize_stem → normalise_number_tokens
     # This is the single authoritative source for filename and ComicInfo fields.
-    parsed   = parse_comic_name(cbz_path)
+    # display_tokens: the new name keeps (YYYY), [vN] and edition tokens while
+    # group/source tags are still dropped (design §5.5); ComicInfo fields and
+    # the series identity are computed exactly as before.
+    parsed   = parse_comic_name(cbz_path, display_tokens=True)
     new_name = override_name if override_name is not None else parsed.filename
 
     if new_name != cbz_path.name:
@@ -955,6 +981,55 @@ def restore_ai_decensor_backups(processed: list[tuple[Path, Path]]) -> None:
                 pass
 
 
+def _rekey_ai_backups(
+    ai_backups: list[tuple[Path, Path]],
+    origins: dict[Path, Path],
+    parsed_by_path: dict,
+) -> list[tuple[Path, Path]]:
+    """Re-key ``(archive, original)`` pairs to each archive's current path.
+
+    The pairs are recorded under the path ``process_cbz_file`` returned;
+    ``_apply_fallback_naming`` may rename the archive after that. *origins*
+    maps each pre-fallback path to its ``ParsedComicName.original_path``,
+    which a fallback rename carries over unchanged, so the pair follows its
+    archive instead of pointing at a name that no longer exists.
+    """
+    current = {
+        getattr(parsed, "original_path", path): path
+        for path, parsed in parsed_by_path.items()
+    }
+    return [
+        (current.get(origins.get(archive, archive), archive), backup)
+        for archive, backup in ai_backups
+    ]
+
+
+def _routed_ai_backups(
+    ai_backups: list[tuple[Path, Path]], landed: Path | None
+) -> list[tuple[Path, Path]]:
+    """The originals whose **own** archive routed, for offloading.
+
+    A non-None *landed* says some archive of the directory landed; it is no
+    receipt for any particular one. In the mixed-directory branch a refused
+    placeholder stays in the import folder while its accepted siblings move,
+    so each original is completed only if its own archive has left the
+    import folder. The rest stay on C: with their archive, for the deferred
+    retry. With *landed* None nothing routed and every pair is passed on,
+    so ``archive_completed_ai_backups`` reports them all as kept.
+    """
+    if landed is None:
+        return list(ai_backups)
+    routed = []
+    for archive, backup in ai_backups:
+        if archive.exists():
+            log.warning(
+                f"    AI original kept on C: for deferred '{archive.name}': {backup}"
+            )
+        else:
+            routed.append((archive, backup))
+    return routed
+
+
 def archive_completed_ai_backups(processed: list[tuple[Path, Path]], landed: Path | None) -> None:
     """Offload originals only after the whole directory was routed successfully."""
     if not processed:
@@ -982,15 +1057,59 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     Treats files that differ only by spacing or punctuation as the same book
     (e.g. "Series Ch.1" and "Series Ch. 1"), so the merge keeps one copy instead
     of letting both cosmetic variants survive. Returns None when none match.
+
+    Display tokens (design §5.5) compare as the pre-§5.5 names did:
+
+    * ``(YYYY)`` is dropped from the key. Names before §5.5 never carried
+      it, so ``Berserk Ch. 5 (2019)`` arriving beside ``Berserk Ch. 5`` is
+      the same book and still meets it.
+    * Zero-padding after a volume, issue or chapter marker is ignored, so
+      the canonical ``Berserk v01 #003`` meets the legacy ``Berserk v1
+      #003``. ``v01`` and ``v02`` still differ.
+    * ``(Uncensored)``/``(Decensored)`` compares as the bare word every
+      earlier name carried, so a decensored re-arrival meets its copy.
+    * ``[vN]`` and the other edition tokens stay in the key on purpose: a
+      [v3] stored as "... [v2]" would be a wrong version label (§4.6), and
+      two editions are not one book. Those land side by side for the
+      supersession plan to judge.
+
+    On a match the merge works as before: the existing **name** always
+    survives. The incoming bytes replace the existing bytes under that name
+    only when they are larger by ``REPLACEMENT_MIN_GAIN_BYTES``; otherwise
+    the incoming copy is discarded. So a ``(2019)`` arrival that wins on size
+    loses its year token from the name -- accepted: the existing name wins,
+    exactly as it did when both names were token-free.
     """
     if not target_dir.is_dir():
         return None
-    key = normalise_archive_key(stem)
+    key = _archive_collision_key(stem)
     for existing in target_dir.iterdir():
         if existing.is_file() and existing.suffix.lower() in {".cbz", ".cbr"}:
-            if normalise_archive_key(existing.stem) == key:
+            if _archive_collision_key(existing.stem) == key:
                 return existing
     return None
+
+
+# A canonical year token, as cbz_core's display path writes it.
+_YEAR_TOKEN_RE = re.compile(r"\(([1-9][0-9]{3})\)")
+# Leading zeros of a number written after a volume, issue or chapter marker:
+# the canonical "v01", "#003", "ch. 01" and the legacy "v1", "Vol. 1",
+# "#3", "Ch. 1". The legacy pipeline unpads v/Vol/Ch numbers and the
+# formatter pads them, so without this one book keys two ways
+# ("berserkv1#003" vs "berserkv01#003"). Only padding is removed, and only
+# for comparison: nothing is classified as a volume or version, and a
+# bracketed "[v02]" is left alone (the lookbehind excludes "[") so version
+# labels keep distinguishing books.
+_NUMBER_PADDING_RE = re.compile(
+    r"(?<![\w\[])(v|vol(?:ume)?\.?\s*|#\s*|ch(?:ap(?:ter)?)?\.?\s*)0+(?=\d)",
+    re.IGNORECASE,
+)
+
+
+def _archive_collision_key(stem: str) -> str:
+    """The book-identity key ``_find_archive_collision`` compares."""
+    stem = _NUMBER_PADDING_RE.sub(r"\1", _YEAR_TOKEN_RE.sub(" ", stem))
+    return normalise_archive_key(decensor_tokens_as_words(stem))
 
 
 # A stem is a "placeholder" name — carrying no information of its own — when
@@ -1007,15 +1126,75 @@ _PLACEHOLDER_STEM_RE = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class FallbackRefused:
+    """``_fallback_display_stem`` could not name the archive; why, for review.
+
+    A refusal is never turned into some other name. The caller keeps the
+    archive's current name and routes it to review (#118: a
+    ``CanonicalNameError`` is a review item, not a cue to assemble an
+    unchecked alternative).
+    """
+
+    reason: str
+
+
+def _fallback_display_stem(
+    series_name: str, chapter: str | None, source_stem: str
+) -> str | FallbackRefused:
+    """The stem a fallback-named archive gets, via the canonical formatter.
+
+    The fields are the resolved series folder and the chapter number the
+    enclosing folder implied -- folder context, the third source in design
+    §3.1, not name evidence -- plus the display tokens of the archive's own
+    name (``source_stem``): its ``(YYYY)``, ``(Edition)`` and ``[vN]``.
+
+    A ``[vN]`` is carried into the version slot as **display preservation
+    only**: the uploader's own bracketed text stays in the name it already
+    had. Nothing here verifies it as a version label in the §4.2/§4.6 sense
+    (family membership, keeper label); that is the supersession plan's job.
+    The bracketed spelling is used because it is the one that can never read
+    as a volume. A bare ``v<N>`` is never a token, so it cannot arrive here
+    as either.
+
+    Returns :class:`FallbackRefused` -- never a substitute name -- when the
+    fields do not fit the grammar (more than one year, edition or version)
+    or the formatter refuses them (a series that ends in a name token such
+    as ``Series Special``, a reserved or over-long name).
+    """
+    # A decensor word the folder name already carries is not repeated as an
+    # edition: the rule append_display_tokens and preserve_decensor_markers
+    # apply, taken from the same function.
+    tokens = display_tokens_for(series_name, source_stem)
+    editions = tokens.editions
+    if len(tokens.years) > 1 or len(editions) > 1 or len(tokens.versions) > 1:
+        return FallbackRefused(
+            f"conflicting tokens in '{source_stem}': years {list(tokens.years)}, "
+            f"editions {list(editions)}, versions {list(tokens.versions)}"
+        )
+    try:
+        name = format_canonical_name(CanonicalFields(
+            series=series_name,
+            chapter=chapter,
+            year=tokens.years[0] if tokens.years else None,
+            edition=editions[0] if editions else None,
+            version=tokens.versions[0] if tokens.versions else None,
+        ))
+    except CanonicalNameError as exc:
+        return FallbackRefused(f"{type(exc).__name__}: {exc}")
+    return name[: -len(CANONICAL_EXTENSION)]
+
+
 def _apply_fallback_naming(
     parsed_by_path: dict[Path, ParsedComicName],
     series_name: str,
     dir_number: str | None,
-) -> None:
+) -> list[Path]:
     """Rename placeholder-named files (see ``_PLACEHOLDER_STEM_RE``) to the
-    resolved series name, appending the chapter number implied by the
-    enclosing directory (``dir_number``, from ``_resolve_series_dir_name``)
-    when one was found.
+    resolved series name, with the chapter number implied by the enclosing
+    directory (``dir_number``, from ``_resolve_series_dir_name``) when one was
+    found. The name comes from the canonical formatter
+    (``_fallback_display_stem``): ``Series ch. 4 (2019) (Uncensored) [v2]``.
 
     Without this, files that arrive with an uninformative, group-generic name
     and no chapter number of their own (e.g. every release from a given
@@ -1023,17 +1202,44 @@ def _apply_fallback_naming(
     different issues, silently colliding — and one being discarded — when
     their directories are later merged into the same series folder.
 
+    A placeholder is recognised on the cleaned stem as before, or on the
+    archive name with every bracketed block removed, so a display token such
+    as ``(Uncensored)`` cannot hide one. ``dir_number`` is always a chapter
+    here: a folder named with a volume (``v3``, ``Vol. 3``) makes
+    ``parsed.volume`` non-empty, and those archives are skipped, as before.
+
+    When the formatter refuses (``FallbackRefused``) the archive keeps its
+    current name, a review reason is logged, and its path is returned. The
+    caller must then **not** merge it into the library: a placeholder that
+    keeps its generic name is exactly what collides with the next chapter
+    that shares it. The returned list is empty when nothing was refused.
+
     Mutates *parsed_by_path* in place so later lookups by the caller see the
     renamed path.
     """
+    refused: list[Path] = []
     for cbz, parsed in list(parsed_by_path.items()):
         if not cbz.exists() or parsed.chapter or parsed.volume:
             continue
-        if not _PLACEHOLDER_STEM_RE.match(parsed.stem):
+        if not (
+            _PLACEHOLDER_STEM_RE.match(parsed.stem)
+            or _PLACEHOLDER_STEM_RE.match(sanitize_without_markers(cbz.stem))
+        ):
             continue
 
+        # The ComicInfo title keeps the pre-§5.5 form; only the file name
+        # carries the display tokens (see ParsedComicName).
         new_stem = f"{series_name} Ch. {dir_number}" if dir_number else series_name
-        new_name = new_stem + cbz.suffix
+        display_stem = _fallback_display_stem(series_name, dir_number, cbz.stem)
+        if isinstance(display_stem, FallbackRefused):
+            log.warning(
+                f"    REVIEW: fallback name refused for '{cbz.name}' "
+                f"(series '{series_name}', chapter {dir_number}): "
+                f"{display_stem.reason}. Keeping its current name."
+            )
+            refused.append(cbz)
+            continue
+        new_name = display_stem + cbz.suffix
         if new_name == cbz.name:
             continue
 
@@ -1057,6 +1263,7 @@ def _apply_fallback_naming(
         process_comicinfo(new_path, patched)
         del parsed_by_path[cbz]
         parsed_by_path[new_path] = patched
+    return refused
 
 
 def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
@@ -1065,6 +1272,15 @@ def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
     numbering was known, see ``_apply_fallback_naming``) as "Ch. 1" so both chapters
     end up with distinct, stable names instead of one being liable to collide with —
     and be silently discarded in favour of — the other.
+
+    The "Ch. 1" name is formatted like every fallback name
+    (``_fallback_display_stem``), so a backfilled first chapter and the
+    fallback-named second one share one spelling. Note this renames a file
+    that is already in the library, as it did before design §5.5; only the
+    target spelling changed (``ch. 1``). It is not a bulk canonical rename.
+    When the formatter refuses, nothing is renamed and a review reason is
+    logged: the sibling keeps its bare name, which still differs from the
+    incoming numbered chapter's, so the merge cannot collide on it.
     """
     if not dest_dir.is_dir():
         return
@@ -1074,7 +1290,14 @@ def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
             continue
         if normalise_archive_key(existing.stem) != bare_key:
             continue
-        target = existing.with_name(f"{series_name} Ch. 1{existing.suffix}")
+        display_stem = _fallback_display_stem(series_name, "1", existing.stem)
+        if isinstance(display_stem, FallbackRefused):
+            log.warning(
+                f"  REVIEW: chapter-1 backfill refused for '{existing.name}': "
+                f"{display_stem.reason}. Not renamed."
+            )
+            return
+        target = existing.with_name(display_stem + existing.suffix)
         if target.exists():
             return
         existing.rename(target)
@@ -1799,19 +2022,42 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 # chapter that reuses a scanlator's generic filename collides
                 # under the same name and one is silently discarded during
                 # _move_cbz_dir's merge.
-                _apply_fallback_naming(parsed_by_path, series_name, dir_number)
+                origins = {
+                    path: getattr(parsed, "original_path", path)
+                    for path, parsed in parsed_by_path.items()
+                }
+                refused = set(_apply_fallback_naming(
+                    parsed_by_path, series_name, dir_number) or ())
+                ai_backups = _rekey_ai_backups(
+                    ai_decensor_backups, origins, parsed_by_path)
 
-                if has_nested_comic_dirs:
+                if refused and not has_nested_comic_dirs:
+                    # A refused placeholder kept its generic name. Moving the
+                    # directory would merge that name into the series folder,
+                    # where the next chapter sharing it collides -- the loss
+                    # the fallback exists to prevent. So the whole directory
+                    # stays in the import folder for review; nothing in it is
+                    # moved, and the next settle pass or restart retries it.
+                    log.warning(
+                        f"  Deferred '{comic_dir.name}' for review: fallback name "
+                        f"refused for {len(refused)} placeholder archive(s); "
+                        f"left in the import folder.")
+                    landed = None
+                elif has_nested_comic_dirs:
                     log.warning(
                         f"  '{comic_dir.name}' has loose .cbz file(s) alongside subdirectories that "
                         f"have their own .cbz files — moving only the loose files, not the whole "
                         f"directory, so unrelated series aren't swept along with it."
                     )
-                    archives = list(parsed_by_path.keys())
+                    # Refused placeholders stay behind in the import folder;
+                    # the other loose files move as before. With none left there
+                    # is nothing to move, and _move_loose_files would still create
+                    # an empty series folder, so it is not called.
+                    archives = [a for a in parsed_by_path if a not in refused]
                     _shadow_route(comic_dir, dest_folder, series_name, archives,
                                   shadow_results, shadow_handoffs,
                                   mixed_parent=True)
-                    landed = _move_loose_files(archives, dest_folder, series_name)
+                    landed = _move_loose_files(archives, dest_folder, series_name) if archives else None
                     _note_move(series_name, dest_folder, landed)
                 else:
                     _shadow_route(comic_dir, dest_folder, series_name,
@@ -1821,7 +2067,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                                            target_name=series_name,
                                            chapter_number=dir_number)
                     _note_move(series_name, dest_folder, landed)
-            archive_completed_ai_backups(ai_decensor_backups, landed)
+            archive_completed_ai_backups(_routed_ai_backups(ai_backups, landed), landed)
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
             # nothing was mutated, the arrival is still in the watch folder,

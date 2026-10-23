@@ -2,8 +2,10 @@
 
 Implements §6 step 3 part A of ``docs/canonical_naming_and_version_supersession.md``
 (§2 grammar, numbers and path safety; §3.2 and §4.6 for what the volume and
-version fields mean; §5.5 for the fixpoint requirement). The watcher and
-sanitizer convergence onto this formatter (part B) is a separate change.
+version fields mean; §5.5 for the fixpoint requirement). Part B converged the
+watcher and the ``cbz_core`` sanitizer onto it: ``cbz_core`` imports
+:data:`EDITION_WORDS` for the display tokens it keeps, and the watcher's
+fallback names come from :func:`format_canonical_name`.
 
 The grammar (§2.1), with the special word placed as described below::
 
@@ -23,9 +25,11 @@ Three properties are load-bearing and pinned by ``tests/test_canonical_name.py``
   (``"Batman v01"`` with no volume) is refused rather than renamed into a
   name that later parses as a volume.
 * **Idempotent sanitising.** ``sanitize_series_name(sanitize_series_name(x))
-  == sanitize_series_name(x)``. ``cbz_core.sanitize`` is not
-  (``"Batman].cC"`` -> ``"Batman.cC"`` -> ``""``, §5.5), which is why the
-  series display name is not routed through it.
+  == sanitize_series_name(x)``. ``cbz_core.sanitize`` was not
+  (``"Batman].cC"`` -> ``"Batman.cC"`` -> ``""``, §5.5) until part B made it
+  a fixpoint, but it also deletes brackets, group tags and URLs, which is
+  not this function's job, so the series display name is still not routed
+  through it.
 * **Refuse, never drop.** Every invalid field raises a specific
   :class:`CanonicalNameError` subclass. Nothing is silently omitted,
   truncated or guessed: a too-long name raises instead of being cut, a

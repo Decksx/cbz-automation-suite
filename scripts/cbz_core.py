@@ -45,16 +45,37 @@ except ImportError:
     def unidecode(text: str) -> str:
         return text
 
+# The canonical formatter owns the closed edition list and the canonical-name
+# recogniser (design §5.5). Imported, never copied: a second copy of the list
+# is exactly the drift the convergence exists to prevent.
+try:
+    from scripts.cbz_canonical_name import (
+        EDITION_WORDS,
+        CanonicalNameError,
+        parse_canonical_name,
+    )
+except ModuleNotFoundError:  # run from inside scripts/ without the package
+    from cbz_canonical_name import (  # type: ignore[no-redef]
+        EDITION_WORDS,
+        CanonicalNameError,
+        parse_canonical_name,
+    )
+
 __all__ = [
     "ALL_RULES",
     "GIBBERISH_RE",
     "IGNORED_SERIES_FOLDERS",
     "NUMBER_PREFIX_RE",
     "TRAILING_JUNK_RE",
+    "DisplayTokens",
     "ParsedComicName",
+    "append_display_tokens",
     "clean_directory_name",
     "clean_filename",
     "clean_xml_field",
+    "decensor_tokens_as_words",
+    "display_tokens_for",
+    "extract_display_tokens",
     "extract_chapter_number",
     "extract_volume_number",
     "extract_season_number",
@@ -73,6 +94,8 @@ __all__ = [
     "preserve_decensor_markers",
     "repair_mojibake",
     "sanitize",
+    "sanitize_display",
+    "sanitize_without_markers",
     "series_base_name",
     "shorten_mixed_original_title",
     "translate_metadata_text",
@@ -261,6 +284,16 @@ NUMBERED_CHAPTER_RE = re.compile(
 
 @dataclass(frozen=True)
 class ParsedComicName:
+    """Fields parsed from one archive path by :func:`parse_comic_name`.
+
+    ``stem`` is the cleaned name text that ComicInfo ``<Title>`` and the
+    placeholder checks read. ``filename`` is the name the archive should
+    carry on disk. They agree (``filename == stem + ext``) except when
+    ``parse_comic_name`` ran with ``display_tokens=True``: the display
+    filename then also keeps the canonical tokens of design §5.5 (year,
+    edition, version), which belong in the file name but not in the title.
+    """
+
     original_path: Path
     filename: str
     stem: str
@@ -585,8 +618,42 @@ def preserve_decensor_markers(source: str, cleaned: str) -> str:
     return _collapse_spaces(" ".join((cleaned, *missing))) if missing else cleaned
 
 
-def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
-    original = text
+def _to_fixpoint(step, text: str) -> str:
+    """Apply *step* until its output stops changing, and return that output.
+
+    Why iterate rather than reorder the rules: the rules interact. Removing a
+    stray bracket can expose a URL (``"Batman].cC"`` -> ``"Batman.cC"`` ->
+    ``""``, design §5.5), each ``html.unescape`` peels one entity level
+    (``"&amp;amp;"``), and ``_GCODE_RE`` strips one trailing code per pass. No
+    single ordering removes every such interaction; iterating makes
+    ``f(f(x)) == f(x)`` hold by construction rather than by audit, and an
+    input that was already a fixpoint costs one extra comparison.
+
+    Termination: every cleaning rule either deletes characters or turns a
+    non-space character into a space. The one rule that adds text,
+    ``preserve_decensor_markers``, re-adds a marker word only after the
+    bracket around it was deleted, and the bracket is longer than the word
+    plus its separating space. So every pass that changes the text strictly
+    lowers (length, non-space count), and ``2 * len(text) + 2`` passes always
+    suffice. Exceeding the bound means some rule broke that argument; it
+    raises rather than return a value that is not a fixpoint.
+
+    The argument is about the cleaning rules this module passes in
+    (``_sanitize_pass``, ``_sanitize_core``, the filename and directory
+    passes). It is not a guarantee for an arbitrary *step*: translation, for
+    one, is never run inside this loop.
+    """
+    limit = 2 * len(text) + 2
+    for _ in range(limit):
+        cleaned = step(text)
+        if cleaned == text:
+            return text
+        text = cleaned
+    raise RuntimeError(f"cleaning did not reach a fixpoint within {limit} passes")
+
+
+def _sanitize_core(text: str, rules: set[str]) -> str:
+    """One pass of the cleaning rules, without re-attaching decensor markers."""
     text = repair_mojibake(text)
     text = html.unescape(text)
 
@@ -610,7 +677,237 @@ def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
     if "windows_safe" in rules:
         text = _make_windows_safe(text)
 
-    return preserve_decensor_markers(original, _collapse_spaces(text))
+    return _collapse_spaces(text)
+
+
+def _sanitize_pass(text: str, rules: set[str]) -> str:
+    return preserve_decensor_markers(text, _sanitize_core(text, rules))
+
+
+def sanitize(text: str, rules: set[str] = ALL_RULES) -> str:
+    """Clean *text* for use as a name: the import pipeline's base cleaner.
+
+    Strips URLs, scan-group words, G-codes and (with the ``brackets`` rule)
+    every bracketed block, then keeps any ``uncensored``/``decensored`` word
+    that was inside a removed bracket (:func:`preserve_decensor_markers`).
+
+    Idempotent: ``sanitize(sanitize(x)) == sanitize(x)`` for any rule set.
+    A single pass was not (``"Batman].cC"`` -> ``"Batman.cC"`` -> ``""``,
+    design §5.5), so the pass is repeated to its fixpoint; see
+    :func:`_to_fixpoint`. Inputs that one pass already left stable clean
+    exactly as before; inputs that a single pass did not settle now clean to
+    their fixpoint, for every caller of this module, not only the watcher.
+
+    This is the **identity** cleaner: series-folder lookup and every caller
+    outside the watcher's display path use it, so ``Berserk [Judas]`` still
+    cleans to ``Berserk``. Use :func:`sanitize_display` for a display name.
+    """
+    return _to_fixpoint(lambda t: _sanitize_pass(t, rules), text)
+
+
+def sanitize_without_markers(text: str, rules: set[str] = ALL_RULES) -> str:
+    """:func:`sanitize` without re-attaching decensor markers, to its fixpoint.
+
+    The bare name text with every bracketed block removed: the "core" that
+    :func:`sanitize_display` appends canonical tokens to, and what the
+    watcher's placeholder check reads so a ``(Uncensored)`` token does not
+    hide a placeholder name.
+    """
+    return _to_fixpoint(lambda t: _sanitize_core(t, rules), text)
+
+
+# ---------------------------------------------------------------------------
+# Display tokens (design §5.5)
+#
+# David's 2026-10-22 decision splits the "brackets" rule: identity matching
+# (series_key, series-folder lookup, everything sanitize() serves) still
+# strips every bracketed block, while the display name keeps the canonical
+# tokens -- (YYYY), [vN] and the edition list -- and still drops scanlator,
+# group and source tags. Recognised shapes, and nothing else:
+#
+#   (YYYY)              four ASCII digits, 1000-9999, in round brackets
+#   [vN]                v or V and a positive whole number, in square brackets;
+#                       written [vN] with no padding
+#   (Edition)           a whole EDITION_WORDS entry in round brackets, any
+#                       case; written in the list's spelling
+#   any bracket holding an uncensored/decensored word
+#                       written (Uncensored)/(Decensored), the formatter's
+#                       edition token, wherever preserve_decensor_markers
+#                       would have kept the bare word
+#
+# Deliberately not kept, pending a decision (see the PR): [2019] and (v2)
+# (not the canonical bracket for that token), [English] and other square-
+# bracket edition words (the scanlation-tag convention, where nearly every
+# release carries [English]), and bracketed SPECIAL_WORDS such as (Omnibus),
+# which the grammar writes bare after the series with no bracket to keep.
+# A bare v<N> outside brackets is never a token here: name evidence alone
+# never makes it a volume or a version (§3.2); it stays in the text as is.
+# ---------------------------------------------------------------------------
+
+_EDITION_BY_FOLD = {word.casefold(): word for word in EDITION_WORDS}
+# The decensor marker words must be formatter edition words, so a marker is
+# displayed as exactly the token format_canonical_name writes. A KeyError here,
+# at import, means EDITION_WORDS and _DECENSOR_MARKER_RE have drifted apart.
+_DECENSOR_EDITION = {
+    marker: _EDITION_BY_FOLD[marker] for marker in ("uncensored", "decensored")
+}
+_DECENSOR_TOKEN_RE = re.compile(
+    r"\((" + "|".join(re.escape(w) for w in _DECENSOR_EDITION.values()) + r")\)"
+)
+_DISPLAY_YEAR_RE = re.compile(r"[1-9][0-9]{3}")
+_DISPLAY_VERSION_RE = re.compile(r"[vV]0*([1-9][0-9]*)")
+# Bound on the display-name loops below. Each pass is a fixpoint step that
+# converges in two passes for every input the property tests generate; the
+# bound only stops a pathological input, which then keeps the legacy name.
+_DISPLAY_MAX_PASSES = 16
+
+
+@dataclass(frozen=True)
+class DisplayTokens:
+    """Canonical display tokens found in a name's brackets, in first-seen order.
+
+    Duplicates are dropped. Tokens are display text taken from the name, not
+    resolved fields: a ``[v2]`` here is the uploader's own version marker,
+    and nothing in this module treats it as a verified version (§4.6).
+    """
+
+    years: tuple[int, ...] = ()
+    editions: tuple[str, ...] = ()
+    versions: tuple[int, ...] = ()
+
+
+def extract_display_tokens(source: str) -> DisplayTokens:
+    """Return the canonical display tokens in *source*'s bracketed blocks.
+
+    Brackets are found with ``_BRACKET_RE``, the same pattern the identity
+    rule strips, so a token is kept exactly when it sat in a block identity
+    matching removes. Everything not listed in the section comment above is
+    ignored.
+    """
+    years: list[int] = []
+    editions: list[str] = []
+    versions: list[int] = []
+
+    def add(found: list, value) -> None:
+        if value not in found:
+            found.append(value)
+
+    for match in _BRACKET_RE.finditer(source):
+        bracket = match.group(0)
+        inner = bracket[1:-1].strip()
+        if bracket[0] == "(":
+            if _DISPLAY_YEAR_RE.fullmatch(inner):
+                add(years, int(inner))
+            elif inner.casefold() in _EDITION_BY_FOLD:
+                add(editions, _EDITION_BY_FOLD[inner.casefold()])
+        else:
+            version = _DISPLAY_VERSION_RE.fullmatch(inner)
+            if version:
+                add(versions, int(version.group(1)))
+        for marker in _DECENSOR_MARKER_RE.finditer(bracket):
+            add(editions, _DECENSOR_EDITION[marker.group(0).casefold()])
+    return DisplayTokens(tuple(years), tuple(editions), tuple(versions))
+
+
+def append_display_tokens(core: str, source: str) -> str:
+    """Append *source*'s display tokens to the bracket-free *core*.
+
+    Tokens go after the core in the canonical grammar's order -- years, then
+    editions, then versions -- so a name converges on the grammar's tail
+    ``(<year>) (<edition>) [v<N>]`` without anything being parsed out of the
+    core. A decensor edition is skipped when the core already carries the
+    word bare, matching :func:`preserve_decensor_markers`, which never
+    duplicates a marker either. An empty core stays empty: a name made only
+    of tokens has no name, and callers already treat an empty clean as
+    "fall back to the folder name".
+    """
+    if not core:
+        return core
+    tokens = display_tokens_for(core, source)
+    parts = [core]
+    parts.extend(f"({year})" for year in tokens.years)
+    parts.extend(f"({edition})" for edition in tokens.editions)
+    parts.extend(f"[v{version}]" for version in tokens.versions)
+    return " ".join(parts)
+
+
+def display_tokens_for(core: str, source: str) -> DisplayTokens:
+    """The tokens of *source* that belong after *core*.
+
+    :func:`extract_display_tokens`, less any decensor edition whose word the
+    core already carries bare. Shared by :func:`append_display_tokens` and
+    the watcher's fallback naming so the two cannot disagree on it.
+    """
+    tokens = extract_display_tokens(source)
+    seen = {m.group(0).casefold() for m in _DECENSOR_MARKER_RE.finditer(core)}
+    return DisplayTokens(
+        tokens.years,
+        tuple(e for e in tokens.editions if e.casefold() not in seen),
+        tokens.versions,
+    )
+
+
+def decensor_tokens_as_words(text: str) -> str:
+    """Rewrite ``(Uncensored)``/``(Decensored)`` tokens as the bare words.
+
+    Display names write the marker as the formatter's edition token, while
+    every name produced before design §5.5 carries the bare word. Comparing
+    the two spellings through this function keeps them one book, exactly
+    as they were when both were bare.
+    """
+    return _collapse_spaces(_DECENSOR_TOKEN_RE.sub(r"\1", text))
+
+
+# Returned by _display_fixpoint when the bound is reached without a fixpoint.
+_NO_FIXPOINT = object()
+
+
+def _display_fixpoint(step, text: str):
+    """Iterate a display *step* to its fixpoint.
+
+    Returns the fixpoint; ``None`` when the very first step returned ``None``
+    (the input's core is empty: the caller keeps the legacy name); or
+    ``_NO_FIXPOINT`` when the bound ran out or a *later* step found an empty
+    core. The latter happens when the stem pipeline exposes text the cleaner
+    then removes (``"G5678-"`` -> ``"G5678"`` -> ``""``): the legacy name is
+    then not a fixpoint either, so each caller resolves ``_NO_FIXPOINT`` to
+    a name that is, never to the last value seen.
+    """
+    current = text
+    for passes in range(_DISPLAY_MAX_PASSES):
+        following = step(current)
+        if following is None:
+            return None if passes == 0 else _NO_FIXPOINT
+        if following == current:
+            return current
+        current = following
+    return _NO_FIXPOINT
+
+
+def sanitize_display(text: str, rules: set[str] = ALL_RULES) -> str:
+    """Clean *text* as a **display** name (design §5.5), idempotently.
+
+    The identity clean (:func:`sanitize_without_markers`) plus the canonical
+    tokens of :func:`extract_display_tokens`: ``"[Judas] Berserk (2019)
+    [v2] (Digital)"`` -> ``"Berserk (2019) [v2]"``. Falls back to
+    :func:`sanitize` when the core is empty, so ``"[Uncensored]"`` still
+    cleans to ``"Uncensored"`` rather than to a name with nothing in front of
+    its token. Without the ``brackets`` rule nothing is stripped, so there is
+    nothing to keep, and this is :func:`sanitize`.
+    """
+    if "brackets" not in rules:
+        return sanitize(text, rules)
+
+    def step(current: str) -> str | None:
+        core = sanitize_without_markers(current, rules)
+        return append_display_tokens(core, current) if core else None
+
+    # The core is already a fixpoint and the tokens re-extract identically,
+    # so step settles on its second pass; _NO_FIXPOINT is not expected here
+    # and is treated like an empty core, whose sanitize() result is a
+    # fixpoint of this function too (no brackets are left to keep).
+    display = _display_fixpoint(step, text)
+    return display if isinstance(display, str) else sanitize(text, rules)
 
 
 _FILENAME_EXT_RE = re.compile(r"(\.[a-zA-Z0-9]{2,4})$")
@@ -633,12 +930,21 @@ def _split_name(name: str) -> tuple[str, str]:
     return name, ""
 
 
-def clean_filename(name: str, rules: set[str] = ALL_RULES) -> str:
+def _clean_filename_pass(name: str, rules: set[str]) -> str:
     stem, ext = _split_name(name)
     return sanitize(stem, rules) + ext
 
 
-def clean_directory_name(name: str, rules: set[str] = ALL_RULES) -> str:
+def clean_filename(name: str, rules: set[str] = ALL_RULES) -> str:
+    """:func:`sanitize` the stem of *name* and keep its extension; idempotent.
+
+    Repeated to a fixpoint like :func:`sanitize`, because the stem/extension
+    split is re-done on the cleaned name and may land differently.
+    """
+    return _to_fixpoint(lambda n: _clean_filename_pass(n, rules), name)
+
+
+def _clean_directory_name_pass(name: str, rules: set[str]) -> str:
     name = sanitize(name, rules)
     name = _DIR_LEADING_HASH_RE.sub("", name)
     name = _DIR_TRAILING_HASH_RE.sub("", name).strip()
@@ -646,7 +952,22 @@ def clean_directory_name(name: str, rules: set[str] = ALL_RULES) -> str:
     return _collapse_spaces(name)
 
 
+def clean_directory_name(name: str, rules: set[str] = ALL_RULES) -> str:
+    """Clean a directory name for identity and folder use; idempotent.
+
+    :func:`sanitize` plus stripping of leading/trailing ``#`` and a dangling
+    ``part``/``v``/``ch`` stub. Repeated to a fixpoint: stripping one stub
+    can expose another (``"Foo ch v"``). Brackets are always stripped here,
+    display tokens included: the bracket policy for folder names is
+    unchanged (§5.5 is about archive names; the design does not name folder
+    display names). A name a single pass did not settle now cleans to its
+    fixpoint.
+    """
+    return _to_fixpoint(lambda n: _clean_directory_name_pass(n, rules), name)
+
+
 def clean_xml_field(value: str, rules: set[str] = ALL_RULES) -> str:
+    """:func:`sanitize` for a ComicInfo field value; idempotent."""
     return sanitize(value, rules)
 
 
@@ -828,20 +1149,8 @@ def infer_series_name(path: Path, library_root: Path | None = None) -> str:
     return candidates[-1] if candidates else parent.name
 
 
-def parse_comic_name(
-    path: Path,
-    rules: set[str] = ALL_RULES,
-    library_root: Path | None = None,
-) -> ParsedComicName:
-    raw_series = infer_series_name(path, library_root=library_root)
-    series = clean_directory_name(raw_series, rules)
-
-    # Capture the raw title (filename stem before cleaning) so we can detect a
-    # CJK-only name and translate it. clean_filename() strips most non-Latin
-    # text, so this must happen on the raw stem.
-    raw_stem, _raw_ext = _split_name(path.name)
-
-    stem, ext = _split_name(clean_filename(path.name, rules))
+def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
+    """The stem normalisation that follows cleaning in :func:`parse_comic_name`."""
     if "leading_nums" in rules:
         stem = NUMBER_PREFIX_RE.sub("", stem).strip()
     stem = _SCANLATION_HASH_RE.sub("", stem).strip()
@@ -851,6 +1160,90 @@ def parse_comic_name(
         stem = normalise_number_tokens(stem)
     if "trailing_junk" in rules:
         stem = TRAILING_JUNK_RE.sub("", stem).strip()
+    return stem
+
+
+def _display_stem(
+    name: str,
+    raw_stem: str,
+    series: str,
+    rules: set[str],
+    translated_stem: str | None,
+) -> str | None:
+    """The display stem for :func:`parse_comic_name`, or ``None`` for legacy.
+
+    * A name the canonical formatter already produced is kept verbatim:
+      re-running the stem pipeline would undo its padding (``v01`` ->
+      ``v1``), and keeping it classifies nothing. "Already produced" needs
+      more than ``parse_canonical_name``, whose series slot accepts any text:
+      ``[Judas] Berserk.cbz`` parses, with series ``[Judas] Berserk``. So
+      the series must also be one the cleaning and stem pipeline leave
+      alone.
+    * A translated name keeps the translation and gains the tokens.
+    * Otherwise the stem pipeline runs on the identity core and the tokens
+      are appended, repeated to a fixpoint so the watcher's naming step is a
+      no-op on its own output.
+
+    ``None`` -- an empty core or no ``brackets`` rule -- means the caller
+    keeps today's name. A step with no fixpoint keeps the arrival's own
+    stem: ``normalize_stem`` can prefix the folder name forever when the
+    folder itself starts with a chapter token (a folder ``ch. 1``), and the
+    pipeline can expose text the cleaner then removes (``G5678-`` ->
+    ``G5678`` -> empty). Today's name would change again on the next pass in
+    both cases; the arrival's name does not, and nothing is named by a guess.
+    """
+    if "brackets" not in rules:
+        return None
+    try:
+        fields = parse_canonical_name(name)
+    except CanonicalNameError:
+        pass
+    else:
+        core = sanitize_without_markers(fields.series, rules)
+        if core == fields.series and _stem_pipeline(core, series, rules) == core:
+            return raw_stem
+    if translated_stem is not None:
+        return append_display_tokens(translated_stem, raw_stem) or None
+
+    def step(current: str) -> str | None:
+        core = _stem_pipeline(sanitize_without_markers(current, rules), series, rules)
+        return append_display_tokens(core, current) if core else None
+
+    display = _display_fixpoint(step, raw_stem)
+    return raw_stem if display is _NO_FIXPOINT else display
+
+
+def parse_comic_name(
+    path: Path,
+    rules: set[str] = ALL_RULES,
+    library_root: Path | None = None,
+    *,
+    display_tokens: bool = False,
+) -> ParsedComicName:
+    """Parse *path* into the names and fields the import pipeline writes.
+
+    With ``display_tokens=True`` (the watcher's arrival path) ``filename``
+    keeps the canonical display tokens of design §5.5 -- ``(YYYY)``,
+    ``[vN]``, ``(Edition)`` -- and is a fixpoint of this function. Every
+    other field, ``stem`` and ``series`` included, is computed exactly as
+    without it, so ComicInfo and chapter and volume extraction keep their
+    bracket policy. The default stays ``False`` because the library
+    maintenance and sanitizer CLIs use this function on files already in the
+    library, and the display tokens are for arrivals only. Those callers do
+    see the fixpoint change in :func:`sanitize` for inputs a single pass did
+    not settle.
+    """
+    raw_series = infer_series_name(path, library_root=library_root)
+    series = clean_directory_name(raw_series, rules)
+
+    # Capture the raw title (filename stem before cleaning) so we can detect a
+    # CJK-only name and translate it. clean_filename() strips most non-Latin
+    # text, so this must happen on the raw stem.
+    raw_stem, _raw_ext = _split_name(path.name)
+
+    stem, ext = _split_name(clean_filename(path.name, rules))
+    stem = _stem_pipeline(stem, series, rules)
+    translated_stem: str | None = None
 
     chapter = extract_chapter_number(stem)
     volume = extract_volume_number(stem) or extract_volume_number(series)
@@ -917,13 +1310,20 @@ def parse_comic_name(
                     elif volume:
                         rebuilt = f"{english_stem} Vol. {volume}"
                     stem = rebuilt.strip() or stem
+                    translated_stem = stem
+
+    display = (
+        _display_stem(path.name, raw_stem, series, rules, translated_stem)
+        if display_tokens
+        else None
+    )
 
     stem = preserve_decensor_markers(raw_stem, stem)
     series = preserve_decensor_markers(raw_series, series)
 
     return ParsedComicName(
         original_path=path,
-        filename=stem + ext,
+        filename=(display if display is not None else stem) + ext,
         stem=stem,
         series=series,
         chapter=chapter,

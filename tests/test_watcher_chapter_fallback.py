@@ -69,15 +69,19 @@ def test_generic_same_name_releases_get_unique_chapter_names(tmp_path, monkeypat
     series_dir = dest_root / "Arrest Thy Neighbor"
     assert series_dir.is_dir()
 
+    # "ch. N", not "Ch. N": since design §5.5 the fallback and backfill names
+    # come from the canonical formatter, whose chapter token is David's
+    # "ch. 1" form. What this test guards -- two distinct names, both payloads
+    # intact -- is unchanged.
     names = sorted(p.name for p in series_dir.glob("*.cbz"))
     assert names == [
-        "Arrest Thy Neighbor Ch. 1.cbz",
-        "Arrest Thy Neighbor Ch. 2.cbz",
+        "Arrest Thy Neighbor ch. 1.cbz",
+        "Arrest Thy Neighbor ch. 2.cbz",
     ]
 
     # Both issues' actual page content survived intact — no silent data loss.
-    assert _payload_size(series_dir / "Arrest Thy Neighbor Ch. 1.cbz") == 200
-    assert _payload_size(series_dir / "Arrest Thy Neighbor Ch. 2.cbz") == 400
+    assert _payload_size(series_dir / "Arrest Thy Neighbor ch. 1.cbz") == 200
+    assert _payload_size(series_dir / "Arrest Thy Neighbor ch. 2.cbz") == 400
 
 
 def test_single_generic_release_with_no_sibling_gets_bare_series_name(tmp_path, monkeypatch):
