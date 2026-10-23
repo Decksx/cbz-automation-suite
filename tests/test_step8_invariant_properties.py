@@ -29,11 +29,12 @@ there is no shrinking, and the inputs are drawn from hand-chosen alphabets
 aimed at the characters that have bitten this project before. That is
 weaker than a real property-testing engine and is recorded as such.
 
-Two invariants do not hold today
---------------------------------
+Two invariants found false, one since fixed
+-------------------------------------------
 
-Running these properties found two places where the stated invariant is
-false on master. Neither is fixed here -- this slice is tests only -- and
+Running these properties found two places where the stated invariant was
+false on master. The ``series_key`` one is now fixed (below); the page-order
+one is not. Neither was fixed in the slice that found them, and
 neither is hidden by narrowing the generator until it passes. Each is split
 into:
 
@@ -43,12 +44,14 @@ into:
     into a hard failure (XPASS) the moment the defect is fixed, so the
     marker cannot outlive the bug.
 
-``series_key`` is not idempotent when a marker word is glued to a word
+``series_key`` was not idempotent when a marker word was glued to a word
 character that a later step turns into a separator: ``_Uncensored``
-survives marker removal (no ``\\b`` between ``_`` and ``U``), the
-underscore then becomes a space, and a second pass removes the marker.
-The practical consequence is a series split: ``Berserk_Uncensored`` keys to
-``berserk uncensored`` while ``Berserk Uncensored`` keys to ``berserk``.
+survived marker removal (no ``\\b`` between ``_`` and ``U``), the
+underscore then became a space, and a second pass removed the marker.
+The practical consequence was a series split: ``Berserk_Uncensored`` keyed
+to ``berserk uncensored`` while ``Berserk Uncensored`` keyed to
+``berserk``. **Fixed by #111's reorder** (marker removal after the
+separator rule); its two strict xfails are now ordinary passing tests.
 
 Page order is not deterministic when two image names have equal natural
 keys (``a.png``/``A.png``, ``01.png``/``1.png``): the sort is stable, so
@@ -204,26 +207,16 @@ def test_series_key_ignores_nfc_versus_nfd_encoding(seed: int) -> None:
         assert series_key(nfc) == series_key(nfd), ascii(name)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "series_key is not idempotent when a marker word is glued to a "
-        "character that a later step turns into a separator: "
-        "'_decensored' -> 'decensored' -> ''. Minimal counterexamples "
-        "found by the generator: '_decensored', 'decensored_', "
-        "'_Uncensored', 'Uncensored_', '\\u0130Uncensored', "
-        "'\\u0130decensored'. Not fixed in this slice."
-    ),
-)
 @pytest.mark.parametrize("seed", SEEDS[:2])
 def test_series_key_is_idempotent_with_marker_words_present(
     seed: int,
 ) -> None:
-    """The full idempotence claim, which master does not meet.
+    """The full idempotence claim, including glued marker words.
 
-    Strict: if a fix lands, this XPASSes and fails the run, which is the
-    signal to delete the marker and fold this into the passing property.
+    A strict xfail until #111's fix moved marker removal after the
+    separator rule. The counterexamples it carried ('_decensored',
+    'decensored_', '_Uncensored', 'Uncensored_' and the U+0130 forms) are
+    pinned individually in `tests/test_series_key_canonical.py`.
     """
     rng = random.Random(seed)
 
@@ -233,16 +226,6 @@ def test_series_key_is_idempotent_with_marker_words_present(
         assert series_key(once) == once, ascii(name)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "'Berserk_Uncensored' keys to 'berserk uncensored' while "
-        "'Berserk Uncensored' keys to 'berserk': marker removal runs "
-        "before underscores become separators, and \\b does not match "
-        "between '_' and a letter. Not fixed in this slice."
-    ),
-)
 @pytest.mark.parametrize(
     "joined",
     ["Berserk_Uncensored", "Berserk_decensored", "Uncensored_Berserk"],
@@ -250,12 +233,12 @@ def test_series_key_is_idempotent_with_marker_words_present(
 def test_an_underscore_joined_marker_keys_like_a_space_joined_one(
     joined: str,
 ) -> None:
-    """The consequence of the idempotence defect: a real series split.
+    """The idempotence defect's consequence, a series split, stays fixed.
 
     Releases that spell the same title with `_` and with spaces are one
-    series by the #44 rule, and so are their uncensored editions. Today the
-    underscore spelling of an uncensored edition gets an identity of its
-    own.
+    series by the #44 rule, and so are their uncensored editions. Before
+    #111 the underscore spelling of an uncensored edition got an identity
+    of its own.
     """
     assert series_key(joined) == series_key(joined.replace("_", " "))
 

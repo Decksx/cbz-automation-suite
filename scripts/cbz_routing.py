@@ -110,12 +110,27 @@ def series_key(name: str) -> str:
     The normalization, in order:
 
         0. Unicode composition normalized to NFC
-        1. `uncensored` / `decensored` removed as whole words, case-insensitive
-        2. lowercased
-        3. every non-word, non-space character *and every underscore*
+        1. lowercased
+        2. every non-word, non-space character *and every underscore*
            replaced with a space
+        3. `uncensored` / `decensored` removed as whole words
         4. runs of whitespace collapsed, ends stripped
         5. the result normalized to NFC again, as a postcondition
+
+    **Markers are removed after separators exist, not before** (#111). Run
+    first, as it was until then, the whole-word match misses a marker glued
+    to anything that is a word character but later becomes a separator: an
+    underscore (`\\b` does not match between `_` and a letter), or a
+    combining mark produced by lowercasing (`İ` lowers to `i` plus U+0307).
+    The marker then survived the first pass and was removed by a second, so
+    the function was not a fixpoint, and the practical result was a split:
+    `Berserk_Uncensored` keyed to `berserk uncensored` while
+    `Berserk Uncensored` keyed to `berserk`. Matching after step 2 sees
+    every separator as a space, so the two spellings key alike and
+    `series_key(series_key(x)) == series_key(x)` holds. Keys change only
+    where a marker was glued that way, which is why an index built under the
+    old order has to be rebuilt; `scripts/cbz_series_key_change_report.py`
+    lists exactly which names change.
 
     So "BERSERK", "Berserk!!", "Berserk (Uncensored)" and "Berserk " all key
     alike, and "Attack-on-Titan", "Attack_on_Titan" and "Attack on Titan" are
@@ -189,8 +204,8 @@ def series_key(name: str) -> str:
     behaviour to depend on.
     """
     name = unicodedata.normalize("NFC", name or "")
-    name = _MARKER_WORDS_RE.sub("", name)
     name = _SERIES_KEY_PUNCT_RE.sub(" ", name.lower())
+    name = _MARKER_WORDS_RE.sub("", name)
     name = _SERIES_KEY_SPACE_RE.sub(" ", name).strip()
     # Postcondition, not a repeat of the call above: callers are entitled to
     # an NFC identity regardless of what the transforms in between do.
