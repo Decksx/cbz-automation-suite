@@ -650,7 +650,17 @@ def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
 # scan of an unsupported document small, and is itself a refusal.
 MAX_COMICINFO_DEPTH = 8
 
-_IMAGE_INDEX_RE = re.compile(r"[0-9]+")
+# A Page ``Image`` index: one to six decimal digits. The length bound comes
+# before ``int()``, so an oversized digit string is an unsupported shape
+# rather than the interpreter's int-string-limit ValueError (PR #123 round
+# 4); no ComicInfo needs a millionth page.
+_IMAGE_INDEX_RE = re.compile(r"[0-9]{1,6}")
+_SHOWN_INDEX_CHARS = 12
+
+
+def _namespaced(name: str) -> bool:
+    """True for an ElementTree ``{uri}local`` expanded name."""
+    return name.startswith("{")
 
 
 def _local(tag: str) -> str:
@@ -694,9 +704,10 @@ def _pages_entries(
 ) -> tuple[dict[int, dict[str, str]], list[str]]:
     """The supported ``Pages`` shape: {Image index: attributes}, plus problems.
 
-    Supported: no attributes, text or tails on ``Pages``; only ``Page``
-    children, each with no children, text or tail, and an ``Image`` that is
-    a non-negative decimal integer, unique within ``Pages``. Anything else
+    Supported: no attributes, text or tails on ``Pages``; only unqualified
+    ``Page`` children, each with no children, text, tail or namespaced
+    attribute, and an ``Image`` of one to six decimal digits, unique by
+    value within ``Pages``. Anything else
     is a problem, and a document with a problem never certifies coverage.
     """
     entries: dict[int, dict[str, str]] = {}
@@ -706,11 +717,21 @@ def _pages_entries(
     if not _blank(pages.text):
         problems.append("Pages (text)")
     for page in pages:
-        if _local(page.tag) != "Page":
-            problems.append(f"Pages/{_local(page.tag)} (not a Page)")
+        # Raw names throughout: a namespaced Page, or a ``{uri}Bookmark``
+        # attribute, is not the ComicInfo Page or Bookmark and must never
+        # match it by local name.
+        if page.tag != "Page":
+            problems.append(f"Pages/{page.tag} (not a Page)")
             continue
         image = page.attrib.get("Image")
-        where = f"Pages/Page[Image={image!r}]"
+        shown = image if image is None or len(image) <= _SHOWN_INDEX_CHARS else (
+            image[:_SHOWN_INDEX_CHARS] + "..."
+        )
+        where = f"Pages/Page[Image={shown!r}]"
+        qualified = sorted(name for name in page.attrib if _namespaced(name))
+        if qualified:
+            problems.append(f"{where} (namespaced attributes {qualified})")
+            continue
         if len(page) or not _blank(page.text) or not _blank(page.tail):
             problems.append(f"{where} (content)")
         if image is None or not _IMAGE_INDEX_RE.fullmatch(image):
@@ -720,7 +741,7 @@ def _pages_entries(
         if index in entries:
             problems.append(f"{where} (duplicate Image index)")
             continue
-        entries[index] = {_local(name): value for name, value in page.attrib.items()}
+        entries[index] = dict(page.attrib)
     return entries, problems
 
 
@@ -744,11 +765,14 @@ def _keeper_offer(
     no Pages, problems with its Pages). Only these shapes can cover.
     """
     simple = {
-        _local(child.tag)
+        child.tag
         for child in keeper
-        if not child.attrib and not len(child) and not _blank(child.text)
+        if not _namespaced(child.tag)
+        and not child.attrib
+        and not len(child)
+        and not _blank(child.text)
     }
-    pages = [child for child in keeper if _local(child.tag) == "Pages"]
+    pages = [child for child in keeper if child.tag == "Pages"]
     if not pages:
         return simple, None, []
     if len(pages) > 1:
@@ -770,6 +794,10 @@ def _coverage(
       with a non-blank value, other than ``Image``, must be non-blank on the
       keeper's Page with the same Image index.
 
+    Names are compared raw: a namespaced (``{uri}``-qualified) element or
+    attribute is unsupported in the older document and never covers in the
+    keeper's.
+
     An element with only blank content needs nothing. Every other shape is
     unsupported and refuses the drop. Values may differ: coverage judges
     presence, never accuracy.
@@ -781,7 +809,10 @@ def _coverage(
         unsupported += _scan_comicinfo(root)
         pages_seen = 0
         for child in root:
-            name = _local(child.tag)
+            name = child.tag
+            if _namespaced(name):
+                unsupported.append(f"{name} (namespaced element)")
+                continue
             if name == "Pages":
                 pages_seen += 1
                 if pages_seen > 1:
