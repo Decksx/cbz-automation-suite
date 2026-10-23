@@ -7,9 +7,11 @@ members it supersedes, and what needs a human. It renames, moves,
 quarantines and writes nothing: its output is a serialisable report that
 the step-7 plan consumes.
 
-Nothing here writes. Each archive is read with ``open(path, "rb")``,
-held in memory when it is at most ``max_held_bytes`` and streamed
-otherwise, and re-hashed from disk afterwards; the database is read only through
+Nothing here writes to a library file or the database. Each archive is
+read with ``open(path, "rb")``: held in memory when it is at most
+``max_held_bytes``, otherwise copied into a private temp file that is
+deleted afterwards (the only write this module makes, and never under the
+library), and re-hashed from disk at the end. The database is read only through
 `field_resolution.load_page_evidence`, which goes through the DAL's
 `read_guards.read_consistent_snapshot` (``mode=ro``, ``query_only``,
 ``data_version`` bracketing). The module opens no connection of its own.
@@ -22,8 +24,10 @@ evaluation read. For an archive of at most ``max_held_bytes`` (512 MiB by
 default) the page sequence is re-derived **from those same held bytes**
 (`derive_archive`): the buffer is hashed, then opened as a ZIP, so the
 sequence describes exactly the bytes the hash names. A larger archive is
-streamed: hash and stat, derive from the path, hash and stat again; its
-residual change-and-restore window is documented on `derive_archive`. The archive is admitted with the shared
+copied into a private temp file, the hash is taken over the copy stream,
+and everything is derived from that copy alone, with the same guarantee.
+An archive that cannot be copied is unresolved ("too large to bind"). The
+archive is admitted with the shared
 `archive_limits.validate_archive_members`, and pages are hashed and ordered
 by `page_hashing.hash_ordered_pages`, the same pass `calculate_page_hashes`
 runs, so §1.2 order and per-page sha256 are defined once.
@@ -31,10 +35,11 @@ runs, so §1.2 order and per-page sha256 are defined once.
 After the derivation the file on disk is hashed again. If it no longer has
 the evaluated hash, the file changed during evaluation and the archive is
 unresolved: the report would otherwise describe bytes that are no longer
-at the path. A change that is reverted before the re-hash is not
-detectable, and does not need to be: the evaluated bytes are exactly the
-bytes the recorded hash names, and step 7 revalidates against that hash
-before acting.
+at the path. A change that is made and reverted mid-evaluation cannot
+mislead the report, because the hash and the inventory both describe the
+one owned byte source; the final hash shows those bytes were the file's
+when evaluation ended, and step 7 revalidates against that hash before
+acting.
 
 Stored rows nominate, never prove
 ---------------------------------
@@ -44,14 +49,15 @@ re-derived sequence. An archive with no stored rows, rows that are not
 comparable evidence (legacy ordering contract, unresolved stored order,
 incomplete inventory) or rows whose digests differ from the re-derived
 sequence is **unresolved** with that reason (§4.3: "if the two disagree,
-the stored rows are stale"). The comparison itself always uses the
-re-derived sequence.
+the stored rows are stale"). The reason says which: rows refused for
+their contract are not claimed to differ in bytes. The comparison itself
+always uses the re-derived sequence.
 
 Comparable (§4.1)
 -----------------
 
-An archive is comparable when it is bound (read, hashed, re-hashed
-unchanged), complete (every image member hashed -- a member that cannot be
+An archive is comparable when it is bound (hashed and derived from one
+owned byte source, and the file re-hashed unchanged afterwards), complete (every image member hashed -- a member that cannot be
 read makes the whole archive unresolved, never a shorter sequence),
 nonempty, and ordered (unique image member names), and its stored rows
 agree. Only the exact ``sha256`` basis is used. The perceptual ``dhash``
@@ -76,7 +82,8 @@ sha256, as a multiset) must exist in B with identical bytes. A ComicInfo.xml
 of A may be dropped only when the caller passes
 ``accept_comicinfo_drop=True`` (operator acceptance, default off); the drop
 is then listed, not silent, and is allowed only when B carries its own
-ComicInfo.xml (§8 question 6, the conservative reading). Otherwise the relation is downgraded to review,
+usable ComicInfo.xml -- well-formed, consistent, not the bare injected
+template (§8 question 6, the conservative reading). Otherwise the relation is downgraded to review,
 listing A's unique members. The **index map** from A's pages to B's is the
 greedy left-to-right walk over B, written into the relation.
 
@@ -117,7 +124,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import shutil
 import sqlite3
+import tempfile
 import zipfile
 import zlib
 from collections import Counter
@@ -128,6 +138,8 @@ from typing import Any
 
 from comic_automation.archive.archive_limits import UnsafeArchiveError
 from comic_automation.archive.field_resolution import (
+    COMICINFO_EDITED_TEMPLATE,
+    COMICINFO_USABLE,
     FAMILY_ESTABLISHED,
     FAMILY_INCOMPARABLE,
     ArchiveFacts,
@@ -212,7 +224,7 @@ class DerivedArchive:
     not produce a bound, complete inventory: unreadable file, refused or
     corrupt archive, or a file that changed during evaluation. Pages and
     members are then empty and carry no meaning. ``read_mode`` is
-    ``buffered`` or ``streamed`` (`derive_archive`); None when unread.
+    ``buffered`` or ``private_copy`` (`derive_archive`); None when unread.
     """
 
     path: Path
@@ -261,20 +273,26 @@ class DerivedArchive:
 
 # Largest archive `derive_archive` holds in memory (512 MiB). At or under it
 # the archive is read once into one buffer and everything is derived from
-# that buffer. Above it the streaming path runs instead, so a multi-GB
-# omnibus (admission allows up to 16 GiB declared) is never held whole.
-# Conservative, not calibrated against the library.
+# that buffer. Above it the archive is copied into a private temp file
+# instead, so a multi-GB omnibus (admission allows up to 16 GiB declared)
+# is never held whole. Conservative, not calibrated against the library.
 DEFAULT_MAX_HELD_BYTES = 512 * 1024 * 1024
 
 READ_BUFFERED = "buffered"
-READ_STREAMED = "streamed"
+READ_COPIED = "private_copy"
+
+TOO_LARGE_TO_BIND = "too large to bind"
+
+
+class _CopyTooLarge(Exception):
+    """The archive exceeded ``max_copy_bytes`` while being copied."""
 
 
 def _read_capped(path: Path, limit: int) -> bytes | None:
     """The file's bytes, or None when it holds more than ``limit`` bytes.
 
     Reads at most ``limit + 1`` bytes, so a file that grew after it was
-    sized is never read unbounded: it falls through to the streaming path.
+    sized is never read unbounded: it falls through to the copy path.
     """
     with open(path, "rb") as handle:
         data = handle.read(limit + 1)
@@ -289,20 +307,40 @@ def _file_sha256(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> str:
     return digest.hexdigest()
 
 
-def _stat_identity(path: Path) -> tuple[int, int, int, int]:
-    """(size, mtime_ns, ino, dev): a replacement or a touch changes one of them.
+def _copy_to_private(
+    source: Path,
+    directory: Path,
+    chunk_size: int,
+    max_copy_bytes: int | None,
+) -> tuple[Path, str, int]:
+    """Copy ``source`` into ``directory``, hashing exactly the bytes written.
 
-    ``st_ino``/``st_dev`` are the NTFS file index and volume serial on
-    Windows, and 0 where a file system has none; equal zeros then compare
-    equal and the size, mtime and hash checks still apply.
+    Returns (copy path, sha256 of the copy stream, size). The digest is
+    updated with each chunk as it is written, so it names the copy's bytes,
+    not whatever the source holds a moment later.
+
+    The protection is ownership, not an OS lock: the copy is created by
+    ``tempfile.mkstemp`` (``O_EXCL``, an unpredictable name) inside a fresh
+    directory from ``tempfile.mkdtemp`` (owner-only permissions on POSIX;
+    on Windows, the temp directory's ACL), and no other component is told
+    its name. A process that deliberately rewrites another process's
+    private temp files is outside this contract.
     """
-    stat = path.stat()
-    return (
-        int(stat.st_size),
-        int(stat.st_mtime_ns),
-        int(getattr(stat, "st_ino", 0) or 0),
-        int(getattr(stat, "st_dev", 0) or 0),
-    )
+    handle, name = tempfile.mkstemp(prefix="archive-", suffix=".cbz", dir=directory)
+    digest = hashlib.sha256()
+    total = 0
+    with os.fdopen(handle, "wb") as copy, open(source, "rb") as original:
+        while chunk := original.read(chunk_size):
+            total += len(chunk)
+            if max_copy_bytes is not None and total > max_copy_bytes:
+                raise _CopyTooLarge(
+                    f"larger than max_copy_bytes ({max_copy_bytes})"
+                )
+            copy.write(chunk)
+            digest.update(chunk)
+        copy.flush()
+        os.fsync(copy.fileno())
+    return Path(name), digest.hexdigest(), total
 
 
 def _hash_non_image_members(
@@ -323,9 +361,10 @@ def _hash_non_image_members(
 def _derive_members(source: Callable[[], Any], chunk_size: int) -> tuple[Any, ...]:
     """(pages, page order, non-image members, ComicInfo documents).
 
-    ``source`` returns a fresh readable source on each call: an in-memory
-    buffer or the path. Raises what ``zipfile`` and the admission check
-    raise; `derive_archive` maps those to a ``problem``.
+    ``source`` returns a fresh readable source on each call: the held
+    buffer, or the private copy's path -- never the library file. Raises
+    what ``zipfile`` and the admission check raise; `derive_archive` maps
+    those to a ``problem``.
     """
     with zipfile.ZipFile(source(), mode="r") as archive:
         pages, order = hash_ordered_pages(archive, chunk_size=chunk_size)
@@ -339,25 +378,34 @@ def derive_archive(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_held_bytes: int = DEFAULT_MAX_HELD_BYTES,
+    temp_dir: str | Path | None = None,
+    max_copy_bytes: int | None = None,
 ) -> DerivedArchive:
     """Re-derive one archive's inventory from bytes bound to its sha256.
 
-    **Buffered** (file at most ``max_held_bytes``): the file is read once
-    into memory and that buffer is hashed; pages, non-image members and
-    ComicInfo are derived from the same buffer, so they describe exactly
-    the hashed bytes. The file is then re-hashed on disk, and a different
-    hash means it changed during evaluation (unresolved).
+    The full-file hash, the pages, the non-image members and the ComicInfo
+    always come from **one byte source that this evaluation owns**, never
+    from separate reads of the library file:
 
-    **Streamed** (larger files): ``stat`` (size, mtime_ns, ino, dev) is
-    recorded and the file's sha256 streamed; the members are then derived
-    from a ZipFile opened on the path; finally the sha256 is streamed again
-    and the file re-stat'ed. Any difference in hash or stat makes the
-    archive unresolved, "changed during evaluation". **Residual window:**
-    here the members are read from the file, not from the hashed bytes, so
-    a change made after the first hash and fully reverted before the second
-    -- bytes *and* size, mtime and file identity restored -- goes
-    undetected. That needs a writer that restores mtime deliberately; step
-    7 revalidates against the recorded hash before acting either way.
+    * **Buffered** (file at most ``max_held_bytes``): the file is read once
+      into memory, and that buffer is hashed and opened as a ZIP.
+    * **Private copy** (larger files): the file is copied into a private
+      temp file (`_copy_to_private`) and the hash is taken over the copy
+      stream; everything is then derived from the copy alone, and the copy
+      and its directory are deleted in a ``finally``. This writes a temp
+      file under ``temp_dir`` (default: the system temp directory, which
+      the caller must not point into a library) and never writes a library
+      file. If the copy cannot be made -- no space,
+      an I/O error, or more than ``max_copy_bytes`` -- the archive is
+      unresolved, "too large to bind", and never comparable.
+
+    Because the hash and the inventory come from the same owned bytes, a
+    change to the library file made and reverted mid-evaluation can no
+    longer pair one revision's hash with another revision's pages. The
+    library file is still re-hashed after the derivation: a different hash
+    means it changed during evaluation (unresolved), and an equal hash
+    means the evaluated bytes were the file's bytes when evaluation ended,
+    so step 7's recheck of the recorded hash rechecks the evaluated content.
 
     Failures are reported in ``problem``, never raised: one bad archive
     makes its family unresolved, it does not stop the folder.
@@ -372,63 +420,78 @@ def derive_archive(
             if size <= max_held_bytes
             else None
         )
-        if data is None:
-            before_stat: tuple[int, int, int, int] | None = _stat_identity(archive_path)
-            sha256 = _file_sha256(archive_path, chunk_size)
     except OSError as exc:
         return DerivedArchive(
             archive_path, None, None, problem=f"file could not be read: {exc}"
         )
 
-    source: Callable[[], Any]
-    if data is not None:
-        mode = READ_BUFFERED
-        sha256 = hashlib.sha256(data).hexdigest()
-        file_size = len(data)
-        before_stat = None
-        source = lambda: io.BytesIO(data)  # noqa: E731
-    else:
-        mode = READ_STREAMED
-        assert before_stat is not None
-        file_size = before_stat[0]
-        source = lambda: archive_path  # noqa: E731
-
-    def unresolved(problem: str) -> DerivedArchive:
-        return DerivedArchive(
-            archive_path, sha256, file_size, problem=problem, read_mode=mode
-        )
-
+    private_dir: Path | None = None
     try:
-        pages, order, non_image, comicinfo = _derive_members(source, chunk_size)
-    except UnsafeArchiveError as exc:
-        return unresolved(f"archive refused by admission limits ({exc.reason}): {exc}")
-    except (
-        zipfile.BadZipFile,
-        zlib.error,
-        EOFError,
-        RuntimeError,
-        NotImplementedError,
-    ) as exc:
-        return unresolved(f"corrupt or unreadable archive: {type(exc).__name__}: {exc}")
-    except OSError as exc:
-        return unresolved(f"file vanished or became unreadable during evaluation: {exc}")
+        source: Callable[[], Any]
+        if data is not None:
+            mode = READ_BUFFERED
+            sha256 = hashlib.sha256(data).hexdigest()
+            file_size = len(data)
+            source = lambda: io.BytesIO(data)  # noqa: E731
+        else:
+            mode = READ_COPIED
+            try:
+                private_dir = Path(tempfile.mkdtemp(
+                    prefix="cbz-supersession-",
+                    dir=None if temp_dir is None else str(temp_dir),
+                ))
+                copy_path, sha256, file_size = _copy_to_private(
+                    archive_path, private_dir, chunk_size, max_copy_bytes
+                )
+            except (OSError, _CopyTooLarge) as exc:
+                return DerivedArchive(
+                    archive_path,
+                    None,
+                    None,
+                    problem=(
+                        f"{TOO_LARGE_TO_BIND}: no private copy could be made "
+                        f"({type(exc).__name__}: {exc})"
+                    ),
+                    read_mode=mode,
+                )
+            source = lambda: copy_path  # noqa: E731
 
-    # The binding check: the bytes evaluated must still be the file's bytes,
-    # and on the streamed path the file must still be the same file.
+        def unresolved(problem: str) -> DerivedArchive:
+            return DerivedArchive(
+                archive_path, sha256, file_size, problem=problem, read_mode=mode
+            )
+
+        try:
+            pages, order, non_image, comicinfo = _derive_members(source, chunk_size)
+        except UnsafeArchiveError as exc:
+            return unresolved(
+                f"archive refused by admission limits ({exc.reason}): {exc}"
+            )
+        except (
+            zipfile.BadZipFile,
+            zlib.error,
+            EOFError,
+            RuntimeError,
+            NotImplementedError,
+        ) as exc:
+            return unresolved(
+                f"corrupt or unreadable archive: {type(exc).__name__}: {exc}"
+            )
+        except OSError as exc:
+            return unresolved(f"archive could not be read for derivation: {exc}")
+    finally:
+        if private_dir is not None:
+            shutil.rmtree(private_dir, ignore_errors=True)
+
+    # The after-check: the evaluated bytes must still be the file's bytes.
     try:
         now = _file_sha256(archive_path, chunk_size)
-        after_stat = None if before_stat is None else _stat_identity(archive_path)
     except OSError as exc:
         return unresolved(f"file vanished or became unreadable during evaluation: {exc}")
     if now != sha256:
         return unresolved(
             f"file changed during evaluation (sha256 {sha256} evaluated, "
             f"{now} on disk afterwards)"
-        )
-    if after_stat != before_stat:
-        return unresolved(
-            "file changed during evaluation (size, mtime_ns, ino, dev "
-            f"{before_stat} before, {after_stat} afterwards)"
         )
 
     return DerivedArchive(
@@ -458,11 +521,17 @@ def stored_rows_verdict(
     if stored is None:
         return f"no stored inventory rows for archive id {archive_id}"
     if not stored.comparable:
-        return f"stored rows are not comparable evidence: {stored.incomparable_reason}"
+        return (
+            "stored rows are not comparable evidence under the required "
+            f"contract ({CONTENT_SIGNATURE_ALGORITHM} version "
+            f"{CONTENT_SIGNATURE_VERSION}, complete, ordered): "
+            f"{stored.incomparable_reason}; this says nothing about whether "
+            "their page bytes differ"
+        )
     if stored.page_digests != derived.page_digests:
         return (
-            "stored rows are stale: they disagree with the sequence re-derived "
-            f"from the current bytes ({len(stored.page_digests)} stored pages, "
+            "stored rows are stale: their page digests differ from the "
+            f"sequence re-derived from the current bytes ({len(stored.page_digests)} stored pages, "
             f"{len(derived.page_digests)} re-derived)"
         )
     return STORED_AGREE
@@ -541,14 +610,32 @@ class Relation:
         }
 
 
+def keeper_comicinfo_is_usable(archive: DerivedArchive) -> bool:
+    """True when ``archive`` carries a usable ComicInfo.xml of its own.
+
+    Usable means `comicinfo_facts` classifies its ComicInfo member(s) as
+    ``usable`` or ``edited_template``: absent, unparseable, contradictory
+    (including differing duplicate documents) and the pristine injected
+    template are not. How many fields it must cover is a design decision
+    still open; an empty ``<ComicInfo/>`` is well-formed and counts.
+    """
+    return comicinfo_facts(archive.comicinfo_documents).status in (
+        COMICINFO_USABLE,
+        COMICINFO_EDITED_TEMPLATE,
+    )
+
+
 def _payload(
     older: DerivedArchive, newer: DerivedArchive, accept_comicinfo_drop: bool
 ) -> tuple[tuple[NonImageMember, ...], tuple[NonImageMember, ...]]:
     """(unique, accepted drops): ``older``'s non-image members not in ``newer``."""
     missing = Counter(older.non_image) - Counter(newer.non_image)
     # §8 question 6: a ComicInfo may be dropped only when the archive that
-    # supersedes it carries its own; otherwise the metadata would be lost.
-    newer_has_comicinfo = any(_is_comicinfo(m.name) for m in newer.non_image)
+    # supersedes it carries its own, and that one is usable metadata:
+    # well-formed, internally consistent and not the bare injected template
+    # (`field_resolution.comicinfo_facts`). Otherwise the only readable
+    # metadata could be discarded for an unusable document.
+    newer_has_comicinfo = keeper_comicinfo_is_usable(newer)
     unique: list[NonImageMember] = []
     dropped: list[NonImageMember] = []
     for member in sorted(missing.elements(), key=lambda m: (m.name, m.sha256)):
@@ -595,8 +682,14 @@ def compare_pair(
         )
         return Relation(
             first_key, second_key, REL_EQUAL_PAGES, OUTCOME_REVIEW,
-            "equal pages but different full files: the non-image members "
-            "differ, so neither supersedes the other",
+            (
+                "equal pages but different full files: the non-image members "
+                "differ, so neither supersedes the other"
+                if differing
+                else "equal pages and identical non-image members, but "
+                "different full files (the ZIP packaging differs); neither "
+                "supersedes the other"
+            ),
             index_map=tuple(range(len(a_pages))),
             differing_non_image=differing,
         )
@@ -1003,6 +1096,8 @@ def evaluate_folder(
     integrity_check: Callable[[sqlite3.Connection], str] | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_held_bytes: int = DEFAULT_MAX_HELD_BYTES,
+    temp_dir: str | Path | None = None,
+    max_copy_bytes: int | None = None,
 ) -> FolderSupersession:
     """Evaluate every ``*.cbz`` directly in ``directory``. Read-only.
 
@@ -1022,7 +1117,9 @@ def evaluate_folder(
 
     ``accept_comicinfo_drop`` is the operator's acceptance of dropping a
     superseded member's ComicInfo.xml (§4.4, §8 question 6); default off.
-    ``max_held_bytes`` bounds the memory `derive_archive` holds per archive.
+    ``max_held_bytes`` bounds the memory `derive_archive` holds per archive;
+    a larger archive is bound through a private copy under ``temp_dir``
+    (never a library directory), refused above ``max_copy_bytes``.
     """
     root = Path(directory)
     files = sorted(
@@ -1048,7 +1145,11 @@ def evaluate_folder(
         key = str(child)
         archive_id = archive_ids.get(child.name)
         derived = derive_archive(
-            child, chunk_size=chunk_size, max_held_bytes=max_held_bytes
+            child,
+            chunk_size=chunk_size,
+            max_held_bytes=max_held_bytes,
+            temp_dir=temp_dir,
+            max_copy_bytes=max_copy_bytes,
         )
         stored = None if archive_id is None else snapshot.result.get(archive_id)
         evaluations[key] = ArchiveEvaluation(
