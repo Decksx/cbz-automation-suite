@@ -533,6 +533,22 @@ def is_injected_template(root: ElementTree.Element) -> bool:
     return True
 
 
+# Digit-length bounds checked before any int() of a ComicInfo value. Year
+# is bounded by `normalize_year`'s four-digit pattern.
+MAX_MONTH_DIGITS = 2
+MAX_COUNT_DIGITS = 6
+_MONTH_DIGITS_RE = re.compile(rf"\d{{1,{MAX_MONTH_DIGITS}}}")
+_COUNT_DIGITS_RE = re.compile(rf"\d{{1,{MAX_COUNT_DIGITS}}}")
+_SHOWN_CHARS = 20
+
+
+def _shown(value: str) -> str:
+    """``repr`` of a ComicInfo value, cut short for a review reason."""
+    if len(value) <= _SHOWN_CHARS:
+        return repr(value)
+    return repr(value[:_SHOWN_CHARS] + "...") + f" ({len(value)} characters)"
+
+
 def comicinfo_facts(documents: Sequence[str | bytes]) -> ComicInfoFacts:
     """Classify an archive's ComicInfo.xml member(s).
 
@@ -544,8 +560,14 @@ def comicinfo_facts(documents: Sequence[str | bytes]) -> ComicInfoFacts:
     * a document that does not parse, or whose root is not ``ComicInfo``;
     * a read field present twice with different values;
     * a ``Year`` that is not a four-digit year in range, or a ``Month``
-      outside 1-12;
+      that is not one or two digits in 1-12;
+    * a ``Number`` with more than `MAX_COUNT_DIGITS` whole digits in any
+      part, or an all-digit ``Count`` that is longer than that or not
+      convertible (``str.isdigit`` accepts "²", ``int`` does not);
     * a numeric ``Number`` greater than a numeric ``Count``.
+
+    No value is converted with ``int()`` before its length is bounded, so a
+    hostile value makes the document inconsistent and never raises.
 
     The template check runs on a consistent document, so the reported
     reason for a template is always "template", never a side effect. A
@@ -598,13 +620,32 @@ def comicinfo_facts(documents: Sequence[str | bytes]) -> ComicInfoFacts:
 
     if "Year" in fields and normalize_year(fields["Year"]) is None:
         reasons.append(f"Year {fields['Year']!r} is not a plausible year")
+    # Every digit string is length-bounded before int() (PR #123): a
+    # 5000-digit value would otherwise raise the interpreter's int-string
+    # limit and stop evaluate_folder, and str.isdigit() also accepts
+    # characters such as "²" that int() rejects. Oversized or such values
+    # make the document inconsistent, never raise.
     if "Month" in fields and not (
-        fields["Month"].isdigit() and 1 <= int(fields["Month"]) <= 12
+        _MONTH_DIGITS_RE.fullmatch(fields["Month"])
+        and 1 <= int(fields["Month"]) <= 12
     ):
-        reasons.append(f"Month {fields['Month']!r} is not 1-12")
+        reasons.append(f"Month {_shown(fields['Month'])} is not 1-12")
     number = normalize_number(fields.get("Number"))
+    if number is not None and any(
+        len(part.partition(".")[0]) > MAX_COUNT_DIGITS for part in number.split("-")
+    ):
+        reasons.append(
+            f"Number {_shown(fields['Number'])} has more than "
+            f"{MAX_COUNT_DIGITS} digits"
+        )
+        number = None
     count = fields.get("Count", "")
-    if number is not None and "-" not in number and count.isdigit():
+    if count.isdigit() and not _COUNT_DIGITS_RE.fullmatch(count):
+        reasons.append(
+            f"Count {_shown(count)} is not a number of at most "
+            f"{MAX_COUNT_DIGITS} digits"
+        )
+    elif number is not None and "-" not in number and count.isdigit():
         if int(count) > 0 and float(number) > int(count):
             reasons.append(f"Number {number} exceeds Count {count}")
 
