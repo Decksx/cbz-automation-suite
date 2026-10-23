@@ -1085,7 +1085,118 @@ digest, backup before apply, and David's approval.
    `legacy_ordering_version` rows for current locations, and the content
    audit is re-run for review.
 
-Steps 2 and 3 need a tool that does not exist yet; this PR provides only
-the gate and the counts. The re-inventory itself is an operator action
-against production. The V1 per-page digest semantics are unchanged: only
-which index a page occupies moved.
+Steps 2 and 3 needed a tool that did not exist when this entry was written;
+the PR that introduced the gate provided only the gate and the counts. The
+re-inventory itself is an operator action against production. The V1
+per-page digest semantics are unchanged: only which index a page occupies
+moved.
+
+### The re-certification tool (steps 2, 3 and 5)
+
+`comic_automation/archive/content_signature_recertify.py`, tested by
+`tests/test_content_signature_recertify.py` on `tmp_path` fixtures only. It
+has not been run against production; running it is the operator's step,
+under the same rules as the plan above.
+
+```text
+python -m comic_automation.archive.content_signature_recertify plan \
+    --database DB --json-out PLAN.json
+python -m comic_automation.database.backup_cli ...   # verified report
+python -m comic_automation.archive.content_signature_recertify apply \
+    --database DB --plan PLAN.json --expect-digest HEX --expect-count N \
+    --backup-report BACKUP_REPORT.json [--json-out APPLY.json]
+python -m comic_automation.archive.content_signature_recertify postflight \
+    --database DB --plan PLAN.json [--json-out POST.json]
+```
+
+Exit codes: 0 done, 1 failed, 2 refused (nothing written), 3 apply skipped
+a row or postflight did not pass.
+
+**Provenance: recorded metadata, never live bytes.** No archive file is
+opened. A row counts as bound to current bytes when
+`archive_content_signatures.source_file_size = file_locations.file_size`
+and `archive_content_signatures.source_modified_time_ns =
+file_locations.modified_time_ns` for the archive's single `is_current = 1`
+location. These are the same fields `enqueue_missing` compares. No current
+location, more than one, or a NULL or unequal value makes the row `stale`.
+Equal values are a diagnostic. They do not prove that the stored page rows
+describe the bytes on disk today. A relabel certifies **the recorded order
+only**: the stored names sort the same way under contracts `"1"` and
+`"2"`, and the stored digest equals the version-`"2"` digest recomputed from
+the stored page sha256 rows. It does not meet #112's full-file/member
+validation for authoritative supersession.
+
+**Classes, first match wins.**
+
+1. `stale`: not bound, as above.
+2. `unresolved`: a repeated raw `entry_name`.
+3. `tied`: distinct names that tie on `_natural_key`.
+4. `inconsistent`: the stored basis does not reproduce the stored digest.
+   This class was added beyond steps 1 to 5, because a relabel must not
+   certify a digest the rows cannot reproduce. Its causes are a page-row
+   count different from `page_count`, `page_index` values that are not
+   `0..n-1`, a page without its sha256 row, a stored order that is not the
+   `page_order_key` order, or a recomputed digest that differs.
+5. `order_stable`: none of the above. A test recomputes the version-`"2"`
+   digest independently, both from the stored rows and fresh from the
+   archive bytes. It shows the two are equal for order-stable rows and
+   unequal for a tied row.
+
+`tied`, `unresolved` and `inconsistent` together are
+`reinventory_archive_ids`, the step-4 cost. `stale` rows take the ordinary
+rehash path.
+
+**Plan** reads one `read_consistent_snapshot`: `mode=ro` plus `query_only`,
+`data_version` taken before and after, and one deferred transaction. It
+writes a JSON plan whose `plan_digest` is the SHA-256 of the body's
+canonical JSON (sorted keys, compact separators, ASCII). Snapshot readings
+stay out of the body, so the same rows always give the same digest.
+
+**Apply** refuses before any write when any of these fail:
+
+- the recomputed digest differs from the recorded digest or from
+  `--expect-digest`;
+- `--expect-count` differs from the number of order-stable rows;
+- the plan's format, algorithm or version pair is not this tool's;
+- the backup report is not a verified `backup_cli` report for this
+  database.
+
+Otherwise one `dal.transaction` (`BEGIN IMMEDIATE`) re-classifies every
+planned archive from the rows as they are inside the lock. A row is
+relabelled only if it is still `order_stable` with an identical basis:
+signature id, digest, `page_count`, source size and mtime, current location
+id, and a SHA-256 of the stored names in `page_index` order. Each other row
+is skipped and named, not relabelled:
+
+- `signature_missing`;
+- `now_<class>:<reason>`;
+- `basis_changed`;
+- `version_<v>`, for a version that is neither `"1"` nor `"2"`.
+
+A row already at `"2"` with the planned basis is `already_recertified`, so a
+re-run is a no-op. The `UPDATE` also requires `algorithm_version = '1'`. If
+that predicate matches no row, the whole apply rolls back. A relabel writes
+only `archive_content_signatures.algorithm_version` and `updated_at`. Page
+rows, `page_hashes` (exact and perceptual), `calculated_at` and
+`archive_files` are not written. Perceptual rows keep their binding:
+`page_id` to an unchanged `(page_index, entry_name)` row.
+
+**Postflight populations are stated, not implied.** The report includes:
+
+- `signature_evidence_counts`, over every signature row in any location
+  state;
+- `legacy_rows_by_class`, the remaining version-`"1"` rows, classified;
+- `planned_order_stable_still_legacy`.
+
+It passes only when no `order_stable` legacy row remains and no planned
+archive is still at `"1"`. That includes a planned row that drifted into
+another class, which the scoped counts alone would miss. `stale`, `tied`,
+`unresolved` and `inconsistent` rows stay legacy, excluded from comparison,
+until step 4 re-inventories them. The postflight does not fail on them; it
+counts them.
+
+**Not done here.** Step 4 (re-inventory) is not done. The tool does not take
+the backup itself: `apply` only refuses without a verified report. A
+`location_id` that differs between the signature and the current location
+is not by itself stale, because the comparison is size and mtime only, as
+in `enqueue_missing`.
