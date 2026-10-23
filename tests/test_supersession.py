@@ -458,12 +458,13 @@ def test_dropping_comicinfo_needs_the_operator_flag(tmp_path, database):
 def test_a_comicinfo_drop_needs_the_keeper_to_cover_every_field(
     tmp_path, database, keeper_comicinfo, accepted, missing
 ):
-    """David's #111 decision: more comprehensive metadata may replace old,
-    mechanically by field coverage, otherwise review.
+    """Field coverage, the proposed and reviewed mechanism under the drop flag.
 
-    Every element non-empty in A's ComicInfo (free text included, by
-    presence) must be non-empty in B's; values may differ. Codex's
-    ``empty_metadata`` probe is the first case.
+    David's #111 permission is that more accurate or more comprehensive
+    metadata may replace old; accuracy is not judged automatically. The
+    mechanism checks presence only: every element populated in A's
+    ComicInfo (free text included) must be populated in B's, and values may
+    differ. Codex's ``empty_metadata`` probe is the first case.
     """
     folder = tmp_path / "coverage" / "Series"
     _book(folder, "Series ch. 1 v1.cbz", [P1],
@@ -485,23 +486,141 @@ def test_a_comicinfo_drop_needs_the_keeper_to_cover_every_field(
     assert f"does not cover {missing}" in relation.reason
 
 
-def test_an_unusable_older_comicinfo_may_be_dropped_for_a_usable_keeper(
-    tmp_path, database
-):
-    """A's ComicInfo is malformed: it has no fields to cover, so a usable
-    keeper ComicInfo discharges it under the flag (and not without it)."""
-    folder = tmp_path / "older-broken" / "Series"
-    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": b"<ComicInfo><broken"})
-    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": _ci()})
-
-    family = _family(
-        _evaluate(folder, database, accept_comicinfo_drop=True), folder,
+def _drop_family(tmp_path, database, case, older_comicinfo, keeper_comicinfo, **kw):
+    folder = tmp_path / case / "Series"
+    _book(folder, "Series ch. 1 v1.cbz", [P1], {"ComicInfo.xml": older_comicinfo})
+    _book(folder, "Series ch. 1 v2.cbz", [P1, P2], {"ComicInfo.xml": keeper_comicinfo})
+    return _family(
+        _evaluate(folder, database, accept_comicinfo_drop=True, **kw), folder,
         "Series ch. 1 v1.cbz",
     )
-    assert family.status == sv.FAMILY_SUPERSESSION
-    assert [m.name for m in family.relations[0].accepted_comicinfo_drops] == ["ComicInfo.xml"]
-    family = _family(_evaluate(folder, database), folder, "Series ch. 1 v1.cbz")
+
+
+def test_an_unparseable_older_comicinfo_is_never_dropped(tmp_path, database):
+    """PR #123 round 2: a document that cannot be inventoried cannot certify
+    that the keeper covers it, so even with the flag the drop is refused."""
+    family = _drop_family(tmp_path, database, "older-broken",
+                          b"<ComicInfo><broken", _ci(notes="keeper notes"))
     assert family.status == sv.FAMILY_REVIEW
+    (relation,) = family.relations
+    assert relation.accepted_comicinfo_drops == ()
+    assert "cannot be parsed" in relation.reason
+
+
+_INCONSISTENT = (
+    b"<ComicInfo><Series>Series</Series><Number>1</Number>"
+    b"<Notes>unique original notes</Notes><Number>2</Number></ComicInfo>"
+)
+
+
+@pytest.mark.parametrize(
+    "keeper, accepted",
+    [(_ci(), False), (_ci(notes="keeper notes"), True)],
+    ids=["keeper-without-notes", "keeper-covers"],
+)
+def test_an_inconsistent_older_comicinfo_keeps_its_fields(
+    tmp_path, database, keeper, accepted
+):
+    """PR #123 round 2: A holds Number twice (1 and 2) plus unique Notes.
+
+    Inconsistency is not emptiness: A's readable fields, the contradictory
+    one included, are still inventoried from its XML, so a keeper without
+    Notes does not cover it. The control keeper carries Series, Number and
+    Notes and is accepted.
+    """
+    family = _drop_family(tmp_path, database, "inconsistent", _INCONSISTENT, keeper)
+    (relation,) = family.relations
+    if accepted:
+        assert family.status == sv.FAMILY_SUPERSESSION
+        assert [m.name for m in relation.accepted_comicinfo_drops] == ["ComicInfo.xml"]
+        return
+    assert family.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert "does not cover ['Notes']" in relation.reason
+
+
+_PAGES = b'<Pages><Page Image="0" Type="FrontCover" Bookmark="Important"/></Pages>'
+
+
+def _with(extra: bytes) -> bytes:
+    return _ci().replace(b"</ComicInfo>", extra + b"</ComicInfo>")
+
+
+@pytest.mark.parametrize(
+    "keeper, gaps",
+    [
+        (_ci(), ["Pages"]),
+        (_with(b"<Pages/>"), ["Pages"]),
+        (_with(b'<Pages><Page Image="1" Type="FrontCover"/></Pages>'),
+         ["Pages/Page[Image=0]"]),
+        (_with(b'<Pages><Page Image="0"/><Page Image="1" Type="Story"/></Pages>'),
+         ["Pages/Page[Image=0]@Bookmark", "Pages/Page[Image=0]@Type"]),
+        (_with(b'<Pages><Page Image="0" Type="Story" Bookmark="Other"/></Pages>'), []),
+    ],
+    ids=["keeper-missing", "keeper-empty", "other-page-only", "page-without-annotations",
+         "keeper-carries-it"],
+)
+def test_structured_comicinfo_fields_count_for_coverage(tmp_path, database, keeper, gaps):
+    """PR #123 round 2: a Pages annotation lives in attributes, not text.
+
+    A's page annotation must be carried by the keeper's Page with the same
+    Image index and at least the same attribute names (values may differ).
+    """
+    family = _drop_family(tmp_path, database, "pages", _with(_PAGES), keeper)
+    (relation,) = family.relations
+    if not gaps:
+        assert family.status == sv.FAMILY_SUPERSESSION
+        assert [m.name for m in relation.accepted_comicinfo_drops] == ["ComicInfo.xml"]
+        return
+    assert family.status == sv.FAMILY_REVIEW
+    assert relation.accepted_comicinfo_drops == ()
+    assert f"does not cover {gaps}" in relation.reason
+
+
+@pytest.mark.parametrize(
+    "keeper, gaps",
+    [
+        (_with(b'<Credits><Credit name="someone"/></Credits>'), ["Credits/Credit@role"]),
+        (_with(b'<Credits><Credit role="Inker"/></Credits>'), []),
+    ],
+    ids=["other-attribute", "same-shape-other-value"],
+)
+def test_other_structured_fields_are_covered_by_shape(tmp_path, database, keeper, gaps):
+    """Outside Pages, B must carry A's populated child paths and attribute names."""
+    older = _with(b'<Credits><Credit role="Writer"/></Credits>')
+    family = _drop_family(tmp_path, database, "shape", older, keeper)
+    (relation,) = family.relations
+    if not gaps:
+        assert family.status == sv.FAMILY_SUPERSESSION
+        return
+    assert family.status == sv.FAMILY_REVIEW
+    assert f"does not cover {gaps}" in relation.reason
+
+
+def test_unmatchable_page_annotations_go_to_review(tmp_path, database):
+    """A Page without an Image index cannot be matched confidently."""
+    older = _with(b'<Pages><Page Type="FrontCover"/></Pages>')
+    # The keeper carries the same Page (and extra Notes, so the documents
+    # differ and a drop is actually needed); it still cannot be matched.
+    keeper = older.replace(b"<Number>1</Number>", b"<Number>1</Number><Notes>k</Notes>")
+    family = _drop_family(tmp_path, database, "no-index", older, keeper)
+    (relation,) = family.relations
+    assert family.status == sv.FAMILY_REVIEW
+    assert "Pages/Page without an Image index" in relation.reason
+
+
+def test_a_leftover_private_copy_is_logged(tmp_path, folder, monkeypatch, caplog):
+    """Cleanup is best-effort; a directory that survives it is reported."""
+    v1 = _book(folder, "book v1.cbz", [P1])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(sv.shutil, "rmtree", lambda *args, **kwargs: None)
+    with caplog.at_level("WARNING", logger=sv.__name__):
+        derived = derive_archive(v1, max_held_bytes=0, temp_dir=scratch)
+    assert derived.problem is None
+    (leftover,) = list(scratch.iterdir())
+    assert any(str(leftover) in record.getMessage() for record in caplog.records)
+    assert all(record.levelname == "WARNING" for record in caplog.records)
 
 
 @pytest.mark.parametrize(
