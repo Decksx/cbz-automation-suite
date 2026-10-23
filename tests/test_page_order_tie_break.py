@@ -15,10 +15,10 @@ archives only:
 2. **Duplicate names are unresolved.** Identical raw names cannot be ordered
    by name. The ordering helper reports them, the in-memory result carries
    the flag, stored rows expose it (duplicated ``archive_pages.entry_name``),
-   and the two consumers gated on it so far (``duplicate_content_groups``
-   and the maintenance deletion guard) refuse to compare such an archive.
-   ``content_duplicate_audit`` and ``near_duplicate`` are not gated yet;
-   see ``docs/engineering_decisions.md``.
+   and ``duplicate_content_groups`` and the maintenance deletion guard
+   refuse to compare such an archive. The audit and near-duplicate entry
+   points, and the ordering-version gate, are covered in
+   ``tests/test_ordered_evidence_gating.py``.
 3. **Re-association by entry name.** A re-inventory under the new order
    moves members to different ``page_index`` values. Each digest must stay
    with the member it was computed from, never with the index it used to
@@ -203,8 +203,46 @@ def test_duplicate_member_names_make_the_archive_unresolved(
     assert result.order_resolved is False
     assert result.duplicate_entry_names == ("1.png",)
     # Every member is still inventoried: unresolved withholds the order's
-    # authority, not the pages.
-    assert result.page_count == 3
+    # authority, not the pages. Checked by digest multiplicity, not by
+    # count: reading a member by *name* (`archive.open(entry.filename)`)
+    # returns the last same-named record every time, which keeps the count
+    # at 3 but hashes `second_payload` twice. Only the diff-bytes case can
+    # tell those apart, which is why both cases exist.
+    same_named = sorted(
+        (page.digest, page.entry_size, page.bytes_read)
+        for page in result.pages
+        if page.entry_name == "1.png"
+    )
+    assert same_named == sorted(
+        (hashlib.sha256(payload).hexdigest(), len(payload), len(payload))
+        for payload in (b"first", second_payload)
+    )
+
+
+def test_perceptual_hashing_reads_each_duplicate_named_member_once(
+    tmp_path: Path,
+) -> None:
+    """The perceptual reader also hashes every same-named record by its own bytes.
+
+    Two distinct images under one name must give the two images' own
+    dhashes, not one image's dhash twice. The expected values come from an
+    archive holding the same images under unique names.
+    """
+    first, second = gc.page_image(1), gc.page_image(2)
+    duplicated = _build_with_duplicates(
+        tmp_path / "dupes.cbz", [("1.png", first), ("1.png", second)]
+    )
+    reference = gc.build_cbz(
+        tmp_path / "ref.cbz", [("1.png", first), ("2.png", second)]
+    )
+
+    expected = sorted(
+        page.dhash for page in calculate_perceptual_hashes(reference).pages
+    )
+    assert len(set(expected)) == 2
+    assert sorted(
+        page.dhash for page in calculate_perceptual_hashes(duplicated).pages
+    ) == expected
 
 
 def test_duplicate_name_detection_is_scoped_to_image_members(
