@@ -146,7 +146,7 @@ _ASYM_HYPH_L_RE = re.compile(r"(\S) -(\S)")
 _ASYM_HYPH_R_RE = re.compile(r"(\S)- (\S)")
 _SPACES_RE = re.compile(r"\s+")
 _MARKER_WORDS_RE = re.compile(r"\b(uncensored|decensored)\b", re.IGNORECASE)
-_CHAPTER_TOKEN_RE = re.compile(r"(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
+_CHAPTER_TOKEN_RE = re.compile(r"(?<![^\W\d_])(ch(?:ap(?:ter)?)?p?\.?\s*)(\d[\d.]*)", re.IGNORECASE)
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:

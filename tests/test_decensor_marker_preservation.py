@@ -72,6 +72,18 @@ def test_watcher_import_keeps_markers_in_cbz_name_and_comicinfo(tmp_path):
     _assert_markers_survived(result)
 
 
+def test_watcher_normalizes_apostrophes_in_new_archive_names(tmp_path):
+    source = tmp_path / "Incoming" / "Chapter 1.cbz"
+    _marked_book(source)
+    with patch.object(cbz_watcher, "wait_for_file_stable", return_value=True), \
+            patch.object(cbz_core, "translate_metadata_text", side_effect=lambda text: (text, None)):
+        result, parsed = cbz_watcher.process_cbz_file(
+            source, override_name="Debra’s Story.cbz"
+        )
+    assert parsed is not None
+    assert result.name == "Debra's Story.cbz"
+
+
 def test_sanitizer_keeps_markers_in_cbz_name_and_comicinfo(tmp_path):
     source = tmp_path / "Series (Decensored)" / "Book [Uncensored].cbz"
     _marked_book(source)
