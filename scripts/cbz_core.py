@@ -1058,14 +1058,22 @@ def is_generic(text: str) -> bool:
 is_generic_title = is_generic
 
 
+# One decimal number token: digits, then either one ".digits" fraction or a
+# single trailing dot. Validated by fullmatch, not by stripping dots, because
+# rstrip('.') turned "1.." into "1" and "1.2." into "1.2" -- multi-dot runs
+# accepted as numbers they never were (#126 review).
+_NUM_FIELD_RE = re.compile(r"\d+(?:\.\d+|\.)?")
+
+
 def _num_field(value: str) -> str | None:
     """Canonical text of one decimal number token, or ``None`` if it is not one.
 
     ``"005"`` -> ``"5"``, ``"12.50"`` -> ``"12.5"``, ``"12."`` -> ``"12"``.
     The number regexes capture a digit followed by any run of digits and
     dots, so a token can carry more than one dot (``"1.2.3"``,
-    ``"12.5012.5"``) and is then not a number at all; a run of digits long
-    enough to overflow ``float`` to ``inf`` is not one either.
+    ``"12.5012.5"``, ``"1.."``, ``"1.2."``) and is then not a number at all;
+    a run of digits long enough to overflow ``float`` to ``inf`` is not one
+    either.
     Both come back ``None`` instead of raising (issue #120): this runs inside
     ``parse_comic_name`` on every arrival, and one malformed name must not
     raise out of the watcher's per-file loop and abort its whole folder.
@@ -1075,10 +1083,12 @@ def _num_field(value: str) -> str | None:
     contained -- guessing ``"12.5"`` out of ``"12.5012.5"`` would be name
     evidence classifying a file (design §3.2).
     """
+    if not _NUM_FIELD_RE.fullmatch(value):
+        return None
+    number = float(value)  # accepts "12." as 12.0
     try:
-        number = float(value.rstrip('.'))
         return str(int(number)) if number == int(number) else str(number)
-    except (ValueError, OverflowError):
+    except OverflowError:  # float() gave inf
         return None
 
 
