@@ -1224,3 +1224,123 @@ def test_a_source_changed_after_the_intent_is_never_moved(env):
     assert "source changed after intent" in report.stopped
     assert source.exists() and not destination.exists()
     assert env.step_journal(report.attempt_id) == [("intent", "ren1", 1)]
+
+
+# --- guards proven by the lead's independent mutants (PR #128 review) -----------
+
+
+def test_phase_two_compares_the_renamed_keepers_re_derived_sequence(env, monkeypatch):
+    """Phase 2 re-derives the keeper's sequence at its resulting path.
+
+    Equal sha256 means equal pages for a deterministic derivation, so this
+    guard is reachable only through an injected derivation: here the
+    renamed keeper's derivation loses its last page while its sha256 is
+    unchanged. Without the guard, phase 3's relation check would still block
+    the family, so the reason shows which guard fired (mutant:
+    phase2_sequence_not_compared)."""
+    from dataclasses import replace
+
+    spec, keeper, deps, renamed = _family(env, rename=True)
+    document = env.plan(families=[spec])
+    real = executor.derive_archive
+
+    def derive(path, *args, **kwargs):
+        derived = real(path, *args, **kwargs)
+        if Path(path) == renamed:
+            return replace(derived, pages=derived.pages[:-1])
+        return derived
+
+    monkeypatch.setattr(executor, "derive_archive", derive)
+    report = env.apply(document)
+
+    assert unit_status(report, "fam1") == executor.UNIT_BLOCKED
+    assert report.unit("fam1")["reasons"] == ["renamed keeper's re-derived sequence differs"]
+    assert all(p.exists() for p in deps)
+
+
+def test_a_dependant_row_that_moved_blocks_the_family_before_anything_moves(env):
+    """Phase 1 checks every dependant's row (mutant:
+    phase1_dependant_rows_skipped -- the quarantine CAS would then refuse,
+    but only after the file had already been moved)."""
+    spec, keeper, deps, _ = _family(env, dependants=1)
+    document = env.plan(families=[spec])
+    env.execute(
+        "UPDATE file_locations SET path = 'elsewhere' WHERE id = ?",
+        (spec.dependants[0].member.location_id,),
+    )
+
+    report = env.apply(document)
+
+    assert unit_status(report, "fam1") == executor.UNIT_BLOCKED
+    assert "dependant fam1:quarantine:1: file_locations row" in report.unit("fam1")["reasons"][0]
+    assert report.stopped is None
+    assert deps[0].exists() and env.step_journal(report.attempt_id) == []
+
+
+def test_the_keeper_row_is_revalidated_before_every_quarantine(env):
+    """§5.3 phase 3: the keeper is re-validated at its current path, rows
+    included. Its row moves after the first quarantine; the second
+    dependant stays."""
+    spec, keeper, deps, _ = _family(env, dependants=2)
+    document = env.plan(families=[spec])
+
+    def move_row(point, context):
+        if point == "after_dependant":
+            env.execute(
+                "UPDATE file_locations SET path = 'elsewhere' WHERE id = ?",
+                (spec.keeper.location_id,),
+            )
+
+    report = env.apply(document, fault=move_row)
+
+    assert unit_status(report, "fam1") == executor.UNIT_BLOCKED
+    assert report.unit("fam1")["reasons"][0].startswith("keeper: file_locations row")
+    assert [p.exists() for p in deps] == [False, True]
+
+
+def test_recovery_refuses_a_complete_action_whose_rows_moved(env):
+    """Bytes still at the proven location, row moved since (mutant:
+    recover_complete_rows_unchecked)."""
+    source = book(env.series, "a.cbz", [P1])
+    destination = env.series / "A ch. 1.cbz"
+    document = env.plan(renames=[env.rename_spec(source, destination, "ren1")])
+    forward = env.apply(document)
+    env.execute("UPDATE file_locations SET path = 'elsewhere' WHERE id = ?", (document["renames"][0]["location_id"],))
+
+    report = env.recover(document, forward.attempt_id)
+
+    assert statuses(report) == {"ren1": executor.RES_REFUSED}
+    assert "database rows are not at the proven location" in report.resolutions[0]["detail"]
+
+
+def test_recovery_refuses_an_intent_only_step_whose_rows_moved(env):
+    """Intent only, source intact, but the row is no longer at the step's
+    preimage: not retryable (mutant: intent_only_rows_unchecked)."""
+    source = book(env.series, "a.cbz", [P1])
+    destination = env.series / "A ch. 1.cbz"
+    document = env.plan(renames=[env.rename_spec(source, destination, "ren1")])
+    with pytest.raises(SimulatedCrash):
+        env.apply(document, fault=crash_at("after_intent"))
+    attempt = env.only_attempt()
+    env.execute("UPDATE file_locations SET path = 'elsewhere' WHERE id = ?", (document["renames"][0]["location_id"],))
+
+    report = env.recover(document, attempt)
+
+    assert statuses(report) == {"ren1": executor.RES_REFUSED}
+    assert "not at the step's preimage" in report.resolutions[0]["detail"]
+    with pytest.raises(executor.Refused):
+        env.apply(document, resume_attempt=attempt)
+    assert source.exists() and not destination.exists()
+
+
+def test_a_held_scope_lock_is_refused_at_once_never_waited_for(env):
+    """The second acquirer refuses promptly with the non-blocking refusal
+    (mutant: blocking_lock -- LK_LOCK retries for about ten seconds before
+    it raises, so only the timing tells it apart)."""
+    import time
+
+    with scope_lock.ScopeLock(env.root, "first", "apply"):
+        started = time.monotonic()
+        with pytest.raises(scope_lock.ScopeLockHeld, match="refusing rather than waiting"):
+            scope_lock.ScopeLock(env.root, "second", "recover").acquire()
+        assert time.monotonic() - started < 2.0
