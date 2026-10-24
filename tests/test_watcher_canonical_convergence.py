@@ -30,6 +30,7 @@ wherever the watcher pipeline runs, and the random properties exclude the
 from __future__ import annotations
 
 import random
+import re
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
@@ -63,7 +64,15 @@ _TOKENS = [
     "&amp", "&#1", "#", "#3", "G1234", " G5678", "Ch.", "Ch. 5", "ch. 1",
     "Chapter", "Vol", "Vol. 2", "scans", "Scanlations", "/", ":", "?", "|",
     "ワン", "鬼", "é", "é", "0", "12", "12.5", "~",
+    # Malformed number tokens (issue #120): more than one dot, and a digit
+    # run that overflows float() to inf. "12.5" + "12.5" also concatenates
+    # into one, and "Ch. " + either reaches the chapter extractor.
+    "1.2.3", "12.5012.5", "1..2", "Ch. 1.2.3", "9" * 400,
 ]
+
+# A digit run with two or more dots, or long enough to overflow: the inputs
+# _fmt_num_text raised on before issue #120.
+_MALFORMED_NUMBER_RE = re.compile(r"\d[\d.]*\.[\d.]*\.|\d{309}")
 
 
 def _random_name(rng: random.Random, max_tokens: int = 9) -> str:
@@ -79,20 +88,16 @@ def _random_rules(rng: random.Random) -> set[str]:
     return {rule for rule in NO_TRANSLATE if rng.random() < 0.8}
 
 
-def _parse_or_none(path: Path, **kwargs):
-    """parse_comic_name, or None for the one crash that predates this change.
+def _parse(path: Path, **kwargs):
+    """parse_comic_name without translation (a network service).
 
-    A chapter token whose digits run into a second fraction
-    (``"Ch. 12.5012.5"``) makes ``_fmt_num_text`` raise ``ValueError`` on
-    master too, with or without display tokens. It is a separate defect,
-    reported rather than fixed here; such inputs are skipped, and the caller
-    asserts they stay rare so the skip cannot hollow the property out.
+    These properties used to skip inputs with a malformed number token
+    (``"Ch. 12.5012.5"``), which raised ``ValueError``. Issue #120 made
+    ``_fmt_num_text`` total, so nothing is skipped: every generated input,
+    malformed tokens included, must satisfy the property, and the callers
+    assert such inputs are actually generated.
     """
-    try:
-        return cbz_core.parse_comic_name(path, rules=NO_TRANSLATE, **kwargs)
-    except ValueError as exc:
-        assert "could not convert string to float" in str(exc)
-        return None
+    return cbz_core.parse_comic_name(path, rules=NO_TRANSLATE, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -162,18 +167,16 @@ def test_watcher_naming_step_is_a_fixpoint(seed, tmp_path):
     a network service and is outside this claim.
     """
     rng = random.Random(seed)
-    skipped = 0
+    malformed = 0
     for _ in range(CASES_PER_SEED):
         folder = cbz_core.clean_directory_name(_random_filename_part(rng, 4)) or "Series"
         path = tmp_path / folder / (_random_filename_part(rng) + ".cbz")
-        first = _parse_or_none(path, display_tokens=True)
-        if first is None:
-            skipped += 1
-            continue
-        again = _parse_or_none(path.with_name(first.filename), display_tokens=True)
-        assert again is not None, path.name
+        malformed += bool(_MALFORMED_NUMBER_RE.search(path.name))
+        first = _parse(path, display_tokens=True)
+        again = _parse(path.with_name(first.filename), display_tokens=True)
         assert again.filename == first.filename, (path.name, first.filename)
-    assert skipped <= CASES_PER_SEED // 20
+    # The property must actually cover the inputs that used to be skipped.
+    assert malformed > 0
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -182,15 +185,15 @@ def test_display_mode_changes_only_the_filename(seed, tmp_path):
     computed exactly as without them, so a [v2] cannot become a volume and a
     bare v2 is classified no differently than before (§3.2)."""
     rng = random.Random(seed)
+    malformed = 0
     for _ in range(CASES_PER_SEED):
         path = tmp_path / "Series" / (_random_filename_part(rng) + ".cbz")
-        legacy = _parse_or_none(path)
-        display = _parse_or_none(path, display_tokens=True)
-        assert (legacy is None) == (display is None), path.name
-        if legacy is None:
-            continue
+        malformed += bool(_MALFORMED_NUMBER_RE.search(path.name))
+        legacy = _parse(path)
+        display = _parse(path, display_tokens=True)
         for field in ("stem", "series", "chapter", "volume", "season", "episode", "part"):
             assert getattr(display, field) == getattr(legacy, field), (field, path.name)
+    assert malformed > 0
 
 
 def test_fixpoint_bound_raises_instead_of_returning_a_non_fixpoint():

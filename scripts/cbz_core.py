@@ -1048,7 +1048,7 @@ def extract_trailing_bare_number(name: str) -> str | None:
     which this function is meant to be paired with.
     """
     m = _TRAILING_BARE_NUMBER_RE.search(name)
-    return _fmt_num_text(m.group(1)) if m else None
+    return _num_field(m.group(1)) if m else None
 
 
 def is_generic(text: str) -> bool:
@@ -1058,17 +1058,56 @@ def is_generic(text: str) -> bool:
 is_generic_title = is_generic
 
 
+# One decimal number token: digits, then either one ".digits" fraction or a
+# single trailing dot. Validated by fullmatch, not by stripping dots, because
+# rstrip('.') turned "1.." into "1" and "1.2." into "1.2" -- multi-dot runs
+# accepted as numbers they never were (#126 review).
+_NUM_FIELD_RE = re.compile(r"\d+(?:\.\d+|\.)?")
+
+
+def _num_field(value: str) -> str | None:
+    """Canonical text of one decimal number token, or ``None`` if it is not one.
+
+    ``"005"`` -> ``"5"``, ``"12.50"`` -> ``"12.5"``, ``"12."`` -> ``"12"``.
+    The number regexes capture a digit followed by any run of digits and
+    dots, so a token can carry more than one dot (``"1.2.3"``,
+    ``"12.5012.5"``, ``"1.."``, ``"1.2."``) and is then not a number at all;
+    a run of digits long enough to overflow ``float`` to ``inf`` is not one
+    either.
+    Both come back ``None`` instead of raising (issue #120): this runs inside
+    ``parse_comic_name`` on every arrival, and one malformed name must not
+    raise out of the watcher's per-file loop and abort its whole folder.
+
+    The field extractors use this directly, so a malformed token leaves the
+    ComicInfo field unset rather than writing a number the name never
+    contained -- guessing ``"12.5"`` out of ``"12.5012.5"`` would be name
+    evidence classifying a file (design §3.2).
+    """
+    if not _NUM_FIELD_RE.fullmatch(value):
+        return None
+    number = float(value)  # accepts "12." as 12.0
+    try:
+        return str(int(number)) if number == int(number) else str(number)
+    except OverflowError:  # float() gave inf
+        return None
+
+
 def _fmt_num_text(value: str) -> str:
-    number = float(value.rstrip('.'))
-    return str(int(number)) if number == int(number) else str(number)
+    """Canonical spelling of a number token for a *name*; total, never raises.
+
+    A token :func:`_num_field` rejects is returned unchanged, so it stays in
+    the filename as the text it arrived as, and re-parsing that name returns
+    it unchanged again (the naming step stays a fixpoint).
+    """
+    formatted = _num_field(value)
+    return value if formatted is None else formatted
 
 
 def normalise_number_tokens(stem: str) -> str:
+    # _fmt_num_text already leaves a malformed token as its own text, so the
+    # match is rebuilt from the marker plus that text with no error handling.
     def _sub(match: re.Match[str]) -> str:
-        try:
-            return match.group(1) + _fmt_num_text(match.group(2))
-        except ValueError:
-            return match.group(0)
+        return match.group(1) + _fmt_num_text(match.group(2))
 
     return _NUM_TOKEN_RE.sub(_sub, stem)
 
@@ -1117,7 +1156,7 @@ def extract_chapter_number(stem: str) -> str | None:
     if not match:
         return None
     value = next(group for group in match.groups() if group is not None)
-    return _fmt_num_text(value)
+    return _num_field(value)
 
 
 def extract_volume_number(stem: str) -> str | None:
@@ -1125,7 +1164,7 @@ def extract_volume_number(stem: str) -> str | None:
     if not match:
         return None
     value = match.group(1) or match.group(2)
-    return _fmt_num_text(value)
+    return _num_field(value)
 
 
 def _extract_first_group(regex: re.Pattern, stem: str) -> str | None:
@@ -1134,7 +1173,7 @@ def _extract_first_group(regex: re.Pattern, stem: str) -> str | None:
     if not match:
         return None
     value = next((g for g in match.groups() if g is not None), None)
-    return _fmt_num_text(value) if value is not None else None
+    return _num_field(value) if value is not None else None
 
 
 def extract_season_number(stem: str) -> str | None:
@@ -1280,14 +1319,20 @@ def parse_comic_name(
 
     # Fallback: pull chapter/volume from CJK markers (第N話/N話 -> chapter,
     # 第N巻/N巻 -> volume) when Latin-token extraction found nothing.
+    # The number is the whole digit-and-dot run before the marker, never a
+    # fragment of it: "1.2.3話" used to yield "3" and "12.5話" "5" (#120).
+    # The run goes through _num_field like every other token, so a
+    # malformed one leaves the field unset instead of a guessed number.
+    # The greedy run already starts at the leftmost digit; the lookbehind is
+    # for a run that starts with a dot (".5話"), whose "5" is a fragment too.
     if chapter is None:
-        m = re.search(r"第?\s*(\d+)\s*[話话章]", raw_stem)
+        m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[話话章]", raw_stem)
         if m:
-            chapter = _fmt_num_text(m.group(1))
+            chapter = _num_field(m.group(1))
     if volume is None:
-        m = re.search(r"第?\s*(\d+)\s*[巻卷]", raw_stem)
+        m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[巻卷]", raw_stem)
         if m:
-            volume = _fmt_num_text(m.group(1))
+            volume = _num_field(m.group(1))
 
     # Translation handling: native CJK titles are always eligible; romanized
     # Japanese/Korean/Chinese titles are eligible only after conservative
