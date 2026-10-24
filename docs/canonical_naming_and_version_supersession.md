@@ -812,6 +812,12 @@ review.
       that name, because `Path.exists` ignores case on Windows.
     - A destination counts as "occupied" when anything exists at it in any
       case (`os.path.lexists`).
+20. **An injection-only guard.** Phase 2 compares the renamed keeper's
+    re-derived pages with phase 1's. Equal sha256 implies equal pages for
+    a deterministic derivation, so the comparison is reachable only
+    through an injected derivation, and it is tested that way. Phase 3
+    re-validates the keeper's `file_locations` row as well as its bytes
+    before every quarantine.
 
 ## 7. Named tests (for the implementation PRs)
 
