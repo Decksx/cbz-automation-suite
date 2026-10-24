@@ -686,6 +686,133 @@ code takes. They are open to review.
 
 Perceptual hashes are not consulted at all in step 5.
 
+### Step 7 implementation notes
+
+Step 7 is the package `comic_automation/library/canonical_apply/`: `plan`,
+`scope_lock`, `journal`, `markers`, `executor` and `cli`. It runs against
+tmp fixtures only. The design was silent on the points below. Each one
+records the conservative reading the code takes, and each is open to
+review.
+
+1. **The marker table is not a numbered migration.** Migration 015 is
+   declared protected. The Slice 4 executor requires the ledger to equal
+   exactly `{v < 15}` before it applies 015 (`slice4_migration_design.md`
+   §12.1 step 3), and `tests/test_migrations.py` requires contiguous
+   version numbers. So an ordinary `016` would either fail the contiguity
+   sentinel, or later make every database that ran it unable to apply 015.
+   - `rename_attempt_steps` and its two append-only triggers are created
+     by `markers.install_schema`, or by `cli install-schema`. That is
+     `CREATE ... IF NOT EXISTS` in one `BEGIN IMMEDIATE`, outside the
+     ledger.
+   - `apply`, `recover` and `undo` refuse a database whose table is
+     missing or differs from the expected schema.
+   - Bringing the table into the ledger waits until the Slice 4 numbering
+     is settled.
+2. **The plan format** is defined here (`canonical-naming-plan-v1`). No
+   live `plan` command is built: that is step 8.
+   - `plan.build_plan` and `plan.family_spec_from_evaluation` are the
+     pure builders. The second takes a step-5 verdict, and only a
+     `supersession` verdict is accepted.
+   - `--expect-renames` counts ordinary renames only. Keeper renames are
+     part of their family and are counted separately as `keeper_renames`.
+   - The digest is the sha256 of the sorted, compact JSON of every key
+     except `plan_digest`.
+3. **Plan structure is refused before the lock.** All of these are
+   refused:
+   - a path that is not absolute and normalised, not under the root, or
+     not a `.cbz`;
+   - a path inside the canonical-naming state (the lock, the owner file,
+     or the journal directory);
+   - a rename that changes directory;
+   - a destination that is any source, except a case-only rename's own;
+   - a dependant whose relation is not a strict-prefix supersession;
+   - a quarantine path outside
+     `<root>\.cbz-canonical-quarantine\<YYYY-MM-DD>`.
+
+   Quarantine paths are fixed at plan time, so the date is the plan's
+   date.
+4. **An archive named by two units** blocks every unit that names it.
+   The plan is not refused. This is how §5.3's "no other unit schedules
+   the keeper for quarantine" is enforced.
+5. **Windows only.** POSIX `rename` replaces an existing destination, so
+   every entry point raises `UnsupportedPlatformError` elsewhere.
+6. **Quiescence has no cross-process mechanism yet.** The series locks are
+   in-process watcher locks, and no operator mode exists.
+   - The library API takes a required `quiescence` probe. The CLI accepts
+     only the operator's `--attest-quiescent` and refuses without it.
+   - The probe is checked right after the lock is taken, and again at
+     every batch boundary.
+   - A `unit_gate` seam is where a future series-lock wait goes.
+7. **Lock waits.** Validation of a unit always runs after its gate
+   returns. The SQLite write lock is the other wait: inside
+   `BEGIN IMMEDIATE`, the destination is re-hashed before the conditional
+   updates.
+8. **Journal.** Each record is one JSON line, `fsync`ed before the caller
+   goes on, and the file is created exclusively.
+   - The reader refuses the whole journal on a torn final line, a parse
+     error, a foreign contract or attempt id, or a gap in the sequence.
+     No prefix is trusted.
+   - The parent directory is not fsynced. Python on Windows cannot do it.
+     This is a known gap.
+9. **What recovery writes.** Each round re-derives everything from
+   scratch and writes at most one record. A run repeats rounds on one
+   action until its frontier step is confirmed or refused, so a single
+   run settles a `done` step. `single_round` exposes one round.
+   - Recovery never begins a step that has no `intent`.
+   - An `intent`-only step whose source is intact is reported
+     `not_done_retryable`. `apply --resume` (or `undo --resume`) retries
+     it under full unit validation, reusing the durable intent, which must
+     match the plan step.
+   - **Abandon is not implemented.** Such an attempt stays unfinished.
+10. **Completed history is still checked.** For an action that is complete
+    or sits at a step boundary, recovery re-checks the content and rows at
+    the proven location. Drift there is a refusal, so it also refuses a
+    resume. It does not merely block the family.
+11. **One unfinished attempt at a time.** A new apply or undo is refused
+    while any attempt under the root is unfinished.
+    - "Unfinished" is decided from journals alone: every receipt carries
+      `steps_total`.
+    - A journal that cannot be read counts as unfinished.
+    - Re-applying a plan digest that an earlier attempt already started
+      needs `--resume`.
+12. **Unit or run.** A failure before an `intent` is durable blocks only
+    its unit. A failure after it stops the whole run for recovery: either
+    `os.rename` refusing, or the database step refusing and rolling back.
+13. **Database rows.**
+    - The `file_locations` row is updated in place (`path`,
+      `last_seen_at`), matched on `id`, `archive_id`, the preimage path and
+      `is_current = 1`.
+    - A quarantined file's row stays current, at its quarantine path.
+    - No `file_events`, `archive_quarantine` or migration-013 disposition
+      rows are written. That is left for review.
+14. **Pairing records.** No pairing table exists yet.
+    - The caller registers `(table, path column)` pairs, and the plan
+      names only a registered table and a row id. Identifiers never come
+      from the plan.
+    - The CLI registers none, so a plan carrying pairings is refused there.
+15. **Durability of the database step.** The apply connection uses
+    `synchronous = FULL`. Under WAL, `NORMAL` may lose the last commit,
+    and the `confirmed` record follows that commit.
+16. **Run-wide stop.** The defaults are a drift fraction of 0.05 and a
+    batch size of 25 units. Both are conservative and uncalibrated. The
+    fraction is checked at batch boundaries only, in addition to the
+    per-unit checks.
+17. **Undo.**
+    - Every requested action is checked before anything moves. One
+      failure refuses the whole undo.
+    - It refuses while any forward action is part-way along its chain.
+    - Actions are reversed latest first, by first intent.
+    - An undo attempt cannot itself be undone.
+    - A case-only undo reuses the forward attempt's temporary name.
+18. **Strong identity** is always step 5's `derive_archive` sha256. That
+    includes ordinary rename sources, so a rename parses the archive.
+    Family members must also be comparable.
+19. **Exact names.**
+    - A file is "present" only when its parent directory lists exactly
+      that name, because `Path.exists` ignores case on Windows.
+    - A destination counts as "occupied" when anything exists at it in any
+      case (`os.path.lexists`).
+
 ## 7. Named tests (for the implementation PRs)
 
 Naming and resolution:
