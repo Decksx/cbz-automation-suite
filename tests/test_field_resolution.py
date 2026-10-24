@@ -446,6 +446,57 @@ def test_inconsistent_comicinfo_is_ignored(documents):
     )
 
 
+_HUGE_DIGITS = "9" * 5000
+
+
+@pytest.mark.parametrize(
+    "document, reason",
+    [
+        (f"<ComicInfo><Number>1</Number><Count>{_HUGE_DIGITS}</Count></ComicInfo>",
+         "Count '99999999999999999999...' (5000 characters) is not a number of at most 6"),
+        (f"<ComicInfo><Month>{_HUGE_DIGITS}</Month></ComicInfo>",
+         "Month '99999999999999999999...' (5000 characters) is not 1-12"),
+        (f"<ComicInfo><Year>{_HUGE_DIGITS}</Year></ComicInfo>", "is not a plausible year"),
+        (f"<ComicInfo><Number>{_HUGE_DIGITS}</Number><Count>3</Count></ComicInfo>",
+         "has more than 6 digits"),
+        ("<ComicInfo><Number>1234567</Number></ComicInfo>", "has more than 6 digits"),
+        ("<ComicInfo><Count>1234567</Count></ComicInfo>", "at most 6 digits"),
+        ("<ComicInfo><Month>012</Month></ComicInfo>", "is not 1-12"),
+        ("<ComicInfo><Month>²</Month></ComicInfo>", "is not 1-12"),
+        ("<ComicInfo><Number>1</Number><Count>²</Count></ComicInfo>",
+         "at most 6 digits"),
+    ],
+    ids=["huge-count", "huge-month", "huge-year", "huge-number", "seven-digit-number",
+         "seven-digit-count", "three-digit-month", "superscript-month",
+         "superscript-count"],
+)
+def test_oversized_or_unconvertible_digits_are_inconsistent_not_raised(document, reason):
+    """PR #123: every digit string is length-bounded before ``int()``.
+
+    A 5000-digit value used to raise Python's int-string-limit ValueError
+    (and "²" passes ``isdigit`` but not ``int``), which stopped the whole
+    supersession evaluation. Now it makes the document inconsistent.
+    """
+    facts = comicinfo_facts([document])
+    assert facts.status == fr.COMICINFO_INCONSISTENT
+    assert any(reason in r for r in facts.reasons), facts.reasons
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "<ComicInfo><Number>999999</Number><Count>999999</Count></ComicInfo>",
+        "<ComicInfo><Month>12</Month><Month>12</Month></ComicInfo>",
+        "<ComicInfo><Month>7</Month><Year>2001</Year></ComicInfo>",
+        "<ComicInfo><Number>1</Number><Count>many</Count></ComicInfo>",
+    ],
+    ids=["six-digits", "two-digit-month", "plain-month-year", "non-numeric-count"],
+)
+def test_digit_bounds_leave_ordinary_values_usable(document):
+    """Controls at and under the bounds; a non-numeric Count stays ignored."""
+    assert comicinfo_facts([document]).status == fr.COMICINFO_USABLE
+
+
 @pytest.mark.parametrize(
     "year, plausible",
     [("1899", False), ("1066", False), ("1900", True),

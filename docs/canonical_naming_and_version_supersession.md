@@ -542,6 +542,150 @@ without David's explicit go-ahead.
 8. A live dry-run plan for David's review. Then, only on his approval of a
    digest, a batched apply on Tower.
 
+### Step 5 implementation notes
+
+Step 5 is `comic_automation/archive/supersession.py`, which is read-only.
+The design was silent on the points below, so each records the reading the
+code takes. They are open to review.
+
+1. **Stored rows are required.** §4.3 says the planner compares the
+   re-derived sequence with the stored rows, but not what happens when there
+   are none. The evaluator takes `archive_ids` and a database. A file with
+   no id, or an id with no rows, is unresolved, so a new arrival blocks its
+   family until it has been inventoried.
+2. **Rows that are not comparable evidence are stale**, even when their
+   digests match the bytes. This covers legacy ordering contract `"1"`, an
+   unresolved stored order, and an incomplete inventory. The refusal
+   reason says the rows fail the required contract. It does not claim
+   their bytes differ, which is a separate reason.
+3. **Dropping ComicInfo (§8 question 6, conservative reading).** With
+   `accept_comicinfo_drop` (default off), A's ComicInfo.xml may be dropped
+   only when B carries its own **usable** ComicInfo.xml. Usable means
+   `field_resolution.comicinfo_facts` reads it as `usable` or
+   `edited_template`. A missing, malformed or contradictory document (for
+   example two differing ComicInfo members) does not qualify, and nor does
+   the bare injected template. Otherwise the relation goes to review as
+   before. An accepted drop is listed in the relation.
+
+   **Field coverage.** David's permission is recorded on #111: "more
+   accurate or more comprehensive metadata may replace old metadata". The
+   same record keeps that permission separate from a *proposed mechanical
+   rule*, and says accuracy is not judged automatically. Step 5 implements
+   that rule as the reviewed mechanism behind the explicit drop flag. It is
+   not itself David's decision, and presence alone does not establish
+   accuracy.
+
+   The mechanism is deliberately narrow; it is not an XML merger. Only
+   these shapes in A's document can certify coverage, and values may
+   differ in all of them:
+   - **Simple top-level element:** no attributes, no children, and text
+     that is non-blank after strip. It is covered when B has the same
+     element with non-blank text. Free text such as Notes and Summary
+     counts the same way.
+   - **`Pages`**, in this shape only:
+     - `Pages` has no attributes and no non-blank text;
+     - its children are only `Page` elements;
+     - each `Page` has no children, no text and no tail, and an `Image`
+       attribute of one to six decimal digits, unique by value within
+       `Pages`. The length is checked before conversion, so an oversized
+       index is a refusal rather than an interpreter error.
+
+     It is covered when every A `Page` attribute other than `Image` with a
+     non-blank value is also non-blank on B's `Page` with the same `Image`
+     index. B's `Pages` must be in the same supported shape.
+   - **An element whose content is blank** (blank text, no attributes, no
+     children) needs no cover. Neither does a blank `Page` attribute.
+
+   **Everything else in A refuses the drop** with "unsupported ComicInfo
+   shape: <path>" and goes to review:
+   - any other element with attributes or children;
+   - non-blank tail text anywhere;
+   - text or attributes on `Pages`, or on the root;
+   - a root tag that is not exactly the unqualified `ComicInfo`, in A's or
+     B's document. That includes a prefixed `x:ComicInfo`, and a default
+     namespace whose children reset it with `xmlns=""`. A keeper with such
+     a root covers nothing;
+   - a missing, blank, invalid (including more than six digits) or
+     duplicate `Image` index;
+   - any namespaced (`{uri}`-qualified) element or `Page` attribute. Names
+     are compared raw, so `x:Bookmark` is never `Bookmark`. A namespaced
+     element in the keeper's document never covers;
+   - a repeated `Pages`;
+   - nesting deeper than `MAX_COMICINFO_DEPTH` (8).
+
+   The scan is iterative and stops at the depth bound, so a deeply nested
+   older document is a family-local refusal that cannot stop the folder.
+   An empty `<ComicInfo/>` never replaces a filled one.
+
+   **When A's ComicInfo is inconsistent but well-formed**, it is still
+   inventoried from its XML, including a field that holds contradictory
+   values: inconsistency is not emptiness. **When A's ComicInfo does not
+   parse**, it cannot be inventoried, so the drop goes to review.
+4. **Payload identity.** The non-image payload is compared by exact raw
+   member name and sha256, as a multiset. A credits file moved into a
+   subfolder therefore blocks supersession.
+5. **Duplicates at the top of a family.** Byte-identical duplicates there
+   are two maximal members, so there is no keeper and the family goes to
+   review. Duplicates below the keeper both point at it.
+6. **Inserted pages.** The proposed keeper, pointers and index maps are
+   reported, but the family status is `review`. Only `supersession` is
+   actionable by a later step.
+7. **Direction.** For unequal lengths, the shorter sequence is the older
+   one. A shorter archive that is a subsequence of a longer one is reported
+   as superseded with inserted pages, whatever its name claims.
+8. **No ComicInfo version label yet.** §4.6 allows a label from the keeper's
+   own ComicInfo. ComicInfo has no standard version element and step 4 reads
+   none, so that route never fires and such a label is held for a decision.
+   A held label must stay a separate rename gate in the later planner.
+9. **A bare `v<N>` is the keeper's own marker** once step 4 has classified
+   it as a version through the established family and the version field is
+   resolved, that is, uncontradicted.
+10. **Higher numbers on other members are not contradictions.** Another
+    member's higher number is a note for review, never a contradiction and
+    never the label (§4.6, the v2-versus-v8 example).
+11. **Unreachable guards.** Relations derived from bytes cannot cycle,
+    because every edge strictly lengthens the sequence, and containment is
+    transitive. So the cycle guard, the missing-direct-relation guard and
+    the two-established-families guard raise
+    `InconsistentRelationsError`, and are proven only by tests that inject
+    relations. They rest on three assumptions, which must hold for the
+    guards to stay unreachable:
+    - page counts strictly increase along every edge;
+    - containment and the payload rule are transitive;
+    - step 4's grouping gives no archive two established families.
+12. **Memory bound and binding.** The full-file hash, the pages, the
+    non-image members and the ComicInfo always come from one byte source
+    that the evaluation owns, never from separate reads of the library
+    file.
+    - **At most `max_held_bytes`** (512 MiB by default), that source is one
+      in-memory buffer.
+    - **Larger archives** are copied into a private temp file, and the hash
+      is taken over the copy stream. Everything is then derived from the
+      copy alone. Afterwards the copy and its fresh `mkdtemp` directory are
+      removed, best-effort. A leftover is logged at warning level with its
+      path; removal is not guaranteed.
+    - **Writes.** The copy path writes temp files under `temp_dir` (default
+      the system temp directory), never a library file.
+    - **Failure.** If the copy cannot be made (no space, an I/O error, or
+      larger than an optional `max_copy_bytes`), the archive is unresolved,
+      "too large to bind", and is never comparable.
+    - **After-check.** Either way the library file is re-hashed at the end.
+      A difference makes the archive unresolved. Equality means the
+      evaluated bytes were the file's bytes when evaluation ended, so step
+      7's recheck of the recorded hash rechecks the evaluated content.
+
+    A change made and reverted during derivation therefore cannot pair one
+    revision's hash with another revision's pages. That was possible in the
+    earlier streamed design, refused in the #123 review. The copy is
+    protected by ownership (an `O_EXCL` file in a private directory), not
+    by an OS lock.
+13. **Scope of failure.** One unreadable, corrupt or refused archive makes
+    its own family unresolved. It does not stop the folder. Only an
+    inconsistent relation set (item 11) or a concurrent database commit
+    stops the run.
+
+Perceptual hashes are not consulted at all in step 5.
+
 ## 7. Named tests (for the implementation PRs)
 
 Naming and resolution:
