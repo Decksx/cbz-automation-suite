@@ -55,6 +55,20 @@ def _parse(name: str, folder: str = "Series", **kwargs):
         ("Series Part 1.2.3.cbz", "part"),
         (f"Series 第{HUGE}話.cbz", "chapter"),
         (f"Series 第{HUGE}巻.cbz", "volume"),
+        # More than one dot counting the trailing one (#126 review): rstrip
+        # used to accept "1.." as 1 and "1.2." as 1.2.
+        ("Series Ch. 1...cbz", "chapter"),
+        ("Series Ch. 1.2..cbz", "chapter"),
+        ("Series Ch. 1.2...cbz", "chapter"),
+        ("Series Vol. 3...cbz", "volume"),
+        ("Series #1.2..cbz", "chapter"),
+        ("Series Ep. 1...cbz", "episode"),
+        ("Series Part 1.2..cbz", "part"),
+        ("Series S1..E4.cbz", "season"),
+        ("Series 第1..話.cbz", "chapter"),
+        ("Series 第1.2.話.cbz", "chapter"),
+        ("Series 1.2.話.cbz", "chapter"),
+        ("Series 第1.2.巻.cbz", "volume"),
     ],
 )
 @pytest.mark.parametrize("display_tokens", [False, True])
@@ -69,7 +83,14 @@ def test_malformed_token_is_kept_as_text_and_leaves_the_field_unset(
 
 @pytest.mark.parametrize(
     "name",
-    ["Series Ch. 1.2.3.cbz", "Series Ch. 12.5012.5.cbz", "Series Vol. 1.2.3.cbz"],
+    [
+        "Series Ch. 1.2.3.cbz",
+        "Series Ch. 12.5012.5.cbz",
+        "Series Vol. 1.2.3.cbz",
+        "Series Ch. 1...cbz",
+        "Series Ch. 1.2..cbz",
+        "Series 第1.2.話.cbz",
+    ],
 )
 def test_malformed_token_survives_verbatim_in_the_filename(name):
     """The issue's examples come back unchanged: the token is neither dropped
@@ -91,6 +112,10 @@ def test_generic_chapter_stem_with_a_malformed_token_is_named_from_the_folder():
         ("Series Ch. 12.5.cbz", "12.5", None),
         ("Series Ch. 005.cbz", "5", None),
         ("Series Ch. 12.50.cbz", "12.5", None),
+        # One trailing dot is still a number (the documented "12." case).
+        ("Series Ch. 12..cbz", "12", None),
+        ("Series Vol. 3. Ch. 4.cbz", "4", "3"),
+        ("Series 第12.話.cbz", "12", None),
         ("Series Vol. 03 Ch. 7.cbz", "7", "3"),
         ("Series Vol. 1.2.3 Ch. 4.cbz", "4", None),
     ],
@@ -157,7 +182,9 @@ def test_cjk_fallback_reads_the_whole_number_run(name, chapter, volume):
     assert (parsed.chapter, parsed.volume) == (chapter, volume)
 
 
-@pytest.mark.parametrize("name", ["Series 1.2.3", "Series - 12.5012.5", "Series_1..2"])
+@pytest.mark.parametrize(
+    "name", ["Series 1.2.3", "Series - 12.5012.5", "Series_1..2", "Series 1..", "Series 1.2."]
+)
 def test_trailing_bare_number_takes_no_fragment_of_a_malformed_run(name):
     assert cbz_core.extract_trailing_bare_number(name) is None
 
@@ -231,3 +258,73 @@ def test_a_malformed_sibling_does_not_abort_its_folder(watch, bad):
     assert _comicinfo_number(dest / "Series Ch. 2.cbz") == "2"
     # No number is invented from the malformed token.
     assert _comicinfo_number(dest / bad) is None
+
+
+# ---------------------------------------------------------------------------
+# What reaches ComicInfo (#126 review): multi-dot runs counting the trailing
+# dot ("1..", "1.2.") write no <Number>/<Volume>; controls write exact values.
+# ---------------------------------------------------------------------------
+
+_WRITTEN_CASES = [
+    # name, expected <Number>, expected <Volume>
+    ("Series 第1..話.cbz", None, None),
+    ("Series 第1.2.話.cbz", None, None),
+    ("Series 第1..巻.cbz", None, None),
+    ("Series 第1.2.巻.cbz", None, None),
+    ("Series Ch. 1...cbz", None, None),
+    ("Series Ch. 1.2..cbz", None, None),
+    ("Series Vol. 3...cbz", None, None),
+    ("Series Vol. 1.2..cbz", None, None),
+    ("Series #1.2..cbz", None, None),
+    # Controls: well-formed, fractional, full-width and single-trailing-dot.
+    ("Series 第12話.cbz", "12", None),
+    ("Series 第3巻.cbz", None, "3"),
+    ("Series 12.5話.cbz", "12.5", None),
+    ("Series 第１２話.cbz", "12", None),
+    ("Series Ch. 12..cbz", "12", None),
+    ("Series Vol. 3. Ch. 4.cbz", "4", "3"),
+]
+
+
+def _field_text(xml_text: str, tag: str) -> str | None:
+    """Text of *tag*, or None when it is absent or empty. The watcher's
+    template carries an empty ``<Number></Number>``, so "not written" is
+    an empty element there and a missing one from a bare ``<ComicInfo/>``."""
+    element = ElementTree.fromstring(xml_text).find(tag)
+    if element is None:
+        return None
+    return (element.text or "").strip() or None
+
+
+@pytest.mark.parametrize("name, number, volume", _WRITTEN_CASES)
+def test_update_comicinfo_writes_only_well_formed_numbers(name, number, volume):
+    parsed = _parse(name)
+    xml_text, _changed = cbz_core.update_comicinfo_xml("<ComicInfo/>", parsed)
+    root = ElementTree.fromstring(xml_text)
+    if number is None:
+        assert root.find("Number") is None, xml_text
+    else:
+        assert root.findtext("Number") == number
+    if volume is None:
+        assert root.find("Volume") is None, xml_text
+    else:
+        assert root.findtext("Volume") == volume
+
+
+@pytest.mark.parametrize("name, number, volume", _WRITTEN_CASES)
+def test_watcher_writes_only_well_formed_numbers_into_the_cbz(watch, name, number, volume):
+    """End to end: one arrival per case (so no two land on the same name),
+    processed by the watcher; the ComicInfo.xml inside the archive that
+    reaches the library is read back."""
+    watch_root, library = watch
+    arrival = watch_root / "Series"
+    _make_cbz(arrival / name)
+
+    watcher.process_and_move_directory(arrival)
+
+    landed = list(library.rglob("*.cbz"))
+    assert len(landed) == 1, landed
+    with zipfile.ZipFile(landed[0]) as zf:
+        xml_text = zf.read("ComicInfo.xml").decode("utf-8")
+    assert _field_text(xml_text, "Number") == number
+    assert _field_text(xml_text, "Volume") == volume
