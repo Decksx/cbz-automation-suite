@@ -768,6 +768,10 @@ def _run_family(run: _Run, unit: FamilyUnit) -> str:
             _continue_action(run, unit.keeper_action, state)
         keeper_at = unit.keeper_action.destination
         fresh = _derive_member(keeper_at, unit.keeper.sha256, "renamed keeper")
+        # Equal sha256 implies equal pages unless the derivation itself is
+        # not deterministic, so this comparison is reachable only by an
+        # injected derivation (tested that way); it pins §5.3's "sequence
+        # re-derived" at the resulting path rather than trusting phase 1's.
         if fresh.page_digests != keeper.page_digests:
             raise _Blocked("renamed keeper's re-derived sequence differs")
         _validate_rows(run.view([unit.keeper_action]), unit.keeper, keeper_at, "renamed keeper")
@@ -780,6 +784,12 @@ def _run_family(run: _Run, unit: FamilyUnit) -> str:
         if state.complete:
             continue
         keeper = _derive_member(keeper_at, unit.keeper.sha256, "keeper")
+        # The keeper's row too, not only its bytes: nothing else checks an
+        # unrenamed keeper's row once phase 1 has passed, and a keeper the
+        # database no longer places here is not a keeper this run may rely on.
+        _validate_rows(
+            run.view(unit.actions, [unit.keeper.location_id]), unit.keeper, keeper_at, "keeper"
+        )
         older = _derive_member(state.location, dependant.member.sha256, f"dependant {dependant.action.action_id}")
         problem = _relation_problem(unit, dependant, older, keeper)
         if problem is not None:
