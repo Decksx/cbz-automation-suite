@@ -1309,12 +1309,18 @@ def parse_comic_name(
 
     # Fallback: pull chapter/volume from CJK markers (第N話/N話 -> chapter,
     # 第N巻/N巻 -> volume) when Latin-token extraction found nothing.
+    # The number is the whole digit-and-dot run before the marker, never a
+    # fragment of it: "1.2.3話" used to yield "3" and "12.5話" "5" (#120).
+    # The run goes through _num_field like every other token, so a
+    # malformed one leaves the field unset instead of a guessed number.
+    # The greedy run already starts at the leftmost digit; the lookbehind is
+    # for a run that starts with a dot (".5話"), whose "5" is a fragment too.
     if chapter is None:
-        m = re.search(r"第?\s*(\d+)\s*[話话章]", raw_stem)
+        m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[話话章]", raw_stem)
         if m:
             chapter = _num_field(m.group(1))
     if volume is None:
-        m = re.search(r"第?\s*(\d+)\s*[巻卷]", raw_stem)
+        m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[巻卷]", raw_stem)
         if m:
             volume = _num_field(m.group(1))
 
