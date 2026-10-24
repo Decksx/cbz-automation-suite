@@ -45,6 +45,9 @@ a measurement, not permission to run the live rename plan or change settings.
 - Existing Komf-configured automation authentication was reused in memory,
   approved by David in chat (Claude's hive **#2530**). Credentials were never
   printed, saved, changed or included in the report/evidence.
+  Before that approval, Codex had already used it for read-only discovery
+  GETs (library list, actuator info and OpenAPI), disclosed this in **#2527**,
+  and held authenticated work until the approval in **#2530**.
 
 ## Method and observations
 
