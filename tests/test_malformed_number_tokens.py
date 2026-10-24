@@ -100,6 +100,68 @@ def test_well_formed_tokens_are_formatted_as_before(name, chapter, volume):
     assert (parsed.chapter, parsed.volume) == (chapter, volume)
 
 
+_NUMBER_FIELDS = ("chapter", "volume", "season", "episode", "part")
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        # CJK fallbacks: on 740045f (and on master for the forms without 第)
+        # these took the trailing fragment "3" of "1.2.3" as the number.
+        ("Series 第1.2.3話.cbz", {}),
+        ("Series 1.2.3話.cbz", {}),
+        ("Series 1.2.3话.cbz", {}),
+        ("Series 1.2.3章.cbz", {}),
+        ("Series 第1.2.3巻.cbz", {}),
+        ("Series 1.2.3巻.cbz", {}),
+        ("Series 1.2.3卷.cbz", {}),
+        # A run that starts with a dot: "5" is a fragment of ".5".
+        ("Series .5話.cbz", {}),
+        ("Series 第.5巻.cbz", {}),
+        # Latin markers and bare runs: no fragment of the run is picked up.
+        ("Series 1.2.3.cbz", {}),
+        ("Series #1.2.3.cbz", {}),
+        ("Series Vol 1.2.3.cbz", {}),
+        ("Series v1.2.3.cbz", {}),
+        ("Series Part 1.2.3.cbz", {}),
+        ("Series Pt 1.2.3.cbz", {}),
+        ("Series p1.2.3.cbz", {}),
+        ("Series E1.2.3.cbz", {}),
+        ("Series s1.2.3.cbz", {}),
+        ("Series Ch.1.2.3.4.cbz", {}),
+        # The season run is malformed and stays unset; E4 is its own marker
+        # token (as in S01E04), not a fragment of the run, so it is kept.
+        ("Series S1.2.3E4.cbz", {"episode": "4"}),
+    ],
+)
+def test_no_number_is_taken_from_a_fragment_of_a_malformed_run(name, expected):
+    parsed = _parse(name)
+    found = {f: getattr(parsed, f) for f in _NUMBER_FIELDS if getattr(parsed, f)}
+    assert found == expected, name
+
+
+@pytest.mark.parametrize(
+    "name, chapter, volume",
+    [
+        # Controls: the CJK fallback still reads well-formed markers, and now
+        # reads a fractional one whole ("12.5", where it used to give "5").
+        ("Series 第3話.cbz", "3", None),
+        ("Series 第 03 话.cbz", "3", None),
+        ("Series 12.5話.cbz", "12.5", None),
+        ("Series 2.5巻.cbz", None, "2.5"),
+        ("Series 2巻 第5話.cbz", "5", "2"),
+    ],
+)
+def test_cjk_fallback_reads_the_whole_number_run(name, chapter, volume):
+    parsed = _parse(name)
+    assert (parsed.chapter, parsed.volume) == (chapter, volume)
+
+
+@pytest.mark.parametrize("name", ["Series 1.2.3", "Series - 12.5012.5", "Series_1..2"])
+def test_trailing_bare_number_takes_no_fragment_of_a_malformed_run(name):
+    assert cbz_core.extract_trailing_bare_number(name) is None
+
+
 def test_trailing_bare_number_overflow_is_none():
     assert cbz_core.extract_trailing_bare_number(f"Series {HUGE}") is None
     assert cbz_core.extract_trailing_bare_number("Series 02") == "2"
