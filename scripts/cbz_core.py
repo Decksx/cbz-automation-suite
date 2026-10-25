@@ -1263,7 +1263,11 @@ def _display_stem(
       more than ``parse_canonical_name``, whose series slot accepts any text:
       ``[Judas] Berserk.cbz`` parses, with series ``[Judas] Berserk``. So
       the series must also be one the cleaning and stem pipeline leave
-      alone.
+      alone. **Exception:** when the canonical edition is a language word
+      the display name drops (``_DISPLAY_LANGUAGE_WORDS``, hive #2646), the
+      name is not kept verbatim. It is re-formatted without the edition, so
+      ``Berserk v01 (English)`` becomes ``Berserk v01``: only the
+      ``(English)`` token goes, and the padding stays.
     * A translated name keeps the translation and gains the tokens.
     * Otherwise the stem pipeline runs on the identity core and the tokens
       are appended, repeated to a fixpoint so the watcher's naming step is a
