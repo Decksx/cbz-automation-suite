@@ -17,6 +17,7 @@ arrival with nothing to collide with still lands.
 
 from __future__ import annotations
 
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -471,3 +472,278 @@ def test_dropped_round_tags(name, tags):
     that is only close to noise (``(Digital-Empire)``, a scan word that is
     not the last word) is unclassified, so it counts."""
     assert cbz_core.dropped_round_tags(name) == tags
+
+
+# --- a hold survives failures, retries and restarts (PR #132 review) ---------
+#
+# Codex's review found that the hold lived in one rename: the arrival was
+# renamed to its stripped name on import and renamed back when held, so a
+# failed rename back left the next pass nothing to hold on. A rename that
+# strips a distinguishing tag is now deferred until the archive lands, so
+# the tag stays in the file name for as long as the archive is in the import
+# folder. These drive the real entry point through failures, a retry, a
+# restart and a crash, and check that both books survive each.
+
+S2_ARRIVAL = "Solo Leveling ch. 4 (s2).cbz"
+
+
+class _Crash(BaseException):
+    """A crash: not an ``Exception``, so no handler in the watcher stops it."""
+
+
+def _seed_collision(env):
+    incoming, library, _quarantine, _mode = env
+    existing = _make_cbz(library / "Solo Leveling" / "Solo Leveling ch. 4.cbz", SMALL)
+    arrival = incoming / "Solo Leveling"
+    _make_cbz(arrival / S2_ARRIVAL, BIG, b"\1")
+    return existing, existing.read_bytes(), arrival
+
+
+def _break_tag_restoring_renames(monkeypatch, folder: Path) -> list[tuple[str, str]]:
+    """Codex's injection: every rename in *folder* that would put ``(s2)``
+    back on an archive's name raises ``OSError``; the rest go through. Every
+    rename in *folder* is recorded, failed or not, as (from, to) names."""
+    renames: list[tuple[str, str]] = []
+    real_rename = Path.rename
+
+    def rename(path, target):
+        target = Path(target)
+        if path.parent == folder:
+            renames.append((path.name, target.name))
+            if "(s2)" in target.name and "(s2)" not in path.name:
+                raise OSError("injected: restoring the arrival name failed")
+        return real_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    return renames
+
+
+def _restart(env, monkeypatch) -> None:
+    """What a watcher restart resets: the series locks, the in-progress set
+    and, in resolver mode, the resolver, rebuilt from the library on disk."""
+    _incoming, library, quarantine, mode = env
+    monkeypatch.setattr(watcher, "_SERIES_LOCKS", type(watcher._SERIES_LOCKS)())
+    monkeypatch.setattr(watcher, "_processing_dirs", set())
+    if mode == "resolver":
+        monkeypatch.setattr(watcher, "_series_resolvers", {
+            "manga": SeriesResolver(library, quarantine_root=quarantine)})
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["retry", "restart"])
+def test_a_failed_rename_back_cannot_release_the_hold(env, monkeypatch, caplog, restart):
+    """Codex's P1 probe. The first pass runs with every tag-restoring rename
+    in the import folder failing; the second is a normal pass, in the same
+    process (a settle-pass retry) or after a restart. The existing book's
+    bytes never change, and the incoming book is still in the import folder,
+    byte for byte, under the name it arrived with. No rename in the import
+    folder ever took the tag off it, so there was nothing to restore."""
+    existing, existing_bytes, arrival = _seed_collision(env)
+    real_rename = Path.rename
+    renames = _break_tag_restoring_renames(monkeypatch, arrival)
+
+    watcher.process_and_move_directory(arrival)
+    held = arrival / S2_ARRIVAL
+    assert existing.read_bytes() == existing_bytes
+    assert _payload(held) == b"\1" * BIG
+
+    monkeypatch.setattr(Path, "rename", real_rename)
+    if restart:
+        _restart(env, monkeypatch)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
+    assert [r for r in renames if "(s2)" in r[0] and "(s2)" not in r[1]] == []
+
+
+@pytest.mark.parametrize("crash_in", ["_resolve_series_dir_name", "_move_cbz_dir"])
+def test_a_crash_after_processing_leaves_the_tag_for_the_restart(
+    env, monkeypatch, caplog, crash_in
+):
+    """A crash after the archive was processed (renamed, ComicInfo written)
+    but before or at the move. Before the fix the archive already carried
+    its stripped name here, so the restart met a plain same-name conflict
+    and replaced the existing book. Now the tag is still on disk."""
+    existing, existing_bytes, arrival = _seed_collision(env)
+    real = getattr(watcher, crash_in)
+
+    def crash(*args, **kwargs):
+        raise _Crash(crash_in)
+
+    monkeypatch.setattr(watcher, crash_in, crash)
+    with pytest.raises(_Crash):
+        watcher.process_and_move_directory(arrival)
+    held = arrival / S2_ARRIVAL
+    assert held.is_file()
+    assert existing.read_bytes() == existing_bytes
+
+    monkeypatch.setattr(watcher, crash_in, real)
+    _restart(env, monkeypatch)
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
+
+
+@pytest.mark.parametrize("error", [OSError, PermissionError])
+def test_a_failed_comparison_holds_and_the_next_pass_holds_again(
+    env, monkeypatch, caplog, error
+):
+    """Same-size archives are told apart by digest. If reading either one
+    fails, nothing shows the two are the same book, so the arrival is held,
+    not merged and not left for a pass that would no longer see its tag."""
+    incoming, library, _quarantine, _mode = env
+    monkeypatch.setattr(watcher, "process_comicinfo", lambda *a, **k: None)
+    existing = _make_cbz(library / "Solo Leveling" / "Solo Leveling ch. 4.cbz", SMALL)
+    existing_bytes = existing.read_bytes()
+    arrival = incoming / "Solo Leveling"
+    _make_cbz(arrival / "Solo Leveling ch. 4 (1).cbz", SMALL, b"\1")
+    real_digest = watcher.digest
+
+    def failing_digest(path):
+        raise error("injected: digest read failed")
+
+    monkeypatch.setattr(watcher, "digest", failing_digest)
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+    held = arrival / "Solo Leveling ch. 4 (1).cbz"
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * SMALL)
+    assert "Could not compare" in caplog.text
+    assert "Failed to move directory" not in caplog.text
+
+    monkeypatch.setattr(watcher, "digest", real_digest)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * SMALL)
+
+
+def test_a_failed_sibling_move_keeps_the_held_tag_for_the_retry(env, monkeypatch, caplog):
+    """An ``OSError`` during the merge itself (a sibling that cannot be
+    moved) stops the directory part-way. The held archive was never renamed,
+    so the retry holds it again and lands the sibling."""
+    existing, existing_bytes, arrival = _seed_collision(env)
+    _make_cbz(arrival / "Solo Leveling ch. 5 (s2).cbz", 80, b"\3")
+    real_move = watcher.shutil.move
+    failures = []
+
+    def failing_move(src, dest, *args, **kwargs):
+        if Path(src).name == "Solo Leveling ch. 5 (s2).cbz" and not failures:
+            failures.append(src)
+            raise PermissionError("injected: sibling locked")
+        return real_move(src, dest, *args, **kwargs)
+
+    monkeypatch.setattr(watcher.shutil, "move", failing_move)
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+    assert failures
+    assert "Failed to move directory" in caplog.text
+    assert existing.read_bytes() == existing_bytes
+    assert (arrival / S2_ARRIVAL).is_file()
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+    landed = existing.parent / "Solo Leveling ch. 5.cbz"
+    assert _payload(landed) == b"\3" * 80
+    assert existing.read_bytes() == existing_bytes
+    assert _payload(arrival / S2_ARRIVAL) == b"\1" * BIG
+    assert "HELD FOR REVIEW" in caplog.text
+
+
+def test_a_placeholder_fallback_name_that_strips_a_tag_is_deferred_too(env, caplog):
+    """``_apply_fallback_naming`` renames a placeholder after processing. A
+    fallback name that drops a distinguishing tag is deferred like any
+    other, so a held placeholder also keeps its arrival name on disk."""
+    incoming, library, _quarantine, _mode = env
+    existing = _make_cbz(library / "Solo Leveling" / "Solo Leveling ch. 4.cbz", SMALL)
+    existing_bytes = existing.read_bytes()
+    arrival = incoming / "Solo Leveling Ch. 4"
+    _make_cbz(arrival / "volvox_Chapter (s2).cbz", BIG, b"\1")
+
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    held = arrival / "volvox_Chapter (s2).cbz"
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
+    assert "Rename deferred to landing (placeholder fallback)" in caplog.text
+
+
+def test_display_names_on_a_whole_directory_move_never_overwrite(env, monkeypatch, caplog):
+    """A new series folder is moved whole, archives under their arrival
+    names, and renamed in the library. Two arrivals that strip to one name
+    both land: the first gets the display name, the second keeps its tag.
+    A rename that fails there keeps the arrival name; no book is lost.
+    Renames in the library follow POSIX here, replacing an existing target,
+    so it is the watcher's own check that keeps the first book, not the
+    Windows refusal to rename onto an existing file."""
+    incoming, library, _quarantine, _mode = env
+    arrival = incoming / "Solo Leveling"
+    _make_cbz(arrival / "Solo Leveling ch. 4 (s2).cbz", BIG, b"\1")
+    _make_cbz(arrival / "Solo Leveling ch. 4 (s3).cbz", 90, b"\2")
+    _make_cbz(arrival / "Solo Leveling ch. 6 (s2).cbz", 70, b"\4")
+    series = library / "Solo Leveling"
+    real_rename = Path.rename
+
+    def rename(path, target):
+        target = Path(target)
+        if path.parent != series:
+            return real_rename(path, target)
+        if target.name == "Solo Leveling ch. 6.cbz":
+            raise PermissionError("injected: landing rename failed")
+        os.replace(path, target)
+        return target
+
+    monkeypatch.setattr(Path, "rename", rename)
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    payloads = {p.name: _payload(p) for p in series.glob("*.cbz")}
+    assert payloads == {
+        "Solo Leveling ch. 4.cbz": b"\1" * BIG,
+        "Solo Leveling ch. 4 (s3).cbz": b"\2" * 90,
+        "Solo Leveling ch. 6 (s2).cbz": b"\4" * 70,
+    }
+    assert not arrival.exists()
+    assert "Kept arrival name" in caplog.text
+
+
+def test_a_held_archive_keeps_its_ai_original_while_a_routed_sibling_offloads(
+    env, monkeypatch, tmp_path
+):
+    """Codex's P2 probe, with a sibling. AI decensor runs (a fixture stub:
+    the original is copied to a tmp folder; no Camelia process) and the
+    offload is a recorder (no backup drive). The held archive's original
+    must stay local for the retry; the routed sibling's is offloaded. The
+    originals are told apart by their bytes, not by any file name."""
+    existing, existing_bytes, arrival = _seed_collision(env)
+    _make_cbz(arrival / "Solo Leveling ch. 5 (s2).cbz", 80, b"\3")
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    backups: list[Path] = []
+
+    def fake_decensor(path, destination):
+        backup = originals / f"{len(backups)}.cbz"
+        backup.write_bytes(path.read_bytes())
+        backups.append(backup)
+        return backup
+
+    offloaded: list[Path] = []
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", True)
+    monkeypatch.setattr(watcher, "destination_is_comix", lambda _dest: True)
+    monkeypatch.setattr(watcher, "run_ai_decensor", fake_decensor)
+    monkeypatch.setattr(
+        watcher, "archive_backup",
+        lambda backup, root, series: offloaded.append(backup) or backup,
+    )
+
+    watcher.process_and_move_directory(arrival)
+
+    held_original, = [b for b in backups if _payload(b) == b"\1" * BIG]
+    routed_original, = [b for b in backups if _payload(b) == b"\3" * 80]
+    assert existing.read_bytes() == existing_bytes
+    assert _payload(arrival / S2_ARRIVAL) == b"\1" * BIG
+    assert _payload(existing.parent / "Solo Leveling ch. 5.cbz") == b"\3" * 80
+    assert offloaded == [routed_original]
+    assert held_original.is_file()
