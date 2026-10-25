@@ -165,10 +165,22 @@ an arrival stem carrying a round-bracket tag that the display name drops
 (`cbz_core.dropped_round_tags`), whose collision key also differs from the
 display stem's. When that arrival meets an existing archive with different
 bytes (sha256), the existing archive is left untouched. The incoming archive
-stays in the import folder, renamed back to its arrival name, and a
-`HELD FOR REVIEW` warning is logged. The rename back means the next pass holds
-it again. An exact duplicate is still removed, and an arrival with nothing to
-collide with still lands.
+stays in the import folder under its arrival name, and a `HELD FOR REVIEW`
+warning is logged. An exact duplicate is still removed, and an arrival with
+nothing to collide with still lands.
+
+The arrival name is never taken off the file while it is in the import
+folder (PR #132 review, 2026-10-25). A rename that would drop such a tag is
+deferred: `process_cbz_file` and the placeholder fallback record the display
+name but leave the file as it arrived, and the merge applies the display name
+only as the archive lands (a directory moved whole into a new series folder is
+renamed there, after the move). A hold therefore renames nothing and writes
+nothing. A failed rename, a failed comparison (held: nothing showed the two are
+the same book), a failed sibling move, a crash or a restart all leave the tag
+on disk, and the next pass holds again. An earlier draft renamed the archive on
+import and back when held, so a failed rename back let the next pass replace
+the different book, and the AI original of a held archive was offloaded
+because its pair pointed at the stripped name.
 
 Deliberately **not** held, so keep-the-larger still applies to them:
 
