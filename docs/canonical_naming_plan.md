@@ -6,11 +6,16 @@ that PR's executor or waiting for it to merge. It has no apply mode.
 
 ```powershell
 python -m scripts.cbz_canonical_plan --library-root C:\test-library `
-  --database C:\test-catalog.db --quarantine-date 2026-10-24
+  --database C:\test-catalog.db --quarantine-date 2026-10-24 `
+  --output C:\reports\canonical-plan.json
 ```
 
-The JSON goes to stdout. Save it outside the library if needed; the
-command does not create an output file. Exit 0 means a complete plan with
+`--output` exclusively creates a new UTF-8 file outside the library and
+prints a small receipt (path, digest, counts). It refuses an occupied output,
+including one appearing during planning; it never overwrites. The parent
+directory must already exist. This avoids shell-dependent redirect encoding
+(notably Windows PowerShell 5.1's UTF-16 output). Without `--output`, the
+JSON goes to stdout. Exit 0 means a complete plan with
 no review holds, 1 means a complete plan with review holds, and 2 means
 no trustworthy plan was produced (stderr explains why). A plan with review
 holds can contain other independently actionable units; the holds are
@@ -32,10 +37,13 @@ expensive over SMB; it does not use cached hashes as proof.
   canonical naming state/quarantine trees. Never follow child symlinks or
   reparse points. Exclusions are named in provenance. Unreadable walks
   abort; incomplete coverage is not reported as a complete plan.
+  `ai-decensor-originals` is excluded before descent at **every depth**;
+  selecting it (or a descendant) as the root refuses the whole run.
 - Match each archive to its exact current catalog path. An uncatalogued
   file, orphan row, ambiguous path, or archive with multiple current
   locations is held. Drive/UNC aliases are not guessed. Use a root spelling
-  consistent with the catalog; the database itself is bound by real path,
+  identical to the catalog; a case-only spelling mismatch is held because
+  the executor compares its row preimage exactly. The database is bound by real path,
   device and file id using #117's `file_identity`.
 - Derive full-file SHA256, pages, non-image members and ComicInfo from one
   owned byte source through step 5. Feed those facts to step 4 and its
@@ -59,12 +67,21 @@ expensive over SMB; it does not use cached hashes as proof.
   ordinary rename candidates. Volume-classified bare `vN` alone does not
   make a version family.
 - Decensor markers in the root name, relative paths or resolved series
-  (including underscore-delimited markers) are held until a stable pairing
-  adapter exists. A root inside a directory
-  named `ai-decensor-originals` is refused before archive derivation.
+  (including underscore/hyphen delimiters, `uncen`, `uncensor` and `decensor`
+  stems) are held until a stable pairing adapter exists. Byte-bound
+  ComicInfo `Series`, `Title` and `Tags` are checked too: Camelia decensors
+  in place, so an unchanged filename can carry only `Tags=uncensored,
+  camelia:black_bars` or a title marker. Any Camelia method tag also holds.
+  Malformed metadata cannot rule out protected identity and is held.
   No F: originals are scanned, paired, renamed or superseded.
   The emitted pairing lists are empty; this slice does not invent a
   pairing registry or silently update one.
+  Source audit: the current watcher keeps `(archive, original)` pairs in
+  memory, rekeys them across fallback renames and logs `archive_backup`
+  results. `ai_decensor_backups.py` installs originals by series/name; these
+  paths write no durable pairing table/manifest the planner could consume.
+  Missing/removed markers cannot be reconstructed from that provenance;
+  no unmarked archive is claimed proven unrelated to an original.
 - A keeper rename is part of its family; each dependant gets a proposed
   dated quarantine path containing the family id and archive id. No
   quarantine move happens. `--accept-comicinfo-drop` defaults off; even
