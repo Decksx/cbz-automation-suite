@@ -898,6 +898,17 @@ def process_cbz_file(
                 f"    Rename skipped: target already exists '{new_name}' "
                 f"(keeping original '{cbz_path.name}')"
             )
+        elif _defers_rename(cbz_path.stem, new_path.stem):
+            # The new name drops a tag that may name a different book, such
+            # as (s2), so the archive keeps its arrival name until it lands
+            # (_stripped_arrivals, issue #131). Renamed here, a failure or a
+            # restart before the merge would leave nothing on disk to tell
+            # the next pass that the tag was ever there.
+            log.info(
+                f"    Rename deferred to landing: '{cbz_path.name}' -> '{new_name}'"
+            )
+            if parsed.filename != new_name:
+                parsed = _dataclasses_replace(parsed, filename=new_name)
         else:
             cbz_path.rename(new_path)
             log.info(f"    Renamed: '{cbz_path.name}' -> '{new_name}'")
@@ -1293,15 +1304,26 @@ def _apply_fallback_naming(
             )
             continue
 
-        cbz.rename(new_path)
-        log.info(f"    Renamed (placeholder fallback): '{cbz.name}' -> '{new_name}'")
-
         patched = _dataclasses_replace(
             parsed,
             chapter=dir_number or parsed.chapter,
             filename=new_name,
             stem=new_stem,
         )
+        if _defers_rename(cbz.stem, new_path.stem):
+            # As in process_cbz_file: a name that drops a distinguishing tag
+            # is applied only when the archive lands (_stripped_arrivals).
+            log.info(
+                f"    Rename deferred to landing (placeholder fallback): "
+                f"'{cbz.name}' -> '{new_name}'"
+            )
+            process_comicinfo(cbz, patched)
+            parsed_by_path[cbz] = patched
+            continue
+
+        cbz.rename(new_path)
+        log.info(f"    Renamed (placeholder fallback): '{cbz.name}' -> '{new_name}'")
+
         process_comicinfo(new_path, patched)
         del parsed_by_path[cbz]
         parsed_by_path[new_path] = patched
@@ -1379,67 +1401,134 @@ def _replacement_gain_is_meaningful(
     return (src_size - dest_size) >= min_gain
 
 
+def _defers_rename(current_stem: str, new_stem: str) -> bool:
+    """Whether renaming *current_stem* to *new_stem* drops a distinguishing tag.
+
+    True when *current_stem* carries a tag ``dropped_round_tags`` reports
+    (``(s2)``, ``(1)``, ``(Inuyasha)``) **and** its collision key differs
+    from *new_stem*'s. The second test is the one issue #131 proposes: an
+    existing archive that the new name would meet, but the current name
+    would not, is met only because of the stripping, so it is not evidence
+    of the same book.
+
+    Both tests are needed. Without the first, a rename that only normalises
+    (``Solo_Leveling_Chapter_4`` -> ``Solo Leveling ch. 4``) would be
+    deferred and held, and those arrivals are exactly the same-book upgrades
+    the keep-the-larger merge is for. Without the second, a tag the name
+    kept in another form would count as stripped.
+
+    Such a rename is deferred until the archive lands (``process_cbz_file``,
+    ``_apply_fallback_naming``), so the tag stays on disk, in the import
+    folder, for as long as the archive does. That is what lets a hold
+    survive a failure, a retry and a restart: every pass reads the tag from
+    the file name again, and there is never a rename to undo.
+    """
+    if not dropped_round_tags(current_stem):
+        return False
+    return _archive_collision_key(current_stem) != _archive_collision_key(new_stem)
+
+
 def _stripped_arrivals(
     parsed_by_path: dict[Path, ParsedComicName],
 ) -> dict[Path, str]:
-    """Archives whose name changed because a distinguishing tag was stripped.
+    """Archives whose rename was deferred because it strips a tag.
 
-    Maps each archive's current path to the name it arrived with. An archive
-    is listed when its arrival stem carries a tag ``dropped_round_tags``
-    reports (``(s2)``, ``(1)``, ``(Inuyasha)``) **and** that stem's collision
-    key differs from the current stem's. The second test is the one issue
-    #131 proposes: an existing archive that the current name meets, but the
-    arrival name would not have, is met only because of the stripping, so
-    it is not evidence of the same book.
+    Maps each archive's path, still under its arrival name, to the display
+    name it lands under (``ParsedComicName.filename``). The moves apply that
+    name as the archive lands, or hold the archive instead
+    (``_hold_stripped_collision``) when the name meets a different existing
+    archive.
 
-    Both tests are needed. Without the first, a rename that only normalises
-    (``Solo_Leveling_Chapter_4`` -> ``Solo Leveling ch. 4``) would be held,
-    and those arrivals are exactly the same-book upgrades the keep-the-larger
-    merge is for. Without the second, a tag the name kept in another form
-    would count as stripped.
+    An archive whose display name is already taken in the import folder is
+    not listed: its rename was skipped, not deferred, so it lands under its
+    own name, as it always has.
     """
     stripped: dict[Path, str] = {}
     for path, parsed in parsed_by_path.items():
-        original = getattr(parsed, "original_path", None)
-        if original is None or not dropped_round_tags(original.stem):
+        display = getattr(parsed, "filename", None)
+        if display is None or display == path.name:
             continue
-        if _archive_collision_key(original.stem) != _archive_collision_key(path.stem):
-            stripped[path] = original.name
+        if not _defers_rename(path.stem, Path(display).stem):
+            continue
+        if any(
+            (path.parent / name).exists()
+            for name in {display, normalize_apostrophes(display)}
+        ):
+            continue
+        stripped[path] = display
     return stripped
 
 
-def _hold_stripped_collision(src: Path, dest: Path, arrival_name: str) -> bool:
-    """Hold *src* in the import folder instead of merging it over *dest*.
+def _hold_stripped_collision(src: Path, dest: Path, display_name: str) -> bool:
+    """Hold *src* in the import folder instead of landing it on *dest*.
 
-    Called only for a stripped arrival (``_stripped_arrivals``) whose name
-    meets an existing archive. Returns ``False``, holding nothing, when the
-    two hold the same bytes: an exact duplicate is removed as before by the
-    caller's own conflict handling. Otherwise the existing archive is left
-    untouched and *src* stays where it is, renamed back to the name it
-    arrived with, and ``True`` is returned.
+    Called only for an archive whose rename was deferred
+    (``_stripped_arrivals``) and whose display name *display_name* meets
+    the existing archive *dest*. Returns ``False``, holding nothing, only
+    when the two provably hold the same bytes: an exact duplicate is removed
+    as before by the caller's own conflict handling. Otherwise the existing
+    archive is left untouched, *src* stays where it is under its arrival
+    name, and ``True`` is returned.
 
-    The rename back is what keeps the hold a hold. Left under its stripped
-    name, the next settle pass or restart would see an arrival whose name
-    no longer changes, and keep-the-larger would replace the existing book
-    after all. ``unique_path`` adds `` (2)`` when the arrival name is taken;
-    that suffix is itself a stripped tag, so the retry holds it again.
+    Nothing is renamed or written, so a hold cannot fail part-way, and the
+    next settle pass or restart reads the same tag from the same name and
+    holds again. A comparison that fails (an ``OSError`` reading either
+    file) cannot show that the two are the same book, so it holds as well.
     """
-    if src.stat().st_size == dest.stat().st_size and digest(src) == digest(dest):
+    try:
+        same = (
+            src.stat().st_size == dest.stat().st_size
+            and digest(src) == digest(dest)
+        )
+    except OSError as e:
+        log.error(
+            f"    Could not compare '{src.name}' with '{dest}' "
+            f"({type(e).__name__}: {e}); holding it."
+        )
+        same = False
+    if same:
         return False
-    held = src
-    if src.name != arrival_name:
-        target = unique_path(src.with_name(arrival_name))
-        try:
-            src.rename(target)
-            held = target
-        except OSError as e:
-            log.error(f"    Could not restore arrival name '{arrival_name}' for held '{src.name}': {e}")
     log.warning(
-        f"    HELD FOR REVIEW: '{arrival_name}' was named '{src.name}' by tag stripping, "
-        f"which collides with the different existing '{dest}'. Existing left untouched; "
-        f"incoming kept in the import folder as '{held}' (issue #131)."
+        f"    HELD FOR REVIEW: '{src.name}' would land as '{display_name}', "
+        f"which collides with the different existing '{dest}'. Existing left "
+        f"untouched; incoming kept in the import folder as '{src}' (issue #131)."
     )
     return True
+
+
+def _land_deferred_names(
+    src_dir: Path, dest_dir: Path, stripped_arrivals: dict[Path, str] | None
+) -> None:
+    """Give the archives of a directory moved whole their deferred names.
+
+    ``_move_cbz_dir`` moves a directory whole only when its series folder
+    did not exist, so nothing already in the library can collide with it:
+    the archives carry their arrival names in and are renamed here. A
+    display name already taken in the new folder (two arrivals that strip
+    to one name), or a rename that fails, leaves that archive under its
+    arrival name. Both books are kept; only the name is not the display one.
+    """
+    for src, display_name in (stripped_arrivals or {}).items():
+        try:
+            landed = dest_dir / src.relative_to(src_dir)
+            target = landed.with_name(display_name)
+            if not landed.is_file():
+                continue
+            if target.exists() or _find_archive_collision(
+                target.parent, target.stem
+            ) is not None:
+                log.warning(
+                    f"    Kept arrival name '{landed.name}': its display name "
+                    f"'{display_name}' is taken in '{dest_dir}'."
+                )
+                continue
+            landed.rename(target)
+            log.info(f"    Renamed on landing: '{landed.name}' -> '{display_name}'")
+        except (OSError, ValueError) as e:
+            log.warning(
+                f"    Kept arrival name for '{src.name}' in '{dest_dir}': "
+                f"{type(e).__name__}: {e}"
+            )
 
 
 def _merge_directories(
@@ -1470,18 +1559,23 @@ def _merge_directories(
             dest_item.mkdir(parents=True, exist_ok=True)
             continue
 
+        # A deferred rename (_stripped_arrivals) is applied here, as the
+        # archive lands, so the conflict checks below read its display name.
+        display_name = stripped_arrivals.get(src_item)
+        if display_name is not None:
+            dest_item = dest_item.with_name(display_name)
+
         # When the exact name is free, still treat a file that normalises to the
         # same key (differs only by spacing/punctuation) as a conflict so the two
         # cosmetic variants don't both land in the destination.
         if not dest_item.exists() and src_item.suffix.lower() in {".cbz", ".cbr"}:
-            match = _find_archive_collision(dest_item.parent, src_item.stem)
+            match = _find_archive_collision(dest_item.parent, dest_item.stem)
             if match is not None:
                 dest_item = match
 
         if dest_item.exists():
-            arrival_name = stripped_arrivals.get(src_item)
-            if arrival_name is not None and _hold_stripped_collision(
-                src_item, dest_item, arrival_name
+            if display_name is not None and _hold_stripped_collision(
+                src_item, dest_item, display_name
             ):
                 continue
             if conflict_quarantine_root is not None:
@@ -2138,7 +2232,8 @@ def _move_cbz_dir(
     *stripped_arrivals* is passed to ``_merge_directories``; an archive it
     holds for review stays in *dir_path*, which ``_remove_merged_source``
     then leaves in place. A move into a folder that does not exist yet has
-    no conflict to hold.
+    no conflict to hold; its archives whose rename was deferred get their
+    display names once the folder has landed (``_land_deferred_names``).
     """
     if not dir_path.exists():
         log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
@@ -2188,6 +2283,7 @@ def _move_cbz_dir(
             try:
                 shutil.move(str(dir_path), str(dest_dir))
                 log.info(f"  Moved successfully.")
+                _land_deferred_names(dir_path, dest_dir, stripped_arrivals)
                 return dest_dir
             except (OSError, shutil.Error):
                 # WinError 183: dest was created by a concurrent thread between
@@ -2245,16 +2341,17 @@ def _move_loose_files(
         if not src.exists():
             continue
 
-        dest_item = dest_dir / src.name
+        # A deferred rename (_stripped_arrivals) is applied as the file lands.
+        display_name = stripped_arrivals.get(src)
+        dest_item = dest_dir / (display_name or src.name)
         if not dest_item.exists():
-            match = _find_archive_collision(dest_dir, src.stem)
+            match = _find_archive_collision(dest_dir, dest_item.stem)
             if match is not None:
                 dest_item = match
 
         if dest_item.exists():
-            arrival_name = stripped_arrivals.get(src)
-            if arrival_name is not None and _hold_stripped_collision(
-                src, dest_item, arrival_name
+            if display_name is not None and _hold_stripped_collision(
+                src, dest_item, display_name
             ):
                 continue
             if conflict_quarantine_root is not None:
