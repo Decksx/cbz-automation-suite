@@ -128,8 +128,15 @@ class ScopeLock:
             ) from exc
         self._fd = fd
         # Written only now that the lock is ours, so an owner file can never
-        # name a process that did not hold the lock when it was written.
-        self._write_owner()
+        # name a process that did not hold the lock when it was written. If
+        # writing it fails, the lock is released before the error escapes:
+        # a raising ``__enter__`` never reaches ``__exit__``, so otherwise
+        # the handle would hold the root locked until the process exits.
+        try:
+            self._write_owner()
+        except BaseException:
+            self.release()
+            raise
         return self
 
     def _write_owner(self) -> None:
