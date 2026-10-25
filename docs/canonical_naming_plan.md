@@ -55,8 +55,10 @@ expensive over SMB; it does not use cached hashes as proof.
   Step 4 also emits unmarked candidate groups/singletons; those remain
   ordinary rename candidates. Volume-classified bare `vN` alone does not
   make a version family.
-- Decensor-marked relative paths are held until a stable pairing adapter
-  exists. No F: originals are scanned, paired, renamed or superseded.
+- Decensor markers in the root name, relative paths or resolved series
+  are held until a stable pairing adapter exists. A root inside a directory
+  named `ai-decensor-originals` is refused before archive derivation.
+  No F: originals are scanned, paired, renamed or superseded.
   The emitted pairing lists are empty; this slice does not invent a
   pairing registry or silently update one.
 - A keeper rename is part of its family; each dependant gets a proposed
