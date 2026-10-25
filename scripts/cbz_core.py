@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -52,12 +52,14 @@ try:
     from scripts.cbz_canonical_name import (
         EDITION_WORDS,
         CanonicalNameError,
+        format_canonical_name,
         parse_canonical_name,
     )
 except ModuleNotFoundError:  # run from inside scripts/ without the package
     from cbz_canonical_name import (  # type: ignore[no-redef]
         EDITION_WORDS,
         CanonicalNameError,
+        format_canonical_name,
         parse_canonical_name,
     )
 
@@ -732,9 +734,10 @@ def sanitize_without_markers(text: str, rules: set[str] = ALL_RULES) -> str:
 #   (YYYY)              four ASCII digits, 1000-9999, in round brackets
 #   [vN]                v or V and a positive whole number, in square brackets;
 #                       written [vN] with no padding
-#   (Edition)           a whole EDITION_WORDS entry in round brackets, any
-#                       case; written in the list's spelling
-#   [Colored]           the one square-bracket edition word promoted to its
+#   (Edition)           a whole _ROUND_EDITION_WORDS entry in round brackets,
+#                       any case; written in the list's spelling. That is
+#                       EDITION_WORDS less the language words (below)
+#   [Colored]          the one square-bracket edition word promoted to its
 #                       round-bracket token (David, 2026-10-23): a whole
 #                       _SQUARE_EDITION_WORDS entry, any case, written
 #                       (Colored); one token even when (Colored) is there too
@@ -742,6 +745,14 @@ def sanitize_without_markers(text: str, rules: set[str] = ALL_RULES) -> str:
 #                       written (Uncensored)/(Decensored), the formatter's
 #                       edition token, wherever preserve_decensor_markers
 #                       would have kept the bare word
+#
+# Every other round-bracket block is dropped from the display name wherever
+# it sits, because the display core is the identity core: group, source,
+# status and language tags such as (ManhwaClub), (Incognitymous), (Ongoing),
+# (Digital) and (English). David confirmed this on 2026-10-24 (hive #2646),
+# including (English): a language tag, not an edition, even though the
+# formatter's EDITION_WORDS still lists it (whether the formatter itself
+# should accept it is design §8 question 4, not decided here).
 #
 # Deliberately not kept, pending a decision (see the PR): [2019] and (v2)
 # (not the canonical bracket for that token), [English], [Colorized] and
@@ -768,6 +779,19 @@ _DECENSOR_EDITION = {
 # means the two lists have drifted apart).
 _SQUARE_EDITION_WORDS = {
     word: _EDITION_BY_FOLD[word] for word in ("colored",)
+}
+# Edition words that are language tags, dropped from the display name in any
+# bracket (David, 2026-10-24, hive #2646). A closed list, like the one above:
+# a KeyError at import means EDITION_WORDS no longer carries the word.
+_DISPLAY_LANGUAGE_WORDS = frozenset(
+    _EDITION_BY_FOLD[word].casefold() for word in ("english",)
+)
+# The round-bracket edition tokens the display name keeps: the formatter's
+# edition list less its language words.
+_ROUND_EDITION_WORDS = {
+    fold: word
+    for fold, word in _EDITION_BY_FOLD.items()
+    if fold not in _DISPLAY_LANGUAGE_WORDS
 }
 _DECENSOR_TOKEN_RE = re.compile(
     r"\((" + "|".join(re.escape(w) for w in _DECENSOR_EDITION.values()) + r")\)"
@@ -816,8 +840,8 @@ def extract_display_tokens(source: str) -> DisplayTokens:
         if bracket[0] == "(":
             if _DISPLAY_YEAR_RE.fullmatch(inner):
                 add(years, int(inner))
-            elif inner.casefold() in _EDITION_BY_FOLD:
-                add(editions, _EDITION_BY_FOLD[inner.casefold()])
+            elif inner.casefold() in _ROUND_EDITION_WORDS:
+                add(editions, _ROUND_EDITION_WORDS[inner.casefold()])
         else:
             version = _DISPLAY_VERSION_RE.fullmatch(inner)
             if version:
@@ -1262,7 +1286,23 @@ def _display_stem(
     else:
         core = sanitize_without_markers(fields.series, rules)
         if core == fields.series and _stem_pipeline(core, series, rules) == core:
-            return raw_stem
+            if (
+                fields.edition is None
+                or fields.edition.casefold() not in _DISPLAY_LANGUAGE_WORDS
+            ):
+                return raw_stem
+            # A canonical name whose edition is a language word the display
+            # name drops (hive #2646) loses only that token, and keeps the
+            # formatter's spelling of everything else ("v01" stays "v01"):
+            # "Book (English)" names the same file "Book (English) (Group)"
+            # does. Dropping a field cannot make the formatter refuse; if it
+            # ever does, the name takes the pipeline below like any other.
+            try:
+                return _split_name(
+                    format_canonical_name(replace(fields, edition=None))
+                )[0]
+            except CanonicalNameError:
+                pass
     if translated_stem is not None:
         return append_display_tokens(translated_stem, raw_stem) or None
 
