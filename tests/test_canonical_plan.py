@@ -495,7 +495,8 @@ def test_another_book_in_the_folder_restores_normal_version_evidence_rules(env):
     book("Other ch. 2.cbz", series="Other", number="2")
     report = plan()
     assert report["diagnostics"]["unverified_version_labels"] == 0
-    assert str(source) in str(report["review"])
+    assert any(str(source) in item.get("members", []) or item.get("path") == str(source)
+               for item in report["review"])
 
 
 def test_a_canonical_version_with_an_unverified_label_is_a_zero_exit_noop(env, capsys):
