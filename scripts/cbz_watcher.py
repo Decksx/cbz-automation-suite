@@ -29,9 +29,11 @@ from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from comic_automation.series_resolver import (
     SeriesResolver,
+    digest,
     normalize_apostrophes,
     safe_name,
     settle_file_conflict,
+    unique_path,
 )
 from comic_automation.library.exclusions import (
     DEFAULT_EXCLUDED_DIRECTORIES,
@@ -54,6 +56,7 @@ try:
         clean_filename,
         decensor_tokens_as_words,
         display_tokens_for,
+        dropped_round_tags,
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
@@ -70,6 +73,7 @@ except ModuleNotFoundError:
         clean_filename,
         decensor_tokens_as_words,
         display_tokens_for,
+        dropped_round_tags,
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
@@ -1113,6 +1117,10 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     the incoming copy is discarded. So a ``(2019)`` arrival that wins on size
     loses its year token from the name -- accepted: the existing name wins,
     exactly as it did when both names were token-free.
+
+    A match met only because a round-bracket tag was stripped (``(s2)``,
+    ``(1)``, a parody tag) is not evidence of the same book: the merge holds
+    such an arrival for review instead (``_stripped_arrivals``, issue #131).
     """
     if not target_dir.is_dir():
         return None
@@ -1371,17 +1379,89 @@ def _replacement_gain_is_meaningful(
     return (src_size - dest_size) >= min_gain
 
 
+def _stripped_arrivals(
+    parsed_by_path: dict[Path, ParsedComicName],
+) -> dict[Path, str]:
+    """Archives whose name changed because a distinguishing tag was stripped.
+
+    Maps each archive's current path to the name it arrived with. An archive
+    is listed when its arrival stem carries a tag ``dropped_round_tags``
+    reports (``(s2)``, ``(1)``, ``(Inuyasha)``) **and** that stem's collision
+    key differs from the current stem's. The second test is the one issue
+    #131 proposes: an existing archive that the current name meets, but the
+    arrival name would not have, is met only because of the stripping, so
+    it is not evidence of the same book.
+
+    Both tests are needed. Without the first, a rename that only normalises
+    (``Solo_Leveling_Chapter_4`` -> ``Solo Leveling ch. 4``) would be held,
+    and those arrivals are exactly the same-book upgrades the keep-the-larger
+    merge is for. Without the second, a tag the name kept in another form
+    would count as stripped.
+    """
+    stripped: dict[Path, str] = {}
+    for path, parsed in parsed_by_path.items():
+        original = getattr(parsed, "original_path", None)
+        if original is None or not dropped_round_tags(original.stem):
+            continue
+        if _archive_collision_key(original.stem) != _archive_collision_key(path.stem):
+            stripped[path] = original.name
+    return stripped
+
+
+def _hold_stripped_collision(src: Path, dest: Path, arrival_name: str) -> bool:
+    """Hold *src* in the import folder instead of merging it over *dest*.
+
+    Called only for a stripped arrival (``_stripped_arrivals``) whose name
+    meets an existing archive. Returns ``False``, holding nothing, when the
+    two hold the same bytes: an exact duplicate is removed as before by the
+    caller's own conflict handling. Otherwise the existing archive is left
+    untouched and *src* stays where it is, renamed back to the name it
+    arrived with, and ``True`` is returned.
+
+    The rename back is what keeps the hold a hold. Left under its stripped
+    name, the next settle pass or restart would see an arrival whose name
+    no longer changes, and keep-the-larger would replace the existing book
+    after all. ``unique_path`` adds `` (2)`` when the arrival name is taken;
+    that suffix is itself a stripped tag, so the retry holds it again.
+    """
+    if src.stat().st_size == dest.stat().st_size and digest(src) == digest(dest):
+        return False
+    held = src
+    if src.name != arrival_name:
+        target = unique_path(src.with_name(arrival_name))
+        try:
+            src.rename(target)
+            held = target
+        except OSError as e:
+            log.error(f"    Could not restore arrival name '{arrival_name}' for held '{src.name}': {e}")
+    log.warning(
+        f"    HELD FOR REVIEW: '{arrival_name}' was named '{src.name}' by tag stripping, "
+        f"which collides with the different existing '{dest}'. Existing left untouched; "
+        f"incoming kept in the import folder as '{held}' (issue #131)."
+    )
+    return True
+
+
 def _merge_directories(
     src_dir: Path,
     dest_dir: Path,
     conflict_quarantine_root: Path | None = None,
+    stripped_arrivals: dict[Path, str] | None = None,
 ) -> None:
     """Recursively merge *src_dir* into *dest_dir*.
 
     Legacy imports retain the measured replacement threshold. Resolver imports
     compare exact duplicates and quarantine the smaller non-identical file
     outside the library instead of discarding it.
+
+    *stripped_arrivals* (``_stripped_arrivals``) names the archives whose
+    match with an existing file may exist only because a tag was stripped.
+    Such a conflict with different bytes is held for review in either mode
+    (``_hold_stripped_collision``), so neither keep-the-larger branch can
+    replace, quarantine or delete a different book. Every other conflict is
+    settled exactly as before.
     """
+    stripped_arrivals = stripped_arrivals or {}
     for src_item in iter_paths_excluding_directories(src_dir):
         relative  = src_item.relative_to(src_dir)
         dest_item = dest_dir / relative
@@ -1399,6 +1479,11 @@ def _merge_directories(
                 dest_item = match
 
         if dest_item.exists():
+            arrival_name = stripped_arrivals.get(src_item)
+            if arrival_name is not None and _hold_stripped_collision(
+                src_item, dest_item, arrival_name
+            ):
+                continue
             if conflict_quarantine_root is not None:
                 outcome = settle_file_conflict(
                     src_item,
@@ -2034,6 +2119,7 @@ def _move_cbz_dir(
     target_name: str | None = None,
     chapter_number: str | None = None,
     conflict_quarantine_root: Path | None = None,
+    stripped_arrivals: dict[Path, str] | None = None,
 ) -> Path | None:
     """Move a processed comic directory to dest_folder, merging if it already exists.
 
@@ -2048,6 +2134,11 @@ def _move_cbz_dir(
     numbered chapter — triggering ``_backfill_chapter_one`` so a lone
     bare-named sibling already in the destination gets retroactively labelled
     "Ch. 1" instead of remaining ambiguous alongside the new numbered file.
+
+    *stripped_arrivals* is passed to ``_merge_directories``; an archive it
+    holds for review stays in *dir_path*, which ``_remove_merged_source``
+    then leaves in place. A move into a folder that does not exist yet has
+    no conflict to hold.
     """
     if not dir_path.exists():
         log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
@@ -2088,6 +2179,7 @@ def _move_cbz_dir(
             _merge_directories(
                 dir_path, dest_dir,
                 conflict_quarantine_root=conflict_quarantine_root,
+                stripped_arrivals=stripped_arrivals,
             )
             _remove_merged_source(dir_path)
             log.info(f"  Merge complete.")
@@ -2107,6 +2199,7 @@ def _move_cbz_dir(
                     _merge_directories(
                         dir_path, dest_dir,
                         conflict_quarantine_root=conflict_quarantine_root,
+                        stripped_arrivals=stripped_arrivals,
                     )
                     _remove_merged_source(dir_path)
                     log.info(f"  Merge complete.")
@@ -2128,10 +2221,13 @@ def _move_loose_files(
     dest_folder: str,
     series_name: str,
     conflict_quarantine_root: Path | None = None,
+    stripped_arrivals: dict[Path, str] | None = None,
 ) -> Path | None:
     """Move individual .cbz files — not their parent directory — into
     ``dest_folder/series_name``, applying the same keep-the-larger-on-conflict
-    policy as ``_merge_directories`` on a per-file basis.
+    policy as ``_merge_directories`` on a per-file basis, including its hold
+    for a stripped arrival that meets a different book (*stripped_arrivals*,
+    issue #131). A held file stays where it is and is not counted as moved.
 
     Used for .cbz files that sit directly in a directory which also contains
     other subdirectories that are themselves comic directories (each with
@@ -2143,6 +2239,7 @@ def _move_loose_files(
     dest_dir = existing if existing is not None else Path(dest_folder) / series_name
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    stripped_arrivals = stripped_arrivals or {}
     moved = 0
     for src in files:
         if not src.exists():
@@ -2155,6 +2252,11 @@ def _move_loose_files(
                 dest_item = match
 
         if dest_item.exists():
+            arrival_name = stripped_arrivals.get(src)
+            if arrival_name is not None and _hold_stripped_collision(
+                src, dest_item, arrival_name
+            ):
+                continue
             if conflict_quarantine_root is not None:
                 outcome = settle_file_conflict(
                     src,
@@ -2474,6 +2576,14 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     parsed_by_path, series_name, dir_number) or ())
                 ai_backups = _rekey_ai_backups(
                     ai_decensor_backups, origins, parsed_by_path)
+                # Read after the fallback renames, which change paths. Passed
+                # to the moves below only when non-empty, like the quarantine
+                # root, so their signatures are unchanged for every other
+                # arrival (issue #131).
+                stripped = _stripped_arrivals(parsed_by_path)
+                stripped_option = (
+                    {"stripped_arrivals": stripped} if stripped else {}
+                )
 
                 if refused and not has_nested_comic_dirs:
                     # A refused placeholder kept its generic name. Moving the
@@ -2507,7 +2617,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         else {}
                     )
                     landed = _move_loose_files(
-                        archives, dest_folder, series_name, **loose_options
+                        archives, dest_folder, series_name,
+                        **loose_options, **stripped_option,
                     ) if archives else None
                     _note_move(series_name, dest_folder, landed)
                 else:
@@ -2525,6 +2636,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         target_name=series_name,
                         chapter_number=dir_number,
                         **move_options,
+                        **stripped_option,
                     )
                     _note_move(series_name, dest_folder, landed)
                 if (
