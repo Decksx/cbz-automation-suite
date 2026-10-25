@@ -23,6 +23,7 @@ from datetime import date
 from ntpath import normcase as windows_normcase
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from comic_automation.archive import field_resolution as fr
 from comic_automation.archive import supersession as sv
@@ -38,7 +39,7 @@ PLANNER_VERSION = 1
 _INTERNAL = NON_SERIES_DIRECTORIES | {
     ".cbz-canonical-naming", ".cbz-canonical-quarantine",
 }
-_DECENSOR = re.compile(r"\b(?:uncensored|decensored)\b", re.I)
+_DECENSOR = re.compile(r"\b(?:uncen|uncensor(?:ed|ing)?|decensor(?:ed|ing)?)\b", re.I)
 
 
 class PlanningRefused(ValueError):
@@ -69,6 +70,30 @@ def _reparse(info: os.stat_result) -> bool:
     )
 
 
+def _decensor_marker(text: str) -> bool:
+    return bool(_DECENSOR.search(unicodedata.normalize("NFKC", text).replace("_", " ")))
+
+
+def _metadata_problems(documents: tuple[bytes, ...]) -> list[str]:
+    """Hold in-place Camelia outputs whose path never acquired a marker.
+
+    Read only the XML already bound by step 5, never reopen the library file.
+    A malformed document cannot rule out protected identity either.
+    """
+    for document in documents:
+        try:
+            xml = ElementTree.fromstring(document)
+        except ElementTree.ParseError:
+            return ["ComicInfo cannot be inventoried for decensor identity"]
+        for element in xml.iter():
+            name = element.tag.rsplit("}", 1)[-1].casefold()
+            if name in {"series", "title", "tags"}:
+                text = " ".join(element.itertext())
+                if _decensor_marker(text) or (name == "tags" and "camelia:" in text.casefold()):
+                    return [f"decensor identity/pairing adapter required (ComicInfo {name})"]
+    return []
+
+
 def _safe_destination(path: str, root: Path) -> bool:
     """Refuse existing reparse components, including excluded state trees."""
     target = Path(path)
@@ -95,6 +120,9 @@ def _inventory(root: Path) -> tuple[list[dict], list[Path], list[dict]]:
         for child in sorted(folder.iterdir(), key=lambda p: p.name):
             info = child.lstat()
             relative = str(child.relative_to(root))
+            if child.name.casefold() == "ai-decensor-originals":
+                excluded.append({"path": relative, "reason": "protected decensor originals"})
+                continue
             if child.name.casefold() in _INTERNAL:
                 excluded.append({"path": relative, "reason": "internal/history"})
                 continue
@@ -232,7 +260,7 @@ def build_plan(
     root = Path(os.path.abspath(library_root))
     if not root.is_dir():
         raise PlanningRefused(f"library root is not a directory: {root}")
-    if any(part.casefold() == "ai-decensor-originals" for part in root.resolve().parts):
+    if any(part.casefold() == "ai-decensor-originals" for part in (*root.parts, *root.resolve().parts)):
         raise PlanningRefused("ai-decensor-originals is preserved and outside planner scope")
     temporary = Path(temp_dir if temp_dir is not None else tempfile.gettempdir()).resolve(strict=True)
     if not temporary.is_dir() or _under(temporary, root.resolve(strict=True)):
@@ -254,14 +282,16 @@ def build_plan(
         by_path = defaultdict(list)
         owners = Counter(row["archive_id"] for row in catalog)
         for row in catalog:
-            by_path[os.path.normcase(row["path"])].append(row)
+            by_path[windows_normcase(row["path"])].append(row)
         mapping, mapping_problems = {}, {}
         for path in books:
-            rows = by_path[os.path.normcase(str(path))]
+            rows = by_path[windows_normcase(str(path))]
             if len(rows) != 1 or rows[0]["owner"] is None:
                 mapping_problems[str(path)] = "no unique current catalog location"
             elif owners[rows[0]["archive_id"]] != 1:
                 mapping_problems[str(path)] = "archive has multiple current locations"
+            elif rows[0]["path"] != str(path):
+                mapping_problems[str(path)] = "catalog path spelling differs from the observed path"
             else:
                 mapping[str(path)] = rows[0]
         ids = sorted({row["archive_id"] for row in mapping.values()})
@@ -295,16 +325,14 @@ def build_plan(
             reasons, destinations = {}, {}
             for path in paths:
                 key = str(path)
-                problems = []
+                problems = _metadata_problems(derived[key].comicinfo_documents)
                 if key in mapping_problems:
                     problems.append(mapping_problems[key])
                 if derived[key].unresolved_reason:
                     problems.append(derived[key].unresolved_reason)
                 series = resolutions[key].fields["series"].value or ""
-                # Underscores delimit the same markers the resolver accepts
-                # (e.g. Series_Uncensored); regex word boundaries alone do not.
-                identity_text = " ".join((root.name, str(path.relative_to(root)), series)).replace("_", " ")
-                if _DECENSOR.search(identity_text):
+                identity_text = " ".join((root.name, str(path.relative_to(root)), series))
+                if _decensor_marker(identity_text):
                     problems.append("decensor identity/pairing adapter required")
                 try:
                     destinations[key] = str(path.with_name(_destination(resolutions[key])))
