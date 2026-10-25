@@ -95,8 +95,83 @@ strict xfails.
 | `#<III>` | **Issue** within a volume, at least three digits (`#003`). |
 | `ch. <C>` | **Chapter**, for books without volumes. Written unpadded, in David's form `ch. 1`. |
 | `(<year>)` | Four-digit year, when established. |
-| `(<edition>)` | An edition or language variant from a closed list, for example `(Uncensored)`, `(Colored)` or `(English)`. |
+| `(<edition>)` | An edition variant from a closed list, for example `(Uncensored)` or `(Colored)`. An arrival's display name drops the language tag `(English)` (David, 2026-10-24, hive #2646; see below). |
 | `[v<N>]` | **Version**, for WIP books only, and only when it is verified (§4.6). |
+
+**Round-bracket tags in display names: three layers, three authorities.**
+They are kept apart here because only the first was decided on 2026-10-24.
+
+1. **David's approval, 2026-10-24** (hive #2646, following #2641). Arrival
+   display names strip round-bracket **group, status and language tags**:
+   group or uploader tags such as `(ManhwaClub)` and `(Incognitymous)`,
+   status tags such as `(Ongoing)`, and the language tag `(English)` in any
+   case. `(Digital)`-style source tags were already dropped under the
+   2026-10-22 decision (§5.5). The only code change this needed is
+   `(English)`. It had been kept because the formatter's `EDITION_WORDS`
+   lists `English`; the display keep-list now leaves it out
+   (`cbz_core._ROUND_EDITION_WORDS`, that is `EDITION_WORDS` less
+   `_DISPLAY_LANGUAGE_WORDS`). A canonical name carrying `(English)` loses
+   only that token: `Berserk v01 #003 (2019) (English) [v2]` becomes
+   `Berserk v01 #003 (2019) [v2]`. Whether the formatter should keep
+   accepting `edition="English"` from resolved fields is still §8
+   question 4.
+2. **Inherited arrival-cleaner behaviour, since #112** (the 2026-10-22
+   split). This is not part of #2646. The display core *is* the identity
+   core, which removes every bracketed block. Only the keep-list goes back
+   on:
+   - `(YYYY)`;
+   - `(Colored)`, also written for `[Colored]`;
+   - the other edition words: `(Uncensored)`, `(Decensored)`,
+     `(Colorized)`, `(Special Edition)`, `(Limited Edition)`,
+     `(Alternate Cover)`;
+   - `[vN]`.
+
+   So the watcher already drops **every** other round-bracket block, at
+   any position. That includes tokens nobody has classified: seasons
+   (`(s2)`), parody or source-work tags (`(Inuyasha)`), credits
+   (`(OC by Riz)`, `(ft. Reina)`), variants (`(Original)`, `(+Extras)`)
+   and copy suffixes (`(1)`). David has not approved dropping those; it is
+   how the cleaner behaved before #2646. Dropping one can make two
+   different books share a name. At the watcher that is **not** refused:
+   the merge keeps the larger file (inherited limitation, below).
+3. **Bulk canonical rename of the existing library** (§5, step 8). No
+   disposition has been decided for round tokens there. The read-only
+   planner must **keep any round token it cannot classify in review**: it
+   must not drop it on the strength of the arrival cleaner or of how rare
+   the token is in a scan. Rarity does not classify a token. Only tokens in
+   David's approved classes (layer 1) or on the keep-list may be
+   auto-handled.
+
+**Inherited limitation: stripped-tag collisions at the watcher.** Probed on
+tmp files at the #2646 implementation PR (#129). The setup is an existing
+`Solo Leveling ch. 4.cbz` and a larger incoming `Solo Leveling ch. 4
+(s2).cbz`. The arrival is named `Solo Leveling ch. 4.cbz`, and
+`_merge_directories` / `_move_loose_files` apply keep-the-larger. What
+happens to the loser depends on the mode:
+
+- **Legacy mode** (no `--series-resolver`): the losing archive is
+  **deleted outright** (`Path.unlink`, no Recycle Bin and no quarantine).
+- **Resolver mode:** the loser is moved under the resolver quarantine root
+  (`settle_file_conflict`), so it can be recovered.
+
+In both modes the library keeps one file, holding the incoming bytes under
+the season-1 name. This predates #2646; the follow-up is issue #131.
+A proposed-destination review guard in the step-8
+planner is a separate piece of work.
+
+**Measured against** a read-only scan of the Tower library on 2026-10-24
+(73,564 archives, 22,139 folders). The most common round tags in file names
+were:
+
+| Tag | Files | Layer |
+|---|---|---|
+| `(ManhwaClub)` | 52 | 1 (approved group tag) |
+| `(Incognitymous)` | 29 | 1 (approved group tag) |
+| `(Ongoing)` | 21 | 1 (approved status tag) |
+| `(English)` | 7 | 1 (approved language tag) |
+
+The other tokens in that scan's top lists (#129 lists all of them) are
+dropped at arrival only by layer 2. They stay unclassified for layer 3.
 
 ### 2.2 Numbers that are not plain integers
 
@@ -109,7 +184,8 @@ strict xfails.
   words, `series_key` strips only `uncensored`/`decensored` (by design: a
   decensored copy is the same series). Language and other edition words are
   **not** stripped by the key.
-  - **Display:** the name keeps whichever of these words applies.
+  - **Display:** the name keeps whichever of these words applies, except
+    the language word `English`, which it drops (§2.1, hive #2646).
   - **Identity:** this design does not change how any of them affects
     identity.
   - **Precedent:** `cbz_core.preserve_decensor_markers` already keeps the
@@ -502,6 +578,26 @@ Nothing is deleted, and retention is David's decision.
     dropped.
   - **Tested** by an arrival tagged `[Group]` still resolving to the
     existing series.
+- **Round-bracket group, status and language tags, approved by David on
+  2026-10-24** (hive #2646).
+  - **Dropped from the arrival display name:** `(ManhwaClub)`,
+    `(Incognitymous)`, `(Ongoing)` and `(English)`. `(Digital)` was already
+    dropped (above).
+  - **Kept:** `(YYYY)`, `(Colored)` and the other non-language edition
+    words.
+  - **Unchanged:** identity.
+  - **Not decided by #2646** (§2.1, layers 2 and 3):
+    - the inherited cleaner's dropping of every other round block;
+    - any bulk-rename disposition. The step-8 planner keeps unclassified
+      round tokens in review.
+  - **Tested** in `tests/test_round_group_tags.py`:
+    - an arrival folder `Solo Leveling (ManhwaClub)` merging into the
+      existing `Solo Leveling`;
+    - an arrival `ch. 4 (English)` meeting the existing `ch. 4` as the
+      same book;
+    - the fixpoint property.
+  - **Inherited limitation:** a stripped tag that makes two different books
+    collide is merged as keep-the-larger, not held for review (§2.1).
 
 ### 5.6 Other interactions
 
@@ -686,6 +782,215 @@ code takes. They are open to review.
 
 Perceptual hashes are not consulted at all in step 5.
 
+### Step 7 implementation notes
+
+Step 7 is the package `comic_automation/library/canonical_apply/`: `plan`,
+`scope_lock`, `journal`, `markers`, `executor` and `cli`. It runs against
+tmp fixtures only. The design was silent on the points below. Each one
+records the conservative reading the code takes, and each is open to
+review.
+
+1. **The marker table is not a numbered migration.** Migration 015 is
+   declared protected. The Slice 4 executor requires the ledger to equal
+   exactly `{v < 15}` before it applies 015 (`slice4_migration_design.md`
+   §12.1 step 3), and `tests/test_migrations.py` requires contiguous
+   version numbers. So an ordinary `016` would either fail the contiguity
+   sentinel, or later make every database that ran it unable to apply 015.
+   - `rename_attempt_steps` and its two append-only triggers are created
+     by `markers.install_schema`, or by `cli install-schema`. That is
+     `CREATE ... IF NOT EXISTS` in one `BEGIN IMMEDIATE`, outside the
+     ledger.
+   - `apply`, `recover` and `undo` refuse a database whose table is
+     missing or differs from the expected schema.
+   - Bringing the table into the ledger waits until the Slice 4 numbering
+     is settled.
+2. **The plan format** is defined here (`canonical-naming-plan-v1`). No
+   live `plan` command is built: that is step 8.
+   - `plan.build_plan` and `plan.family_spec_from_evaluation` are the
+     pure builders. The second takes a step-5 verdict, and only a
+     `supersession` verdict is accepted.
+   - `--expect-renames` counts ordinary renames only. Keeper renames are
+     part of their family and are counted separately as `keeper_renames`.
+   - The digest is the sha256 of the sorted, compact JSON of every key
+     except `plan_digest`.
+3. **Plan structure is refused before the lock.** All of these are
+   refused:
+   - a path that is not absolute and normalised, not under the root, or
+     not a `.cbz`;
+   - a path inside the canonical-naming state (the lock, the owner file,
+     or the journal directory);
+   - a rename that changes directory;
+   - a destination that is any source, except a case-only rename's own;
+   - a dependant whose relation is not a strict-prefix supersession;
+   - a quarantine path outside
+     `<root>\.cbz-canonical-quarantine\<YYYY-MM-DD>`.
+
+   Quarantine paths are fixed at plan time, so the date is the plan's
+   date.
+4. **An archive named by two units** blocks every unit that names it.
+   The plan is not refused. This is how §5.3's "no other unit schedules
+   the keeper for quarantine" is enforced.
+5. **Windows only.** POSIX `rename` replaces an existing destination, so
+   every entry point raises `UnsupportedPlatformError` elsewhere.
+6. **Quiescence has no cross-process mechanism yet.** The series locks are
+   in-process watcher locks, and no operator mode exists.
+   - The library API takes a required `quiescence` probe. The CLI accepts
+     only the operator's `--attest-quiescent` and refuses without it.
+   - The probe is checked right after the lock is taken, and again at
+     every batch boundary.
+   - A `unit_gate` seam is where a future series-lock wait goes.
+7. **Lock waits.** Validation of a unit always runs after its gate
+   returns. The SQLite write lock is the other wait: inside
+   `BEGIN IMMEDIATE`, the destination is re-hashed before the conditional
+   updates.
+8. **Journal.** Each record is one JSON line, `fsync`ed before the caller
+   goes on, and the file is created exclusively.
+   - The reader refuses the whole journal on a torn final line, a parse
+     error, a foreign contract or attempt id, or a gap in the sequence.
+     No prefix is trusted.
+   - The parent directory is not fsynced. Python on Windows cannot do it.
+     This is a known gap.
+9. **What recovery writes.** Each round re-derives everything from
+   scratch and writes at most one record. A run repeats rounds on one
+   action until its frontier step is confirmed or refused, so a single
+   run settles a `done` step. `single_round` exposes one round.
+   - Recovery never begins a step that has no `intent`.
+   - An `intent`-only step whose source is intact is reported
+     `not_done_retryable`. `apply --resume` (or `undo --resume`) retries
+     it under full unit validation, reusing the durable intent, which must
+     match the plan step.
+   - **Abandon is not implemented.** Such an attempt stays unfinished.
+10. **Completed history is still checked.** For an action that is complete
+    or sits at a step boundary, recovery re-checks the content and rows at
+    the proven location. Drift there is a refusal, so it also refuses a
+    resume. It does not merely block the family.
+11. **One unfinished attempt at a time.** A new apply or undo is refused
+    while any attempt under the root is unfinished.
+    - "Unfinished" is decided from journals alone: every receipt carries
+      `steps_total`.
+    - A journal that cannot be read counts as unfinished.
+    - Re-applying a plan digest that an earlier attempt already started
+      needs `--resume`.
+12. **Unit or run.** A failure before an `intent` is durable blocks only
+    its unit. A failure after it stops the whole run for recovery: either
+    `os.rename` refusing, or the database step refusing and rolling back.
+13. **Database rows.**
+    - The `file_locations` row is updated in place (`path`,
+      `last_seen_at`), matched on `id`, `archive_id`, the preimage path and
+      `is_current = 1`.
+    - A quarantined file's row stays current, at its quarantine path.
+    - No `file_events`, `archive_quarantine` or migration-013 disposition
+      rows are written. That is left for review.
+14. **Pairing records.** No pairing table exists yet.
+    - The caller registers `(table, path column)` pairs, and the plan
+      names only a registered table and a row id. Identifiers never come
+      from the plan.
+    - The CLI registers none, so a plan carrying pairings is refused there.
+15. **Durability of the database step.** The apply connection uses
+    `synchronous = FULL`. Under WAL, `NORMAL` may lose the last commit,
+    and the `confirmed` record follows that commit.
+16. **Run-wide stop.** The defaults are a drift fraction of 0.05 and a
+    batch size of 25 units. Both are conservative and uncalibrated. The
+    fraction is checked at batch boundaries only, in addition to the
+    per-unit checks.
+17. **Undo.**
+    - Every requested action is checked before anything moves. One
+      failure refuses the whole undo.
+    - It refuses while any forward action is part-way along its chain.
+    - Actions are reversed latest first, by first intent.
+    - An undo attempt cannot itself be undone.
+    - A case-only undo reuses the forward attempt's temporary name.
+18. **Strong identity** is always step 5's `derive_archive` sha256. That
+    includes ordinary rename sources, so a rename parses the archive.
+    Family members must also be comparable.
+19. **Exact names.**
+    - A file is "present" only when its parent directory lists exactly
+      that name, because `Path.exists` ignores case on Windows.
+    - A destination counts as "occupied" when anything exists at it in any
+      case (`os.path.lexists`).
+20. **An injection-only guard.** Phase 2 compares the renamed keeper's
+    re-derived pages with phase 1's. Equal sha256 implies equal pages for
+    a deterministic derivation, so the comparison is reachable only
+    through an injected derivation, and it is tested that way. Phase 3
+    re-validates the keeper's `file_locations` row as well as its bytes
+    before every quarantine.
+21. **Physical containment (PR #128 review).** The plan's path checks are
+    lexical, and a junction can defeat them while every string still
+    looks contained. So the executor checks physical containment
+    (`containment.require_contained`) for:
+    - every source, destination and temporary name;
+    - the quarantine root;
+    - the run state: the lock, the owner file and the journal directory.
+
+    The check refuses a reparse point (junction, symlink or any
+    `FILE_ATTRIBUTE_REPARSE_POINT`) on any existing component below the
+    root, and refuses a target whose `realpath` is outside the root's.
+    - The root itself may be a mapping or a share. Only what lies below it
+      is constrained.
+    - **When it runs:** for the whole run before the lock, again before
+      each step's intent, again immediately before each `os.rename`, and
+      before the quarantine directory is created.
+    - **The remaining window** is between that last check and the rename.
+      Closing it would need handle-relative renames, which this prototype
+      does not do.
+    - **UNC roots** are handled by the pure helper: shares are drives, and
+      case is ignored. That is unit-tested on UNC-shaped strings with
+      injected filesystem calls. **No SMB target has been measured.**
+22. **Root binding.** `apply`, `recover` and `undo` act on the plan's root
+    only. A `library_root` argument that does not resolve to the same
+    physical directory is refused before any lock, owner file or journal is
+    touched under either root. A journal header written for another root
+    is refused too.
+23. **Database binding.** This reuses #117's
+    `content_signature_recertify.file_identity` (real path, `st_dev`,
+    `st_ino`).
+    - The plan records the identity as `database_target`, and every
+      attempt header records it too.
+    - It is verified at entry before the lock, every time a read
+      connection is opened, and under the write lock before the
+      conditional updates.
+    - A backup clone, a copy, a hard link or a restored file is a
+      different database, and needs a new plan.
+24. **Attempt ids and the journal leaf (PR #128 re-review).**
+    - **One grammar for every attempt id:**
+      `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`, which matches what
+      `executor._new_attempt_id` generates.
+    - **Where it applies:** ids supplied to `apply`, `recover` and
+      `undo` (including the CLI's `--resume`, `--attempt` and
+      `--forward-attempt`), and ids read from a header, such as an
+      undo's forward attempt.
+    - **When it is checked:** before any filesystem access, and again
+      inside `journal.journal_path`, so no caller can build an
+      unvalidated journal path.
+    - **Header action ids** must be actions of the plan.
+    - **Unknown files block new attempts.** `list_attempts` returns only
+      names in the grammar. Any other file in the attempts directory
+      counts as unfinished and blocks new attempts.
+    - **Run state is re-checked after every wait.** That covers the
+      journal leaf path itself, the journal directory, the owner file,
+      the lock and the quarantine root. The re-check runs:
+      - after the quiescence wait;
+      - immediately before a journal is created or opened, and before
+        every journal read;
+      - after each unit gate, where a failure stops the run;
+      - under the database write lock.
+
+    **Audit of other externally supplied paths:**
+    - **Plan paths** are lexically and physically contained (notes 3
+      and 21).
+    - **Action and family ids** never name a path in the executor.
+    - **Temp names** are built only from a validated destination and a
+      validated attempt id.
+    - **Header fields other than ids** (root, database target, digest,
+      mode) are compared and never used as paths.
+    - **Journal record fields** are compared with the plan's steps and
+      never used as paths.
+    - **CLI arguments:** the root is bound to the plan, the database to
+      its identity, `--plan` is only read, and `--action` ids are looked
+      up in the forward chain.
+    - **Pairing identifiers** come from the caller's registry, never from
+      the plan.
+
 ## 7. Named tests (for the implementation PRs)
 
 Naming and resolution:
@@ -767,6 +1072,18 @@ Apply, drift and recovery:
 2. **Quarantine retention** for superseded versions (§5.4).
 3. **Komga.** Is a read-progress reset acceptable, once measured (§5.6)?
 4. **Closed lists.** The specials and edition vocabularies (§2.1, §2.2).
+   **Partly closed** on 2026-10-24 (David, hive #2646): arrival display
+   names strip round-bracket group, status and language tags, `(English)`
+   included, and keep the year and the non-language edition words (§2.1,
+   layer 1).
+
+   Still open:
+   - Whether the formatter's `EDITION_WORDS` should drop `English`.
+   - The specials list.
+   - Whether `Colorized` folds into `Colored`.
+   - Every round token outside the approved classes: seasons, parody tags,
+     credits, variants, copy suffixes. The bulk-rename planner keeps these
+     in review (§2.1, layer 3).
 5. ~~Brackets~~: **closed** on 2026-10-22. David confirmed the §5.5 split.
 6. **Dropping ComicInfo.** May a superseded member's ComicInfo.xml be
    dropped when the keeper carries its own (§4.4)?
