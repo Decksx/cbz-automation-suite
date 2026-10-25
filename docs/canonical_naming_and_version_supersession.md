@@ -159,6 +159,30 @@ the season-1 name. This predates #2646; the follow-up is issue #131.
 A proposed-destination review guard in the step-8
 planner is a separate piece of work.
 
+[RESOLVED 2026-10-24, issue #131] The finding above is kept as measured. The
+watcher now holds such an arrival for review in both modes. The trigger is
+an arrival stem carrying a round-bracket tag that the display name drops
+(`cbz_core.dropped_round_tags`), whose collision key also differs from the
+display stem's. When that arrival meets an existing archive with different
+bytes (sha256), the existing archive is left untouched. The incoming archive
+stays in the import folder, renamed back to its arrival name, and a
+`HELD FOR REVIEW` warning is logged. The rename back means the next pass holds
+it again. An exact duplicate is still removed, and an arrival with nothing to
+collide with still lands.
+
+Deliberately **not** held, so keep-the-larger still applies to them:
+
+- square-bracket tags, such as `[Judas]`, which the identity cleaner always
+  stripped;
+- language words such as `(English)`, the same book by David's decision
+  (hive #2646);
+- renames that only normalise, such as `ch. 4` in folder `Solo Leveling`
+  becoming `Solo Leveling Ch. 4`.
+
+Still open: a held archive can be released only by hand. Round-bracket
+group and source tags, such as `(Digital)` and `(ManhwaClub)`, are held as
+well, because the name alone cannot tell them from `(s2)`.
+
 **Measured against** a read-only scan of the Tower library on 2026-10-24
 (73,564 archives, 22,139 folders). The most common round tags in file names
 were:
