@@ -16,6 +16,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 
+# cbz_core's number-token validator (#120, #126), imported rather than
+# re-derived so a chapter number means the same thing here as in the watcher
+# and the sanitizer.
+try:
+    from scripts.cbz_core import _num_field
+except ModuleNotFoundError:  # run from inside scripts/ without the package
+    from cbz_core import _num_field  # type: ignore[no-redef]
+
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
@@ -65,10 +73,19 @@ _NUMBER_RE = re.compile(
 )
 
 def extract_number(stem: str) -> float | None:
+    """Issue/chapter number of *stem*, or None.
+
+    The marker alternatives capture any digit-and-dot run, so the token can
+    be malformed (``ch. 1.2.3``, ``#1..2``). That gives None and the file is
+    counted as unnumbered, instead of a ValueError out of scan_series. A run
+    long enough to overflow gives None too: float() made it inf, and
+    find_gaps then counted towards inf forever.
+    """
     m = _NUMBER_RE.search(stem)
     if m:
         val = next(g for g in m.groups() if g is not None)
-        return float(val)
+        number = _num_field(val)
+        return None if number is None else float(number)
     return None
 
 def format_number(n: float) -> str:

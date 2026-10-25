@@ -50,6 +50,8 @@ try:
             extract_season_number as _extract_season_number,
             extract_episode_number as _extract_episode_number,
             extract_part_number as _extract_part_number,
+            _num_field as _num_field,
+            _fmt_num_text as _fmt_num_text,
             build_sep_notes as _build_sep_notes,
             preserve_decensor_markers as _preserve_decensor_markers,
         )
@@ -63,6 +65,8 @@ try:
             extract_season_number as _extract_season_number,
             extract_episode_number as _extract_episode_number,
             extract_part_number as _extract_part_number,
+            _num_field as _num_field,
+            _fmt_num_text as _fmt_num_text,
             build_sep_notes as _build_sep_notes,
             preserve_decensor_markers as _preserve_decensor_markers,
         )
@@ -97,6 +101,24 @@ except Exception:
 
     def _build_sep_notes(existing_notes, season, episode, part):
         return (existing_notes or "").strip(), False
+
+    # The degraded run is exactly where the legacy rename and ComicInfo code
+    # below is live (process_cbz_file uses it only when parse_comic_name is
+    # unavailable), so these keep cbz_core's contract (#120, #126) rather
+    # than letting that path fall back to a bare float(): one decimal number
+    # by fullmatch, else None; inf (an overflowing run) is not a number.
+    def _num_field(value: str) -> str | None:
+        if not re.fullmatch(r"\d+(?:\.\d+|\.)?", value):
+            return None
+        number = float(value)
+        try:
+            return str(int(number)) if number == int(number) else str(number)
+        except OverflowError:
+            return None
+
+    def _fmt_num_text(value: str) -> str:
+        formatted = _num_field(value)
+        return value if formatted is None else formatted
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -366,13 +388,11 @@ def is_generic(text: str) -> bool:
     return any(r.search(text) for r in _TITLE_OVERWRITE_RES)
 
 def normalise_number_tokens(stem: str) -> str:
+    # _fmt_num_text keeps a malformed token ("1.2.3", "1..") as its own text,
+    # as cbz_core's twin does. The old float() round-trip caught ValueError
+    # but not the OverflowError int(inf) raises for an overflowing run.
     def _sub(m: re.Match) -> str:
-        try:
-            n = float(m.group(2))
-            fmt = str(int(n)) if n == int(n) else str(n)
-            return m.group(1) + fmt
-        except ValueError:
-            return m.group(0)
+        return m.group(1) + _fmt_num_text(m.group(2))
     return _NUM_TOKEN_RE.sub(_sub, stem)
 
 def normalize_stem(stem: str, dir_name: str) -> str:
@@ -401,29 +421,44 @@ def normalize_stem(stem: str, dir_name: str) -> str:
     return stem
 
 def extract_chapter_number(stem: str) -> str | None:
+    """Canonical chapter text in *stem*, or None.
+
+    The regex captures any digit-and-dot run, so a token can be malformed
+    (``ch. 1.2.3``, ``ch. 1..``); it gives None, as in cbz_core, rather than
+    raising or guessing a number the name never contained (#120).
+    """
     m = _CHAPTER_NUMBER_RE.search(stem)
     if m:
         val = next(g for g in m.groups() if g is not None)
-        n = float(val)
-        return str(int(n)) if n == int(n) else str(n)
+        return _num_field(val)
     return None
 
 def extract_volume_number(stem: str) -> str | None:
+    """Canonical volume text in *stem*, or None (``v1..2`` gives None)."""
     m = _VOLUME_NUMBER_RE.search(stem)
     if m:
         val = m.group(1) or m.group(2)
-        n = float(val)
-        return str(int(n)) if n == int(n) else str(n)
+        return _num_field(val)
     return None
 
 def _fmt_num(n: float) -> str:
     return str(int(n)) if n == int(n) else str(n)
 
 def extract_chapter(name: str) -> float | None:
+    """Chapter number of *name* for compilation detection, or None.
+
+    _process_series_dir calls this on every file it has just renamed, with
+    or without cbz_core, and the rename keeps a malformed token as text --
+    so a bare float() here raised out of the loop and left the rest of the
+    series directory unprocessed. A malformed token gives None, which only
+    leaves that file out of compilation detection. An overflowing run gives
+    None too: it used to come back inf and raise in _fmt_num downstream.
+    """
     m = _CHAPTER_NUMBER_RE.search(name)
     if m:
         val = next(g for g in m.groups() if g is not None)
-        return float(val)
+        chapter = _num_field(val)
+        return None if chapter is None else float(chapter)
     return None
 
 
@@ -661,12 +696,16 @@ def _resolve_cjk_title(raw_stem: str) -> tuple[str | None, str | None, str | Non
     # Pull CJK chapter/volume numbers for metadata.
     chapter = None
     volume = None
-    m = re.search(r"第?\s*(\d+)\s*[話话章]", raw_stem)
+    # The number is the whole digit-and-dot run before the marker, never a
+    # fragment of it ("1.2.3話" used to give "3", "12.5話" "5"), and goes
+    # through _num_field so a malformed run leaves the field unset -- the
+    # same rule cbz_core.parse_comic_name applies since #126.
+    m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[話话章]", raw_stem)
     if m:
-        chapter = format_chapter_number(m.group(1))
-    m = re.search(r"第?\s*(\d+)\s*[巻卷]", raw_stem)
+        chapter = _num_field(m.group(1))
+    m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[巻卷]", raw_stem)
     if m:
-        volume = format_chapter_number(m.group(1))
+        volume = _num_field(m.group(1))
 
     # Strip tokens so the translator sees only the title.
     title_part = _NUM_TOKEN_RE.sub("", raw_stem)
@@ -684,12 +723,13 @@ def _resolve_cjk_title(raw_stem: str) -> tuple[str | None, str | None, str | Non
 
 
 def format_chapter_number(value: str) -> str:
-    """Format a numeric string, dropping a trailing .0 (e.g. '5.0' -> '5')."""
-    try:
-        f = float(value)
-        return str(int(f)) if f == int(f) else str(f)
-    except ValueError:
-        return value
+    """Format a numeric string, dropping a trailing .0 (e.g. '5.0' -> '5').
+
+    Total: anything that is not one decimal number, including a run long
+    enough to overflow float (which used to raise OverflowError past the
+    ValueError guard), is returned unchanged.
+    """
+    return _fmt_num_text(value)
 
 
 def _inject_sep_notes(xml_text: str, stem: str) -> tuple[str, bool]:
