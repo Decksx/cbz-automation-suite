@@ -41,10 +41,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _rename_doc(env, name="a.cbz", new="A ch. 1.cbz", action_id="ren1", folder=None):
+def _rename_doc(env, name="a.cbz", new="A ch. 1.cbz", action_id="ren1", folder=None, database=None):
     folder = folder or env.series
     source = book(folder, name, [P1])
-    return env.plan(renames=[env.rename_spec(source, folder / new, action_id)]), source, folder / new
+    document = env.plan(renames=[env.rename_spec(source, folder / new, action_id)], database=database)
+    return document, source, folder / new
 
 
 # --- scope lock -----------------------------------------------------------------
@@ -130,7 +131,7 @@ def test_apply_refuses_a_database_without_the_marker_table(env, tmp_path):
     bare = tmp_path / "bare.db"
     with database_connection(bare) as connection:
         apply_migrations(connection, fx.MIGRATIONS)
-    document, source, _ = _rename_doc(env)
+    document, source, _ = _rename_doc(env, database=bare)
     with pytest.raises(markers.SchemaMissingError):
         executor.apply(env.load(document), library_root=env.root, database=bare, quiescence=fx.quiet)
     assert source.exists() and env.attempts() == ()
@@ -253,7 +254,7 @@ def test_plan_structure_is_refused_before_anything_is_locked(env, tmp_path):
     with pytest.raises(PlanError, match="quarantine_root"):
         env.plan(families=[outside_quarantine])
     with pytest.raises(PlanError, match="quarantine_root"):
-        build_plan(library_root=str(env.root), quarantine_root=str(env.root / "q" / fx.DATE))
+        build_plan(library_root=str(env.root), quarantine_root=str(env.root / "q" / fx.DATE), database=env.database)
 
 
 def test_the_digest_is_over_canonical_bytes_not_file_formatting(env):
