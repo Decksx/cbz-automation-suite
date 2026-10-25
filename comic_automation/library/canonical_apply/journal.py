@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -62,12 +63,37 @@ class JournalCorruptError(JournalError):
     """The journal cannot be read in full and is refused."""
 
 
+class InvalidAttemptId(JournalError):
+    """An attempt id is not one safe file name (PR #128 review)."""
+
+
+# One strict grammar for every attempt id, supplied or read from a header:
+# a single file name with no separator, dot or drive, so ``journal_path`` can
+# never leave the attempts directory and `list_attempts` sees every journal.
+# `executor._new_attempt_id` (uuid4 hex) is inside it.
+ATTEMPT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def validate_attempt_id(attempt_id: object) -> str:
+    """``attempt_id`` if it matches `ATTEMPT_ID`, else `InvalidAttemptId`.
+
+    Pure: touches no filesystem, so it can run before anything else.
+    """
+    if not isinstance(attempt_id, str) or not ATTEMPT_ID.fullmatch(attempt_id):
+        raise InvalidAttemptId(
+            f"attempt id {attempt_id!r} is not a safe attempt id "
+            f"(must match {ATTEMPT_ID.pattern})"
+        )
+    return attempt_id
+
+
 def attempts_dir(library_root: str | Path) -> Path:
     return Path(library_root) / JOURNAL_DIRNAME / ATTEMPTS_DIRNAME
 
 
 def journal_path(library_root: str | Path, attempt_id: str) -> Path:
-    return attempts_dir(library_root) / f"{attempt_id}.jsonl"
+    """The journal of ``attempt_id``; the id is validated first, always."""
+    return attempts_dir(library_root) / f"{validate_attempt_id(attempt_id)}.jsonl"
 
 
 @dataclass(frozen=True)
@@ -200,11 +226,28 @@ def read_journal(library_root: str | Path, attempt_id: str) -> tuple[JournalReco
 
 
 def list_attempts(library_root: str | Path) -> tuple[str, ...]:
-    """Attempt ids that have a journal under ``library_root``, sorted."""
+    """Attempt ids that have a journal under ``library_root``, sorted.
+
+    Only names in the attempt-id grammar; anything else is reported by
+    `foreign_journal_files`, so it cannot hide from the unfinished check.
+    """
     directory = attempts_dir(library_root)
     if not directory.is_dir():
         return ()
-    return tuple(sorted(p.stem for p in directory.glob("*.jsonl")))
+    return tuple(sorted(
+        p.stem for p in directory.glob("*.jsonl") if ATTEMPT_ID.fullmatch(p.stem)
+    ))
+
+
+def foreign_journal_files(library_root: str | Path) -> tuple[str, ...]:
+    """Entries in the attempts directory that are not a valid attempt journal."""
+    directory = attempts_dir(library_root)
+    if not directory.is_dir():
+        return ()
+    return tuple(sorted(
+        p.name for p in directory.iterdir()
+        if p.suffix != ".jsonl" or not ATTEMPT_ID.fullmatch(p.stem)
+    ))
 
 
 def step_records(
