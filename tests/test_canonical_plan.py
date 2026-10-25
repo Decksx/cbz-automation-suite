@@ -1,7 +1,7 @@
 """Planner entry-point witnesses: real tmp CBZ files and a migrated tmp DB.
 
 These assert decisions and refusal behaviour, rather than reproducing the
-planner's implementation. No live library, executor or schema installer is used.
+planner's implementation. All database and executor operations use fixtures.
 """
 
 from __future__ import annotations
@@ -190,16 +190,17 @@ def test_originals_root_is_refused_before_any_archive_is_derived(env, monkeypatc
         cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
 
 
-def test_nested_originals_are_excluded_before_descent_or_archive_reads(env, monkeypatch):
+@pytest.mark.parametrize("originals", ["ai-decensor-originals", "AI-Decensor-Originals"])
+def test_nested_originals_are_excluded_before_descent_or_archive_reads(env, monkeypatch, originals):
     root, db, book, plan = env
-    original = book(folder="nested/ai-decensor-originals/Series")
+    original = book(folder=f"nested/{originals}/Series")
     before = original.read_bytes()
     source = book()
     derive = cp.sv.derive_archive
     seen = []
 
     def guarded(path, **kwargs):
-        assert "ai-decensor-originals" not in Path(path).parts
+        assert "ai-decensor-originals" not in {part.casefold() for part in Path(path).parts}
         seen.append(path)
         return derive(path, **kwargs)
 
@@ -207,7 +208,7 @@ def test_nested_originals_are_excluded_before_descent_or_archive_reads(env, monk
     report = plan()
     assert seen == [source] and len(report["renames"]) == 1
     assert original.read_bytes() == before
-    assert {"path": str(Path("nested/ai-decensor-originals")),
+    assert {"path": str(Path("nested") / originals),
             "reason": "protected decensor originals"} in report["provenance"]["excluded"]
 
 
@@ -489,10 +490,11 @@ def test_a_lone_canonical_version_is_reviewed_when_a_resolved_field_would_change
     assert report["review"] and not report["unchanged"] and not report["renames"]
 
 
-def test_another_book_in_the_folder_restores_normal_version_evidence_rules(env):
+def test_another_book_in_the_same_identity_group_restores_normal_version_evidence_rules(env):
+    """A co-member still requires the full family proof, even for a no-op."""
     root, db, book, plan = env
     source = book("Series ch. 1 [v2].cbz", number="1")
-    book("Other ch. 2.cbz", series="Other", number="2")
+    book("old Ch. 1.cbz", number="1", pages=(b"different",))
     report = plan()
     assert report["diagnostics"]["unverified_version_labels"] == 0
     assert any(str(source) in item.get("members", []) or item.get("path") == str(source)
@@ -688,3 +690,134 @@ def test_cli_exclusive_create_refuses_a_file_appearing_after_the_last_check(env,
     assert main(["--library-root", str(root), "--database", str(db),
                  "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
     assert output.read_bytes() == b"late foreign occupant" and capsys.readouterr().err
+
+
+def _junction(link: Path, target: Path) -> None:
+    """Use a real filesystem alias so lexical containment mutants are tested."""
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       check=True, capture_output=True)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+@pytest.mark.parametrize("series,number", [("Series", "2"), ("Other", "1")])
+def test_lone_label_is_scoped_to_its_identity_group(env, series, number):
+    """Other chapters or series in one folder do not certify or block a label."""
+    root, db, book, plan = env
+    source = book("Series ch. 1 [v2].cbz", number="1")
+    book(f"{series} ch. {number}.cbz", series=series, number=number)
+    report = plan()
+    assert not report["review"] and not report["renames"] and not report["families"]
+    assert report["diagnostics"] == {"unverified_version_labels": 1}
+    item = next(row for row in report["unchanged"] if row["path"] == str(source))
+    assert item["diagnostic"] == "unverified_version_label"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the executor rename protocol is Windows-only")
+def test_family_apply_replans_in_a_multi_chapter_folder(env):
+    """A real family and ordinary renames settle together after actual apply."""
+    root, db, book, plan = env
+    book("Series ch. 1 v1.cbz", number="1")
+    book("Series ch. 1 v2.cbz", number="1", pages=(b"a", b"b"))
+    book("old Ch. 2.cbz", number="2")
+    book("old Ch. 3.cbz", number="3")
+    markers.install_schema(db)
+    first = plan()
+    assert first["counts"]["renames"] == 2 and first["counts"]["families"] == 1
+    forward = executor.apply(parse_plan(first), library_root=root, database=db,
+                             quiescence=lambda _: None)
+    assert forward.stopped is None
+    assert all(row["status"] == executor.UNIT_COMPLETED for row in forward.units)
+    second = plan()
+    assert not second["review"] and not second["renames"] and not second["families"]
+    assert len(second["unchanged"]) == 3
+    assert second["diagnostics"]["unverified_version_labels"] == 1
+    # A new co-member restores family evidence even beside other chapters.
+    book("Series ch. 1 v3.cbz", number="1", pages=(b"a", b"b", b"c"))
+    third = plan()
+    assert not third["review"] and third["counts"]["families"] == 1
+    assert third["diagnostics"]["unverified_version_labels"] == 0
+
+
+@pytest.mark.parametrize("family", [False, True])
+def test_proposed_names_must_survive_resolution_again(env, family):
+    """Title text may acquire optional-field candidates after formatting.
+
+    Both ordinary and family proposals must hold before a rename strands the
+    next plan in review; a family hold must also prevent quarantine.
+    """
+    root, db, book, plan = env
+    book("old Ch. 7 v1.cbz" if family else "old Ch. 7.cbz", series="Series Vol. 2")
+    if family:
+        book("old Ch. 7 v2.cbz", series="Series Vol. 2", pages=(b"a", b"b"))
+    report = plan()
+    assert report["review"] and not report["renames"] and not report["families"]
+    assert any("fixpoint" in reason for item in report["review"] for reason in item["reasons"])
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_catalog_inside_library_is_refused_before_any_read(env, tmp_path, monkeypatch, alias):
+    """No SQLite open may create WAL/SHM in the library, even through an alias."""
+    root, db, book, plan = env
+    inside = root / "catalog.db"
+    inside.write_bytes(db.read_bytes())
+    database = inside
+    if alias:
+        link = tmp_path / "db-alias"
+        _junction(link, root)
+        database = link / inside.name
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("must refuse before opening SQLite")
+
+    monkeypatch.setattr(cp, "read_consistent_snapshot", forbidden)
+    with pytest.raises(cp.PlanningRefused, match="database.*outside the library"):
+        cp.build_plan(root, database=database, quarantine_date="2026-10-24")
+    assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_originals_root_hidden_by_a_junction_is_refused(env, tmp_path, monkeypatch):
+    """A root's lexical parts cannot establish that it is outside originals."""
+    root, db, book, plan = env
+    source = book(folder="AI-Decensor-Originals/Series")
+    link = tmp_path / "innocent-root"
+    _junction(link, source.parent)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("originals may not be opened")
+
+    monkeypatch.setattr(cp.sv, "derive_archive", forbidden)
+    with pytest.raises(cp.PlanningRefused, match="originals is preserved"):
+        cp.build_plan(link, database=db, quarantine_date="2026-10-24")
+
+
+def test_output_alias_into_library_is_refused_before_planning(env, tmp_path, monkeypatch, capsys):
+    """An external report directory may still resolve into the library."""
+    from scripts import cbz_canonical_plan as cli
+    root, db, book, plan = env
+    source = book()
+    link = tmp_path / "report-alias"
+    _junction(link, source.parent)
+    output = link / "plan.json"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("output refusal must precede planning")
+
+    monkeypatch.setattr(cli, "build_plan", forbidden)
+    assert cli.main(["--library-root", str(root), "--database", str(db),
+                     "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+    assert not output.exists() and "outside the library" in capsys.readouterr().err
+
+
+def test_saved_receipt_preserves_nonzero_diagnostics(env, tmp_path, capsys):
+    """The receipt must expose the same unverified-label count as its file."""
+    root, db, book, plan = env
+    book("Series ch. 1 [v2].cbz", number="1")
+    output = tmp_path / "report.json"
+    assert main(["--library-root", str(root), "--database", str(db),
+                 "--quarantine-date", "2026-10-24", "--output", str(output)]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["diagnostics"] == document["diagnostics"] == {"unverified_version_labels": 1}
