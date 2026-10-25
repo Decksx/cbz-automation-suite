@@ -20,6 +20,7 @@ import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import date
+from ntpath import normcase as windows_normcase
 from pathlib import Path
 from typing import Any
 
@@ -129,8 +130,15 @@ def _destination(resolution: fr.ArchiveResolution) -> str:
         and bool(resolution.v_tokens) and not tokens.volume_words
         and all(v.classification == fr.V_VERSION for v in resolution.v_tokens)
     )
+    volume_only_version_candidate = (
+        fields["version"].reason == "filename_candidate_only"
+        and bool(resolution.v_tokens) and not tokens.version_markers
+        and all(v.classification == fr.V_VOLUME for v in resolution.v_tokens)
+    )
     for field in fields.values():
         if field.field == "volume" and version_only_volume_candidate:
+            continue
+        if field.field == "version" and volume_only_version_candidate:
             continue
         if field.has_evidence and not field.resolved:
             raise PlanningRefused(f"{field.field} unresolved ({field.reason})")
@@ -183,7 +191,7 @@ def _remove_collisions(doc: dict, inventory: list[dict], root: Path) -> None:
         occupants = occupied[_key(destination)]
         own_case_only = (
             occupants == [source]
-            and os.path.normcase(source) == os.path.normcase(destination)
+            and windows_normcase(source) == windows_normcase(destination)
         )
         if occupants and not own_case_only:
             blocked[unit].append(f"occupied destination: {destination}")
@@ -293,7 +301,10 @@ def build_plan(
                 if derived[key].unresolved_reason:
                     problems.append(derived[key].unresolved_reason)
                 series = resolutions[key].fields["series"].value or ""
-                if _DECENSOR.search(" ".join((root.name, str(path.relative_to(root)), series))):
+                # Underscores delimit the same markers the resolver accepts
+                # (e.g. Series_Uncensored); regex word boundaries alone do not.
+                identity_text = " ".join((root.name, str(path.relative_to(root)), series)).replace("_", " ")
+                if _DECENSOR.search(identity_text):
                     problems.append("decensor identity/pairing adapter required")
                 try:
                     destinations[key] = str(path.with_name(_destination(resolutions[key])))
