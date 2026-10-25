@@ -201,6 +201,22 @@ def test_decensor_identity_in_root_or_comicinfo_alone_is_preserved(env, marker):
     assert "decensor identity/pairing adapter required" in str(report["review"])
 
 
+@pytest.mark.parametrize("marker", ["filename", "root", "comicinfo"])
+def test_underscore_delimited_decensor_markers_still_require_pairing_evidence(env, marker):
+    root, db, book, plan = env
+    if marker == "root":
+        source = book(folder="Series_Decensored")
+        report = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
+    elif marker == "comicinfo":
+        book(series="Series_Decensored")
+        report = plan()
+    else:
+        book("Series_Uncensored ch. 7.cbz")
+        report = plan()
+    assert report["renames"] == report["families"] == []
+    assert "decensor identity/pairing adapter required" in str(report["review"])
+
+
 @pytest.mark.parametrize("occupant", ["file", "directory", "case_variant"])
 def test_an_occupied_canonical_destination_is_held_even_with_identical_bytes(env, occupant):
     root, db, book, plan = env
@@ -268,6 +284,43 @@ def test_case_only_rename_remains_a_proposal_for_the_executor(env):
     report = plan()
     assert len(report["renames"]) == 1 and not report["review"]
     assert report["renames"][0]["destination"].endswith("Series ch. 7.cbz")
+
+
+def test_case_only_rename_uses_windows_semantics_when_host_normcase_is_identity(env, monkeypatch):
+    root, db, book, plan = env
+    book("SERIES CH. 7.cbz")
+    # POSIX normcase is identity. The plan targets Windows executor semantics
+    # regardless of the host generating the read-only document.
+    monkeypatch.setattr(cp.os.path, "normcase", lambda path: path)
+    report = plan()
+    assert len(report["renames"]) == 1 and not report["review"]
+
+
+def test_casefold_equivalence_alone_does_not_grant_the_case_only_exception(env):
+    root, db, book, plan = env
+    book("Straße ch. 7.cbz", series="STRASSE")
+    report = plan()
+    assert not report["renames"] and report["review"]
+
+
+@pytest.mark.parametrize("number", [None, "3"])
+def test_conclusively_volume_classified_v_is_not_an_unresolved_version(env, number):
+    root, db, book, plan = env
+    ci = b"<ComicInfo><Series>Series</Series><Volume>1</Volume>" + (
+        b"" if number is None else b"<Number>3</Number>"
+    ) + b"</ComicInfo>"
+    source = book("Series v1.cbz" if number is None else "Series v1 Ch. 3.cbz", ci=ci)
+    report = plan()
+    assert not report["review"] and len(report["renames"]) == 1
+    expected = "Series v01.cbz" if number is None else "Series v01 #003.cbz"
+    assert report["renames"][0]["destination"] == str(source.with_name(expected))
+
+
+def test_a_real_unresolved_version_marker_beside_a_volume_is_still_held(env):
+    root, db, book, plan = env
+    book("Series v1 [v2].cbz", ci=b"<ComicInfo><Series>Series</Series><Volume>1</Volume></ComicInfo>")
+    report = plan()
+    assert not report["renames"] and not report["families"] and report["review"]
 
 
 def test_an_already_canonical_archive_is_unchanged(env):
