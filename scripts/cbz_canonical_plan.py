@@ -61,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.output is None:
         print(json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False))
     else:
-        print(json.dumps({"output": str(target), "plan_digest": doc["plan_digest"], "counts": doc["counts"]}))
+        print(json.dumps({"output": str(target), "plan_digest": doc["plan_digest"],
+                          "counts": doc["counts"], "diagnostics": doc["diagnostics"]}))
     return 1 if doc["counts"]["review"] else 0
 
 
