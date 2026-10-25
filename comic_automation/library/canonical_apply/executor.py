@@ -389,7 +389,23 @@ class _Run:
     writer: jn.JournalWriter | None = None
 
     def records(self) -> tuple[jn.JournalRecord, ...]:
+        self.check_state()
         return jn.read_journal(self.library_root, self.attempt_id)
+
+    def check_state(self, *, stop: bool = False) -> None:
+        """Re-check the run state's containment (journal leaf included).
+
+        Called after every wait and before every journal read, so a
+        junction swapped in at the state directory during a wait is
+        refused instead of followed. ``stop`` raises `RunStopped` rather
+        than `Refused`, for checks between units.
+        """
+        try:
+            _check_state_paths(self.library_root, self.plan, [self.attempt_id])
+        except Refused as exc:
+            if stop:
+                raise RunStopped(str(exc)) from exc
+            raise
 
     def view(self, actions: Sequence[Action], locations: Sequence[int] = ()) -> DatabaseView:
         """One guarded snapshot: this attempt's markers, the actions' rows,
@@ -513,6 +529,7 @@ class _Run:
             # still the database the plan is bound to.
             try:
                 _verify_database(self.plan, self.database)
+                self.check_state()
             except Refused as exc:
                 raise StepRefused(str(exc)) from exc
             problem = _identity_problem(step.destination, action.sha256)
@@ -650,7 +667,9 @@ def _unfinished_attempts(root: Path, exclude: str | None) -> list[str]:
     Decided from journals alone (every receipt names its chain length), so
     it needs no plan. A journal that cannot be read counts as unfinished.
     """
-    unfinished = []
+    # A file in the attempts directory that is not a valid attempt journal
+    # cannot be proven finished, so it blocks new attempts like a torn one.
+    unfinished = [f"foreign:{name}" for name in jn.foreign_journal_files(root)]
     for attempt_id in jn.list_attempts(root):
         if attempt_id == exclude:
             continue
@@ -901,6 +920,7 @@ def _run_units(
         # below always runs after it returns (§5.3).
         unit_gate(unit.unit_id)
         try:
+            run.check_state(stop=True)
             if isinstance(unit, FamilyUnit):
                 status = _run_family(run, unit)
             else:
@@ -967,16 +987,38 @@ def _contain(root: Path, path: str, label: str) -> None:
         raise Refused(f"{label}: {exc}") from exc
 
 
-def _check_state_paths(root: Path, plan: Plan) -> None:
-    """Lock, owner file, journal directory and quarantine root, physically."""
+def _check_state_paths(root: Path, plan: Plan, attempt_ids: Sequence[str] = ()) -> None:
+    """Lock, owner file, journal directory, the journals of ``attempt_ids``
+    (their actual leaf paths) and the quarantine root, physically."""
     for path in (
         lock_path(root),
         owner_path(root),
         root / jn.JOURNAL_DIRNAME,
         jn.attempts_dir(root),
+        *(jn.journal_path(root, attempt_id) for attempt_id in attempt_ids),
         Path(plan.quarantine_root),
     ):
         _contain(root, str(path), "canonical-naming state")
+
+
+def _validate_ids(*attempt_ids: str | None) -> None:
+    """Every supplied attempt id in the one grammar, before any file access."""
+    for attempt_id in attempt_ids:
+        if attempt_id is not None:
+            try:
+                jn.validate_attempt_id(attempt_id)
+            except jn.InvalidAttemptId as exc:
+                raise Refused(str(exc)) from exc
+
+
+def _create_journal(root: Path, plan: Plan, attempt_id: str, header: Mapping[str, Any]) -> jn.JournalWriter:
+    _check_state_paths(root, plan, [attempt_id])
+    return jn.JournalWriter.create(root, attempt_id, header)
+
+
+def _open_journal(root: Path, plan: Plan, attempt_id: str) -> jn.JournalWriter:
+    _check_state_paths(root, plan, [attempt_id])
+    return jn.JournalWriter.open_existing(root, attempt_id)
 
 
 def _check_chains(root: Path, chains: Mapping[str, Sequence[Step]]) -> None:
@@ -1028,6 +1070,7 @@ def apply(
     and refuses if any action is refused by it.
     """
     require_windows()
+    _validate_ids(resume_attempt, attempt_id)
     root = _bind_root(plan, library_root)
     _verify_database(plan, database)
     registry = dict(pairing_columns or {})
@@ -1035,10 +1078,12 @@ def apply(
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     attempt = resume_attempt or attempt_id or _new_attempt_id()
-    _check_state_paths(root, plan)
+    _check_state_paths(root, plan, [attempt])
     _check_chains(root, {a.action_id: a.steps(attempt) for a in plan.actions.values()})
     with ScopeLock(root, attempt, "apply"):
         _check_quiescent(quiescence, root)
+        # Re-checked after the quiescence wait, not only at entry.
+        _check_state_paths(root, plan, [attempt])
         run = _Run(
             plan, root, Path(database), attempt, registry, fault,
             {a.action_id: a.steps(attempt) for a in plan.actions.values()},
@@ -1048,8 +1093,8 @@ def apply(
         if resume_attempt is None:
             _refuse_new_attempt(root, plan)
             run.view([])  # schema present and the database readable
-            run.writer = jn.JournalWriter.create(
-                root, attempt,
+            run.writer = _create_journal(
+                root, plan, attempt,
                 {
                     "mode": jn.MODE_APPLY, "plan_digest": plan.digest, "library_root": str(root),
                     "database_target": dict(plan.database_target), "pid": os.getpid(),
@@ -1063,7 +1108,7 @@ def apply(
             unfinished = _unfinished_attempts(root, exclude=resume_attempt)
             if unfinished:
                 raise Refused(f"other attempts are unfinished: {unfinished}")
-            run.writer = jn.JournalWriter.open_existing(root, resume_attempt)
+            run.writer = _open_journal(root, plan, resume_attempt)
             resolutions = _recover_actions(run, list(plan.actions.values()), single_round=False)
             report.resolutions = [r.as_dict() for r in resolutions]
             refused = [r for r in resolutions if r.status == RES_REFUSED]
@@ -1117,8 +1162,12 @@ def _attempt_run(plan: Plan, root: Path, database: Path, attempt_id: str, regist
         chains = {a.action_id: a.steps(attempt_id) for a in actions.values()}
         selected = dict(actions)
     elif header.get("mode") == jn.MODE_UNDO:
-        forward = header["forward_attempt_id"]
-        selected = {action_id: actions[action_id] for action_id in header["action_ids"]}
+        forward = header.get("forward_attempt_id")
+        _validate_ids(forward)
+        listed = header.get("action_ids")
+        if not isinstance(listed, list) or any(a not in actions for a in listed):
+            raise Refused(f"attempt {attempt_id} lists actions that are not in the plan: {listed!r}")
+        selected = {action_id: actions[action_id] for action_id in listed}
         chains = {
             action_id: action.reverse_steps(forward, plan.quarantine_root)
             for action_id, action in selected.items()
@@ -1148,16 +1197,18 @@ def recover(
     at most one record.
     """
     require_windows()
+    _validate_ids(attempt_id)
     root = _bind_root(plan, library_root)
     _verify_database(plan, database)
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
-    _check_state_paths(root, plan)
+    _check_state_paths(root, plan, [attempt_id])
     with ScopeLock(root, attempt_id, "recover"):
         _check_quiescent(quiescence, root)
+        _check_state_paths(root, plan, [attempt_id])
         run, header = _attempt_run(plan, root, Path(database), attempt_id, registry, fault)
         report = RunReport(attempt_id, f"recover:{header.get('mode')}", str(jn.journal_path(root, attempt_id)))
-        run.writer = jn.JournalWriter.open_existing(root, attempt_id)
+        run.writer = _open_journal(root, plan, attempt_id)
         try:
             resolutions = _recover_actions(run, list(run.actions.values()), single_round=single_round)
         finally:
@@ -1187,14 +1238,16 @@ def undo(
     latest first.
     """
     require_windows()
+    _validate_ids(forward_attempt, resume_attempt, attempt_id)
     root = _bind_root(plan, library_root)
     _verify_database(plan, database)
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
     attempt = resume_attempt or attempt_id or _new_attempt_id()
-    _check_state_paths(root, plan)
+    _check_state_paths(root, plan, [attempt, forward_attempt])
     with ScopeLock(root, attempt, "undo"):
         _check_quiescent(quiescence, root)
+        _check_state_paths(root, plan, [attempt, forward_attempt])
         forward_run, forward_header = _attempt_run(plan, root, Path(database), forward_attempt, registry, fault)
         if forward_header.get("mode") != jn.MODE_APPLY:
             raise Refused(f"attempt {forward_attempt} is not a forward apply; an undo is not undone")
@@ -1229,8 +1282,8 @@ def undo(
             if problems:
                 raise Refused("undo refused, nothing moved: " + "; ".join(problems))
             ordered = sorted(requested, key=lambda a: states[a].first_seq, reverse=True)
-            writer = jn.JournalWriter.create(
-                root, attempt,
+            writer = _create_journal(
+                root, plan, attempt,
                 {
                     "mode": jn.MODE_UNDO, "plan_digest": plan.digest, "library_root": str(root),
                     "database_target": dict(plan.database_target),
@@ -1242,7 +1295,7 @@ def undo(
         if header.get("mode") != jn.MODE_UNDO or header.get("forward_attempt_id") != forward_attempt:
             raise Refused(f"attempt {attempt} is not an undo of {forward_attempt}")
         report = RunReport(attempt, jn.MODE_UNDO, str(jn.journal_path(root, attempt)))
-        run.writer = jn.JournalWriter.open_existing(root, attempt)
+        run.writer = _open_journal(root, plan, attempt)
         try:
             if resume_attempt is not None:
                 unfinished = _unfinished_attempts(root, exclude=attempt)
