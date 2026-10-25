@@ -95,8 +95,83 @@ strict xfails.
 | `#<III>` | **Issue** within a volume, at least three digits (`#003`). |
 | `ch. <C>` | **Chapter**, for books without volumes. Written unpadded, in David's form `ch. 1`. |
 | `(<year>)` | Four-digit year, when established. |
-| `(<edition>)` | An edition or language variant from a closed list, for example `(Uncensored)`, `(Colored)` or `(English)`. |
+| `(<edition>)` | An edition variant from a closed list, for example `(Uncensored)` or `(Colored)`. An arrival's display name drops the language tag `(English)` (David, 2026-10-24, hive #2646; see below). |
 | `[v<N>]` | **Version**, for WIP books only, and only when it is verified (§4.6). |
+
+**Round-bracket tags in display names: three layers, three authorities.**
+They are kept apart here because only the first was decided on 2026-10-24.
+
+1. **David's approval, 2026-10-24** (hive #2646, following #2641). Arrival
+   display names strip round-bracket **group, status and language tags**:
+   group or uploader tags such as `(ManhwaClub)` and `(Incognitymous)`,
+   status tags such as `(Ongoing)`, and the language tag `(English)` in any
+   case. `(Digital)`-style source tags were already dropped under the
+   2026-10-22 decision (§5.5). The only code change this needed is
+   `(English)`. It had been kept because the formatter's `EDITION_WORDS`
+   lists `English`; the display keep-list now leaves it out
+   (`cbz_core._ROUND_EDITION_WORDS`, that is `EDITION_WORDS` less
+   `_DISPLAY_LANGUAGE_WORDS`). A canonical name carrying `(English)` loses
+   only that token: `Berserk v01 #003 (2019) (English) [v2]` becomes
+   `Berserk v01 #003 (2019) [v2]`. Whether the formatter should keep
+   accepting `edition="English"` from resolved fields is still §8
+   question 4.
+2. **Inherited arrival-cleaner behaviour, since #112** (the 2026-10-22
+   split). This is not part of #2646. The display core *is* the identity
+   core, which removes every bracketed block. Only the keep-list goes back
+   on:
+   - `(YYYY)`;
+   - `(Colored)`, also written for `[Colored]`;
+   - the other edition words: `(Uncensored)`, `(Decensored)`,
+     `(Colorized)`, `(Special Edition)`, `(Limited Edition)`,
+     `(Alternate Cover)`;
+   - `[vN]`.
+
+   So the watcher already drops **every** other round-bracket block, at
+   any position. That includes tokens nobody has classified: seasons
+   (`(s2)`), parody or source-work tags (`(Inuyasha)`), credits
+   (`(OC by Riz)`, `(ft. Reina)`), variants (`(Original)`, `(+Extras)`)
+   and copy suffixes (`(1)`). David has not approved dropping those; it is
+   how the cleaner behaved before #2646. Dropping one can make two
+   different books share a name. At the watcher that is **not** refused:
+   the merge keeps the larger file (inherited limitation, below).
+3. **Bulk canonical rename of the existing library** (§5, step 8). No
+   disposition has been decided for round tokens there. The read-only
+   planner must **keep any round token it cannot classify in review**: it
+   must not drop it on the strength of the arrival cleaner or of how rare
+   the token is in a scan. Rarity does not classify a token. Only tokens in
+   David's approved classes (layer 1) or on the keep-list may be
+   auto-handled.
+
+**Inherited limitation: stripped-tag collisions at the watcher.** Probed on
+tmp files at the #2646 implementation PR (#129). The setup is an existing
+`Solo Leveling ch. 4.cbz` and a larger incoming `Solo Leveling ch. 4
+(s2).cbz`. The arrival is named `Solo Leveling ch. 4.cbz`, and
+`_merge_directories` / `_move_loose_files` apply keep-the-larger. What
+happens to the loser depends on the mode:
+
+- **Legacy mode** (no `--series-resolver`): the losing archive is
+  **deleted outright** (`Path.unlink`, no Recycle Bin and no quarantine).
+- **Resolver mode:** the loser is moved under the resolver quarantine root
+  (`settle_file_conflict`), so it can be recovered.
+
+In both modes the library keeps one file, holding the incoming bytes under
+the season-1 name. This predates #2646; the follow-up is issue #131.
+A proposed-destination review guard in the step-8
+planner is a separate piece of work.
+
+**Measured against** a read-only scan of the Tower library on 2026-10-24
+(73,564 archives, 22,139 folders). The most common round tags in file names
+were:
+
+| Tag | Files | Layer |
+|---|---|---|
+| `(ManhwaClub)` | 52 | 1 (approved group tag) |
+| `(Incognitymous)` | 29 | 1 (approved group tag) |
+| `(Ongoing)` | 21 | 1 (approved status tag) |
+| `(English)` | 7 | 1 (approved language tag) |
+
+The other tokens in that scan's top lists (#129 lists all of them) are
+dropped at arrival only by layer 2. They stay unclassified for layer 3.
 
 ### 2.2 Numbers that are not plain integers
 
@@ -109,7 +184,8 @@ strict xfails.
   words, `series_key` strips only `uncensored`/`decensored` (by design: a
   decensored copy is the same series). Language and other edition words are
   **not** stripped by the key.
-  - **Display:** the name keeps whichever of these words applies.
+  - **Display:** the name keeps whichever of these words applies, except
+    the language word `English`, which it drops (§2.1, hive #2646).
   - **Identity:** this design does not change how any of them affects
     identity.
   - **Precedent:** `cbz_core.preserve_decensor_markers` already keeps the
@@ -502,6 +578,26 @@ Nothing is deleted, and retention is David's decision.
     dropped.
   - **Tested** by an arrival tagged `[Group]` still resolving to the
     existing series.
+- **Round-bracket group, status and language tags, approved by David on
+  2026-10-24** (hive #2646).
+  - **Dropped from the arrival display name:** `(ManhwaClub)`,
+    `(Incognitymous)`, `(Ongoing)` and `(English)`. `(Digital)` was already
+    dropped (above).
+  - **Kept:** `(YYYY)`, `(Colored)` and the other non-language edition
+    words.
+  - **Unchanged:** identity.
+  - **Not decided by #2646** (§2.1, layers 2 and 3):
+    - the inherited cleaner's dropping of every other round block;
+    - any bulk-rename disposition. The step-8 planner keeps unclassified
+      round tokens in review.
+  - **Tested** in `tests/test_round_group_tags.py`:
+    - an arrival folder `Solo Leveling (ManhwaClub)` merging into the
+      existing `Solo Leveling`;
+    - an arrival `ch. 4 (English)` meeting the existing `ch. 4` as the
+      same book;
+    - the fixpoint property.
+  - **Inherited limitation:** a stripped tag that makes two different books
+    collide is merged as keep-the-larger, not held for review (§2.1).
 
 ### 5.6 Other interactions
 
@@ -767,6 +863,18 @@ Apply, drift and recovery:
 2. **Quarantine retention** for superseded versions (§5.4).
 3. **Komga.** Is a read-progress reset acceptable, once measured (§5.6)?
 4. **Closed lists.** The specials and edition vocabularies (§2.1, §2.2).
+   **Partly closed** on 2026-10-24 (David, hive #2646): arrival display
+   names strip round-bracket group, status and language tags, `(English)`
+   included, and keep the year and the non-language edition words (§2.1,
+   layer 1).
+
+   Still open:
+   - Whether the formatter's `EDITION_WORDS` should drop `English`.
+   - The specials list.
+   - Whether `Colorized` folds into `Colored`.
+   - Every round token outside the approved classes: seasons, parody tags,
+     credits, variants, copy suffixes. The bulk-rename planner keeps these
+     in review (§2.1, layer 3).
 5. ~~Brackets~~: **closed** on 2026-10-22. David confirmed the §5.5 split.
 6. **Dropping ComicInfo.** May a superseded member's ComicInfo.xml be
    dropped when the keeper carries its own (§4.4)?
