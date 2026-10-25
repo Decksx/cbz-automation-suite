@@ -1,5 +1,21 @@
 # Engineering Decisions
 
+## Read-only canonical naming plans precede live apply
+
+The step-8 planner emits the step-7 JSON contract without importing the
+executor, so fixture-only implementation does not depend on #128 merging.
+It composes the existing field resolver, byte-bound supersession evaluator
+and canonical formatter under a global WAL-aware read window. It does not
+infer folder authority, discard unknown variants or synthesize decensor
+pairings. Failed families stay held as units; collisions block whole units.
+No live mutation is part of plan generation. The filesystem observation
+is non-atomic and apply must revalidate every strong hash.
+
+Protocol, limits and ownership are in
+[canonical_naming_plan.md](canonical_naming_plan.md). David's hive #2646
+authorizes Claude's later read-only live plan after step 7 and the tag
+policy land; batch apply still needs the exact digest approval.
+
 ## Shared core is authoritative
 
 Normalization, series inference, title handling, translation helpers, number extraction, and ComicInfo update decisions belong in `cbz_core.py`.
