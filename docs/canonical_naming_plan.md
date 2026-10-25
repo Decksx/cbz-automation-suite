@@ -2,7 +2,7 @@
 
 Implements #112 step 8's plan generation. This command emits the
 `canonical-naming-plan-v1` document consumed by #128, without importing
-that PR's executor or waiting for it to merge. It has no apply mode.
+that PR's executor. It has no apply mode.
 
 ```powershell
 python -m scripts.cbz_canonical_plan --library-root C:\test-library `
@@ -22,8 +22,10 @@ holds can contain other independently actionable units; the holds are
 carried in the digested document and never executed.
 
 No library, database row, schema, lock, owner file, journal or quarantine
-directory is written. SQLite may create/touch its WAL/SHM sidecars when
-opening read-only; this is the established DAL read contract. An archive
+directory is written. The database must resolve outside the library,
+including through directory aliases; this is checked before any database
+open. SQLite may create/touch WAL/SHM sidecars beside that external catalog
+when opening read-only; this is the established DAL read contract. An archive
 above `--max-held-bytes` (default 512 MiB) is bound through the existing
 step-5 private-copy mechanism. `--temp-dir` must resolve outside the
 library; copies are cleaned up best-effort by that mechanism.
@@ -61,13 +63,24 @@ expensive over SMB; it does not use cached hashes as proof.
   Symmetrically, a bare `vN` conclusively classified as volume does not
   retain a phantom unresolved version. Explicit bracketed version markers
   and genuine unresolved version evidence still block.
+- Before emitting actions, re-resolve the proposed names together using
+  the same ComicInfo and byte-bound page facts. A proposed name that fails
+  resolution or formats differently is held as a non-fixpoint. The second
+  resolution can only reject an original proposal; its filename candidates
+  supply no new authority. A member's failure holds its entire family,
+  including quarantine. This catches title text such as `Series Vol. 2`
+  gaining unresolved optional-field candidates after formatting.
 - **Lone canonical version no-op** (Claude's review disposition, hive
   #2708): when the formatter's output equals the existing filename
   byte-for-byte and the only missing classification is its `[vN]`, report
   unchanged with `unverified_version_label`. Certify no version, family or
   supersession. The diagnostic count is separate from the executor's five
   action counts, under `diagnostics.unverified_version_labels`, and appears
-  in the saved-output receipt. It causes no review exit by itself. A sibling,
+  in the saved-output receipt. It causes no review exit by itself. "Lone"
+  means alone in the decided identity candidate group (series key plus
+  primary chapter/issue number, or volume when no number was offered), not
+  alone in the containing folder. Other chapters or series do not block the
+  no-op. A co-member in that group,
   any proposed name change, protected identity, catalog problem or collision
   restores the normal evidence rules. Prior attempt-receipt certification
   can be a later adapter; a filename never becomes version authority here.
