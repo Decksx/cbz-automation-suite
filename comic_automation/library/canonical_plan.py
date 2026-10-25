@@ -19,6 +19,7 @@ import stat
 import tempfile
 import unicodedata
 from collections import Counter, defaultdict
+from dataclasses import replace
 from datetime import date
 from ntpath import normcase as windows_normcase
 from pathlib import Path
@@ -30,8 +31,9 @@ from comic_automation.archive import supersession as sv
 from comic_automation.archive.content_signature_recertify import file_identity
 from comic_automation.database.read_guards import read_consistent_snapshot
 from scripts.cbz_canonical_name import (
-    CanonicalFields, CanonicalNameError, format_canonical_name,
+    CanonicalFields, CanonicalNameError, format_canonical_name, parse_canonical_name,
 )
+from scripts.cbz_core import extract_display_tokens
 from scripts.cbz_routing import NON_SERIES_DIRECTORIES
 
 CONTRACT = "canonical-naming-plan-v1"
@@ -144,9 +146,13 @@ def _inventory(root: Path) -> tuple[list[dict], list[Path], list[dict]]:
     )
 
 
-def _destination(resolution: fr.ArchiveResolution) -> str:
-    """Format resolved fields, refusing any offered but unresolved field."""
-    if not resolution.renamable:
+def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | None = None) -> str:
+    """Format resolved fields; the override is only for unchanged comparison.
+
+    ``unchanged_version`` never authorizes an action: the caller can use it
+    only to prove byte-for-byte equality with a lone canonical filename.
+    """
+    if not resolution.renamable and unchanged_version is None:
         raise PlanningRefused("; ".join(resolution.review))
     fields = resolution.fields
     tokens = fr.parse_name_tokens(resolution.filename)
@@ -168,6 +174,8 @@ def _destination(resolution: fr.ArchiveResolution) -> str:
             continue
         if field.field == "version" and volume_only_version_candidate:
             continue
+        if field.field == "version" and unchanged_version is not None and field.reason == "filename_candidate_only":
+            continue
         if field.has_evidence and not field.resolved:
             raise PlanningRefused(f"{field.field} unresolved ({field.reason})")
     series = fields["series"].display_value or fields["series"].value
@@ -179,13 +187,37 @@ def _destination(resolution: fr.ArchiveResolution) -> str:
         raise PlanningRefused("multiple edition/special markers cannot fit the grammar")
     value = lambda field: fields[field].display_value or fields[field].value
     volume, number = value("volume"), value("number")
-    return format_canonical_name(CanonicalFields(
+    fields_to_format = CanonicalFields(
         series=series, volume=volume,
         issue=number if volume is not None else None,
         chapter=number if volume is None else None,
-        year=value("year"), version=value("version"),
+        year=value("year"), version=value("version") if unchanged_version is None else unchanged_version,
         edition=next(iter(editions), None), special=next(iter(markers.specials), None),
-    ))
+    )
+    name = format_canonical_name(fields_to_format)
+    # The shared display policy owns language/edition visibility. Resolution
+    # still retains those distinctions when establishing a version family.
+    if fields_to_format.edition is not None and fields_to_format.edition not in extract_display_tokens(name).editions:
+        name = format_canonical_name(replace(fields_to_format, edition=None))
+    return name
+
+
+def _lone_canonical_unchanged(resolution: fr.ArchiveResolution) -> bool:
+    """Recognize a no-op without certifying its filename-only version label."""
+    fields = resolution.fields
+    if fields["version"].resolved or fields["version"].reason != "filename_candidate_only":
+        return False
+    if not fields["series"].resolved or not (fields["number"].resolved or fields["volume"].resolved):
+        return False
+    if any(v.classification == fr.V_UNRESOLVED and not v.bracketed for v in resolution.v_tokens):
+        return False
+    try:
+        canonical = parse_canonical_name(resolution.filename)
+        return canonical.version is not None and _destination(
+            resolution, unchanged_version=canonical.version
+        ) == resolution.filename
+    except (PlanningRefused, CanonicalNameError):
+        return False
 
 
 def _counts(doc: dict) -> dict[str, int]:
@@ -305,6 +337,7 @@ def build_plan(
             "renames": [], "families": [], "review": [], "unchanged": [],
         }
         folders = defaultdict(list)
+        occupied = Counter(_key(root / row["path"]) for row in before)
         for path in books:
             folders[path.parent].append(path)
         for folder, paths in sorted(folders.items()):
@@ -322,7 +355,7 @@ def build_plan(
                     fr.comicinfo_facts(bound.comicinfo_documents), bound.page_evidence()))
             resolved = fr.resolve_folder(fr.FolderFacts(None, tuple(facts)))
             resolutions = resolved.by_key()
-            reasons, destinations = {}, {}
+            reasons, destinations, unverified_noops = {}, {}, set()
             for path in paths:
                 key = str(path)
                 problems = _metadata_problems(derived[key].comicinfo_documents)
@@ -337,11 +370,18 @@ def build_plan(
                 try:
                     destinations[key] = str(path.with_name(_destination(resolutions[key])))
                 except (PlanningRefused, CanonicalNameError) as exc:
-                    problems.append(str(exc))
+                    if (not problems and len(paths) == 1 and occupied[_key(path)] == 1
+                            and _lone_canonical_unchanged(resolutions[key])):
+                        unverified_noops.add(key)
+                        destinations[key] = key
+                    else:
+                        problems.append(str(exc))
                 reasons[key] = problems
             claimed = set()
             for family in resolved.families:
                 members = sorted(family.members)
+                if len(members) == 1 and members[0] in unverified_noops:
+                    continue
                 # Step 4 emits candidate groups even for singleton, unmarked
                 # books. Such a group must not swallow an ordinary rename.
                 if not any(
@@ -394,7 +434,11 @@ def build_plan(
                     doc["review"].append({"path": key, "reasons": reasons[key],
                         "resolution": resolutions[key].as_dict()})
                 elif destinations[key] == key:
-                    doc["unchanged"].append({"path": key, "sha256": derived[key].sha256})
+                    unchanged = {"path": key, "sha256": derived[key].sha256}
+                    if key in unverified_noops:
+                        unchanged["diagnostic"] = "unverified_version_label"
+                        unchanged["note"] = "canonical filename unchanged; no version/family/supersession certified"
+                    doc["unchanged"].append(unchanged)
                 else:
                     row = mapping[key]
                     doc["renames"].append({"action_id": f"rename-{row['id']}",
@@ -428,5 +472,8 @@ def build_plan(
     for family in doc["families"]:
         family["snapshot"] = {"database": target, **snapshot.report_fields()}
     doc["counts"] = _counts(doc)
+    doc["diagnostics"] = {"unverified_version_labels": sum(
+        item.get("diagnostic") == "unverified_version_label" for item in doc["unchanged"]
+    )}
     doc["plan_digest"] = hashlib.sha256(canonical_bytes(doc)).hexdigest()
     return doc
