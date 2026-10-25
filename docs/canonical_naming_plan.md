@@ -49,8 +49,9 @@ expensive over SMB; it does not use cached hashes as proof.
   owned byte source through step 5. Feed those facts to step 4 and its
   existing precedence/conflict rules, then use the pure step-3 formatter.
   The planner owns no tag vocabulary. The tag-strip PR owns that policy;
-  until integration, master's marker readings/formatter apply and unknown
-  tags go to review. A directory's name is never promoted to resolved
+  the shared display-token helper controls edition visibility (including
+  dropping English) while resolver family distinctions remain intact.
+  Unknown tags go to review. A directory's name is never promoted to resolved
   series authority. Human decision manifests are not yet connected.
 - An ordinary rename requires resolved series/number and every offered
   optional field. An unresolved year/version is not silently discarded.
@@ -60,6 +61,16 @@ expensive over SMB; it does not use cached hashes as proof.
   Symmetrically, a bare `vN` conclusively classified as volume does not
   retain a phantom unresolved version. Explicit bracketed version markers
   and genuine unresolved version evidence still block.
+- **Lone canonical version no-op** (Claude's review disposition, hive
+  #2708): when the formatter's output equals the existing filename
+  byte-for-byte and the only missing classification is its `[vN]`, report
+  unchanged with `unverified_version_label`. Certify no version, family or
+  supersession. The diagnostic count is separate from the executor's five
+  action counts, under `diagnostics.unverified_version_labels`, and appears
+  in the saved-output receipt. It causes no review exit by itself. A sibling,
+  any proposed name change, protected identity, catalog problem or collision
+  restores the normal evidence rules. Prior attempt-receipt certification
+  can be a later adapter; a filename never becomes version authority here.
 - Only established, byte-proved strict-prefix families with a unique
   keeper and its own resolved version label become family units. Failed
   families are held as units, never degraded into independent renames.
