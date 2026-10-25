@@ -177,11 +177,22 @@ Deliberately **not** held, so keep-the-larger still applies to them:
 - language words such as `(English)`, the same book by David's decision
   (hive #2646);
 - renames that only normalise, such as `ch. 4` in folder `Solo Leveling`
-  becoming `Solo Leveling Ch. 4`.
+  becoming `Solo Leveling Ch. 4`;
+- the layer-1 group, source and status tags, `(Digital)`, `(ManhwaClub)`,
+  `(Incognitymous)` and `(Ongoing)` in any case
+  (`cbz_core._DISPLAY_NOISE_TAGS`), and scanlator tags whose last word is a
+  scan-group word (`cbz_core._SCAN_GROUP_RE`, for example `(Asura Scans)`).
+  David chose this, option (b), on 2026-10-25, so a higher-res copy with
+  such a tag still replaces a smaller one.
 
-Still open: a held archive can be released only by hand. Round-bracket
-group and source tags, such as `(Digital)` and `(ManhwaClub)`, are held as
-well, because the name alone cannot tell them from `(s2)`.
+Everything else that is stripped is held: seasons (`(s2)`, `(Season 2)`),
+copy suffixes (`(1)`), parody, credit and variant tags (`(Inuyasha)`,
+`(Parody)`, `(Variant)`), and, failing safe, any tag not on that list,
+including near-misses such as `(Digital-Empire)`. A name with a noise tag
+and a held one, `(Digital) (s2)`, is held.
+
+Still open: a held archive can be released only by hand. Adding a tag to
+the noise list needs David's approval, as layer 1 did.
 
 **Measured against** a read-only scan of the Tower library on 2026-10-24
 (73,564 archives, 22,139 folders). The most common round tags in file names
