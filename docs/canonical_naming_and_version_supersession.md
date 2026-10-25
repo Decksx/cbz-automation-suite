@@ -95,8 +95,49 @@ strict xfails.
 | `#<III>` | **Issue** within a volume, at least three digits (`#003`). |
 | `ch. <C>` | **Chapter**, for books without volumes. Written unpadded, in David's form `ch. 1`. |
 | `(<year>)` | Four-digit year, when established. |
-| `(<edition>)` | An edition or language variant from a closed list, for example `(Uncensored)`, `(Colored)` or `(English)`. |
+| `(<edition>)` | An edition variant from a closed list, for example `(Uncensored)` or `(Colored)`. A display name never carries a language tag such as `(English)` (David, 2026-10-24, hive #2646; see below). |
 | `[v<N>]` | **Version**, for WIP books only, and only when it is verified (§4.6). |
+
+**Round-bracket tags, decided by David on 2026-10-24** (hive #2646). The only
+round-bracket tokens a display name keeps are `(<year>)` and `(<edition>)`:
+
+- **Kept:** `(YYYY)`; `(Colored)`, also written for an arrival's `[Colored]`;
+  and the other edition words, `(Uncensored)`, `(Decensored)`,
+  `(Colorized)`, `(Special Edition)`, `(Limited Edition)` and
+  `(Alternate Cover)`.
+- **Stripped:** every other round-bracket block, wherever it sits.
+  - Group, scanlator and uploader tags: `(ManhwaClub)`, `(Incognitymous)`.
+  - Status tags: `(Ongoing)`, `(Completed)`.
+  - Source tags: `(Digital)`.
+  - Language tags: `(English)`, in any case. It is a language tag, not an
+    edition, although the formatter's `EDITION_WORDS` still lists it.
+    Whether the formatter should keep accepting `edition="English"` from
+    resolved fields is part of §8 question 4.
+
+The display core is the identity core, which already removes every bracket
+(§5.5). So the strip needs no vocabulary of its own: it falls out of the
+keep-list, which is explicit (`cbz_core._ROUND_EDITION_WORDS`, that is
+`EDITION_WORDS` less `_DISPLAY_LANGUAGE_WORDS`).
+
+A canonical name that carries `(English)` loses only that token:
+`Berserk v01 #003 (2019) (English) [v2]` becomes
+`Berserk v01 #003 (2019) [v2]`. Identity is unchanged, so an arrival
+`Series (ManhwaClub)` still resolves to the existing `Series`.
+
+**Measured against** a read-only scan of the Tower library on 2026-10-24
+(73,564 archives, 22,139 folders). The most common round tags in file names
+were:
+
+| Tag | Files |
+|---|---|
+| `(ManhwaClub)` | 52 |
+| `(Incognitymous)` | 29 |
+| `(Ongoing)` | 21 |
+| `(English)` | 7 |
+
+All 25 file tokens and both folder tokens in that scan's top lists are
+stripped. The implementing PR lists the ones a reviewer may
+want kept instead.
 
 ### 2.2 Numbers that are not plain integers
 
@@ -109,7 +150,8 @@ strict xfails.
   words, `series_key` strips only `uncensored`/`decensored` (by design: a
   decensored copy is the same series). Language and other edition words are
   **not** stripped by the key.
-  - **Display:** the name keeps whichever of these words applies.
+  - **Display:** the name keeps whichever of these words applies, except
+    the language word `English`, which it drops (§2.1, hive #2646).
   - **Identity:** this design does not change how any of them affects
     identity.
   - **Precedent:** `cbz_core.preserve_decensor_markers` already keeps the
@@ -502,6 +544,19 @@ Nothing is deleted, and retention is David's decision.
     dropped.
   - **Tested** by an arrival tagged `[Group]` still resolving to the
     existing series.
+- **Round-bracket tags, decided by David on 2026-10-24** (hive #2646).
+  - **Dropped from the display name:** group, status, source and language
+    tags such as `(ManhwaClub)`, `(Incognitymous)`, `(Ongoing)`, `(Digital)`
+    and `(English)`.
+  - **Kept:** `(YYYY)`, `(Colored)` and the other non-language edition
+    words. The keep-list and the scan it was checked against are in §2.1.
+  - **Identity is untouched.**
+  - **Tested** in `tests/test_round_group_tags.py`:
+    - an arrival folder `Solo Leveling (ManhwaClub)` merging into the
+      existing `Solo Leveling`;
+    - an arrival `ch. 4 (English)` meeting the existing `ch. 4` as the
+      same book;
+    - the fixpoint property.
 
 ### 5.6 Other interactions
 
@@ -767,6 +822,15 @@ Apply, drift and recovery:
 2. **Quarantine retention** for superseded versions (§5.4).
 3. **Komga.** Is a read-progress reset acceptable, once measured (§5.6)?
 4. **Closed lists.** The specials and edition vocabularies (§2.1, §2.2).
+   **Partly closed** on 2026-10-24 (David, hive #2646), for round-bracket
+   display tags:
+   - The display name keeps the year and the non-language edition words.
+   - It strips every other round tag, `(English)` included (§2.1).
+
+   Still open:
+   - Whether the formatter's `EDITION_WORDS` should drop `English`.
+   - The specials list.
+   - Whether `Colorized` folds into `Colored`.
 5. ~~Brackets~~: **closed** on 2026-10-22. David confirmed the §5.5 split.
 6. **Dropping ComicInfo.** May a superseded member's ComicInfo.xml be
    dropped when the keeper carries its own (§4.4)?
