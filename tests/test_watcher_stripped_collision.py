@@ -241,7 +241,79 @@ def test_loose_file_in_a_mixed_drop_point_is_held(env, caplog):
     assert sorted(p.name for p in (library / "Drop").iterdir()) == ["Drop ch. 4.cbz"]
 
 
+@pytest.mark.parametrize(
+    "tag",
+    [" (s2)", " (1)", " (Parody)", " (Zorblax)", " (Digital) (s2)"],
+    ids=["season", "copy-suffix", "parody", "unknown", "noise-plus-season"],
+)
+def test_distinguishing_or_unclassified_tag_arrival_is_held(env, caplog, tag):
+    """Option (b) holds every tag that may name a different book: seasons,
+    copy suffixes, fan-work credits and, failing safe, any tag nobody has
+    classified. A noise tag beside one of those does not release it."""
+    incoming, library, _quarantine, _mode = env
+    existing = _make_cbz(library / "Solo Leveling" / "Solo Leveling ch. 4.cbz", SMALL)
+    existing_bytes = existing.read_bytes()
+    arrival = incoming / "Solo Leveling"
+    _make_cbz(arrival / f"Solo Leveling ch. 4{tag}.cbz", BIG, b"\1")
+
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    held = arrival / f"Solo Leveling ch. 4{tag}.cbz"
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
+
+
 # --- controls: behaviour that must not change ------------------------------
+
+
+@pytest.mark.parametrize("tag", ["(Digital)", "(ManhwaClub)"])
+def test_noise_tag_higher_res_arrival_replaces(env, caplog, tag):
+    """Option (b): an approved group or source tag names the same book, so a
+    larger copy with different bytes replaces the existing one exactly as an
+    untagged arrival does, instead of waiting for review."""
+    incoming, library, quarantine, mode = env
+    existing = _make_cbz(library / "Solo Leveling" / "Solo Leveling ch. 4.cbz", SMALL)
+    arrival = incoming / "Solo Leveling"
+    _make_cbz(arrival / f"Solo Leveling ch. 4 {tag}.cbz", BIG, b"\1")
+
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    assert _payload(existing) == b"\1" * BIG
+    assert _files(library) == [str(Path("Solo Leveling") / "Solo Leveling ch. 4.cbz")]
+    assert "HELD FOR REVIEW" not in caplog.text
+    assert not arrival.exists()
+    if mode == "resolver":
+        loser = quarantine / "Solo Leveling" / "Solo Leveling ch. 4.cbz"
+        assert _payload(loser) == b"\0" * SMALL
+    else:
+        assert _files(quarantine) == []
+
+
+@pytest.mark.parametrize("tag", ["", " (Digital)"], ids=["untagged", "digital"])
+def test_smaller_noise_tag_arrival_loses_like_an_untagged_one(env, caplog, tag):
+    """The other half of keep-the-larger: a smaller ``(Digital)`` arrival is
+    the loser, settled exactly as the untagged control beside it. The
+    existing archive is kept; the incoming one is removed in legacy mode and
+    quarantined in resolver mode. Nothing is held."""
+    incoming, library, quarantine, mode = env
+    existing = _make_cbz(library / "Solo Leveling" / "Solo Leveling ch. 4.cbz", BIG)
+    existing_bytes = existing.read_bytes()
+    arrival = incoming / "Solo Leveling"
+    _make_cbz(arrival / f"Solo Leveling ch. 4{tag}.cbz", 50, b"\1")
+
+    with caplog.at_level("INFO"):
+        watcher.process_and_move_directory(arrival)
+
+    assert existing.read_bytes() == existing_bytes
+    assert _files(library) == [str(Path("Solo Leveling") / "Solo Leveling ch. 4.cbz")]
+    assert "HELD FOR REVIEW" not in caplog.text
+    assert not arrival.exists()
+    quarantined = [p for p in quarantine.rglob("*.cbz") if p.is_file()]
+    if mode == "resolver":
+        assert [_payload(p) for p in quarantined] == [b"\1" * 50]
+    else:
+        assert quarantined == []
 
 
 def test_ordinary_same_name_higher_res_arrival_still_replaces(env, caplog):
@@ -372,7 +444,18 @@ def test_stripped_tag_arrival_with_no_collision_still_lands(env, caplog, series_
         ("Solo Leveling ch. 4 (s2)", ("(s2)",)),
         ("Solo Leveling ch. 4 (1)", ("(1)",)),
         ("Kagome Diary (Inuyasha)", ("(Inuyasha)",)),
-        ("Berserk v01 (Digital) (2019)", ("(Digital)",)),
+        ("Berserk v01 (Digital) (2019)", ()),
+        ("Solo Leveling ch. 4 (ManhwaClub)", ()),
+        ("Solo Leveling ch. 4 (Incognitymous) (Ongoing)", ()),
+        ("Solo Leveling ch. 4 (digital)", ()),
+        ("Solo Leveling ch. 4 (Asura Scans)", ()),
+        ("Solo Leveling ch. 4 (Digital) (s2)", ("(s2)",)),
+        ("Solo Leveling ch. 4 (Season 2)", ("(Season 2)",)),
+        ("Title (Parody)", ("(Parody)",)),
+        ("Title (Variant) (Alt Cover)", ("(Variant)", "(Alt Cover)")),
+        ("Title (Zorblax)", ("(Zorblax)",)),
+        ("Title (Digital-Empire)", ("(Digital-Empire)",)),
+        ("Title (Scans of Old)", ("(Scans of Old)",)),
         ("Solo Leveling ch. 4 (English)", ()),
         ("Solo Leveling ch. 4 (2019) (Colored) (Uncensored) [v2]", ()),
         ("[Circle (Artist)] Title", ()),
@@ -382,5 +465,9 @@ def test_stripped_tag_arrival_with_no_collision_still_lands(env, caplog, series_
 )
 def test_dropped_round_tags(name, tags):
     """Pinned: which stripped blocks count. Display tokens, language words
-    (hive #2646) and square-bracket blocks are not distinguishing tags."""
+    (hive #2646), square-bracket blocks and approved group, source, status
+    and scanlator noise (option (b), 2026-10-25) are not distinguishing
+    tags. A noise tag beside a listed one leaves the listed one, and a tag
+    that is only close to noise (``(Digital-Empire)``, a scan word that is
+    not the last word) is unclassified, so it counts."""
     assert cbz_core.dropped_round_tags(name) == tags
