@@ -671,3 +671,20 @@ def test_cli_output_that_appears_during_planning_is_not_overwritten(env, tmp_pat
     assert cli.main(["--library-root", str(root), "--database", str(db),
                      "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
     assert output.read_bytes() == b"foreign occupant" and "already exists" in capsys.readouterr().err
+
+
+def test_cli_exclusive_create_refuses_a_file_appearing_after_the_last_check(env, tmp_path, capsys, monkeypatch):
+    root, db, book, plan = env
+    output = tmp_path / "plan.json"
+    original_open = Path.open
+
+    def appears(path, mode="r", *args, **kwargs):
+        if path == output and mode in {"x", "w"}:
+            with original_open(output, "wb") as stream:
+                stream.write(b"late foreign occupant")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", appears)
+    assert main(["--library-root", str(root), "--database", str(db),
+                 "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+    assert output.read_bytes() == b"late foreign occupant" and capsys.readouterr().err
