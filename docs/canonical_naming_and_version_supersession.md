@@ -159,6 +159,53 @@ the season-1 name. This predates #2646; the follow-up is issue #131.
 A proposed-destination review guard in the step-8
 planner is a separate piece of work.
 
+[RESOLVED 2026-10-24, issue #131] The finding above is kept as measured. The
+watcher now holds such an arrival for review in both modes. The trigger is
+an arrival stem carrying a round-bracket tag that the display name drops
+(`cbz_core.dropped_round_tags`), whose collision key also differs from the
+display stem's. When that arrival meets an existing archive with different
+bytes (sha256), the existing archive is left untouched. The incoming archive
+stays in the import folder under its arrival name, and a `HELD FOR REVIEW`
+warning is logged. An exact duplicate is still removed, and an arrival with
+nothing to collide with still lands.
+
+The arrival name is never taken off the file while it is in the import
+folder (PR #132 review, 2026-10-25). A rename that would drop such a tag is
+deferred: `process_cbz_file` and the placeholder fallback record the display
+name but leave the file as it arrived, and the merge applies the display name
+only as the archive lands (a directory moved whole into a new series folder is
+renamed there, after the move). A hold therefore renames nothing and writes
+nothing. A failed rename, a failed comparison (held: nothing showed the two are
+the same book), a failed sibling move, a crash or a restart all leave the tag
+on disk, and the next pass holds again. An earlier draft renamed the archive on
+import and back when held, so a failed rename back let the next pass replace
+the different book, and the AI original of a held archive was offloaded
+because its pair pointed at the stripped name.
+
+Deliberately **not** held, so keep-the-larger still applies to them:
+
+- square-bracket tags, such as `[Judas]`, which the identity cleaner always
+  stripped;
+- language words such as `(English)`, the same book by David's decision
+  (hive #2646);
+- renames that only normalise, such as `ch. 4` in folder `Solo Leveling`
+  becoming `Solo Leveling Ch. 4`;
+- the layer-1 group, source and status tags, `(Digital)`, `(ManhwaClub)`,
+  `(Incognitymous)` and `(Ongoing)` in any case
+  (`cbz_core._DISPLAY_NOISE_TAGS`), and scanlator tags whose last word is a
+  scan-group word (`cbz_core._SCAN_GROUP_RE`, for example `(Asura Scans)`).
+  David chose this, option (b), on 2026-10-25, so a higher-res copy with
+  such a tag still replaces a smaller one.
+
+Everything else that is stripped is held: seasons (`(s2)`, `(Season 2)`),
+copy suffixes (`(1)`), parody, credit and variant tags (`(Inuyasha)`,
+`(Parody)`, `(Variant)`), and, failing safe, any tag not on that list,
+including near-misses such as `(Digital-Empire)`. A name with a noise tag
+and a held one, `(Digital) (s2)`, is held.
+
+Still open: a held archive can be released only by hand. Adding a tag to
+the noise list needs David's approval, as layer 1 did.
+
 **Measured against** a read-only scan of the Tower library on 2026-10-24
 (73,564 archives, 22,139 folders). The most common round tags in file names
 were:
