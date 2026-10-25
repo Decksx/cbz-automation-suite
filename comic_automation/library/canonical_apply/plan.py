@@ -4,6 +4,12 @@ A plan is one JSON object with contract ``canonical-naming-plan-v1``:
 
 ``library_root``
     The one root every path in the plan lives under.
+``database_target``
+    The identity of the database the plan was made against: its real path
+    and file identity (``st_dev``, ``st_ino``), from
+    `content_signature_recertify.file_identity`, the #117 target-binding
+    idiom. A copy, SQLite backup clone, hard link or restored file is a
+    different database and needs a new plan.
 ``quarantine_root``
     ``<library-root>\\.cbz-canonical-quarantine\\<YYYY-MM-DD>``: the dated,
     same-volume quarantine directory (§5.4, "Volumes and quarantine").
@@ -229,6 +235,10 @@ class Plan:
     conflicts: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
+    def database_target(self) -> Mapping[str, Any]:
+        return self.document["database_target"]
+
+    @property
     def units(self) -> tuple[FamilyUnit | RenameUnit, ...]:
         return self.families + self.renames
 
@@ -296,19 +306,22 @@ def build_plan(
     *,
     library_root: str,
     quarantine_root: str,
+    database: str | Path,
     renames: Sequence[RenameSpec] = (),
     families: Sequence[FamilySpec] = (),
     review: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Assemble a plan document and seal it with its digest.
 
-    Pure: reads nothing. The caller supplies strong identities computed at
-    plan time (`family_spec_from_evaluation` does so from step-5 output).
+    Reads only the file identity of ``database``, which binds the plan to
+    that database. The caller supplies strong identities computed at plan
+    time (`family_spec_from_evaluation` does so from step-5 output).
     The result is validated by the same `parse_plan` that `apply` uses.
     """
     document: dict[str, Any] = {
         "contract": PLAN_CONTRACT,
         "library_root": library_root,
+        "database_target": database_target(database),
         "quarantine_root": quarantine_root,
         "renames": [
             {
@@ -414,6 +427,19 @@ def family_spec_from_evaluation(
         accept_comicinfo_drop=accept_comicinfo_drop,
         snapshot=dict(folder.snapshot),
     )
+
+
+def database_target(database: str | Path) -> dict[str, Any]:
+    """The #117 file identity of ``database``; `PlanError` if it has none."""
+    from comic_automation.archive.content_signature_recertify import (
+        PlanRefusedError,
+        file_identity,
+    )
+
+    try:
+        return file_identity(database)
+    except PlanRefusedError as exc:
+        raise PlanError(str(exc)) from exc
 
 
 def _counts(document: Mapping[str, Any]) -> dict[str, int]:
@@ -543,6 +569,15 @@ def parse_plan(document: Any) -> Plan:
     _require(document.get("counts") == _counts(document), "plan counts do not match its contents")
 
     root = _path(document.get("library_root"), "library_root")
+    target = document.get("database_target")
+    _require(
+        isinstance(target, dict)
+        and set(target) == {"path", "st_dev", "st_ino"}
+        and isinstance(target["path"], str) and bool(target["path"])
+        and all(isinstance(target[k], int) and not isinstance(target[k], bool) for k in ("st_dev", "st_ino"))
+        and target["st_ino"] != 0,
+        "database_target must be a file identity {path, st_dev, st_ino}",
+    )
     quarantine_root = _path(document.get("quarantine_root"), "quarantine_root")
     _require(
         _norm(os.path.dirname(quarantine_root)) == _norm(os.path.join(root, QUARANTINE_DIRNAME))
