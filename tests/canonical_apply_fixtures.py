@@ -166,10 +166,11 @@ class Env:
             keeper_action_id=None if rename_to is None else f"{family_id}:keeper",
         )
 
-    def plan(self, renames=(), families=(), review=()) -> dict[str, Any]:
+    def plan(self, renames=(), families=(), review=(), database=None) -> dict[str, Any]:
         return build_plan(
             library_root=str(self.root),
             quarantine_root=self.quarantine_root,
+            database=self.database if database is None else database,
             renames=renames,
             families=families,
             review=review,
