@@ -74,6 +74,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from comic_automation.archive.content_signature_recertify import (
+    PlanRefusedError,
+    file_identity,
+)
 from comic_automation.archive.supersession import (
     OUTCOME_SUPERSEDED,
     DerivedArchive,
@@ -81,6 +85,11 @@ from comic_automation.archive.supersession import (
     derive_archive,
 )
 from comic_automation.library.canonical_apply import journal as jn
+from comic_automation.library.canonical_apply.containment import (
+    ContainmentError,
+    require_contained,
+    same_root,
+)
 from comic_automation.library.canonical_apply.markers import (
     DatabaseView,
     MarkerError,
@@ -99,6 +108,8 @@ from comic_automation.library.canonical_apply.plan import (
 )
 from comic_automation.library.canonical_apply.scope_lock import (
     ScopeLock,
+    lock_path,
+    owner_path,
     require_windows,
 )
 
@@ -382,7 +393,12 @@ class _Run:
 
     def view(self, actions: Sequence[Action], locations: Sequence[int] = ()) -> DatabaseView:
         """One guarded snapshot: this attempt's markers, the actions' rows,
-        and any further ``locations`` (a keeper that is not renamed)."""
+        and any further ``locations`` (a keeper that is not renamed).
+
+        The database's identity is re-verified every time a connection is
+        opened, so a file swapped in under the same path is never read as
+        the approved catalog."""
+        _verify_database(self.plan, self.database)
         refs: list[PairingRef] = [p for a in actions for p in a.pairings]
         return read_view(
             self.database,
@@ -418,6 +434,15 @@ class _Run:
     def _context(self, action: Action, step: Step) -> dict[str, Any]:
         return {"attempt_id": self.attempt_id, "action_id": action.action_id, **step.as_dict()}
 
+    def containment_problem(self, step: Step) -> str | None:
+        """Why either end of ``step`` is not physically under the root."""
+        for path in (step.source, step.destination):
+            try:
+                require_contained(str(self.library_root), path)
+            except ContainmentError as exc:
+                return str(exc)
+        return None
+
     def run_step(self, action: Action, step: Step, *, intent_exists: bool = False) -> None:
         """The five-part step protocol for one filesystem step.
 
@@ -426,6 +451,11 @@ class _Run:
         it was validated against the plan-derived step.
         """
         context = self._context(action, step)
+        containment = self.containment_problem(step)
+        if containment is not None:
+            if intent_exists:
+                raise RunStopped(f"{action.action_id}: {containment}")
+            raise Refused(f"{action.action_id}: {containment}")
         problem = _identity_problem(step.source, action.sha256)
         if problem is not None:
             if intent_exists:
@@ -452,6 +482,12 @@ class _Run:
         problem = _identity_problem(step.source, action.sha256)
         if problem is not None:
             raise RunStopped(f"{action.action_id}: source changed after intent: {problem}")
+        # And containment, at the last moment before the rename: a junction
+        # introduced since the run's initial check (during a wait, say)
+        # must still refuse before anything moves.
+        containment = self.containment_problem(step)
+        if containment is not None:
+            raise RunStopped(f"{action.action_id}: {containment}; intent written, nothing moved")
         try:
             os.rename(step.source, step.destination)
         except OSError as exc:
@@ -473,6 +509,12 @@ class _Run:
 
         def revalidate() -> None:
             self.fault("after_db_lock", context)
+            # Under the write lock: the file this connection writes is
+            # still the database the plan is bound to.
+            try:
+                _verify_database(self.plan, self.database)
+            except Refused as exc:
+                raise StepRefused(str(exc)) from exc
             problem = _identity_problem(step.destination, action.sha256)
             if problem is not None:
                 raise StepRefused(f"destination drifted under the write lock: {problem}")
@@ -794,7 +836,14 @@ def _run_family(run: _Run, unit: FamilyUnit) -> str:
         problem = _relation_problem(unit, dependant, older, keeper)
         if problem is not None:
             raise _Blocked(problem)
-        os.makedirs(os.path.dirname(dependant.action.destination), exist_ok=True)
+        quarantine_dir = os.path.dirname(dependant.action.destination)
+        try:
+            # Before the directory is created: makedirs through a junction
+            # would already write outside the library.
+            require_contained(str(run.library_root), quarantine_dir)
+        except ContainmentError as exc:
+            raise _Blocked(f"quarantine directory: {exc}") from exc
+        os.makedirs(quarantine_dir, exist_ok=True)
         _continue_action(run, dependant.action, state)
         run.fault("after_dependant", {"unit_id": unit.unit_id, "action_id": dependant.action.action_id})
     return UNIT_COMPLETED
@@ -876,6 +925,83 @@ def _run_units(
 # --- public entry points -------------------------------------------------------------
 
 
+def _bind_root(plan: Plan, library_root: str | Path) -> Path:
+    """The plan's own root, provided ``library_root`` is physically the same.
+
+    Every entry point acts on the plan's paths, so the lock, journal and
+    quiescence check must be the plan root's too. A caller-supplied root
+    that differs is refused here, before any lock, journal or owner file is
+    touched under either root (PR #128 review).
+    """
+    if not same_root(str(library_root), plan.library_root):
+        raise Refused(
+            f"library_root {library_root} is not the plan's library root "
+            f"{plan.library_root}; refusing before any lock or journal is touched"
+        )
+    return Path(plan.library_root)
+
+
+def _verify_database(plan: Plan, database: str | Path) -> None:
+    """Refuse unless ``database`` is the file the plan was made against.
+
+    The #117 target binding (`content_signature_recertify.file_identity`):
+    the same real path *and* file identity. A backup clone, copy, hard link
+    or restored file differs and needs a new plan.
+    """
+    try:
+        actual = file_identity(database)
+    except PlanRefusedError as exc:
+        raise Refused(f"database target: {exc}") from exc
+    if actual != dict(plan.database_target):
+        raise Refused(
+            f"database {database} ({actual}) is not the database this plan is "
+            f"bound to ({dict(plan.database_target)}); a copy, clone or "
+            "restored file needs a new plan"
+        )
+
+
+def _contain(root: Path, path: str, label: str) -> None:
+    try:
+        require_contained(str(root), path)
+    except ContainmentError as exc:
+        raise Refused(f"{label}: {exc}") from exc
+
+
+def _check_state_paths(root: Path, plan: Plan) -> None:
+    """Lock, owner file, journal directory and quarantine root, physically."""
+    for path in (
+        lock_path(root),
+        owner_path(root),
+        root / jn.JOURNAL_DIRNAME,
+        jn.attempts_dir(root),
+        Path(plan.quarantine_root),
+    ):
+        _contain(root, str(path), "canonical-naming state")
+
+
+def _check_chains(root: Path, chains: Mapping[str, Sequence[Step]]) -> None:
+    """Every step's source and destination, temporary names included."""
+    for action_id, steps in chains.items():
+        for step in steps:
+            _contain(root, step.source, f"{action_id} step {step.index} source")
+            _contain(root, step.destination, f"{action_id} step {step.index} destination")
+
+
+def _check_header_root(header: Mapping[str, Any], plan: Plan, attempt_id: str) -> None:
+    """The journal must have been written for the plan's root and database."""
+    if header.get("database_target") != dict(plan.database_target):
+        raise Refused(
+            f"attempt {attempt_id} was journalled for database "
+            f"{header.get('database_target')!r}, not the plan's {dict(plan.database_target)}"
+        )
+    recorded = str(header.get("library_root") or "")
+    if os.path.normcase(os.path.normpath(recorded)) != os.path.normcase(plan.library_root):
+        raise Refused(
+            f"attempt {attempt_id} was journalled for library root {recorded!r}, "
+            f"not the plan's {plan.library_root}"
+        )
+
+
 def _new_attempt_id() -> str:
     return uuid.uuid4().hex
 
@@ -902,12 +1028,15 @@ def apply(
     and refuses if any action is refused by it.
     """
     require_windows()
-    root = Path(library_root)
+    root = _bind_root(plan, library_root)
+    _verify_database(plan, database)
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     attempt = resume_attempt or attempt_id or _new_attempt_id()
+    _check_state_paths(root, plan)
+    _check_chains(root, {a.action_id: a.steps(attempt) for a in plan.actions.values()})
     with ScopeLock(root, attempt, "apply"):
         _check_quiescent(quiescence, root)
         run = _Run(
@@ -921,12 +1050,16 @@ def apply(
             run.view([])  # schema present and the database readable
             run.writer = jn.JournalWriter.create(
                 root, attempt,
-                {"mode": jn.MODE_APPLY, "plan_digest": plan.digest, "library_root": str(root), "pid": os.getpid()},
+                {
+                    "mode": jn.MODE_APPLY, "plan_digest": plan.digest, "library_root": str(root),
+                    "database_target": dict(plan.database_target), "pid": os.getpid(),
+                },
             )
         else:
             header = _header(root, resume_attempt)
             if header.get("mode") != jn.MODE_APPLY or header.get("plan_digest") != plan.digest:
                 raise Refused(f"attempt {resume_attempt} is not an apply of plan {plan.digest}")
+            _check_header_root(header, plan, resume_attempt)
             unfinished = _unfinished_attempts(root, exclude=resume_attempt)
             if unfinished:
                 raise Refused(f"other attempts are unfinished: {unfinished}")
@@ -978,6 +1111,7 @@ def _attempt_run(plan: Plan, root: Path, database: Path, attempt_id: str, regist
     header = _header(root, attempt_id)
     if header.get("plan_digest") != plan.digest:
         raise Refused(f"attempt {attempt_id} belongs to plan {header.get('plan_digest')}, not {plan.digest}")
+    _check_header_root(header, plan, attempt_id)
     actions = plan.actions
     if header.get("mode") == jn.MODE_APPLY:
         chains = {a.action_id: a.steps(attempt_id) for a in actions.values()}
@@ -991,6 +1125,7 @@ def _attempt_run(plan: Plan, root: Path, database: Path, attempt_id: str, regist
         }
     else:
         raise Refused(f"attempt {attempt_id} has unknown mode {header.get('mode')!r}")
+    _check_chains(root, chains)
     return _Run(plan, root, database, attempt_id, registry, fault, chains, selected), header
 
 
@@ -1013,9 +1148,11 @@ def recover(
     at most one record.
     """
     require_windows()
-    root = Path(library_root)
+    root = _bind_root(plan, library_root)
+    _verify_database(plan, database)
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
+    _check_state_paths(root, plan)
     with ScopeLock(root, attempt_id, "recover"):
         _check_quiescent(quiescence, root)
         run, header = _attempt_run(plan, root, Path(database), attempt_id, registry, fault)
@@ -1050,10 +1187,12 @@ def undo(
     latest first.
     """
     require_windows()
-    root = Path(library_root)
+    root = _bind_root(plan, library_root)
+    _verify_database(plan, database)
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
     attempt = resume_attempt or attempt_id or _new_attempt_id()
+    _check_state_paths(root, plan)
     with ScopeLock(root, attempt, "undo"):
         _check_quiescent(quiescence, root)
         forward_run, forward_header = _attempt_run(plan, root, Path(database), forward_attempt, registry, fault)
@@ -1094,6 +1233,7 @@ def undo(
                 root, attempt,
                 {
                     "mode": jn.MODE_UNDO, "plan_digest": plan.digest, "library_root": str(root),
+                    "database_target": dict(plan.database_target),
                     "forward_attempt_id": forward_attempt, "action_ids": ordered, "pid": os.getpid(),
                 },
             )
