@@ -818,6 +818,43 @@ review.
     through an injected derivation, and it is tested that way. Phase 3
     re-validates the keeper's `file_locations` row as well as its bytes
     before every quarantine.
+21. **Physical containment (PR #128 review).** The plan's path checks are
+    lexical, and a junction can defeat them while every string still
+    looks contained. So the executor checks physical containment
+    (`containment.require_contained`) for:
+    - every source, destination and temporary name;
+    - the quarantine root;
+    - the run state: the lock, the owner file and the journal directory.
+
+    The check refuses a reparse point (junction, symlink or any
+    `FILE_ATTRIBUTE_REPARSE_POINT`) on any existing component below the
+    root, and refuses a target whose `realpath` is outside the root's.
+    - The root itself may be a mapping or a share. Only what lies below it
+      is constrained.
+    - **When it runs:** for the whole run before the lock, again before
+      each step's intent, again immediately before each `os.rename`, and
+      before the quarantine directory is created.
+    - **The remaining window** is between that last check and the rename.
+      Closing it would need handle-relative renames, which this prototype
+      does not do.
+    - **UNC roots** are handled by the pure helper: shares are drives, and
+      case is ignored. That is unit-tested on UNC-shaped strings with
+      injected filesystem calls. **No SMB target has been measured.**
+22. **Root binding.** `apply`, `recover` and `undo` act on the plan's root
+    only. A `library_root` argument that does not resolve to the same
+    physical directory is refused before any lock, owner file or journal is
+    touched under either root. A journal header written for another root
+    is refused too.
+23. **Database binding.** This reuses #117's
+    `content_signature_recertify.file_identity` (real path, `st_dev`,
+    `st_ino`).
+    - The plan records the identity as `database_target`, and every
+      attempt header records it too.
+    - It is verified at entry before the lock, every time a read
+      connection is opened, and under the write lock before the
+      conditional updates.
+    - A backup clone, a copy, a hard link or a restored file is a
+      different database, and needs a new plan.
 
 ## 7. Named tests (for the implementation PRs)
 
