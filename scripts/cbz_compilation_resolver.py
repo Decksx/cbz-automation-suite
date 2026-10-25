@@ -20,6 +20,14 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 
+# cbz_core's number-token validator (#120, #126), imported rather than
+# re-derived so a chapter number means the same thing here as in the watcher
+# and the sanitizer.
+try:
+    from scripts.cbz_core import _num_field
+except ModuleNotFoundError:  # run from inside scripts/ without the package
+    from cbz_core import _num_field  # type: ignore[no-redef]
+
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
@@ -136,17 +144,33 @@ def _fmt_num(n: float) -> str:
     return str(int(n)) if n == int(n) else str(n)
 
 def extract_chapter_number(stem: str) -> str | None:
+    """Canonical chapter text in *stem*, or None.
+
+    The regex captures any digit-and-dot run, so the token can be malformed
+    (``ch. 1.2.3``, ``ch. 1..``). That gives None -- the file is simply not
+    an individual chapter -- instead of a ValueError out of scan_directory
+    that abandoned the whole series directory (#120 follow-up).
+    """
     m = _CHAPTER_NUMBER_RE.search(stem)
     if m:
         val = next(g for g in m.groups() if g is not None)
-        n = float(val)
-        return str(int(n)) if n == int(n) else str(n)
+        return _num_field(val)
     return None
 
 def extract_compilation_range(stem: str) -> tuple[float, float] | None:
+    """(start, end) of a ``ch. A-B`` compilation in *stem*, or None.
+
+    Either endpoint malformed gives None, so the file is not treated as a
+    compilation. That includes a run long enough to overflow: float() made
+    it inf, and CompilationArchive.chapter_range then counted towards inf
+    forever.
+    """
     m = _COMPILATION_RE.search(stem)
     if m:
-        return float(m.group(1)), float(m.group(2))
+        start, end = _num_field(m.group(1)), _num_field(m.group(2))
+        if start is None or end is None:
+            return None
+        return float(start), float(end)
     return None
 
 def _is_image(entry_name: str) -> bool:
