@@ -188,6 +188,74 @@ def test_originals_root_is_refused_before_any_archive_is_derived(env, monkeypatc
         cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
 
 
+def test_nested_originals_are_excluded_before_descent_or_archive_reads(env, monkeypatch):
+    root, db, book, plan = env
+    original = book(folder="nested/ai-decensor-originals/Series")
+    before = original.read_bytes()
+    source = book()
+    derive = cp.sv.derive_archive
+    seen = []
+
+    def guarded(path, **kwargs):
+        assert "ai-decensor-originals" not in Path(path).parts
+        seen.append(path)
+        return derive(path, **kwargs)
+
+    monkeypatch.setattr(cp.sv, "derive_archive", guarded)
+    report = plan()
+    assert seen == [source] and len(report["renames"]) == 1
+    assert original.read_bytes() == before
+    assert {"path": str(Path("nested/ai-decensor-originals")),
+            "reason": "protected decensor originals"} in report["provenance"]["excluded"]
+
+
+@pytest.mark.parametrize("metadata", [
+    "<Tags>uncensored, camelia:black_bars</Tags>",
+    "<Tags>uncensored, black_bars</Tags>",
+    "<Title>Uncensored</Title>",
+    "<Tags>camelia:white_bars</Tags>",
+    "<Tags>Uncen</Tags>",
+    "<Title>Decensor</Title>",
+    '<c:Tags xmlns:c="urn:test">uncensored</c:Tags>',
+])
+def test_in_place_camelia_metadata_holds_a_book_with_an_unmarked_filename(env, metadata):
+    root, db, book, plan = env
+    source = book(ci=("<ComicInfo><Series>Series</Series><Number>7</Number>"
+                      + metadata + "</ComicInfo>").encode())
+    before = source.read_bytes()
+    report = plan()
+    assert report["renames"] == report["families"] == []
+    assert "decensor identity/pairing adapter required (ComicInfo" in str(report["review"])
+    assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("folder", ["AI Decensor", "Decensor", "Uncen", "Uncensor", "Series_Decensored"])
+def test_decensor_stem_spellings_are_held(env, folder):
+    root, db, book, plan = env
+    book(folder=folder)
+    report = plan()
+    assert report["renames"] == report["families"] == [] and report["review"]
+
+
+def test_per_member_decensor_problems_block_the_entire_supersession_family(env):
+    root, db, book, plan = env
+    book("Series ch. 1 v1.cbz", number="1", folder="Decensored")
+    book("Series ch. 1 v2.cbz", number="1", folder="Decensored", pages=(b"a", b"b"))
+    report = plan()
+    assert report["families"] == report["renames"] == []
+    assert report["counts"]["quarantines"] == 0 and report["review"]
+
+
+def test_catalog_spelling_must_equal_the_path_the_executor_will_compare(env):
+    root, db, book, plan = env
+    source = book()
+    with database_connection(db) as connection:
+        connection.execute("UPDATE file_locations SET path=?", (str(source).upper(),))
+    report = plan()
+    assert not report["renames"]
+    assert "catalog path spelling differs" in str(report["review"])
+
+
 @pytest.mark.parametrize("marker", ["root", "comicinfo"])
 def test_decensor_identity_in_root_or_comicinfo_alone_is_preserved(env, marker):
     root, db, book, plan = env
@@ -278,6 +346,36 @@ def test_quarantine_through_a_real_junction_is_not_proposed(env, tmp_path):
     assert list(outside.iterdir()) == []
 
 
+def test_a_junction_back_inside_the_library_still_blocks_a_family(env):
+    root, db, book, plan = env
+    book("Series ch. 1 v1.cbz", number="1")
+    book("Series ch. 1 v2.cbz", number="1", pages=(b"a", b"b"))
+    target = root / "holding"
+    target.mkdir()
+    junction = root / ".cbz-canonical-quarantine"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+                       check=True, capture_output=True)
+    else:
+        junction.symlink_to(target, target_is_directory=True)
+    report = plan()
+    assert not report["families"] and report["review"]
+    assert list(target.iterdir()) == []
+
+
+def test_an_occupied_quarantine_destination_in_the_excluded_tree_blocks_the_family(env):
+    root, db, book, plan = env
+    book("Series ch. 1 v1.cbz", number="1")
+    book("Series ch. 1 v2.cbz", number="1", pages=(b"a", b"b"))
+    first = plan()
+    destination = Path(first["families"][0]["dependants"][0]["quarantine_to"])
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"foreign occupant")
+    report = plan()
+    assert not report["families"] and report["review"]
+    assert destination.read_bytes() == b"foreign occupant"
+
+
 def test_case_only_rename_remains_a_proposal_for_the_executor(env):
     root, db, book, plan = env
     book("SERIES CH. 7.cbz")
@@ -321,6 +419,19 @@ def test_a_real_unresolved_version_marker_beside_a_volume_is_still_held(env):
     book("Series v1 [v2].cbz", ci=b"<ComicInfo><Series>Series</Series><Volume>1</Volume></ComicInfo>")
     report = plan()
     assert not report["renames"] and not report["families"] and report["review"]
+
+
+def test_an_applied_volume_name_replans_as_unchanged(env):
+    root, db, book, plan = env
+    source = book("Series Vol. 2 Ch. 12.cbz", ci=b"<ComicInfo><Series>Series</Series><Volume>2</Volume><Number>12</Number></ComicInfo>")
+    first = plan()
+    destination = Path(first["renames"][0]["destination"])
+    source.rename(destination)
+    with database_connection(db) as connection:
+        connection.execute("UPDATE file_locations SET path=? WHERE path=?", (str(destination), str(source)))
+    second = plan()
+    assert not second["renames"] and not second["review"]
+    assert second["unchanged"][0]["path"] == str(destination)
 
 
 def test_an_already_canonical_archive_is_unchanged(env):
@@ -445,3 +556,43 @@ def test_cli_unexpected_failure_never_masquerades_as_a_complete_review_plan(env,
                      "--quarantine-date", "2026-10-24"]) == 2
     streams = capsys.readouterr()
     assert not streams.out and "injected evaluation failure" in streams.err
+
+
+def test_cli_output_is_new_utf8_json_that_the_executor_can_read(env, tmp_path, capsys):
+    root, db, book, plan = env
+    book(series="作品")
+    output = tmp_path / "plan.json"
+    args = ["--library-root", str(root), "--database", str(db),
+            "--quarantine-date", "2026-10-24", "--output", str(output)]
+    assert main(args) == 0
+    data = output.read_bytes()
+    assert data.startswith(b"{") and "作品" in data.decode("utf-8")
+    report = json.loads(data.decode("utf-8"))
+    assert json.loads(capsys.readouterr().out)["plan_digest"] == report["plan_digest"]
+    assert main(args) == 2
+    assert output.read_bytes() == data and "already exists" in capsys.readouterr().err
+
+
+def test_cli_never_writes_a_plan_into_the_library(env, capsys):
+    root, db, book, plan = env
+    output = root / "plan.json"
+    assert main(["--library-root", str(root), "--database", str(db),
+                 "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+    assert not output.exists() and "outside the library" in capsys.readouterr().err
+
+
+def test_cli_output_that_appears_during_planning_is_not_overwritten(env, tmp_path, capsys, monkeypatch):
+    from scripts import cbz_canonical_plan as cli
+    root, db, book, plan = env
+    output = tmp_path / "plan.json"
+    original = cli.build_plan
+
+    def appears(*args, **kwargs):
+        result = original(*args, **kwargs)
+        output.write_bytes(b"foreign occupant")
+        return result
+
+    monkeypatch.setattr(cli, "build_plan", appears)
+    assert cli.main(["--library-root", str(root), "--database", str(db),
+                     "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+    assert output.read_bytes() == b"foreign occupant" and "already exists" in capsys.readouterr().err
