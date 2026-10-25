@@ -1,6 +1,6 @@
 """Read-only canonical naming planner (#112 step 8).
 
-Emits ``canonical-naming-plan-v1`` without importing the unmerged step-7
+Emits ``canonical-naming-plan-v1`` without importing the step-7
 executor. Root inventory, catalog mapping, step-4 field resolution and step-5
 byte-bound supersession are covered by one outer WAL-aware read window. The
 filesystem is observed, not locked: apply must still revalidate every hash.
@@ -220,6 +220,46 @@ def _lone_canonical_unchanged(resolution: fr.ArchiveResolution) -> bool:
         return False
 
 
+def _identity_group_key(resolution: fr.ArchiveResolution) -> tuple | None:
+    """The decided work candidate group, never the containing directory.
+
+    Like step 4, a known primary number groups candidates before edition or
+    version evidence is judged. Volume is primary only when no number was
+    offered. This key grants no family or version authority.
+    """
+    fields = resolution.fields
+    primary = fields["number"] if fields["number"].has_evidence else fields["volume"]
+    if not fields["series"].resolved or not primary.resolved:
+        return None
+    return (fr.series_key(fields["series"].value), primary.field, primary.value)
+
+
+def _fixpoint_problems(facts: list[fr.ArchiveFacts], destinations: dict[str, str]) -> dict[str, str]:
+    """Reject proposals that fail resolution under their proposed names.
+
+    Reuse the same ComicInfo and byte-bound page facts, with all offered
+    names substituted together so sibling evidence sees the proposed state.
+    This second resolution may only reject an original proposal; its new
+    filename evidence never authorizes an action or supplies a missing field.
+    Families later inherit every member's refusal before any quarantine.
+    """
+    proposed = tuple(replace(fact, filename=Path(destinations[fact.archive_key]).name)
+                     if fact.archive_key in destinations else fact for fact in facts)
+    resolved = fr.resolve_folder(fr.FolderFacts(None, proposed)).by_key()
+    problems = {}
+    for fact in facts:
+        destination = destinations.get(fact.archive_key)
+        if destination is None or Path(destination).name == fact.filename:
+            continue
+        try:
+            again = _destination(resolved[fact.archive_key])
+            if again != Path(destination).name:
+                raise PlanningRefused(f"would become {again!r}")
+        except (PlanningRefused, CanonicalNameError) as exc:
+            problems[fact.archive_key] = f"proposed name is not a resolution fixpoint: {exc}"
+    return problems
+
+
 def _counts(doc: dict) -> dict[str, int]:
     return {
         "renames": len(doc["renames"]), "families": len(doc["families"]),
@@ -294,6 +334,10 @@ def build_plan(
         raise PlanningRefused(f"library root is not a directory: {root}")
     if any(part.casefold() == "ai-decensor-originals" for part in (*root.parts, *root.resolve().parts)):
         raise PlanningRefused("ai-decensor-originals is preserved and outside planner scope")
+    # Even mode=ro SQLite may create WAL/SHM sidecars. Refuse before the
+    # first database open, including an external alias into the library.
+    if _under(Path(database).resolve(), root.resolve()):
+        raise PlanningRefused("database must be outside the library")
     temporary = Path(temp_dir if temp_dir is not None else tempfile.gettempdir()).resolve(strict=True)
     if not temporary.is_dir() or _under(temporary, root.resolve(strict=True)):
         raise PlanningRefused("private temporary copies must be outside the library")
@@ -355,6 +399,7 @@ def build_plan(
                     fr.comicinfo_facts(bound.comicinfo_documents), bound.page_evidence()))
             resolved = fr.resolve_folder(fr.FolderFacts(None, tuple(facts)))
             resolutions = resolved.by_key()
+            group_sizes = Counter(_identity_group_key(item) for item in resolutions.values())
             reasons, destinations, unverified_noops = {}, {}, set()
             for path in paths:
                 key = str(path)
@@ -370,13 +415,17 @@ def build_plan(
                 try:
                     destinations[key] = str(path.with_name(_destination(resolutions[key])))
                 except (PlanningRefused, CanonicalNameError) as exc:
-                    if (not problems and len(paths) == 1 and occupied[_key(path)] == 1
+                    if (not problems and _identity_group_key(resolutions[key]) is not None
+                            and group_sizes[_identity_group_key(resolutions[key])] == 1
+                            and occupied[_key(path)] == 1
                             and _lone_canonical_unchanged(resolutions[key])):
                         unverified_noops.add(key)
                         destinations[key] = key
                     else:
                         problems.append(str(exc))
                 reasons[key] = problems
+            for key, problem in _fixpoint_problems(facts, destinations).items():
+                reasons[key].append(problem)
             claimed = set()
             for family in resolved.families:
                 members = sorted(family.members)
