@@ -893,7 +893,7 @@ def test_a_gap_or_receipt_beyond_the_frontier_refuses(env):
 
     def journal_with(entries, **override):
         path.unlink()
-        writer = jn.JournalWriter.create(env.root, attempt, {k: header[k] for k in ("mode", "plan_digest", "library_root")})
+        writer = jn.JournalWriter.create(env.root, attempt, {k: header[k] for k in ("mode", "plan_digest", "library_root", "database_target")})
         for kind, number in entries:
             step = steps[number - 1]
             writer.append(kind, {
@@ -1344,3 +1344,20 @@ def test_a_held_scope_lock_is_refused_at_once_never_waited_for(env):
         with pytest.raises(scope_lock.ScopeLockHeld, match="refusing rather than waiting"):
             scope_lock.ScopeLock(env.root, "second", "recover").acquire()
         assert time.monotonic() - started < 2.0
+
+
+def test_a_moved_keeper_row_blocks_a_keeper_rename_before_it_happens(env):
+    """Phase 1 checks the keeper's row before phase 2 renames it (mutant:
+    phase 1 keeper row check removed -- phase 3 would still block the
+    quarantines, but only after the keeper's rename had moved the file and
+    its conditional database update had stopped the run)."""
+    spec, keeper, deps, renamed = _family(env, rename=True)
+    document = env.plan(families=[spec])
+    env.execute("UPDATE file_locations SET path = 'elsewhere' WHERE id = ?", (spec.keeper.location_id,))
+
+    report = env.apply(document)
+
+    assert unit_status(report, "fam1") == executor.UNIT_BLOCKED
+    assert report.stopped is None
+    assert keeper.exists() and not renamed.exists()
+    assert env.step_journal(report.attempt_id) == []
