@@ -49,6 +49,9 @@ expensive over SMB; it does not use cached hashes as proof.
   The exception is a bare `vN` already explicitly classified as version:
   step 4 retains its filename-grade volume candidate; that candidate is
   not a second unresolved volume. Genuine volume evidence still governs.
+  Symmetrically, a bare `vN` conclusively classified as volume does not
+  retain a phantom unresolved version. Explicit bracketed version markers
+  and genuine unresolved version evidence still block.
 - Only established, byte-proved strict-prefix families with a unique
   keeper and its own resolved version label become family units. Failed
   families are held as units, never degraded into independent renames.
@@ -56,7 +59,8 @@ expensive over SMB; it does not use cached hashes as proof.
   ordinary rename candidates. Volume-classified bare `vN` alone does not
   make a version family.
 - Decensor markers in the root name, relative paths or resolved series
-  are held until a stable pairing adapter exists. A root inside a directory
+  (including underscore-delimited markers) are held until a stable pairing
+  adapter exists. A root inside a directory
   named `ai-decensor-originals` is refused before archive derivation.
   No F: originals are scanned, paired, renamed or superseded.
   The emitted pairing lists are empty; this slice does not invent a
@@ -69,7 +73,9 @@ expensive over SMB; it does not use cached hashes as proof.
   and observed occupants, including directories and uncatalogued files.
   An identical foreign file still blocks. A collision holds every affected
   unit, including the whole family. Case-only ordinary renames are left
-  for the executor's two-step protocol. Existing reparse components in
+  for the executor's two-step protocol, using Windows path comparison even
+  on POSIX hosts; casefold equivalence alone does not grant that exception.
+  Existing reparse components in
   proposed destinations, including excluded quarantine trees, block.
 
 ## Consistency and approval
