@@ -224,6 +224,8 @@ def build_plan(
     root = Path(os.path.abspath(library_root))
     if not root.is_dir():
         raise PlanningRefused(f"library root is not a directory: {root}")
+    if any(part.casefold() == "ai-decensor-originals" for part in root.resolve().parts):
+        raise PlanningRefused("ai-decensor-originals is preserved and outside planner scope")
     temporary = Path(temp_dir if temp_dir is not None else tempfile.gettempdir()).resolve(strict=True)
     if not temporary.is_dir() or _under(temporary, root.resolve(strict=True)):
         raise PlanningRefused("private temporary copies must be outside the library")
@@ -290,7 +292,8 @@ def build_plan(
                     problems.append(mapping_problems[key])
                 if derived[key].unresolved_reason:
                     problems.append(derived[key].unresolved_reason)
-                if _DECENSOR.search(str(path.relative_to(root))):
+                series = resolutions[key].fields["series"].value or ""
+                if _DECENSOR.search(" ".join((root.name, str(path.relative_to(root)), series))):
                     problems.append("decensor identity/pairing adapter required")
                 try:
                     destinations[key] = str(path.with_name(_destination(resolutions[key])))
