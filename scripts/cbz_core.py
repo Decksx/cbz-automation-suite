@@ -891,6 +891,43 @@ def display_tokens_for(core: str, source: str) -> DisplayTokens:
     )
 
 
+def dropped_round_tags(source: str) -> tuple[str, ...]:
+    """The round-bracket tags of *source* that the display name drops and
+    that may be what tells one book from another (issue #131).
+
+    A tag is listed when it is a round-bracket block that holds a word, is
+    not a display token (:func:`extract_display_tokens` keeps it as
+    nothing) and is not a language word (``_DISPLAY_LANGUAGE_WORDS``):
+    ``(s2)``, ``(1)``, ``(Inuyasha)``, ``(Digital)``, ``(ManhwaClub)``. The
+    watcher reads this to tell a merge collision that exists only because
+    the tag was stripped, where keeping the larger file could replace a
+    different book, from an ordinary same-name arrival.
+
+    Deliberately not listed:
+
+    * Square-bracket blocks. They held scanlator and circle tags long
+      before design §5.5 (the identity cleaner has always stripped them),
+      and the keep-the-larger merge has been relied on for those; a round
+      block inside one, ``[Circle (Artist)]``, belongs to the square block,
+      as ``_BRACKET_RE`` matches it.
+    * Language words: David decided (hive #2646) that ``(English)`` names
+      the same book as the bare name, so such an arrival still meets and
+      may replace its copy.
+    """
+    tags: list[str] = []
+    for match in _BRACKET_RE.finditer(source):
+        block = match.group(0)
+        inner = block[1:-1].strip()
+        if block[0] != "(" or not re.search(r"\w", inner):
+            continue
+        if inner.casefold() in _DISPLAY_LANGUAGE_WORDS:
+            continue
+        if extract_display_tokens(block) != DisplayTokens():
+            continue
+        tags.append(block)
+    return tuple(tags)
+
+
 def decensor_tokens_as_words(text: str) -> str:
     """Rewrite ``(Uncensored)``/``(Decensored)`` tokens as the bare words.
 
