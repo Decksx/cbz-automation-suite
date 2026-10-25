@@ -855,6 +855,45 @@ review.
       conditional updates.
     - A backup clone, a copy, a hard link or a restored file is a
       different database, and needs a new plan.
+24. **Attempt ids and the journal leaf (PR #128 re-review).**
+    - **One grammar for every attempt id:**
+      `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`, which matches what
+      `executor._new_attempt_id` generates.
+    - **Where it applies:** ids supplied to `apply`, `recover` and
+      `undo` (including the CLI's `--resume`, `--attempt` and
+      `--forward-attempt`), and ids read from a header, such as an
+      undo's forward attempt.
+    - **When it is checked:** before any filesystem access, and again
+      inside `journal.journal_path`, so no caller can build an
+      unvalidated journal path.
+    - **Header action ids** must be actions of the plan.
+    - **Unknown files block new attempts.** `list_attempts` returns only
+      names in the grammar. Any other file in the attempts directory
+      counts as unfinished and blocks new attempts.
+    - **Run state is re-checked after every wait.** That covers the
+      journal leaf path itself, the journal directory, the owner file,
+      the lock and the quarantine root. The re-check runs:
+      - after the quiescence wait;
+      - immediately before a journal is created or opened, and before
+        every journal read;
+      - after each unit gate, where a failure stops the run;
+      - under the database write lock.
+
+    **Audit of other externally supplied paths:**
+    - **Plan paths** are lexically and physically contained (notes 3
+      and 21).
+    - **Action and family ids** never name a path in the executor.
+    - **Temp names** are built only from a validated destination and a
+      validated attempt id.
+    - **Header fields other than ids** (root, database target, digest,
+      mode) are compared and never used as paths.
+    - **Journal record fields** are compared with the plan's steps and
+      never used as paths.
+    - **CLI arguments:** the root is bound to the plan, the database to
+      its identity, `--plan` is only read, and `--action` ids are looked
+      up in the forward chain.
+    - **Pairing identifiers** come from the caller's registry, never from
+      the plan.
 
 ## 7. Named tests (for the implementation PRs)
 
