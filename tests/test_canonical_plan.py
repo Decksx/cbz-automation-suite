@@ -176,6 +176,31 @@ def test_the_current_formatter_owns_edition_vocabulary(env):
     assert plan()["renames"][0]["destination"].endswith("Series ch. 7 (English).cbz")
 
 
+def test_originals_root_is_refused_before_any_archive_is_derived(env, monkeypatch):
+    root, db, book, plan = env
+    source = book(folder="ai-decensor-originals")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("originals must not be scanned")
+
+    monkeypatch.setattr(cp.sv, "derive_archive", forbidden)
+    with pytest.raises(cp.PlanningRefused, match="originals is preserved"):
+        cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
+
+
+@pytest.mark.parametrize("marker", ["root", "comicinfo"])
+def test_decensor_identity_in_root_or_comicinfo_alone_is_preserved(env, marker):
+    root, db, book, plan = env
+    if marker == "root":
+        source = book(folder="Decensored")
+        report = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
+    else:
+        source = book(series="Series Decensored")
+        report = plan()
+    assert report["renames"] == report["families"] == []
+    assert "decensor identity/pairing adapter required" in str(report["review"])
+
+
 @pytest.mark.parametrize("occupant", ["file", "directory", "case_variant"])
 def test_an_occupied_canonical_destination_is_held_even_with_identical_bytes(env, occupant):
     root, db, book, plan = env
@@ -353,3 +378,17 @@ def test_cli_prints_only_a_complete_plan_and_meaningful_exit_status(env, capsys,
         assert not db.with_name("missing.db").exists()
     else:
         assert json.loads(streams.out)["contract"] == cp.CONTRACT and streams.err == ""
+
+
+def test_cli_unexpected_failure_never_masquerades_as_a_complete_review_plan(env, capsys, monkeypatch):
+    from scripts import cbz_canonical_plan as cli
+    root, db, book, plan = env
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected evaluation failure")
+
+    monkeypatch.setattr(cli, "build_plan", fail)
+    assert cli.main(["--library-root", str(root), "--database", str(db),
+                     "--quarantine-date", "2026-10-24"]) == 2
+    streams = capsys.readouterr()
+    assert not streams.out and "injected evaluation failure" in streams.err
