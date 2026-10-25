@@ -9,12 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
-from comic_automation.archive.content_signature_recertify import PlanRefusedError
-from comic_automation.database.read_guards import ReadGuardError
 from comic_automation.library.canonical_plan import build_plan
 
 
@@ -35,7 +32,9 @@ def main(argv: list[str] | None = None) -> int:
             accept_comicinfo_drop=args.accept_comicinfo_drop,
             temp_dir=args.temp_dir, max_held_bytes=args.max_held_bytes,
             max_copy_bytes=args.max_copy_bytes)
-    except (OSError, ValueError, sqlite3.Error, ReadGuardError, PlanRefusedError) as exc:
+    except Exception as exc:
+        # Exit 1 means only a complete plan with review holds. Unexpected
+        # failures also invalidate the whole observation and must mean 2.
         print(f"Plan not produced: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False))
