@@ -20,6 +20,8 @@ from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
 from comic_automation.database.read_guards import DatabaseChangedError
 from comic_automation.library import canonical_plan as cp
+from comic_automation.library.canonical_apply import executor, markers
+from comic_automation.library.canonical_apply.plan import parse_plan
 from scripts.cbz_canonical_plan import main
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "comic_automation/database/migrations"
@@ -173,7 +175,7 @@ def test_unresolved_or_protected_identity_is_reviewed_instead_of_silently_droppe
 def test_the_current_formatter_owns_edition_vocabulary(env):
     root, db, book, plan = env
     book("old Ch. 7 (English).cbz")
-    assert plan()["renames"][0]["destination"].endswith("Series ch. 7 (English).cbz")
+    assert plan()["renames"][0]["destination"].endswith("Series ch. 7.cbz")
 
 
 def test_originals_root_is_refused_before_any_archive_is_derived(env, monkeypatch):
@@ -432,6 +434,78 @@ def test_an_applied_volume_name_replans_as_unchanged(env):
     second = plan()
     assert not second["renames"] and not second["review"]
     assert second["unchanged"][0]["path"] == str(destination)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the executor rename protocol is Windows-only")
+def test_a_generated_volume_plan_applies_recovers_and_undoes_through_the_real_executor(env):
+    root, db, book, plan = env
+    source = book("Series Vol. 2 Ch. 12.cbz", ci=b"<ComicInfo><Series>Series</Series><Volume>2</Volume><Number>12</Number></ComicInfo>")
+    markers.install_schema(db)
+    document = plan()
+    parsed = parse_plan(document)
+    forward = executor.apply(parsed, library_root=root, database=db, quiescence=lambda _: None)
+    assert forward.stopped is None and forward.units[0]["status"] == executor.UNIT_COMPLETED
+    assert plan()["unchanged"][0]["path"].endswith("Series v02 #012.cbz")
+    recovered = executor.recover(parsed, library_root=root, database=db,
+        attempt_id=forward.attempt_id, quiescence=lambda _: None)
+    assert recovered.resolutions[0]["status"] == executor.RES_COMPLETE
+    undone = executor.undo(parsed, library_root=root, database=db,
+        forward_attempt=forward.attempt_id, quiescence=lambda _: None)
+    assert undone.stopped is None and source.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the executor rename protocol is Windows-only")
+def test_an_applied_family_keeper_is_unchanged_without_certifying_its_lone_version(env):
+    root, db, book, plan = env
+    older = book("Series ch. 1 v1.cbz", number="1")
+    newer = book("Series ch. 1 v2.cbz", number="1", pages=(b"a", b"b"))
+    markers.install_schema(db)
+    first = plan()
+    assert first["counts"]["families"] == 1
+    forward = executor.apply(parse_plan(first), library_root=root, database=db,
+                             quiescence=lambda _: None)
+    assert forward.stopped is None and forward.units[0]["status"] == executor.UNIT_COMPLETED
+    assert not older.exists() and not newer.exists()
+    second = plan()
+    assert not second["families"] and not second["renames"] and not second["review"]
+    (unchanged,) = second["unchanged"]
+    assert unchanged["path"].endswith("Series ch. 1 [v2].cbz")
+    assert unchanged["diagnostic"] == "unverified_version_label"
+    assert "version" not in unchanged and "family" not in unchanged
+    assert second["diagnostics"] == {"unverified_version_labels": 1}
+    # A sibling cancels the no-op shortcut: both books must pass the full
+    # byte-bound family proof, even though the old keeper looks canonical.
+    book("Series ch. 1 v3.cbz", number="1", pages=(b"a", b"b", b"c"))
+    third = plan()
+    assert not third["review"] and third["counts"]["families"] == 1
+    assert third["diagnostics"]["unverified_version_labels"] == 0
+    assert third["families"][0]["keeper"]["path"].endswith("v3.cbz")
+
+
+def test_a_lone_canonical_version_is_reviewed_when_a_resolved_field_would_change_it(env):
+    root, db, book, plan = env
+    book("Series ch. 1 [v2].cbz", number="2")
+    report = plan()
+    assert report["review"] and not report["unchanged"] and not report["renames"]
+
+
+def test_another_book_in_the_folder_restores_normal_version_evidence_rules(env):
+    root, db, book, plan = env
+    source = book("Series ch. 1 [v2].cbz", number="1")
+    book("Other ch. 2.cbz", series="Other", number="2")
+    report = plan()
+    assert report["diagnostics"]["unverified_version_labels"] == 0
+    assert str(source) in str(report["review"])
+
+
+def test_a_canonical_version_with_an_unverified_label_is_a_zero_exit_noop(env, capsys):
+    root, db, book, plan = env
+    book("Series ch. 1 [v2].cbz", number="1")
+    assert main(["--library-root", str(root), "--database", str(db),
+                 "--quarantine-date", "2026-10-24"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["diagnostics"]["unverified_version_labels"] == 1
+    assert not report["families"] and not report["renames"]
 
 
 def test_an_already_canonical_archive_is_unchanged(env):
