@@ -222,8 +222,9 @@ def test_a_junctioned_state_directory_is_refused_before_the_lock(env, tmp_path):
     assert not (env.root / scope_lock.LOCK_FILENAME).exists()
 
 
-def test_a_junction_created_during_a_wait_blocks_the_quarantine(env, tmp_path):
-    """The quarantine directory is checked again right before it is made."""
+def test_a_junction_created_during_a_unit_wait_stops_the_run(env, tmp_path):
+    """The run state (quarantine root included) is re-checked after the
+    unit gate returns: a junction created during the wait stops the run."""
     outside = tmp_path / "outside_late"
     keeper = book(env.series, "Keep.cbz", [P1, P2])
     older = book(env.series, "Old.cbz", [P1])
@@ -234,9 +235,32 @@ def test_a_junction_created_during_a_wait_blocks_the_quarantine(env, tmp_path):
 
     report = env.apply(document, unit_gate=gate)
 
+    assert report.stopped is not None and "canonical-naming state" in report.stopped
+    assert older.exists() and list(outside.iterdir()) == []
+
+
+def test_a_junction_created_after_the_keeper_rename_blocks_the_quarantine(env, tmp_path):
+    """The quarantine directory is checked again right before it is made,
+    after the keeper rename (phase 2) and before any dependant moves. The
+    junction is the family directory below the dated quarantine root, which
+    the run-state checks do not cover."""
+    outside = tmp_path / "outside_late"
+    keeper = book(env.series, "Keep.cbz", [P1, P2])
+    older = book(env.series, "Old.cbz", [P1])
+    renamed = env.series / "Keep (2019).cbz"
+    document = env.plan(families=[env.family_spec("fam1", keeper, [(older, 1)], rename_to=renamed)])
+
+    def late(point, context):
+        # Below the quarantine root, where only the pre-makedirs check looks.
+        if point == "after_keeper_rename":
+            Path(env.quarantine_root).mkdir(parents=True)
+            _junction(Path(env.quarantine_root) / "fam1", outside)
+
+    report = env.apply(document, fault=late)
+
     assert fx.unit_status(report, "fam1") == executor.UNIT_BLOCKED
     assert "quarantine directory" in report.unit("fam1")["reasons"][0]
-    assert older.exists() and list(outside.iterdir()) == []
+    assert older.exists() and renamed.exists() and list(outside.iterdir()) == []
 
 
 def test_containment_is_rechecked_immediately_before_each_rename(env, tmp_path):
@@ -403,6 +427,224 @@ def test_a_database_swapped_while_waiting_is_refused_when_the_view_reopens(env):
 
     with pytest.raises(executor.Refused, match="bound to"):
         env.recover(document, attempt, quiescence=swap_then_quiet)
+
+
+# --- 5. attempt ids and the journal leaf (PR #128 re-review) ------------------------
+
+
+@pytest.mark.parametrize("bad", [
+    "..\\..\\..\\escaped_journal", "../escaped", "a/b", "a\\b", "C:x", ".hidden", "", "x" * 65,
+    "con.txt", "a.b", " lead", "trail ",
+])
+def test_an_unsafe_attempt_id_is_refused_before_any_file_access(env, bad, monkeypatch):
+    """Validated before anything else: no realpath, lock, journal or file
+    outside the root (Codex's first reproduction is the first value)."""
+    document, source, destination = _rename(env)
+    plan = env.load(document)
+    touched = []
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: touched.append(p) or real_realpath(p, *a, **k))
+
+    for call in (
+        lambda: executor.apply(plan, library_root=env.root, database=env.database, quiescence=fx.quiet, attempt_id=bad),
+        lambda: executor.apply(plan, library_root=env.root, database=env.database, quiescence=fx.quiet, resume_attempt=bad),
+        lambda: executor.recover(plan, library_root=env.root, database=env.database, attempt_id=bad, quiescence=fx.quiet),
+        lambda: executor.undo(plan, library_root=env.root, database=env.database, forward_attempt=bad, quiescence=fx.quiet),
+        lambda: executor.undo(plan, library_root=env.root, database=env.database, forward_attempt="ok1", resume_attempt=bad, quiescence=fx.quiet),
+    ):
+        with pytest.raises(executor.Refused, match="not a safe attempt id"):
+            call()
+    monkeypatch.undo()
+    assert touched == []
+    assert source.exists() and not destination.exists()
+    assert not (env.root / scope_lock.LOCK_FILENAME).exists() and not (env.root / jn.JOURNAL_DIRNAME).exists()
+    assert sorted(p.name for p in env.tmp.parent.iterdir()) == ["db", "library", "work"]
+
+
+def test_the_cli_refuses_an_unsafe_attempt_id(env, capsys):
+    document, source, destination = _rename(env)
+    path = env.write_plan(document)
+    common = [
+        "--library-root", str(env.root), "--database", str(env.database), "--plan", str(path),
+        "--expect-digest", document["plan_digest"], "--expect-renames", "1",
+        "--expect-families", "0", "--attest-quiescent",
+    ]
+    for argv in (
+        ["apply", *common, "--resume", "..\\escaped"],
+        ["recover", *common, "--attempt", "..\\escaped"],
+        ["undo", *common, "--forward-attempt", "..\\escaped"],
+    ):
+        assert cli.main(argv) == 1
+        assert "not a safe attempt id" in capsys.readouterr().err
+    assert source.exists() and not (env.root / jn.JOURNAL_DIRNAME).exists()
+
+
+def test_a_header_naming_an_unsafe_forward_attempt_or_unknown_action_is_refused(env):
+    import json
+
+    document, source, destination = _rename(env)
+    forward = env.apply(document)
+    undone = env.undo(document, forward.attempt_id)
+    path = jn.journal_path(env.root, undone.attempt_id)
+    original = path.read_bytes()
+    lines = original.split(b"\n")
+    for key, value in (("forward_attempt_id", "..\\escaped"), ("action_ids", ["not-in-plan"])):
+        header = json.loads(lines[0])
+        header[key] = value
+        path.write_bytes(b"\n".join([json.dumps(header, sort_keys=True).encode()] + lines[1:]))
+        with pytest.raises(executor.Refused, match="not a safe attempt id|not in the plan"):
+            env.recover(document, undone.attempt_id)
+    path.write_bytes(original)
+    assert fx.statuses(env.recover(document, undone.attempt_id)) == {"ren1": executor.RES_COMPLETE}
+    assert source.exists()
+
+
+def test_a_foreign_file_in_the_attempts_directory_blocks_new_attempts(env):
+    document, source, destination = _rename(env)
+    jn.attempts_dir(env.root).mkdir(parents=True)
+    (jn.attempts_dir(env.root) / "not an attempt.jsonl").write_text("{}")
+    with pytest.raises(executor.Refused, match="foreign:"):
+        env.apply(document)
+    assert source.exists()
+
+
+def test_a_state_junction_swapped_in_during_quiescence_is_refused(env, tmp_path):
+    """Codex's second reproduction: the journal directory becomes a junction
+    while the run waits for quiescence. Apply, recover and undo re-check the
+    state paths after the wait, before any journal is created or opened."""
+    document, source, destination = _rename(env)
+    outside = tmp_path / "outside_state"
+    # A planted file the run would read (as a foreign journal) if it
+    # followed the junction before re-checking: the refusal must name the
+    # reparse point, never the planted file.
+    (outside / jn.ATTEMPTS_DIRNAME).mkdir(parents=True)
+    (outside / jn.ATTEMPTS_DIRNAME / "planted.txt").write_text("outside")
+
+    def swap(root):
+        if not os.path.lexists(root / jn.JOURNAL_DIRNAME):
+            _junction(root / jn.JOURNAL_DIRNAME, outside)
+        return None
+
+    with pytest.raises(executor.Refused, match="reparse point"):
+        env.apply(document, quiescence=swap)
+    assert source.exists() and not destination.exists()
+    assert [p.name for p in (outside / jn.ATTEMPTS_DIRNAME).iterdir()] == ["planted.txt"]
+    assert sorted(p.name for p in outside.iterdir()) == [jn.ATTEMPTS_DIRNAME]
+    os.rmdir(env.root / jn.JOURNAL_DIRNAME)  # removes the junction only
+
+    # The controls: apply, recover and undo complete normally, and the same
+    # swap while an existing journal is reopened is refused too.
+    forward = env.apply(document)
+    assert forward.stopped is None and destination.exists()
+    assert fx.statuses(env.recover(document, forward.attempt_id)) == {"ren1": executor.RES_COMPLETE}
+    state = env.root / jn.JOURNAL_DIRNAME
+    moved = tmp_path / "moved_state"
+
+    def swap_existing(root):
+        if not containment.is_reparse(os.lstat(state)):
+            shutil.move(str(state), str(moved))
+            _junction(state, moved)
+        return None
+
+    before = sorted(p.name for p in jn.attempts_dir(env.root).iterdir())
+    with pytest.raises(executor.Refused, match="reparse point"):
+        env.recover(document, forward.attempt_id, quiescence=swap_existing)
+    with pytest.raises(executor.Refused, match="reparse point"):
+        env.undo(document, forward.attempt_id, quiescence=swap_existing)
+    assert sorted(p.name for p in (moved / jn.ATTEMPTS_DIRNAME).iterdir()) == before
+    os.rmdir(state)
+    shutil.move(str(moved), str(state))
+    undone = env.undo(document, forward.attempt_id)
+    assert undone.stopped is None and source.exists() and not destination.exists()
+
+
+def test_journal_path_itself_refuses_an_unsafe_attempt_id(tmp_path):
+    """The journal module validates on every path it builds, so no caller
+    (a header field, a future entry point) can bypass the grammar."""
+    for bad in ("..\\x", "a/b", "", "x" * 65, "a.b"):
+        with pytest.raises(jn.InvalidAttemptId):
+            jn.journal_path(tmp_path, bad)
+    assert jn.journal_path(tmp_path, "abc_DEF-1").name == "abc_DEF-1.jsonl"
+    (tmp_path / jn.JOURNAL_DIRNAME / jn.ATTEMPTS_DIRNAME).mkdir(parents=True)
+    (tmp_path / jn.JOURNAL_DIRNAME / jn.ATTEMPTS_DIRNAME / "x.y.jsonl").write_text("{}")
+    assert jn.list_attempts(tmp_path) == ()
+    assert jn.foreign_journal_files(tmp_path) == ("x.y.jsonl",)
+
+
+def test_a_junction_at_the_journal_leaf_is_refused(env, tmp_path):
+    """The journal's own leaf path is contained, not only its directory:
+    a junction named like the attempt's journal is refused as a reparse
+    point (file symlinks need a privilege this host lacks, so a directory
+    junction stands in for the leaf)."""
+    document, source, destination = _rename(env)
+    with pytest.raises(SimulatedCrash):
+        env.apply(document, fault=crash_at("after_done"))
+    attempt = env.only_attempt()
+    leaf = jn.journal_path(env.root, attempt)
+    shutil.move(str(leaf), str(tmp_path / "moved.jsonl"))
+    _junction(leaf, tmp_path / "outside_leaf")
+
+    with pytest.raises(executor.Refused, match="reparse point"):
+        env.recover(document, attempt)
+    assert env.markers() == [] and destination.exists()
+    assert list((tmp_path / "outside_leaf").iterdir()) == []
+
+
+def _swap_during_a_database_read(monkeypatch, link: Path, target: Path) -> None:
+    """Create a junction at ``link`` during the next guarded database read:
+    a read can wait on SQLite's busy handler, so it is a wait too."""
+    real = executor.read_view
+    done = []
+
+    def read_view(*args, **kwargs):
+        if not done:
+            done.append(True)
+            _junction(link, target)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "read_view", read_view)
+
+
+def test_the_journal_is_not_created_after_a_wait_without_a_recheck(env, tmp_path, monkeypatch):
+    """A junction appears at the quarantine root during the database read
+    that precedes journal creation: creation re-checks and refuses."""
+    document, source, destination = _rename(env)
+    _swap_during_a_database_read(monkeypatch, env.root / ".cbz-canonical-quarantine", tmp_path / "out")
+
+    with pytest.raises(executor.Refused, match="reparse point"):
+        env.apply(document)
+    assert env.attempts() == () and source.exists()
+
+
+def test_journal_reads_recheck_the_run_state(env, tmp_path, monkeypatch):
+    """Recovery after a crash past the DB commit: the run state changes
+    during its first database read; the next journal read refuses."""
+    document, source, destination = _rename(env)
+    with pytest.raises(SimulatedCrash):
+        env.apply(document, fault=crash_at("after_db_commit"))
+    attempt = env.only_attempt()
+    _swap_during_a_database_read(monkeypatch, env.root / ".cbz-canonical-quarantine", tmp_path / "out")
+
+    with pytest.raises(executor.Refused, match="reparse point"):
+        env.recover(document, attempt)
+
+
+def test_the_write_lock_rechecks_the_run_state(env, tmp_path, monkeypatch):
+    """Recovery of a done step: the run state changes during the read
+    before the database step; under the write lock the step refuses and
+    no marker is written."""
+    document, source, destination = _rename(env)
+    with pytest.raises(SimulatedCrash):
+        env.apply(document, fault=crash_at("after_done"))
+    attempt = env.only_attempt()
+    _swap_during_a_database_read(monkeypatch, env.root / ".cbz-canonical-quarantine", tmp_path / "out")
+
+    try:
+        report = env.recover(document, attempt)
+        assert fx.statuses(report) == {"ren1": executor.RES_REFUSED}
+        assert "reparse point" in report.resolutions[0]["detail"]
+    finally:
+        assert env.markers() == []
 
 
 # --- 4. the lock is released when owner metadata fails -------------------------------
