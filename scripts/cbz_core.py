@@ -793,6 +793,16 @@ _ROUND_EDITION_WORDS = {
     for fold, word in _EDITION_BY_FOLD.items()
     if fold not in _DISPLAY_LANGUAGE_WORDS
 }
+# Round-bracket group, source and status tags David approved dropping as
+# noise (§2.1 layer 1, §5.5): (Digital) on 2026-10-22, the rest on 2026-10-24
+# (hive #2646). The display name drops every unlisted round block as well,
+# so this closed list is what tells an approved noise tag from one that may
+# name a different book. Only dropped_round_tags reads it (David chose option
+# (b) for issue #131, 2026-10-25): a listed tag still meets and may replace
+# its copy; anything unlisted is held, never guessed.
+_DISPLAY_NOISE_TAGS = frozenset(
+    ("digital", "manhwaclub", "incognitymous", "ongoing")
+)
 _DECENSOR_TOKEN_RE = re.compile(
     r"\((" + "|".join(re.escape(w) for w in _DECENSOR_EDITION.values()) + r")\)"
 )
@@ -897,13 +907,22 @@ def dropped_round_tags(source: str) -> tuple[str, ...]:
 
     A tag is listed when it is a round-bracket block that holds a word, is
     not a display token (:func:`extract_display_tokens` keeps it as
-    nothing) and is not a language word (``_DISPLAY_LANGUAGE_WORDS``):
-    ``(s2)``, ``(1)``, ``(Inuyasha)``, ``(Digital)``, ``(ManhwaClub)``. The
+    nothing), is not a language word (``_DISPLAY_LANGUAGE_WORDS``) and is
+    not approved noise (below): ``(s2)``, ``(1)``, ``(Inuyasha)``,
+    ``(Parody)``, ``(Variant)``, and any tag nobody has classified. The
     watcher reads this to tell a merge collision that exists only because
     the tag was stripped, where keeping the larger file could replace a
     different book, from an ordinary same-name arrival.
 
     Deliberately not listed:
+
+    * Approved noise (David chose option (b), 2026-10-25, issue #131): the
+      group, source and status tags in ``_DISPLAY_NOISE_TAGS``, such as
+      ``(Digital)`` and ``(ManhwaClub)``, and scanlator tags, whose last
+      word is one ``_SCAN_GROUP_RE`` strips (``(Asura Scans)``). These name
+      the same book, so a higher-res copy still replaces the existing one.
+      A name carrying noise and a listed tag, ``(Digital) (s2)``, still
+      reports the listed one.
 
     * Square-bracket blocks. They held scanlator and circle tags long
       before design §5.5 (the identity cleaner has always stripped them),
@@ -921,6 +940,10 @@ def dropped_round_tags(source: str) -> tuple[str, ...]:
         if block[0] != "(" or not re.search(r"\w", inner):
             continue
         if inner.casefold() in _DISPLAY_LANGUAGE_WORDS:
+            continue
+        if inner.casefold() in _DISPLAY_NOISE_TAGS:
+            continue
+        if _SCAN_GROUP_RE.fullmatch(inner.split()[-1]):
             continue
         if extract_display_tokens(block) != DisplayTokens():
             continue
