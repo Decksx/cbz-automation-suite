@@ -155,8 +155,8 @@ happens to the loser depends on the mode:
   (`settle_file_conflict`), so it can be recovered.
 
 In both modes the library keeps one file, holding the incoming bytes under
-the season-1 name. This predates #2646; the follow-up is the GitHub issue
-filed alongside #129. A proposed-destination review guard in the step-8
+the season-1 name. This predates #2646; the follow-up is issue #131.
+A proposed-destination review guard in the step-8
 planner is a separate piece of work.
 
 **Measured against** a read-only scan of the Tower library on 2026-10-24
