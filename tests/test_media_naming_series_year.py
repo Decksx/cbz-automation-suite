@@ -18,7 +18,8 @@ from comic_automation.database.connection import database_connection
 from comic_automation.database.migrations import apply_migrations
 from comic_automation.library import canonical_plan as cp
 from comic_automation.library.media_naming import (
-    KeepArrivalName, comicvine_series_year, decide_series_year, watcher_fields, with_comicinfo_year,
+    KeepArrivalName, comicvine_series_year, decide_series_year, media_fields, watcher_fields,
+    with_comicinfo_year,
 )
 from comic_automation.library.number_style import NumberStyleRegistry
 from scripts import cbz_watcher as watcher
@@ -223,6 +224,65 @@ def test_bare_number_uses_media_name_only_when_comicinfo_number_agrees(import_is
     assert list(landed) == [f"Series/{expected}"] and not left
 
 
+@pytest.fixture
+def failing_year_writes(monkeypatch):
+    """PermissionError on every .tmp.cbz write while the watcher records Year.
+
+    The real five-attempt writer runs (sleeps suppressed) and gives up
+    without raising, exactly as on a locked SMB share.
+    """
+    state = {"on": True, "attempts": 0}
+    real_zipfile, real_record = zipfile.ZipFile, watcher._record_comicinfo_year
+    active = {"recording": False}
+
+    class LockedZipFile(real_zipfile):
+        def __init__(self, file, mode="r", *args, **kwargs):
+            if (mode == "w" and active["recording"] and state["on"]
+                    and str(file).endswith(".tmp.cbz")):
+                state["attempts"] += 1
+                raise PermissionError(13, "locked by test", str(file))
+            super().__init__(file, mode, *args, **kwargs)
+
+    def recording(*args, **kwargs):
+        active["recording"] = True
+        try:
+            return real_record(*args, **kwargs)
+        finally:
+            active["recording"] = False
+
+    monkeypatch.setattr(zipfile, "ZipFile", LockedZipFile)
+    monkeypatch.setattr(watcher, "_record_comicinfo_year", recording)
+    monkeypatch.setattr(watcher.time, "sleep", lambda s: None)
+    return state
+
+
+@pytest.mark.parametrize("name", ["Batman (2016) #003 (2019).cbz", "Batman #003 (2019).cbz"])
+def test_a_failed_year_write_keeps_the_year_bearing_name_then_a_retry_lands(
+        import_issue, failing_year_writes, tmp_path, name):
+    landed, left = import_issue("Batman (2016)", [(name, None)])
+    assert failing_year_writes["attempts"] == 5
+    # Nothing landed; the intake archive still names 2019 (the XML lacks it).
+    assert not landed and len(left) == 1 and "(2019)" in left[0]
+    retained = next((tmp_path / "intake").rglob("*.cbz"))
+    assert "Year" not in comicinfo(retained)
+    # The lock clears; a retry (the watcher's next pass or a restart) lands it.
+    failing_year_writes["on"] = False
+    watcher.process_and_move_directory(retained.parent)
+    final = tmp_path / "Comix" / "Batman (2016)" / "Batman (2016) #003.cbz"
+    assert final.is_file() and not list((tmp_path / "intake").rglob("*.cbz"))
+    assert comicinfo(final)["Year"] == "2019"
+    assert [p.name for p in (tmp_path / "Comix").rglob("*.cbz")] == [final.name]
+
+
+def test_year_recording_injects_and_verifies_comicinfo_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher.time, "sleep", lambda s: None)
+    path = archive(tmp_path / "Batman #003 (2019).cbz")
+    watcher._record_comicinfo_year(path, "2019")
+    assert comicinfo(path)["Year"] == "2019"
+    with zipfile.ZipFile(path) as zf:
+        assert zf.read("page.png") == b"Batman #003 (2019).cbz"
+
+
 # --- planner -----------------------------------------------------------------
 
 @pytest.fixture
@@ -303,6 +363,30 @@ def test_unnumbered_full_without_comicinfo_is_a_fixpoint_after_apply(plan_librar
     apply(doc)
     again = plan()
     assert not again["renames"] and not again["review"], again["review"]
+
+
+@pytest.mark.parametrize("rel,ci", [
+    ("Batman/Other (2016) #003.cbz", {"Series": "Batman", "Number": "3"}),
+    # Folder authority replaces a ComicInfo/filename typo; its year still counts.
+    ("Tales for a Halloween Night/Tales for a Haloween Nite (2016) #003.cbz",
+     {"Series": "Tales for a HalloweeNight", "Number": "3"}),
+])
+def test_planner_holds_a_year_after_an_unmatched_or_replaced_title(plan_library, rel, ci):
+    book, plan, _ = plan_library
+    source = book(rel, ci)
+    before = source.read_bytes()
+    doc = plan()
+    assert not doc["renames"] and len(doc["review"]) == 1
+    assert source.read_bytes() == before
+
+
+def test_shared_formatting_never_drops_a_year_after_an_unmatched_title():
+    tokens = fr.parse_name_tokens("Other (2016) #003.cbz")
+    with pytest.raises(KeepArrivalName):
+        media_fields(series="Batman", folder="Batman", number="3", volume=None, style="issue", tokens=tokens)
+    fields = media_fields(series="Batman", folder="Batman (2016)", number="3", volume=None,
+                          style="issue", tokens=tokens)
+    assert format_canonical_name(fields) == "Batman (2016) #003.cbz"
 
 
 def test_other_canonical_tpb_volumes_gain_no_filename_authority(plan_library):
