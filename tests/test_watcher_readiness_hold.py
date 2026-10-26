@@ -507,3 +507,18 @@ def test_uncertain_source_identity_never_moves(env, monkeypatch, failure):
     e.clock.value = 3600
     _gate(e)
     assert e.bad.exists() and not _payloads(e)
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_external_move_events_never_reimport_held_archives(env, monkeypatch, ready):
+    e = env
+    destination = e.holding / "readiness-attempt" / e.bad.name
+    destination.parent.mkdir()
+    destination.write_bytes(_zip_bytes() if ready else e.bad.read_bytes())
+    notify = Mock()
+    monkeypatch.setattr(e.tracker, "notify", notify)
+    handler = w.CBZHandler(e.tracker)
+    handler.on_moved(SimpleNamespace(is_directory=False, dest_path=str(destination)))
+    notify.assert_not_called()
+    handler.on_modified(SimpleNamespace(is_directory=False, src_path=str(e.bad)))
+    notify.assert_called_once_with(e.folder)
