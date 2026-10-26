@@ -436,10 +436,11 @@ def test_holding_root_replacement_during_receipt_io_refuses(env, monkeypatch):
     assert not list(e.holding.with_name("old-holding").glob("readiness-*/*.cbz"))
 
 
-@pytest.mark.parametrize("invalid", ["same", "inside", "missing", "file"])
+@pytest.mark.parametrize("invalid", ["same", "inside", "parent", "missing", "file"])
 def test_invalid_holding_roots_refuse_before_startup(env, invalid):
     e = env
-    choices = {"same": e.incoming, "inside": e.folder, "missing": e.holding / "missing", "file": e.bad}
+    choices = {"same": e.incoming, "inside": e.folder, "parent": e.incoming.parent,
+               "missing": e.holding / "missing", "file": e.bad}
     with pytest.raises((OSError, ValueError)):
         w.DirectorySettleTracker(watch_root=e.incoming, readiness_hold_root=choices[invalid])
 
@@ -592,3 +593,39 @@ def test_external_move_events_never_reimport_held_archives(env, monkeypatch, rea
     notify.assert_not_called()
     handler.on_modified(SimpleNamespace(is_directory=False, src_path=str(e.bad)))
     notify.assert_called_once_with(e.folder)
+
+
+def test_ready_gate_retries_after_hold_ownership_and_later_processes(env, monkeypatch):
+    """A lost processing claim must not drop the only ready import event."""
+    e = env
+    e.bad.write_bytes(_zip_bytes())
+    inner = Mock()
+    monkeypatch.setattr(w, "process_and_move_directory", e.normal_process)
+    monkeypatch.setattr(w, "_process_and_move_directory_inner", inner)
+    with w._processing_dirs_lock:
+        w._processing_dirs.add(e.folder)
+    try:
+        _gate(e)
+        inner.assert_not_called()
+        assert e.folder in e.tracker._readiness_retry_timers
+    finally:
+        with w._processing_dirs_lock:
+            w._processing_dirs.discard(e.folder)
+    generation = e.tracker._current_readiness_generation(e.folder)
+    e.tracker._on_readiness_retry(e.folder, generation)
+    inner.assert_called_once_with(e.folder)
+    assert e.folder not in e.tracker._readiness_retry_timers
+
+
+def test_ready_contention_retry_cannot_replace_a_newer_event(env, monkeypatch):
+    e = env
+    e.bad.write_bytes(_zip_bytes())
+
+    def busy_with_new_event(path):
+        e.tracker.notify(path)
+        return False
+
+    monkeypatch.setattr(w, "process_and_move_directory", busy_with_new_event)
+    _gate(e)
+    assert e.folder in e.tracker._timers
+    assert e.folder not in e.tracker._readiness_retry_timers
