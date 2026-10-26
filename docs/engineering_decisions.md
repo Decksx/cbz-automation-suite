@@ -1414,3 +1414,32 @@ but does not fail on them.
 **Not done here.** Step 4 (re-inventory) is not done. The tool does not
 take the backup itself. Apply refuses unless the backup it is given passes
 all the checks above.
+
+## 2026-10-26: explicit media syntax and separate collection identity (#140)
+
+David selected Western `#` issue syntax, Manga-only `ch.`, `v01` collected
+volumes retaining `(TPB)`, normalized-equal folder display, and legal apostrophes.
+Claude approved the design in issue comment 6422344608. Codex implements;
+Claude reviews and owns rollout. Unnumbered Full stays held pending David's
+volume-default decision.
+
+One shared JSON registry selects style by physical root/ancestor identities,
+with explicit CLI overrides. Its exact hash and the selected physical scope
+are part of planner provenance/digest. This avoids both basename guessing and
+the UNC/drive alias mistake from #134, and preserves style for subfolder scans.
+The empty fallback refuses unknown roots; deployment must configure the shared
+registry or explicit style. An environment-selected external registry supports
+GUI launches without committing host-specific paths.
+
+TPB gets a separate pure-formatter collection slot, preserving Colored and
+other independent editions. Only narrow case/space/punctuation equality lets
+folder spelling replace resolved display; substantive differences remain held.
+The watcher's original metadata is captured before its existing rewrite, and
+style follows the final destination after category overrides. Planner and
+watcher share the semantic mapper; the planner retains its stricter authority
+and proposed-name resolution guards. CLI policy state is released on exit.
+
+Protocol, refusal/rollout limits and fixture coverage are in
+`docs/media_aware_naming.md`. No live library/DB/configuration changes are part
+of the implementation. Any Tower batch requires a new plan, verified backup
+and David's approval of the exact new digest.
