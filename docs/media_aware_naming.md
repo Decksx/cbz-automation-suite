@@ -198,3 +198,12 @@ An applied unnumbered-Full default leaves `Series v01 (TPB).cbz`. Re-planning
 recognises exactly that canonical `v01 (TPB)` name, with no ComicInfo Number
 or Volume, as the same operator-policy volume, so the next plan is a no-op.
 No other volume gains filename authority.
+
+The never-drop rule is enforced once in the shared formatter: any `(YYYY)`
+left after the series year and issue year are consumed refuses, including
+after an unmatched title or one the folder replaced (`Batman/Other (2016)
+#003` is held, not renamed to `Batman #003`). The planner, which only
+renames, also refuses a series-year name unless its issue year is already
+in ComicInfo Year. The watcher writes and reads back `<Year>` before it
+renames away the year-bearing name. If the writer gives up, the archive
+stays in intake under that name and a later pass or restart lands it.
