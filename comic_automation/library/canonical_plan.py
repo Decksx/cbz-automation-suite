@@ -459,7 +459,13 @@ def build_plan(
                 if _decensor_marker(identity_text):
                     problems.append("decensor identity/pairing adapter required")
                 try:
-                    display_folder = (folder.name if folder != root or display_key(folder.name) == display_key(series) else None)
+                    # A registered category root is not a series title. A scan
+                    # below that physical root is still a series-folder scan,
+                    # so narrowing scope must not erase a title conflict.
+                    series_scope = (style.source == "registry"
+                        and style.matched_identity != root_identity[:2])
+                    display_folder = (folder.name if folder != root or series_scope
+                        or display_key(folder.name) == display_key(series) else None)
                     display_folders[key] = display_folder
                     destinations[key] = str(path.with_name(_destination(resolutions[key],
                         number_style=style.style, folder=display_folder)))
