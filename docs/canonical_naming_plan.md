@@ -162,3 +162,26 @@ run after #128's journal fixes are reviewed/merged and the tag-strip PR
 lands. Codex's implementation and tests use temporary fixtures only.
 Batch apply remains gated on David's approval of the exact plan digest,
 the verified backup and the executor's independent operational checks.
+
+## Media policy (issue #140)
+
+Planner version 2 requires an established number style. Use
+`--number-style auto|issue|chapter` (default auto) and a shared
+`--number-style-registry <file>`, or set `CBZ_NUMBER_STYLE_REGISTRY` before
+launch. The fallback `config/number-styles.json` is intentionally empty;
+unknown or ambiguous roots refuse auto. Physical root identities handle UNC,
+drive aliases and subfolder scans. An explicit style chooses only the number
+syntax and does not bypass field, database, decensor, family or collision guards.
+
+The registry SHA256, style, decision source, scope and matching root identity
+are sealed in provenance. Western issues use `#003`, collections use
+`v01 (TPB)`, Manga chapters use `ch. 3`, and Manga volumes omit TPB. A separate
+collection field preserves independent edition variants. Unnumbered Full and
+substantively different folder/ComicInfo titles stay held; normalized-equal
+folder spelling wins display without becoming new series authority. The same
+policy is used during the proposed-name resolution guard.
+
+See `docs/media_aware_naming.md` for the complete policy, watcher behavior
+change, configuration/rollout requirement and the conservative Manga-volume
+fixpoint limitation. Existing plans must not be reused for this policy:
+generate a fresh read-only plan and obtain approval of its exact digest.
