@@ -160,3 +160,41 @@ proposed filename; that same source-bound default is used in re-resolution.
 Literal titles such as Full Metal Panic retain their words. Explicit number
 or volume evidence still refuses conflicts. Bare Western volumes and the
 year-before-TPB ordering otherwise remain approved as implemented.
+
+## Series years after review 6424897336 (David #3003)
+
+A parenthesised filename year is never discarded. It becomes the decided
+series year, the issue year (in the name, or in ComicInfo `<Year>` beside a
+reboot series year), or the watcher keeps the legacy arrival name and the
+planner holds. Both callers share the decision:
+
+- A year-qualified chosen series folder decides. In `Batman (2016)`, the
+  scene name `Batman (2016) #003 (2019).cbz` reads 2016 as the series year
+  and checks only 2019 against ComicInfo Year. The result is
+  `Batman (2016) #003.cbz`, and `<Year>2019</Year>` is written when ComicInfo
+  lacked it. A different filename, ComicInfo Series or Volume year refuses;
+  it never overrides the folder.
+- Without a folder year, a filename series year (`Batman (2016) #003`) is
+  kept only when ComicInfo confirms it: `<Series>Batman (2016)</Series>`
+  (David #3003) or the ComicVine/ComicTagger `<Volume>2016</Volume>`.
+  Unconfirmed, the watcher keeps the arrival name, so `Batman (2011) #003`
+  and `Batman (2016) #003` arriving together both land, and the planner holds.
+- A four-digit Volume in 1900-2100 is always the series start year, never a
+  collected volume, even without a filename year: `Batman/Batman #003.cbz`
+  with `<Volume>2016</Volume>` becomes `Batman (2016) #003.cbz`. This matches
+  ComicVine-tagged libraries. A year on a different ComicInfo title (an
+  alias) never decides the chosen folder's identity.
+- A title-adjacent year counts as a series year only when numbering follows
+  it. In an unnumbered `Series Full (2019)` it remains the issue year.
+
+The watcher also uses the media name when a lone bare filename number equals
+authoritative ComicInfo Number (`Series 3` with Number 3 becomes
+`Series #003`), matching the planner. An unconfirmed bare number is still
+never guessed: `Batman (2016) 003 (2019) (Digital) (Zone-Empire).cbz` with
+ComicInfo Number 3 becomes `Batman (2016) #003.cbz`, but without ComicInfo it
+lands under its legacy arrival name.
+
+An applied unnumbered-Full default leaves `Series v01 (TPB).cbz`. Re-planning
+recognises exactly that canonical `v01 (TPB)` name, with no ComicInfo Number
+or Volume, as the same operator-policy volume, so the next plan is a no-op.
+No other volume gains filename authority.
