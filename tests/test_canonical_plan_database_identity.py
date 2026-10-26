@@ -93,7 +93,7 @@ def _refuses_before_open(root: Path, database: Path, local_root: Path, monkeypat
 
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     with pytest.raises(cp.PlanningRefused, match="database.*outside the library"):
-        cp.build_plan(root, database=database, quarantine_date="2026-10-26")
+        cp.build_plan(root, database=database, quarantine_date="2026-10-26", number_style="chapter")
     assert _contents(local_root) == before
 
 
@@ -171,7 +171,7 @@ def test_external_catalog_still_plans_with_a_library_alias(catalog_paths, reques
     elif alias == "mapped":
         chosen = request.getfixturevalue("mapped_parent") / root.name
     before = _contents(root)
-    report = cp.build_plan(chosen, database=outside, quarantine_date="2026-10-26")
+    report = cp.build_plan(chosen, database=outside, quarantine_date="2026-10-26", number_style="chapter")
     assert not report["review"] and not report["renames"] and not report["families"]
     assert report["database_target"] == cp.file_identity(outside)
     assert _contents(root) == before
@@ -211,7 +211,7 @@ def test_a_file_id_on_a_different_device_does_not_mean_containment(catalog_paths
         return SimpleNamespace(**fields)
 
     monkeypatch.setattr(Path, "stat", other_device)
-    report = cp.build_plan(root, database=outside, quarantine_date="2026-10-26")
+    report = cp.build_plan(root, database=outside, quarantine_date="2026-10-26", number_style="chapter")
     assert not report["review"] and not report["renames"] and not report["families"]
 
 
@@ -246,7 +246,7 @@ def test_uncertain_directory_identity_refuses_before_sqlite(catalog_paths, monke
 
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     with pytest.raises(cp.PlanningRefused, match="directory identity"):
-        cp.build_plan(root, database=outside, quarantine_date="2026-10-26")
+        cp.build_plan(root, database=outside, quarantine_date="2026-10-26", number_style="chapter")
 
 
 @pytest.mark.parametrize("direction", ["inside-link", "outside-link"])

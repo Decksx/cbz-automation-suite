@@ -166,6 +166,7 @@ SOURCE_HUMAN = "human_decision"
 SOURCE_COMICINFO = "comicinfo"
 SOURCE_FOLDER = "folder_context"
 SOURCE_FAMILY = "version_family"
+SOURCE_POLICY = "operator_policy"
 SOURCE_FILENAME = "filename"
 
 # Precedence for reporting. SOURCE_FAMILY sits at the folder-context level:
@@ -175,6 +176,7 @@ PRECEDENCE = (
     SOURCE_COMICINFO,
     SOURCE_FOLDER,
     SOURCE_FAMILY,
+    SOURCE_POLICY,
     SOURCE_FILENAME,
 )
 
@@ -717,7 +719,7 @@ _CHAPTER_RE = re.compile(
 )
 _ISSUE_RE = re.compile(rf"#\s*({_NUMBER_TEXT})")
 _VOLUME_WORD_RE = re.compile(
-    rf"(?<![A-Za-z])vol(?:ume)?\.?\s*({_NUMBER_TEXT})", re.IGNORECASE
+    rf"(?<![A-Za-z])(?:vol(?:ume)?|tpb|full)\.?\s*({_NUMBER_TEXT})", re.IGNORECASE
 )
 _V_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+)(?![A-Za-z0-9.])", re.IGNORECASE)
 
@@ -811,6 +813,9 @@ class NameTokens:
     name; its slot boundaries then supply these candidates. They remain
     candidates: filename-grade evidence, never authority.
 
+    ``collections`` retains explicit TPB/Full markers separately from editions
+    and specials; different collection markers refuse version-family identity.
+
     ``other_tags`` is everything else the name says that is not series,
     number, year, version, edition or special: bracket contents
     (``[Judas]``, ``(Digital)``) and leftover text after the numbering. It
@@ -838,6 +843,7 @@ class NameTokens:
     fixed_specials: frozenset[str] = frozenset()
     marker_run: tuple[tuple[str, str], ...] = ()
     canonical: bool = False
+    collections: frozenset[str] = frozenset()
 
     @property
     def primary_numbers(self) -> tuple[tuple[str, str], ...]:
@@ -957,10 +963,11 @@ def _canonical_tokens(filename: str) -> NameTokens | None:
         fields.series
     ):
         return None
-    head = fields.series + (f" {fields.special}" if fields.special else "")
+    canonical_series = fields.series + (f" ({fields.series_year})" if fields.series_year is not None else "")
+    head = canonical_series + (f" {fields.special}" if fields.special else "")
     tail = _EXTENSION_RE.sub("", filename[len(head):])
     numbers = _number_fields(_number_tokens(_BRACKET_GROUP_RE.sub(" ", tail)))
-    series, run = _split_marker_run(fields.series)
+    series, run = _split_marker_run(canonical_series)
     if fields.special:
         run = (*run, (MARKER_SPECIAL, fields.special))
     edition = frozenset({fields.edition}) if fields.edition else frozenset()
@@ -975,6 +982,7 @@ def _canonical_tokens(filename: str) -> NameTokens | None:
         fixed_editions=edition,
         marker_run=run,
         canonical=True,
+        collections=frozenset({fields.collection}) if fields.collection else frozenset(),
         **numbers,
     )
 
@@ -1022,12 +1030,16 @@ def _legacy_tokens(filename: str) -> NameTokens:
     # variant the vocabulary does not know, kept so a family can refuse
     # members that differ in them. A bracketed edition is unambiguous.
     fixed_editions: set[str] = set()
+    collections: set[str] = set()
     other_tags: set[str] = set()
     for match in _BRACKET_GROUP_RE.finditer(stem):
         content = _fold(match.group(0)[1:-1])
         if not content or _TAG_YEAR_RE.fullmatch(content):
             continue
         if _TAG_VERSION_RE.fullmatch(content) and match.group(0)[0] == "[":
+            continue
+        if content == "tpb":
+            collections.add("TPB")
             continue
         if content in _EDITION_BY_FOLD:
             fixed_editions.add(_EDITION_BY_FOLD[content])
@@ -1037,6 +1049,10 @@ def _legacy_tokens(filename: str) -> NameTokens:
     # Bracket groups are blanked before number tokens are read: numbers
     # inside them are not this book's numbering.
     body = _BRACKET_GROUP_RE.sub(" ", stem)
+    if re.search(r"(?<![A-Za-z])TPB\.?\s*" + _NUMBER_TEXT, body, re.I):
+        collections.add("TPB")
+    if re.search(r"(?<![A-Za-z])Full(?:\.?\s*" + _NUMBER_TEXT + r")?\s*$", body, re.I):
+        collections.add("Full")
     found = _number_tokens(body)
     spans = [(start, end) for tokens in found.values() for start, end, _, _ in tokens]
     starts = [start for start, _ in spans]
@@ -1076,6 +1092,7 @@ def _legacy_tokens(filename: str) -> NameTokens:
         specials=frozenset(run_specials),
         slot_prefix=prefix.strip(_SERIES_TRIM) if marker_run else None,
         fixed_editions=frozenset(fixed_editions),
+        collections=frozenset(collections),
         marker_run=marker_run,
         **_number_fields(found),
     )
@@ -1249,11 +1266,16 @@ class FolderFacts:
     resolved it as a series folder (the series index's decision, not this
     module's). None means the folder contributes no series evidence.
     ``archives`` are all the archives in the folder; siblings are judged
-    among them.
+    among them. ``series_folder_wins`` records a caller-confirmed series
+    folder chosen by the operator; original metadata evidence remains visible.
+    ``volume_defaults`` carries approved Full defaults bound to original source
+    facts, and is reused during proposed-name validation, never inferred there.
     """
 
     series_folder: str | None
     archives: tuple[ArchiveFacts, ...]
+    series_folder_wins: bool = False
+    volume_defaults: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1286,6 +1308,7 @@ class FamilyMember:
     human_conflicts: frozenset[str] = frozenset()
     specials: frozenset[str] = frozenset()
     marker_ambiguity: str | None = None
+    collections: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1433,6 +1456,8 @@ def establish_family(members: Sequence[FamilyMember]) -> FamilyEvidence:
             "members have different special/collection markers "
             f"{sorted(sorted(s) or ['absent'] for s in special_sets)}"
         )
+    if len({member.collections for member in members}) > 1:
+        reasons.append("members have different collected-edition markers")
     tag_sets = {member.other_tags for member in members}
     if len(tag_sets) > 1:
         reasons.append(
@@ -1630,7 +1655,7 @@ def _resolve(
     deciding = [
         item
         for item in ordered
-        if item.source in (SOURCE_COMICINFO, SOURCE_FOLDER, SOURCE_FAMILY)
+        if item.source in (SOURCE_COMICINFO, SOURCE_FOLDER, SOURCE_FAMILY, SOURCE_POLICY)
     ]
     if deciding:
         if len({same(item.value) for item in deciding}) == 1:
@@ -1883,6 +1908,7 @@ def _classify_v_token(
     run_volume: str | None,
     in_family: bool,
     human_conflict: bool = False,
+    policy_volume: str | None = None,
 ) -> VTokenClassification:
     """Classify one ``v<N>`` token under §3.2.
 
@@ -1919,6 +1945,8 @@ def _classify_v_token(
 
     if not (volume_why or version_why):
         if not bracketed:
+            if policy_volume == value:
+                volume_why.append("approved original-source collection policy agrees")
             if comicinfo_volume == value:
                 volume_why.append("ComicInfo Volume agrees")
             if run_volume == value:
@@ -1993,6 +2021,9 @@ def resolve_folder(
                 Evidence(SOURCE_FILENAME, token.series, "filename prefix")
             )
         series[key] = _resolve(FIELD_SERIES, evidence, same=series_key)
+        if folder.series_folder_wins and folder.series_folder and not _human_evidence(human[key], FIELD_SERIES):
+            series[key] = FieldResolution(FIELD_SERIES, folder.series_folder, SOURCE_FOLDER,
+                tuple(evidence), "resolved", folder.series_folder)
 
         evidence = _human_evidence(human[key], FIELD_NUMBER)
         evidence += _comicinfo_evidence(
@@ -2110,6 +2141,7 @@ def resolve_folder(
                     human_conflicts=conflicts[m.archive_key],
                     specials=markers[m.archive_key].specials,
                     marker_ambiguity=markers[m.archive_key].ambiguity,
+                    collections=tokens[m.archive_key].collections,
                 )
                 for m in members
             ]
@@ -2132,6 +2164,18 @@ def resolve_folder(
             if archive.comicinfo.authoritative("Volume")
             else None
         )
+        # A labelled collected volume can bind an authoritative ComicInfo
+        # Number to that volume, never from the filename alone. A primary
+        # issue/chapter token or conflicting metadata forbids conversion.
+        collected_number = (
+            number[key].value
+            if not token.primary_numbers and len(token.volume_tokens) == 1
+            and (token.collections or token.volume_words)
+            and number[key].resolved and number[key].value == token.volume_tokens[0]
+            else None
+        )
+        if comicinfo_volume is None and not archive.comicinfo.authoritative("Volume"):
+            comicinfo_volume = collected_number
         token_conflict = bool(conflicts[key] & {FIELD_VOLUME, FIELD_VERSION})
         human_volumes = {e.value for e in _human_evidence(human[key], FIELD_VOLUME)}
         human_versions = {
@@ -2151,6 +2195,7 @@ def resolve_folder(
                 run_volume=volume_run.values.get(key),
                 in_family=in_family,
                 human_conflict=token_conflict,
+                policy_volume=folder.volume_defaults.get(key),
             )
             for value, bracketed in candidates
         ]
@@ -2159,6 +2204,13 @@ def resolve_folder(
         evidence += _comicinfo_evidence(
             archive.comicinfo, "Volume", normalize_number
         )
+        if key in folder.volume_defaults:
+            evidence.append(Evidence(SOURCE_POLICY, folder.volume_defaults[key],
+                "approved unnumbered Full default bound to original archive facts"))
+        if collected_number is not None:
+            evidence.append(Evidence(number[key].source, collected_number,
+                "resolved primary Number agrees with explicit collected-volume label",
+                display=number[key].display_value))
         if key in volume_run.values:
             evidence.append(
                 Evidence(

@@ -38,6 +38,10 @@ from comic_automation.series_resolver import (
     unique_path,
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
+from comic_automation.archive import field_resolution as _media_fr
+from comic_automation.library.media_naming import media_fields, watcher_naming, with_comicinfo_year, KeepArrivalName, split_series_year
+from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
+from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from comic_automation.library.exclusions import (
     DEFAULT_EXCLUDED_DIRECTORIES,
     iter_files_excluding_directories,
@@ -110,6 +114,9 @@ except ModuleNotFoundError:
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"
 REPO_ROOT     = Path(__file__).resolve().parents[1]
 LOG_FILE      = REPO_ROOT / "Logs" / "cbz_watcher.log"
+# Main initializes the shared policy; direct legacy helper callers retain their API.
+_number_style_registry = None
+_number_style_requested = "auto"
 POLL_INTERVAL = 2    # seconds between stability checks
 SETTLE_DELAY  = 5    # seconds of inactivity before processing a directory
 MIN_AGE       = 300  # seconds a directory must exist before processing
@@ -1196,7 +1203,7 @@ class FallbackRefused:
 
 
 def _fallback_display_stem(
-    series_name: str, chapter: str | None, source_stem: str
+    series_name: str, chapter: str | None, source_stem: str, *, number_style="chapter"
 ) -> str | FallbackRefused:
     """The stem a fallback-named archive gets, via the canonical formatter.
 
@@ -1229,9 +1236,9 @@ def _fallback_display_stem(
             f"editions {list(editions)}, versions {list(tokens.versions)}"
         )
     try:
-        name = format_canonical_name(CanonicalFields(
-            series=series_name,
-            chapter=chapter,
+        name = format_canonical_name(media_fields(
+            series=series_name, number=chapter, volume=None, style=number_style,
+            tokens=_media_fr.parse_name_tokens(source_stem + ".cbz"),
             year=tokens.years[0] if tokens.years else None,
             edition=editions[0] if editions else None,
             version=tokens.versions[0] if tokens.versions else None,
@@ -1241,10 +1248,101 @@ def _fallback_display_stem(
     return name[: -len(CANONICAL_EXTENSION)]
 
 
+def _media_naming_enabled():
+    """An empty registry keeps the complete legacy watcher path enabled.
+
+    A loaded nonempty registry opts arrivals into media naming, including
+    explicit syntax overrides. The planner has its independent strict default.
+    """
+    return _number_style_registry is not None and bool(_number_style_registry.roots)
+
+
+def _apply_media_naming(parsed_by_path, originals, series_name, destination):
+    """Name arrivals under the final resolved destination's media policy.
+
+    Pre-rewrite metadata stays bound to each parsed original_path. A policy
+    refusal keeps the archive in intake for review. Existing tag-sensitive
+    landing and no-overwrite rules still own the actual rename.
+    """
+    if not _media_naming_enabled():
+        return set(), None
+    try:
+        selection = _number_style_registry.select(destination, _number_style_requested)
+    except (OSError, NumberStyleRefused) as exc:
+        log.warning("  REVIEW: media naming refused: %s", exc)
+        return set(parsed_by_path), None
+    log.info("  Media naming: %s (%s), registry SHA256 %s",
+             selection.style, selection.source, selection.registry_sha256)
+    refused = set()
+    for path, parsed in list(parsed_by_path.items()):
+        try:
+            fact = originals[parsed.original_path]
+            # Generic placeholders need the resolved directory number below.
+            if not parsed.chapter and not parsed.volume and _PLACEHOLDER_STEM_RE.match(parsed.stem):
+                continue
+            fields, xml_year = watcher_naming(parsed, fact, series=series_name, style=selection.style)
+            name = format_canonical_name(fields)
+            target = path.with_name(name)
+            patched = _dataclasses_replace(parsed, filename=name, series=fields.series + (f" ({fields.series_year})" if fields.series_year else ""),
+                chapter=fields.issue or fields.chapter, volume=fields.volume)
+            if xml_year is not None:
+                # Persist and read back the issue year while the archive name
+                # still carries it; a failure refuses before any rename.
+                _record_comicinfo_year(path, xml_year)
+            if name != path.name:
+                if not _defers_rename(path.stem, target.stem):
+                    rename_arrival(path, target)
+                    del parsed_by_path[path]
+                    path = target
+                elif target.exists():
+                    raise CanonicalNameError("media destination already exists")
+            parsed_by_path[path] = patched
+            process_comicinfo(path, patched)
+        except KeepArrivalName as exc:
+            # Keep the existing parsed/deferred display and its distinguishing
+            # number; this is no new field or family authority.
+            log.info("    Media naming kept legacy arrival %s: %s", path.name, exc)
+        except CaseRenameRecoveryError as exc:
+            retained = exc.retained_path
+            del parsed_by_path[path]
+            parsed_by_path[retained] = _dataclasses_replace(parsed, filename=retained.name)
+            refused.add(retained)
+            log.warning("    REVIEW: %s", exc)
+        except (OSError, ValueError, KeyError) as exc:
+            log.warning("    REVIEW: media naming refused for %s: %s", path.name, exc)
+            refused.add(path)
+    return refused, selection
+
+
+def _read_comicinfo_entry(cbz_path):
+    with zipfile.ZipFile(cbz_path, "r") as zf:
+        entry = next((n for n in zf.namelist() if os.path.basename(n).lower() == "comicinfo.xml"), None)
+        return entry, (zf.read(entry).decode("utf-8", errors="replace") if entry else None)
+
+
+def _record_comicinfo_year(cbz_path, year):
+    """Persist the issue year a reboot series-year filename omits in <Year>.
+
+    Called before the media rename, while the arrival name still carries the
+    year. The writer can give up after its retries without raising, so the
+    Year is read back: if it is not there, OSError keeps the archive in intake
+    under its year-bearing name. An existing different Year refuses
+    (ValueError) instead of replacing it.
+    """
+    entry, xml_text = _read_comicinfo_entry(cbz_path)
+    new_xml = with_comicinfo_year(xml_text if entry else COMICINFO_TEMPLATE, year)
+    if new_xml is not None:
+        _write_cbz_with_comicinfo(cbz_path, new_xml, replace_entry=entry)
+    entry, xml_text = _read_comicinfo_entry(cbz_path)
+    if entry is None or with_comicinfo_year(xml_text, year) is not None:
+        raise OSError(f"ComicInfo Year {year} was not persisted; keeping the year-bearing name")
+
+
 def _apply_fallback_naming(
     parsed_by_path: dict[Path, ParsedComicName],
     series_name: str,
     dir_number: str | None,
+    *, number_style="chapter",
 ) -> list[Path]:
     """Rename placeholder-named files (see ``_PLACEHOLDER_STEM_RE``) to the
     resolved series name, with the chapter number implied by the enclosing
@@ -1286,7 +1384,8 @@ def _apply_fallback_naming(
         # The ComicInfo title keeps the pre-§5.5 form; only the file name
         # carries the display tokens (see ParsedComicName).
         new_stem = f"{series_name} Ch. {dir_number}" if dir_number else series_name
-        display_stem = _fallback_display_stem(series_name, dir_number, cbz.stem)
+        display_stem = _fallback_display_stem(series_name, dir_number, cbz.stem,
+                                               number_style=number_style)
         if isinstance(display_stem, FallbackRefused):
             log.warning(
                 f"    REVIEW: fallback name refused for '{cbz.name}' "
@@ -2116,6 +2215,10 @@ def _resolve_series_dir_name(
     generic name.
     """
     cleaned = clean_directory_name(comic_dir.name) or comic_dir.name
+    if _media_naming_enabled():
+        base, reboot_year = split_series_year(comic_dir.name)
+        if reboot_year is not None:
+            cleaned = f"{clean_directory_name(base) or base} ({reboot_year})"
 
     kw_base = series_base_name(cleaned, bare_numbers=False)
     if kw_base:
@@ -2429,6 +2532,10 @@ def process_and_move_directory(dir_path: Path) -> bool:
 def _process_and_move_directory_inner(dir_path: Path) -> None:
     # Clean the top-level watched directory name first.
     clean_top    = clean_directory_name(dir_path.name)
+    if _media_naming_enabled():
+        base, reboot_year = split_series_year(dir_path.name)
+        if reboot_year is not None:
+            clean_top = f"{clean_directory_name(base) or base} ({reboot_year})"
     old_dir_path = dir_path  # keep original for lock update
     if clean_top and clean_top != dir_path.name:
         new_top = dir_path.parent / clean_top
@@ -2482,6 +2589,10 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         route_category, legacy_dest = _resolve_route(comic_dir)
         incoming_series_alias = comic_dir.name
         clean_dir_name = clean_directory_name(comic_dir.name)
+        if _media_naming_enabled():
+            base, reboot_year = split_series_year(comic_dir.name)
+            if reboot_year is not None:
+                clean_dir_name = f"{clean_directory_name(base) or base} ({reboot_year})"
         preliminary_title = clean_dir_name or comic_dir.name
         _, dest_folder, _, active_resolver = (
             _resolve_import_target(route_category, preliminary_title, legacy_dest)
@@ -2548,6 +2659,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
 
         log.info(f"  Processing directory: {comic_dir.name} ({len(cbz_files)} file(s)) -> {dest_folder}")
         parsed_by_path: dict[Path, ParsedComicName] = {}
+        media_originals = {}
         ai_decensor_backups: list[tuple[Path, Path]] = []
         ai_decensor_this_directory = (
             AI_DECENSOR_ENABLED and destination_is_comix(dest_folder)
@@ -2570,6 +2682,12 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 override = fallback_names.get(cbz)
                 if override:
                     log.info(f"    Empty stem fallback: '{cbz.name}' -> '{override}'")
+                if _media_naming_enabled():
+                    try:
+                        media_originals[cbz] = _media_fr.archive_facts_from_file(cbz)
+                    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                        log.warning("    REVIEW: cannot bind original media facts for %s: %s", cbz, exc)
+                        return
                 result_path, parsed = process_cbz_file(cbz, override_name=override)
                 total_processed += 1
                 if result_path.name != original_name:
@@ -2617,7 +2735,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 metadata_name = _consistent_comicinfo_series(
                     list(parsed_by_path.keys())
                 )
-                if metadata_name and _series_key(metadata_name) != _series_key(name):
+                if (metadata_name and _series_key(metadata_name) != _series_key(name)
+                        and not (_media_naming_enabled() and split_series_year(name)[1] is not None)):
                     # process_cbz_file translates native and confidently romanized
                     # titles before this read. Prefer that English ComicInfo value
                     # only in resolver mode, leaving legacy watcher naming intact.
@@ -2680,8 +2799,19 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     path: getattr(parsed, "original_path", path)
                     for path, parsed in parsed_by_path.items()
                 }
-                refused = set(_apply_fallback_naming(
-                    parsed_by_path, series_name, dir_number) or ())
+                refused = set()
+                media_selection = None
+                refusal_kind = "fallback name refused for {} placeholder archive(s)"
+                if _media_naming_enabled():
+                    refused, media_selection = _apply_media_naming(
+                        parsed_by_path, media_originals, series_name, dest_folder)
+                    if refused:
+                        refusal_kind = "media naming refused for {} archive(s)"
+                media_options = ({"number_style": media_selection.style}
+                                 if media_selection is not None else {})
+                if not refused:
+                    refused.update(_apply_fallback_naming(
+                        parsed_by_path, series_name, dir_number, **media_options) or ())
                 ai_backups = _rekey_ai_backups(
                     ai_decensor_backups, origins, parsed_by_path)
                 # Read after the fallback renames, which change paths. Passed
@@ -2701,8 +2831,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     # stays in the import folder for review; nothing in it is
                     # moved, and the next settle pass or restart retries it.
                     log.warning(
-                        f"  Deferred '{comic_dir.name}' for review: fallback name "
-                        f"refused for {len(refused)} placeholder archive(s); "
+                        f"  Deferred '{comic_dir.name}' for review: "
+                        f"{refusal_kind.format(len(refused))}; "
                         f"left in the import folder.")
                     landed = None
                 elif has_nested_comic_dirs:
@@ -3281,17 +3411,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--readiness-hold-root", type=Path,
         help="Existing writable same-volume directory outside the watch tree; holds are disabled unless set.",
     )
+    parser.add_argument("--number-style", choices=("auto", "issue", "chapter"), default="auto",
+                        help="Number syntax used when a nonempty registry enables media naming.")
+    parser.add_argument("--number-style-registry", type=Path, default=DEFAULT_REGISTRY,
+                        help="Shared media roots; an empty registry keeps legacy watcher naming.")
     return parser
 
 
-def main(argv: list[str] | None = None):
+def _run_watcher(argv: list[str] | None = None):
     """Start the watcher with command-line-selected optional integrations."""
     global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
     global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
+    global _number_style_registry, _number_style_requested
     args = build_argument_parser().parse_args(argv)
+    try:
+        _number_style_registry = NumberStyleRegistry.load(args.number_style_registry)
+        _number_style_requested = args.number_style
+    except NumberStyleRefused as exc:
+        build_argument_parser().error(str(exc))
     AI_DECENSOR_ENABLED = args.ai_decensor
     AI_DECENSOR_MODELS = list(dict.fromkeys(
         args.ai_decensor_models or ["black_bars"]
@@ -3328,6 +3468,7 @@ def main(argv: list[str] | None = None):
 
     log.info("=" * 60)
     log.info("CBZ Watcher started")
+    log.info("  Media naming: %s", "configured registry" if _media_naming_enabled() else "off (legacy naming)")
     log.info(f"  Watching : {WATCH_FOLDER}")
     log.info(f"  Routing  : {ROUTING_FILE}")
     if _router is not None:
@@ -3377,6 +3518,20 @@ def main(argv: list[str] | None = None):
 
     observer.join()
     log.info("CBZ Watcher stopped.")
+
+
+def main(argv: list[str] | None = None):
+    """Run one watcher session and release its media policy on every exit.
+
+    A stopped/failed CLI session must not configure later embedded callers
+    or another session in the same process with stale policy state.
+    """
+    global _number_style_registry, _number_style_requested
+    previous = _number_style_registry, _number_style_requested
+    try:
+        return _run_watcher(argv)
+    finally:
+        _number_style_registry, _number_style_requested = previous
 
 
 if __name__ == "__main__":

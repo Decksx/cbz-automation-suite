@@ -1414,3 +1414,68 @@ but does not fail on them.
 **Not done here.** Step 4 (re-inventory) is not done. The tool does not
 take the backup itself. Apply refuses unless the backup it is given passes
 all the checks above.
+
+## 2026-10-26: explicit media syntax and separate collection identity (#140)
+
+David selected Western `#` issue syntax, Manga-only `ch.`, `v01` collected
+volumes retaining `(TPB)`, normalized-equal folder display, and legal apostrophes.
+Claude approved the design in issue comment 6422344608. Codex implements;
+Claude reviews and owns rollout. Unnumbered Full stays held pending David's
+volume-default decision.
+
+One shared JSON registry selects style by physical root/ancestor identities,
+with explicit CLI overrides. Its exact hash and the selected physical scope
+are part of planner provenance/digest. This avoids both basename guessing and
+the UNC/drive alias mistake from #134, and preserves style for subfolder scans.
+The empty fallback refuses unknown roots; deployment must configure the shared
+registry or explicit style. An environment-selected external registry supports
+GUI launches without committing host-specific paths.
+
+TPB gets a separate pure-formatter collection slot, preserving Colored and
+other independent editions. Only narrow case/space/punctuation equality lets
+folder spelling replace resolved display; substantive differences remain held.
+The watcher's original metadata is captured before its existing rewrite, and
+style follows the final destination after category overrides. Planner and
+watcher share the semantic mapper; the planner retains its stricter authority
+and proposed-name resolution guards. CLI policy state is released on exit.
+
+Protocol, refusal/rollout limits and fixture coverage are in
+`docs/media_aware_naming.md`. No live library/DB/configuration changes are part
+of the implementation. Any Tower batch requires a new plan, verified backup
+and David's approval of the exact new digest.
+
+### #140 review follow-up: preserve arrivals and make watcher activation opt-in
+
+Claude's review 6423576221 of #142 at 3a5517f found four concrete gaps.
+Unconsumed bare filename numbers now retain the legacy arrival display instead
+of disappearing into an unnumbered canonical name. Same-file Windows case
+renames use two no-replace steps, restore on final failure and track the actual
+retained temporary path if rollback is also blocked. Explicit style keeps the
+planner's series-root conflict check, and auto detects registered roots nested
+physically below a scan scope, including through junction aliases.
+
+The review also supersedes the initial watcher empty-registry behavior above:
+an empty registry means media naming OFF and the complete legacy path remains
+available. A nonempty registry opts the watcher in; explicit style can override
+syntax after that. The planner retains its independent strict auto refusal.
+Configured-registry end-to-end witnesses now exercise this boundary alongside
+real normalization, ComicInfo rewriting and movement. Alias/year-folder holds
+and Western volume policy remain unchanged pending David's separate decisions.
+
+
+### #140 operator update: chosen folder identity and reboot year
+
+David's decisions forwarded in hive #2991, with year correction #2996,
+supersede the earlier name-conflict and unnumbered-Full holds. Confirmed
+series folders win series identity/display including aliases and typos.
+Number, Volume and protected-content rules remain independent; original
+ComicInfo evidence stays recorded. Registered roots are categories; an
+unregistered root scan declares --series-folder-root instead of guessing.
+
+The formatter has a separate series_year slot before primary numbering.
+Batman (2016) #003 always uses the reboot year alone: even an issue year
+2020 stays only in ComicInfo. The selected series-year identity survives
+watcher cleanup/rescan and planner re-resolution. Unnumbered Full defaults
+to volume1 with an explicit operator_policy field-evidence source, bound to
+the original Full observation and reused for the proposed-state check.
+No historical human/controller approval is fabricated by that policy fact.

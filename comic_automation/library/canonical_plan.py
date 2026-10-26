@@ -34,10 +34,12 @@ from scripts.cbz_canonical_name import (
     CanonicalFields, CanonicalNameError, format_canonical_name, parse_canonical_name,
 )
 from scripts.cbz_core import extract_display_tokens
+from comic_automation.library.media_naming import media_fields, display_key, unnumbered_full
+from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from scripts.cbz_routing import NON_SERIES_DIRECTORIES
 
 CONTRACT = "canonical-naming-plan-v1"
-PLANNER_VERSION = 1
+PLANNER_VERSION = 2
 _INTERNAL = NON_SERIES_DIRECTORIES | {
     ".cbz-canonical-naming", ".cbz-canonical-quarantine",
 }
@@ -182,7 +184,8 @@ def _inventory(root: Path) -> tuple[list[dict], list[Path], list[dict]]:
     )
 
 
-def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | None = None) -> str:
+def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | None = None,
+                 number_style: str = "chapter", folder: str | None = None) -> str:
     """Format resolved fields; the override is only for unchanged comparison.
 
     ``unchanged_version`` never authorizes an action: the caller can use it
@@ -216,20 +219,29 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
             raise PlanningRefused(f"{field.field} unresolved ({field.reason})")
     series = fields["series"].display_value or fields["series"].value
     markers = fr.effective_markers(tokens, series)
-    if markers.ambiguity or tokens.other_tags:
-        raise PlanningRefused(markers.ambiguity or f"unclassified tags: {sorted(tokens.other_tags)}")
+    full = unnumbered_full(tokens, series, resolution.comicinfo.fields.get("Series"))
+    other_tags = tokens.other_tags - ({"full"} if full else set())
+    if markers.ambiguity or other_tags:
+        raise PlanningRefused(markers.ambiguity or f"unclassified tags: {sorted(other_tags)}")
     editions = markers.editions
     if len(editions) > 1 or len(markers.specials) > 1:
         raise PlanningRefused("multiple edition/special markers cannot fit the grammar")
     value = lambda field: fields[field].display_value or fields[field].value
     volume, number = value("volume"), value("number")
-    fields_to_format = CanonicalFields(
-        series=series, volume=volume,
-        issue=number if volume is not None else None,
-        chapter=number if volume is None else None,
+    ci = resolution.comicinfo
+    fields_to_format = media_fields(
+        series=series, volume=volume, number=number, style=number_style,
+        tokens=tokens, folder=folder, full_default=full,
+        ci_series=ci.fields["Series"] if ci.authoritative("Series") else None,
+        ci_volume=ci.fields["Volume"] if ci.authoritative("Volume") else None,
         year=value("year"), version=value("version") if unchanged_version is None else unchanged_version,
         edition=next(iter(editions), None), special=next(iter(markers.specials), None),
     )
+    if (fields_to_format.series_year is not None and value("year") is not None
+            and fr.normalize_year(ci.fields.get("Year") if ci.authoritative("Year") else None) != str(value("year"))):
+        # A series-year name omits the issue year; the rename-only executor
+        # cannot write it, so it must already be in ComicInfo Year.
+        raise PlanningRefused("issue year is not in ComicInfo Year; a series-year name would drop it")
     name = format_canonical_name(fields_to_format)
     # The shared display policy owns language/edition visibility. Resolution
     # still retains those distinctions when establishing a version family.
@@ -238,7 +250,22 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
     return name
 
 
-def _lone_canonical_unchanged(resolution: fr.ArchiveResolution) -> bool:
+def _applied_full_default(filename: str) -> bool:
+    """Recognize the exact name the unnumbered-Full policy produces.
+
+    ``Series v01 (TPB)`` with no issue/chapter is what an applied Full default
+    leaves behind; it re-establishes that same policy volume so the next plan
+    is a fixpoint. Any other volume or numbering gains no filename authority.
+    """
+    try:
+        canonical = parse_canonical_name(filename)
+    except CanonicalNameError:
+        return False
+    return (canonical.collection == "TPB" and canonical.volume == "1"
+            and canonical.issue is None and canonical.chapter is None)
+
+
+def _lone_canonical_unchanged(resolution: fr.ArchiveResolution, *, number_style="chapter", folder=None) -> bool:
     """Recognize a no-op without certifying its filename-only version label."""
     fields = resolution.fields
     if fields["version"].resolved or fields["version"].reason != "filename_candidate_only":
@@ -250,7 +277,7 @@ def _lone_canonical_unchanged(resolution: fr.ArchiveResolution) -> bool:
     try:
         canonical = parse_canonical_name(resolution.filename)
         return canonical.version is not None and _destination(
-            resolution, unchanged_version=canonical.version
+            resolution, unchanged_version=canonical.version, number_style=number_style, folder=folder
         ) == resolution.filename
     except (PlanningRefused, CanonicalNameError):
         return False
@@ -270,7 +297,8 @@ def _identity_group_key(resolution: fr.ArchiveResolution) -> tuple | None:
     return (fr.series_key(fields["series"].value), primary.field, primary.value)
 
 
-def _fixpoint_problems(facts: list[fr.ArchiveFacts], destinations: dict[str, str]) -> dict[str, str]:
+def _fixpoint_problems(facts: list[fr.ArchiveFacts], destinations: dict[str, str],
+                       *, number_style="chapter", folder=None, display_folders=None, series_folder=None, volume_defaults=None) -> dict[str, str]:
     """Reject proposals that fail resolution under their proposed names.
 
     Reuse the same ComicInfo and byte-bound page facts, with all offered
@@ -281,14 +309,16 @@ def _fixpoint_problems(facts: list[fr.ArchiveFacts], destinations: dict[str, str
     """
     proposed = tuple(replace(fact, filename=Path(destinations[fact.archive_key]).name)
                      if fact.archive_key in destinations else fact for fact in facts)
-    resolved = fr.resolve_folder(fr.FolderFacts(None, proposed)).by_key()
+    resolved = fr.resolve_folder(fr.FolderFacts(series_folder, proposed,
+        series_folder_wins=series_folder is not None, volume_defaults=volume_defaults or {})).by_key()
     problems = {}
     for fact in facts:
         destination = destinations.get(fact.archive_key)
         if destination is None or Path(destination).name == fact.filename:
             continue
         try:
-            again = _destination(resolved[fact.archive_key])
+            again = _destination(resolved[fact.archive_key], number_style=number_style,
+                folder=(display_folders or {}).get(fact.archive_key, folder))
             if again != Path(destination).name:
                 raise PlanningRefused(f"would become {again!r}")
         except (PlanningRefused, CanonicalNameError) as exc:
@@ -354,10 +384,13 @@ def build_plan(
     quarantine_date: str, accept_comicinfo_drop: bool = False,
     max_held_bytes: int = sv.DEFAULT_MAX_HELD_BYTES,
     max_copy_bytes: int | None = None, temp_dir: str | Path | None = None,
+    number_style: str = "auto", number_style_registry: str | Path = DEFAULT_REGISTRY,
+    series_folder_root: bool = False,
 ) -> dict[str, Any]:
     """Produce a sealed executor-compatible plan; read only, no live locks.
 
-    No folder name is promoted to decided series authority. Human decision
+    Only confirmed series folders supply series authority; a flat category
+    root contributes none. Unregistered series roots must be declared. Human decision
     manifests and decensor pairing adapters are not implemented; uncertain
     fields and decensor-marked paths are held. All supplied paths are exact
     catalog spellings (drive/UNC aliases are not guessed). Any concurrent DB
@@ -373,6 +406,11 @@ def build_plan(
     # Even mode=ro SQLite may create WAL/SHM sidecars. Refuse before the
     # first database open, including drive/UNC aliases into the library.
     _require_external_database(root, database)
+    try:
+        style_registry = NumberStyleRegistry.load(number_style_registry)
+        style = style_registry.select(root, number_style)
+    except NumberStyleRefused as exc:
+        raise PlanningRefused(str(exc)) from exc
     temporary = Path(temp_dir if temp_dir is not None else tempfile.gettempdir()).resolve(strict=True)
     if not temporary.is_dir() or _under(temporary, root.resolve(strict=True)):
         raise PlanningRefused("private temporary copies must be outside the library")
@@ -432,10 +470,24 @@ def build_plan(
                     sv.stored_rows_verdict(bound, pages.get(archive_id), archive_id))
                 facts.append(fr.ArchiveFacts(key, path.name,
                     fr.comicinfo_facts(bound.comicinfo_documents), bound.page_evidence()))
-            resolved = fr.resolve_folder(fr.FolderFacts(None, tuple(facts)))
+            confirmed_series = (folder.name if folder != root or series_folder_root or
+                (style.source == "registry" and style.matched_identity != root_identity[:2])
+                else None)
+            volume_defaults = {}
+            for fact in facts:
+                ci = fact.comicinfo
+                title = confirmed_series or (ci.fields.get("Series") if ci.authoritative("Series") else None)
+                if (style.style == "issue" and title and not ci.authoritative("Number")
+                        and not ci.authoritative("Volume")
+                        and (unnumbered_full(fr.parse_name_tokens(fact.filename), title, ci.fields.get("Series"))
+                             or _applied_full_default(fact.filename))):
+                    volume_defaults[fact.archive_key] = "1"
+            resolved = fr.resolve_folder(fr.FolderFacts(confirmed_series, tuple(facts),
+                series_folder_wins=confirmed_series is not None, volume_defaults=volume_defaults))
             resolutions = resolved.by_key()
             group_sizes = Counter(_identity_group_key(item) for item in resolutions.values())
             reasons, destinations, unverified_noops = {}, {}, set()
+            display_folders = {}
             for path in paths:
                 key = str(path)
                 problems = _metadata_problems(derived[key].comicinfo_documents)
@@ -447,19 +499,29 @@ def build_plan(
                 identity_text = " ".join((root.name, str(path.relative_to(root)), series))
                 if _decensor_marker(identity_text):
                     problems.append("decensor identity/pairing adapter required")
+                display_folder = confirmed_series
                 try:
-                    destinations[key] = str(path.with_name(_destination(resolutions[key])))
+                    if (folder == root and confirmed_series is None and style.source == "explicit"
+                            and display_key(folder.name) != display_key(series)):
+                        raise PlanningRefused("unregistered root requires --series-folder-root for folder authority")
+                    display_folder = confirmed_series
+                    display_folders[key] = display_folder
+                    destinations[key] = str(path.with_name(_destination(resolutions[key],
+                        number_style=style.style, folder=display_folder)))
                 except (PlanningRefused, CanonicalNameError) as exc:
                     if (not problems and _identity_group_key(resolutions[key]) is not None
                             and group_sizes[_identity_group_key(resolutions[key])] == 1
                             and occupied[_key(path)] == 1
-                            and _lone_canonical_unchanged(resolutions[key])):
+                            and _lone_canonical_unchanged(resolutions[key],
+                                number_style=style.style, folder=display_folder)):
                         unverified_noops.add(key)
                         destinations[key] = key
                     else:
                         problems.append(str(exc))
                 reasons[key] = problems
-            for key, problem in _fixpoint_problems(facts, destinations).items():
+            for key, problem in _fixpoint_problems(facts, destinations,
+                    number_style=style.style, display_folders=display_folders,
+                    series_folder=confirmed_series, volume_defaults=volume_defaults).items():
                 reasons[key].append(problem)
             claimed = set()
             for family in resolved.families:
@@ -536,8 +598,10 @@ def build_plan(
             raise PlanningRefused("library inventory changed during planning")
         doc["provenance"] = {
             "planner_version": PLANNER_VERSION, "inventory": before,
+            "number_style": style.as_dict(),
             "excluded": excluded, "catalog": catalog,
-            "series_folder_authority": "none; directory names are not decisions",
+            "series_folder_authority": "operator-chosen series folders; registered flat roots contribute none",
+            "series_folder_root": series_folder_root,
             "filesystem_snapshot": "non-atomic observation; apply revalidates strong hashes",
             "accept_comicinfo_drop": accept_comicinfo_drop,
             "max_held_bytes": max_held_bytes, "max_copy_bytes": max_copy_bytes,
@@ -551,6 +615,11 @@ def build_plan(
         raise PlanningRefused("database target changed during planning")
     if root_identity != (root.stat().st_dev, root.stat().st_ino, str(root.resolve(strict=True))):
         raise PlanningRefused("library root identity changed during planning")
+    try:
+        if style_registry.select(root, number_style) != style:
+            raise PlanningRefused("number-style root identity changed during planning")
+    except NumberStyleRefused as exc:
+        raise PlanningRefused(str(exc)) from exc
     doc = snapshot.result
     doc["provenance"]["snapshot"] = snapshot.report_fields()
     for family in doc["families"]:

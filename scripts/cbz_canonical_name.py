@@ -9,7 +9,7 @@ fallback names come from :func:`format_canonical_name`.
 
 The grammar (§2.1), with the special word placed as described below::
 
-    <series> [<special>] [v<VV>] [#<III> | ch. <C>] [(<year>)] [(<edition>)] [[v<N>]].cbz
+    <series> [<special>] [v<VV>] [#<III> | ch. <C>] [(<year>)] [(TPB)] [(<edition>)] [[v<N>]].cbz
 
 This module **formats already-resolved fields**. It never resolves them: it
 does not decide whether a ``v`` token is a volume or a version (§3.2), and it
@@ -66,6 +66,7 @@ __all__ = [
     "NotCanonicalNameError",
     "ReservedNameError",
     "UnknownEditionError",
+    "InvalidCollectionError",
     "UnknownSpecialWordError",
     "find_canonical_collisions",
     "format_canonical_name",
@@ -185,6 +186,10 @@ class UnknownEditionError(CanonicalNameError):
 
 class UnknownSpecialWordError(CanonicalNameError):
     """The special word is not in :data:`SPECIAL_WORDS`."""
+
+
+class InvalidCollectionError(CanonicalNameError):
+    """A collection must be TPB with a volume and no issue/chapter."""
 
 
 class ReservedNameError(CanonicalNameError):
@@ -347,7 +352,7 @@ _TRAILING_TOKEN_RE = re.compile(
     r"|(?:^|\s)ch\.?\s*\d[\d.\-]*"    # chapter-like: ch. 1, ch1, Ch.12.5
     r"|\(\d{4}\)"                     # year
     r"|\[v\d+\]"                      # version
-    rf"|\((?:{_alternation(EDITION_WORDS)})\)"
+    rf"|\((?:{_alternation(EDITION_WORDS)}|TPB)\)"
     rf"|(?:^|\s)(?:{_alternation(SPECIAL_WORDS)})"
     r")$",
     re.IGNORECASE,
@@ -376,6 +381,13 @@ class CanonicalFields:
     with either: the §2.1 grammar admits ``v<VV> ch. <C>`` even though its
     prose describes chapters as the volume-less form.
 
+    ``series_year`` is reboot identity before primary numbering. The issue
+    year stays in ComicInfo and is omitted from this series-year filename.
+
+    ``collection`` is a separate collected-edition marker (currently TPB),
+    requiring a volume without an issue/chapter. It coexists with edition
+    variants such as Colored, which must not disappear.
+
     ``version`` must only be set when §4.6 has verified it for this archive
     itself; the formatter cannot check that.
     """
@@ -388,6 +400,8 @@ class CanonicalFields:
     edition: str | None = None
     special: str | None = None
     version: int | str | None = None
+    collection: str | None = None
+    series_year: int | str | None = None
 
     def __post_init__(self) -> None:
         series = sanitize_series_name(self.series)
@@ -405,6 +419,11 @@ class CanonicalFields:
             raise UnknownEditionError(f"edition {self.edition!r} is not in EDITION_WORDS")
         if self.special is not None and self.special not in SPECIAL_WORDS:
             raise UnknownSpecialWordError(f"special {self.special!r} is not in SPECIAL_WORDS")
+        if self.collection is not None and (
+            self.collection != "TPB" or self.volume is None
+            or self.issue is not None or self.chapter is not None
+        ):
+            raise InvalidCollectionError("TPB requires a volume and no issue/chapter")
         set_ = object.__setattr__
         set_(self, "series", series)
         set_(self, "volume", _canonical_number(self.volume, "volume"))
@@ -412,6 +431,11 @@ class CanonicalFields:
         set_(self, "chapter", _canonical_number(self.chapter, "chapter"))
         set_(self, "year", _canonical_year(self.year))
         set_(self, "version", _canonical_version(self.version))
+        set_(self, "series_year", _canonical_year(self.series_year))
+        if self.series_year is not None:
+            if all(v is None for v in (self.volume, self.issue, self.chapter)):
+                raise CanonicalNameError("series year requires primary numbering to distinguish it from issue year")
+            set_(self, "year", None)  # Reboot year is the only filename year; issue year stays in XML.
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +449,13 @@ _NUM = rf"{_ENDPOINT}(?:-{_ENDPOINT})?"
 # that safe, by refusing any series the non-greedy split would cut short.
 _CANONICAL_RE = re.compile(
     r"(?P<series>.+?)"
+    r"(?: \((?P<series_year>[0-9]{4})\)"
+    rf"(?= (?:(?:{_alternation(SPECIAL_WORDS)}) )?(?:v[0-9]|#[0-9]|ch\. [0-9])))?"
     rf"(?: (?P<special>{_alternation(SPECIAL_WORDS)}))?"
     rf"(?: v(?P<volume>{_NUM}))?"
     rf"(?: (?:#(?P<issue>{_NUM})|ch\. (?P<chapter>{_NUM})))?"
     r"(?: \((?P<year>[0-9]{4})\))?"
+    r"(?: \((?P<collection>TPB)\))?"
     rf"(?: \((?P<edition>{_alternation(EDITION_WORDS)})\))?"
     r"(?: \[v(?P<version>[1-9][0-9]*)\])?"
     + re.escape(CANONICAL_EXTENSION)
@@ -448,7 +475,7 @@ def _is_reserved(name: str) -> bool:
 
 
 def _assemble(fields: CanonicalFields) -> str:
-    parts = [fields.series]
+    parts = [fields.series + (f" ({fields.series_year})" if fields.series_year is not None else "")]
     if fields.special is not None:
         parts.append(fields.special)
     if fields.volume is not None:
@@ -459,6 +486,8 @@ def _assemble(fields: CanonicalFields) -> str:
         parts.append(f"ch. {fields.chapter}")
     if fields.year is not None:
         parts.append(f"({fields.year})")
+    if fields.collection is not None:
+        parts.append(f"({fields.collection})")
     if fields.edition is not None:
         parts.append(f"({fields.edition})")
     if fields.version is not None:

@@ -468,7 +468,6 @@ def test_parse_accepts_only_the_formatters_image():
         "Batman ch.1.cbz",        # missing space
         "Batman.CBZ",             # extension case
         "Batman.cbr",
-        "Batman (2019) v01.cbz",  # slots out of order
         "Batman #001 ch. 1.cbz",  # issue and chapter
         "Batman [v0].cbz",
         "CON.cbz",                # reserved
