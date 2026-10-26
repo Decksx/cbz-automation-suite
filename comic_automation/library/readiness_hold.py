@@ -67,8 +67,8 @@ class ReadinessHolds:
     """Track per-archive inactivity and hold only allowlisted expired inputs.
 
     No root means no holding and no filesystem validation/writes. An explicit
-    root must already exist, be writable, non-reparse, outside the watched
-    tree and on the same volume. Zero minutes also disables holds. Budgets
+    root must already exist, be writable, non-reparse, disjoint from the
+    watched tree and on the same volume. Zero minutes also disables holds. Budgets
     are in-memory and start over on restart; events alone never reset them.
     """
 
@@ -102,8 +102,8 @@ class ReadinessHolds:
     def _validate_roots(self) -> tuple[tuple[int, int], tuple[int, int]]:
         watched = _directory_chain(self.watch_root)
         holding = _directory_chain(self.hold_root)
-        if watched[0] in holding:
-            raise ValueError("readiness hold root must be outside the watched tree")
+        if watched[0] in holding or holding[0] in watched:
+            raise ValueError("readiness hold root and watched tree must not overlap")
         if watched[0][0] != holding[0][0]:
             raise ValueError("readiness hold root must be on the same volume")
         return watched[0], holding[0]
