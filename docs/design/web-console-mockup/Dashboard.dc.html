@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dashboard — CBZ Suite</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0e1016}
+a{color:#c9cede}a:hover{color:#ffffff}
+.nav-link:hover{background:#1b1f2a}
+.ghost-btn:hover{background:#232836}
+.tool-row:hover{background:#1d212c}
+.skip{position:absolute;left:-9999px}.skip:focus{left:16px;top:8px;z-index:10;background:#ff5c72;color:#16080b;padding:8px 12px;border-radius:6px}
+input:focus,select:focus,button:focus-visible,a:focus-visible{outline:2px solid #ff5c72;outline-offset:2px}
+button:disabled{opacity:0.5;cursor:not-allowed}
+</style>
+</helmet>
+<div style="min-height: 1900px; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 14px; line-height: 1.45">
+  <a href="#main" class="skip">Skip to content</a>
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid #232733; background: #12141b">
+    <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; text-decoration: none; color: #ffffff">
+      <span style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; background: #ff5c72; color: #16080b">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h12a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z"></path><path d="M8 9h8M8 13h5"></path></svg>
+      </span>
+      <span style="font-weight: 700; font-size: 16px; letter-spacing: -0.01em">CBZ Suite</span>
+    </a>
+    <div style="flex: 1 1 280px; max-width: 480px; position: relative">
+      <label for="tool-search" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Search tools</label>
+      <input id="tool-search" type="search" value="{{query}}" onChange="{{setQuery}}" placeholder="Search tools and scripts…" style="width: 100%; box-sizing: border-box; height: 38px; padding: 0 12px 0 36px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa1b2" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="position: absolute; left: 12px; top: 11px"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+    </div>
+    <div style="flex: 1 1 0"></div>
+    <a href="#watcher" style="display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: #10261d; border: 1px solid #1d4a37; color: #7fe0b5; text-decoration: none; font-size: 13px; font-weight: 500">
+      <span style="width: 8px; height: 8px; border-radius: 50%; background: #3fd18f"></span>
+      Watcher running
+    </a>
+    <a href="Settings.dc.html" class="ghost-btn" aria-label="Settings" style="width: 38px; height: 38px; box-sizing: border-box; border-radius: 8px; border: 1px solid #2a2f3d; color: #c9cede; display: flex; align-items: center; justify-content: center">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"></path></svg>
+    </a>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; align-items: flex-start">
+
+    <nav aria-label="Main" style="flex: 1 1 220px; max-width: 260px; box-sizing: border-box; padding: 20px 12px; display: flex; flex-direction: column; gap: 20px; border-right: 1px solid #232733; min-height: 1830px">
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <a href="Dashboard.dc.html" aria-current="page" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #ffffff; background: #222736; font-weight: 500">Dashboard</a>
+        <a href="#jobs" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Jobs</a>
+        <a href="#catalog" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">All tools<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">{{toolCount}}</span></a>
+        <a href="Settings.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Settings</a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Pinned</div>
+        <a href="Main.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #ff5c72"></span>Library Maintenance</a>
+        <a href="#watcher" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #5b9cff"></span>CBZ Watcher<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #10261d; color: #7fe0b5">Running</span></a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Needs your decision</div>
+        <a href="PlanReview.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Plans to approve<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #13243f; color: #9cc3ff">1</span></a>
+        <a href="#decisions" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Readiness holds<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">off</span></a>
+        <a href="#jobs" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Failed jobs<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #3a1a20; color: #ff8a9a">1</span></a>
+        <a href="SeriesReview.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #9aa1b2">Series Review<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">v1.1</span></a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Domains</div>
+        <sc-for list="{{navDomains}}" as="d" hint-placeholder-count="7">
+          <a href="#catalog" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">
+            <span style="width: 8px; height: 8px; border-radius: 2px; background: {{d.color}}"></span>{{d.name}}<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">{{d.count}}</span>
+          </a>
+        </sc-for>
+      </div>
+    </nav>
+
+    <main id="main" style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32px 48px; display: flex; flex-direction: column; gap: 24px">
+
+      <div style="display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px">
+        <div style="flex: 1 1 420px; display: flex; flex-direction: column; gap: 6px">
+          <h1 style="margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.02em">Dashboard</h1>
+          <p style="margin: 0; color: #b9bfcc">The watcher, the running job, what needs a decision, and every tool in the suite.</p>
+        </div>
+        <a href="Main.dc.html" style="display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 16px; border-radius: 8px; background: #ff5c72; color: #16080b; text-decoration: none; font-weight: 700">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"></path></svg>
+          New run
+        </a>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; gap: 16px; align-items: stretch">
+
+        <section id="watcher" style="flex: 3 1 520px; min-width: 0; background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 14px">
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px">
+            <h2 style="margin: 0; font-size: 15px; font-weight: 600">CBZ Watcher</h2>
+            <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; background: #10261d; color: #7fe0b5"><span style="width: 7px; height: 7px; border-radius: 50%; background: #3fd18f"></span>Running</span>
+            <span style="font-size: 13px; color: #9aa1b2">pid 18244 · up 3 d 4 h · started by console</span>
+          </div>
+          <dl style="margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 16px; font-size: 13px">
+            <dt style="color: #9aa1b2">Resolver</dt>
+            <dd style="margin: 0">On · threshold 0.95 · Comix <span style="font-family: 'IBM Plex Mono', monospace">Z:\comics\Comix</span> · Manga <span style="font-family: 'IBM Plex Mono', monospace">Z:\comics\Manga</span></dd>
+            <dt style="color: #9aa1b2">Quarantine</dt>
+            <dd style="margin: 0; font-family: 'IBM Plex Mono', monospace">Z:\comics\_resolver_quarantine</dd>
+            <dt style="color: #9aa1b2">Decensor</dt>
+            <dd style="margin: 0">Off</dd>
+            <dt style="color: #9aa1b2">Number style</dt>
+            <dd style="margin: 0">auto · registry <span style="font-family: 'IBM Plex Mono', monospace; overflow-wrap: anywhere">%USERPROFILE%\.cbz-automation\number-styles.json</span> <span style="font-family: 'IBM Plex Mono', monospace; color: #9aa1b2">sha 3f9a1c0e · 6 roots</span></dd>
+            <dt style="color: #9aa1b2">Readiness hold</dt>
+            <dd style="margin: 0">Off (no hold folder configured)</dd>
+          </dl>
+          <details style="border: 1px solid #232733; border-radius: 8px; background: #0a0c11">
+            <summary style="min-height: 40px; display: flex; align-items: center; padding: 0 12px; cursor: pointer; font-size: 13px; color: #c9cede">Exact command</summary>
+            <pre style="margin: 0; padding: 0 12px 12px; color: #c8f5d8; font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere">python -m scripts.cbz_watcher --series-resolver --resolver-comix-root Z:\comics\Comix --resolver-manga-root Z:\comics\Manga --resolver-quarantine-root Z:\comics\_resolver_quarantine --resolver-threshold 0.95 --number-style auto --number-style-registry %USERPROFILE%\.cbz-automation\number-styles.json</pre>
+          </details>
+          <div style="display: flex; flex-wrap: wrap; gap: 8px">
+            <button type="button" disabled style="min-height: 40px; padding: 0 16px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit">Start…</button>
+            <button type="button" class="ghost-btn" style="min-height: 40px; padding: 0 16px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; cursor: pointer">View live log</button>
+            <button type="button" class="ghost-btn" style="min-height: 40px; padding: 0 16px; border-radius: 8px; border: 1px solid #4a2a30; background: transparent; color: #ff8a9a; font: inherit; cursor: pointer">Stop watcher</button>
+            <span style="align-self: center; font-size: 12px; color: #9aa1b2">Only one watcher can run. Start opens the watcher form when it is stopped.</span>
+          </div>
+        </section>
+
+        <section id="decisions" style="flex: 2 1 360px; min-width: 0; background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 10px">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">Needs your decision</h2>
+          <a href="PlanReview.dc.html" class="tool-row" style="display: flex; flex-direction: column; gap: 2px; padding: 8px; margin: 0 -8px; border-radius: 8px; text-decoration: none; color: #e6e8ee">
+            <span style="display: flex; align-items: center; gap: 8px"><span style="font-weight: 500">Plan awaiting approval</span><span style="margin-left: auto; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: #13243f; color: #9cc3ff">REVIEW</span></span>
+            <span style="font-size: 12px; color: #9aa1b2; font-family: 'IBM Plex Mono', monospace">canonical-naming-plan-v1 · Manga · 1f3c9e…07a9 · 2 h old</span>
+          </a>
+          <div style="display: flex; flex-direction: column; gap: 2px; padding: 8px; margin: 0 -8px; border-radius: 8px">
+            <span style="display: flex; align-items: center; gap: 8px"><span style="font-weight: 500; color: #c9cede">Readiness holds</span><span style="margin-left: auto; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; border: 1px solid #2f3546; color: #9aa1b2">OFF</span></span>
+            <span style="font-size: 12px; color: #9aa1b2">No hold folder configured. Held archives appear here once <span style="font-family: 'IBM Plex Mono', monospace">paths.readiness_hold</span> is set.</span>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; margin: 0 -8px; border-radius: 8px">
+            <span style="display: flex; flex-direction: column; gap: 2px; flex: 1 1 200px"><span style="font-weight: 500">Failed job not acknowledged</span><span style="font-size: 12px; color: #b9bfcc">Archive quarantine · Failed (exit 2) · yesterday</span></span>
+            <button type="button" onClick="{{ack}}" class="ghost-btn" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; font-size: 13px; cursor: pointer">{{ackLabel}}</button>
+          </div>
+          <a href="SeriesReview.dc.html" class="tool-row" style="display: flex; flex-direction: column; gap: 2px; padding: 8px; margin: 0 -8px; border-radius: 8px; text-decoration: none; color: #e6e8ee">
+            <span style="display: flex; align-items: center; gap: 8px"><span style="font-weight: 500">New series proposal</span><span style="margin-left: auto; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; border: 1px solid #2f3546; color: #9aa1b2">v1.1</span></span>
+            <span style="font-size: 12px; color: #9aa1b2">6 groups newer than the decisions file · Series Review is coming in v1.1</span>
+          </a>
+        </section>
+      </div>
+
+      <section id="jobs" style="background: #161922; border: 1px solid #232733; border-radius: 12px; overflow: hidden">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid #232733">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">Jobs</h2>
+          <span style="font-size: 13px; color: #9aa1b2">Each job keeps its log file and its exact command</span>
+          <a href="#jobs" style="margin-left: auto; font-size: 13px; color: #ff8a9a">View all</a>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 14px 20px; border-bottom: 1px solid #232733; background: #12141b">
+          <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; background: #3a2410; color: #ffc27a">Running</span>
+          <a href="Main.dc.html" style="font-weight: 500; color: #ffffff; text-decoration: none">Library Maintenance</a>
+          <span style="font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: #13243f; color: #9cc3ff">DRY RUN</span>
+          <span style="font-size: 13px; color: #b9bfcc">organize stage · 412 / 1,280</span>
+          <div role="progressbar" aria-label="Library Maintenance progress" aria-valuenow="32" aria-valuemin="0" aria-valuemax="100" style="flex: 1 1 200px; height: 8px; border-radius: 999px; background: #0e1016; overflow: hidden"><div style="width: 32%; height: 100%; background: #f0a63a; border-radius: 999px"></div></div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px">32%</span>
+        </div>
+        <div style="overflow-x: auto">
+          <table style="width: 100%; min-width: 980px; border-collapse: collapse; font-size: 13px">
+            <thead>
+              <tr style="text-align: left; color: #9aa1b2">
+                <th scope="col" style="padding: 10px 20px; font-weight: 500">Status</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Tool</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Mode</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Target</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Started</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Duration</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Exit</th>
+                <th scope="col" style="padding: 10px 20px; font-weight: 500; text-align: right">Command</th>
+              </tr>
+            </thead>
+            <tbody>
+              <sc-for list="{{jobs}}" as="j" hint-placeholder-count="5">
+                <tr style="border-top: 1px solid #232733">
+                  <td style="padding: 12px 20px"><span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; background: {{j.bg}}; color: {{j.fg}}; white-space: nowrap">{{j.status}}</span></td>
+                  <td style="padding: 12px"><a href="Main.dc.html" style="font-weight: 500; color: #e6e8ee; text-decoration: none">{{j.tool}}</a><sc-if value="{{j.note}}" hint-placeholder-val="{{false}}"><div style="font-size: 12px; color: #ffc27a">{{j.note}}</div></sc-if></td>
+                  <td style="padding: 12px"><span style="font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: {{j.modeBg}}; color: {{j.modeFg}}; white-space: nowrap">{{j.mode}}</span></td>
+                  <td style="padding: 12px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #b9bfcc">{{j.target}}</td>
+                  <td style="padding: 12px; color: #b9bfcc; white-space: nowrap">{{j.when}}</td>
+                  <td style="padding: 12px; color: #b9bfcc; font-family: 'IBM Plex Mono', monospace; font-size: 12px">{{j.dur}}</td>
+                  <td style="padding: 12px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #b9bfcc">{{j.exit}}</td>
+                  <td style="padding: 12px 20px; text-align: right"><button type="button" onClick="{{j.copy}}" class="ghost-btn" style="min-height: 32px; padding: 0 10px; border-radius: 6px; border: 1px solid #2a2f3d; background: transparent; color: #c9cede; font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap">{{j.copyLabel}}</button></td>
+                </tr>
+              </sc-for>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="catalog" style="display: flex; flex-direction: column; gap: 16px">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+          <h2 style="margin: 0; font-size: 20px; font-weight: 600">All tools</h2>
+          <span style="font-size: 13px; color: #9aa1b2">{{shownCount}} of {{toolCount}} · {{schemaCount}} open in the console, the rest are CLI only</span>
+          <div role="group" aria-label="Filter tools" style="margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px">
+            <sc-for list="{{filters}}" as="f" hint-placeholder-count="6">
+              <sc-if value="{{f.on}}" hint-placeholder-val="{{false}}">
+                <button type="button" aria-pressed="true" onClick="{{f.pick}}" style="min-height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #e6e8ee; background: #e6e8ee; color: #0e1016; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer">{{f.label}}</button>
+              </sc-if>
+              <sc-if value="{{f.off}}" hint-placeholder-val="{{true}}">
+                <button type="button" aria-pressed="false" onClick="{{f.pick}}" style="min-height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #2f3546; background: transparent; color: #c9cede; font: inherit; font-size: 13px; cursor: pointer">{{f.label}}</button>
+              </sc-if>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; align-items: start">
+          <sc-for list="{{domains}}" as="d" hint-placeholder-count="7">
+            <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 16px 16px 8px; display: flex; flex-direction: column; gap: 4px">
+              <div style="display: flex; align-items: center; gap: 10px; padding-bottom: 6px">
+                <span style="width: 10px; height: 10px; border-radius: 3px; background: {{d.color}}"></span>
+                <h3 style="margin: 0; font-size: 14px; font-weight: 600">{{d.name}}</h3>
+                <span style="margin-left: auto; font-size: 12px; color: #9aa1b2">{{d.count}}</span>
+              </div>
+              <sc-for list="{{d.tools}}" as="t" hint-placeholder-count="4">
+                <sc-if value="{{t.schema}}" hint-placeholder-val="{{false}}">
+                  <a href="{{t.href}}" class="tool-row" style="display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 4px 8px; margin: 0 -8px; border-radius: 8px; text-decoration: none; color: #e6e8ee">
+                    <span style="flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column">
+                      <span style="font-weight: 600">{{t.name}} <span style="font-weight: 500; color: #ff8a9a; font-size: 12px">Open →</span></span>
+                      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #9aa1b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">{{t.src}}</span>
+                    </span>
+                    <span style="flex: none; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: {{t.badgeBg}}; color: {{t.badgeFg}}">{{t.badge}}</span>
+                  </a>
+                </sc-if>
+                <sc-if value="{{t.cli}}" hint-placeholder-val="{{true}}">
+                  <div style="display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 4px 0">
+                    <span style="flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column">
+                      <span style="color: #c9cede">{{t.name}}</span>
+                      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #9aa1b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">CLI only · {{t.src}}</span>
+                    </span>
+                    <span style="flex: none; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: {{t.badgeBg}}; color: {{t.badgeFg}}">{{t.badge}}</span>
+                  </div>
+                </sc-if>
+              </sc-for>
+            </section>
+          </sc-for>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1900}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { filter: 'all', query: '', acked: false, copied: -1 };
+  }
+  renderVals() {
+    const R = 'ro', W = 'files', D = 'db', S = 'live';
+    // [name, module, effect, schema target or null]
+    const DOMAINS = [
+      { name: 'Workflows', color: '#ff5c72', tools: [
+        ['Library Maintenance', 'scripts.cbz_workflows maintenance', W, 'Main.dc.html'],
+        ['Series Workflow', 'scripts.cbz_workflows series', W, null],
+        ['Apply Dry-Run Plan', 'scripts.cbz_library_maintenance apply-plan', W, null],
+        ['Exclusions Log', 'scripts.cbz_library_maintenance clear-exclusions', W, null]
+      ]},
+      { name: 'Watcher & routing', color: '#5b9cff', tools: [
+        ['CBZ Watcher', 'scripts.cbz_watcher', S, '#watcher'],
+        ['Routing rules', 'scripts.cbz_routing', W, null],
+        ['Router shadow compare', 'scripts.cbz_watcher_router', R, null],
+        ['Readiness hold', 'library.readiness_hold', W, null]
+      ]},
+      { name: 'Naming & classification', color: '#b67ae0', tools: [
+        ['Canonical naming plan', 'scripts.cbz_canonical_plan', R, 'PlanReview.dc.html'],
+        ['Canonical apply', 'library.canonical_apply', W, null],
+        ['Arrival renames', 'library.arrival_rename', W, null],
+        ['Classification staging', 'scripts.cbz_classification_staging', W, null],
+        ['Promote staging', 'scripts.cbz_promote_staging', W, null],
+        ['Library reclassify', 'scripts.cbz_library_reclassify', W, null],
+        ['Shadow handoff plan', 'scripts.cbz_shadow_handoff', R, null]
+      ]},
+      { name: 'Archive integrity', color: '#2fb5a5', tools: [
+        ['Library discovery', 'scripts.comic_library_discovery', D, null],
+        ['Archive inspection', 'scripts.comic_archive_inspection', D, null],
+        ['Archive hashing', 'scripts.comic_archive_hashing', D, null],
+        ['Page hashing', 'scripts.comic_page_hashing', D, null],
+        ['Perceptual hashing', 'scripts.comic_perceptual_hashing', D, null],
+        ['Near-duplicate candidates', 'scripts.comic_near_duplicate_candidates', R, null],
+        ['Duplicate resolution', 'scripts.comic_archive_duplicate_resolution', W, null],
+        ['Archive quarantine', 'scripts.comic_archive_quarantine', W, null],
+        ['Relocation repair', 'library.relocation_repair', W, null],
+        ['Compilation resolver', 'scripts.cbz_compilation_resolver', W, null]
+      ]},
+      { name: 'Decensor', color: '#9b86d6', tools: [
+        ['Camelia Decensor', 'scripts.camelia_decensor', W, null],
+        ['Camelia handoff reconcile', 'library.camelia_handoff', W, null],
+        ['Offload decensor backups', 'scripts.ai_decensor_backups', W, null]
+      ]},
+      { name: 'Reports & audits', color: '#f0a63a', tools: [
+        ['Gap Checker', 'scripts.cbz_gap_checker', R, null],
+        ['Library audit', 'library.cli', R, null],
+        ['Series ambiguity report', 'scripts.cbz_series_ambiguity_report', R, null],
+        ['Series key-change report', 'scripts.cbz_series_key_change_report', R, null],
+        ['Perceptual coverage audit', 'scripts.comic_perceptual_coverage_audit', R, null],
+        ['Perceptual failure audit', 'scripts.comic_perceptual_failure_audit', R, null],
+        ['Perceptual reuse analysis', 'scripts.comic_perceptual_reuse_analysis', R, null]
+      ]},
+      { name: 'Database & jobs', color: '#8a93a8', tools: [
+        ['Automation service', 'scripts.comic_automation_service', S, null],
+        ['Database init / status', 'scripts.db_cli', D, null],
+        ['Database backup', 'scripts.comic_database_backup', D, null],
+        ['Batch postflight', 'scripts.comic_batch_postflight', D, null],
+        ['Abandoned job audit', 'scripts.comic_job_abandoned_audit', R, null],
+        ['Abandoned job recovery', 'scripts.comic_job_abandoned_recovery', D, null],
+        ['Active duplicate job audit', 'scripts.comic_job_active_duplicate_audit', R, null],
+        ['Source drift recovery', 'scripts.comic_perceptual_source_drift_recovery', D, null]
+      ]}
+    ];
+    const BADGE = {
+      ro: { label: 'read-only', bg: '#12261f', fg: '#7fe0b5' },
+      files: { label: 'writes files', bg: '#3a2410', fg: '#ffc27a' },
+      db: { label: 'database', bg: '#13243f', fg: '#9cc3ff' },
+      live: { label: 'service', bg: '#2a2140', fg: '#cbb8ff' }
+    };
+    const f = this.state.filter;
+    const q = (this.state.query || '').toLowerCase();
+    let total = 0, shown = 0, schemaCount = 0;
+    const domains = DOMAINS.map((d) => {
+      total += d.tools.length;
+      d.tools.forEach((t) => { if (t[3]) schemaCount += 1; });
+      const tools = d.tools
+        .filter((t) => (f === 'all' || (f === 'schema' ? !!t[3] : t[2] === f)) && (!q || (t[0] + ' ' + t[1]).toLowerCase().indexOf(q) !== -1))
+        .map((t) => ({ name: t[0], src: t[1], href: t[3] || '#catalog', schema: !!t[3], cli: !t[3], badge: BADGE[t[2]].label, badgeBg: BADGE[t[2]].bg, badgeFg: BADGE[t[2]].fg }));
+      shown += tools.length;
+      return { name: d.name, color: d.color, count: tools.length, tools: tools };
+    }).filter((d) => d.tools.length);
+    const FILTERS = [['all', 'All'], ['schema', 'Opens in console'], ['ro', 'Read-only'], ['files', 'Writes files'], ['db', 'Database'], ['live', 'Services']];
+    const ST = {
+      ok: ['Succeeded', '#12261f', '#7fe0b5'],
+      fail: ['Failed (exit 2)', '#3a1a20', '#ff8a9a'],
+      stop: ['Stopped', '#2a2f3d', '#e6e8ee'],
+      lost: ['Lost', '#3a1a20', '#ff8a9a']
+    };
+    const DRY = ['DRY RUN', '#13243f', '#9cc3ff'], LIVE = ['WRITES CHANGES', '#3a2410', '#ffc27a'], RO = ['READ-ONLY', '#12261f', '#7fe0b5'];
+    const JOBS = [
+      [ST.ok, 'Canonical naming plan', RO, 'Z:\\comics\\Manga', 'Today 15:58', '41m 12s', '1', null],
+      [ST.ok, 'Library Maintenance', DRY, '\\\\tower\\media\\comics\\Comix', 'Yesterday 21:10', '18m 03s', '0', null],
+      [ST.fail, 'Archive quarantine', LIVE, 'Z:\\comics\\Manga', 'Yesterday 19:42', '2m 40s', '2', null],
+      [ST.stop, 'Library Maintenance', LIVE, '\\\\tower\\media\\comics\\Comix', 'Oct 23 22:05', '6m 51s', '—', 'The library may be partly changed'],
+      [ST.ok, 'CBZ Watcher', LIVE, 'X:\\ → Z:\\comics', 'Oct 23 08:00', '2d 13h', '0', null]
+    ];
+    return {
+      query: this.state.query,
+      setQuery: (e) => this.setState({ query: e.target.value }),
+      domains: domains,
+      navDomains: DOMAINS.map((d) => ({ name: d.name, color: d.color, count: d.tools.length })),
+      toolCount: total,
+      shownCount: shown,
+      schemaCount: schemaCount,
+      filters: FILTERS.map((x) => ({ label: x[1], on: f === x[0], off: f !== x[0], pick: () => this.setState({ filter: x[0] }) })),
+      ack: () => this.setState({ acked: true }),
+      ackLabel: this.state.acked ? 'Acknowledged' : 'Acknowledge',
+      jobs: JOBS.map((j, i) => ({
+        status: j[0][0], bg: j[0][1], fg: j[0][2], tool: j[1], mode: j[2][0], modeBg: j[2][1], modeFg: j[2][2],
+        target: j[3], when: j[4], dur: j[5], exit: j[6], note: j[7],
+        copy: () => this.setState({ copied: i }),
+        copyLabel: this.state.copied === i ? 'Copied' : 'Copy command'
+      }))
+    };
+  }
+}
+</script>
+</body>
+</html>

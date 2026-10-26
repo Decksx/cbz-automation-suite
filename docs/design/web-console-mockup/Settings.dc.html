@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Settings — CBZ Suite</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0e1016}
+a{color:#c9cede}a:hover{color:#ffffff}
+.nav-link:hover{background:#1b1f2a}
+.ghost-btn:hover{background:#232836}
+.skip{position:absolute;left:-9999px}.skip:focus{left:16px;top:8px;z-index:10;background:#ff5c72;color:#16080b;padding:8px 12px;border-radius:6px}
+input:focus,select:focus,button:focus-visible,a:focus-visible{outline:2px solid #ff5c72;outline-offset:2px}
+</style>
+</helmet>
+<div style="min-height: 1200px; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 14px; line-height: 1.45">
+  <a href="#main" class="skip">Skip to content</a>
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid #232733; background: #12141b">
+    <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; text-decoration: none; color: #ffffff">
+      <span style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; background: #ff5c72; color: #16080b">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h12a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z"></path><path d="M8 9h8M8 13h5"></path></svg>
+      </span>
+      <span style="font-weight: 700; font-size: 16px; letter-spacing: -0.01em">CBZ Suite</span>
+    </a>
+    <div style="flex: 1 1 280px; max-width: 480px; position: relative">
+      <label for="tool-search" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Search tools</label>
+      <input id="tool-search" type="search" placeholder="Search tools and scripts…" style="width: 100%; box-sizing: border-box; height: 38px; padding: 0 12px 0 36px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa1b2" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="position: absolute; left: 12px; top: 11px"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+    </div>
+    <div style="flex: 1 1 0"></div>
+    <a href="Dashboard.dc.html#watcher" style="display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: #10261d; border: 1px solid #1d4a37; color: #7fe0b5; text-decoration: none; font-size: 13px; font-weight: 500">
+      <span style="width: 8px; height: 8px; border-radius: 50%; background: #3fd18f"></span>
+      Watcher running
+    </a>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; align-items: flex-start">
+
+    <nav aria-label="Main" style="flex: 1 1 220px; max-width: 260px; box-sizing: border-box; padding: 20px 12px; display: flex; flex-direction: column; gap: 20px; border-right: 1px solid #232733; min-height: 1130px">
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Dashboard</a>
+        <a href="Dashboard.dc.html#jobs" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Jobs</a>
+        <a href="Dashboard.dc.html#catalog" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">All tools<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">43</span></a>
+        <a href="Settings.dc.html" aria-current="page" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #ffffff; background: #222736; font-weight: 500">Settings</a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Pinned</div>
+        <a href="Main.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #ff5c72"></span>Library Maintenance</a>
+        <a href="Dashboard.dc.html#watcher" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #5b9cff"></span>CBZ Watcher<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #10261d; color: #7fe0b5">Running</span></a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Needs your decision</div>
+        <a href="PlanReview.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Plans to approve<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #13243f; color: #9cc3ff">1</span></a>
+        <a href="Dashboard.dc.html#decisions" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Readiness holds<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">off</span></a>
+        <a href="Dashboard.dc.html#jobs" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Failed jobs<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #3a1a20; color: #ff8a9a">1</span></a>
+        <a href="SeriesReview.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #9aa1b2">Series Review<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">v1.1</span></a>
+      </div>
+    </nav>
+
+    <main id="main" style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32px 48px; display: flex; flex-direction: column; gap: 20px; max-width: 1180px">
+      <div style="display: flex; flex-direction: column; gap: 6px">
+        <h1 style="margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.02em">Settings</h1>
+        <p style="margin: 0; color: #b9bfcc">The configuration the console is running with, and where each value comes from. To change a value, edit <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px">console.toml</span>; the console doesn't edit it in v1.</p>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; gap: 16px">
+        <section style="flex: 1 1 360px; min-width: 0; background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 12px">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">Server</h2>
+          <dl style="margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; font-size: 13px">
+            <dt style="color: #9aa1b2">Version</dt><dd style="margin: 0; font-family: 'IBM Plex Mono', monospace">f43174e <span style="font-family: 'IBM Plex Sans', sans-serif; color: #9aa1b2">· cbz-automation-suite commit</span></dd>
+            <dt style="color: #9aa1b2">Production catalog</dt><dd style="margin: 0; font-family: 'IBM Plex Mono', monospace; overflow-wrap: anywhere">G:\ComicAutomation\database\comics.db</dd>
+            <dt style="color: #9aa1b2">Address</dt><dd style="margin: 0; font-family: 'IBM Plex Mono', monospace">127.0.0.1:8765 <span style="font-family: 'IBM Plex Sans', sans-serif; color: #9aa1b2">· loopback only</span></dd>
+            <dt style="color: #9aa1b2">Operator</dt><dd style="margin: 0; font-family: 'IBM Plex Mono', monospace">OFFICEPC\david · session 3</dd>
+            <dt style="color: #9aa1b2">Host</dt><dd style="margin: 0">OfficePC</dd>
+          </dl>
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding-top: 10px; border-top: 1px solid #232733">
+            <sc-if value="{{notQuitting}}" hint-placeholder-val="{{true}}">
+              <button type="button" onClick="{{askQuit}}" class="ghost-btn" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid #4a2a30; background: transparent; color: #ff8a9a; font: inherit; cursor: pointer">Quit server</button>
+              <span style="font-size: 12px; color: #9aa1b2">Running jobs keep going; their runners are separate processes.</span>
+            </sc-if>
+            <sc-if value="{{quitting}}" hint-placeholder-val="{{false}}">
+              <span style="font-size: 13px; color: #ffc27a; flex: 1 1 200px">Quit the server? The watcher and 1 running job will keep running.</span>
+              <button type="button" onClick="{{cancelQuit}}" class="ghost-btn" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; cursor: pointer">Cancel</button>
+              <button type="button" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: none; background: #ff5c72; color: #16080b; font: inherit; font-weight: 700; cursor: pointer">Quit server</button>
+            </sc-if>
+          </div>
+        </section>
+
+        <section style="flex: 1 1 360px; min-width: 0; background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 12px">
+          <div style="display: flex; align-items: center; gap: 10px">
+            <h2 style="margin: 0; font-size: 15px; font-weight: 600">State directory</h2>
+            <span style="font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; background: #10261d; color: #7fe0b5">OK</span>
+          </div>
+          <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; padding: 10px 12px; border-radius: 8px; background: #0a0c11; border: 1px solid #232733">G:\ComicAutomation\web-console\</div>
+          <dl style="margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; font-size: 13px">
+            <dt style="color: #9aa1b2">Source</dt><dd style="margin: 0">default</dd>
+            <dt style="color: #9aa1b2">Identity</dt><dd style="margin: 0">matches the identity pinned on first run</dd>
+            <dt style="color: #9aa1b2">Backup</dt><dd style="margin: 0"><span style="font-family: 'IBM Plex Mono', monospace">console.sqlite3</span> · daily, 7 kept · last [time]</dd>
+          </dl>
+          <p style="margin: 0; font-size: 12px; color: #9aa1b2">If G: is missing or its identity changes, the server refuses to start. The approval ledger lives here, so keep it on the G: backup checklist.</p>
+        </section>
+      </div>
+
+      <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; overflow: hidden">
+        <div style="padding: 16px 20px; border-bottom: 1px solid #232733; display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">Effective configuration</h2>
+          <span style="font-size: 13px; color: #9aa1b2">Path parameters must sit under a root of the matching role</span>
+        </div>
+        <div style="overflow-x: auto">
+          <table style="width: 100%; min-width: 820px; border-collapse: collapse; font-size: 13px">
+            <thead>
+              <tr style="text-align: left; color: #9aa1b2">
+                <th scope="col" style="padding: 10px 20px; font-weight: 500">Key</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Effective value</th>
+                <th scope="col" style="padding: 10px 12px; font-weight: 500">Source</th>
+                <th scope="col" style="padding: 10px 20px; font-weight: 500">On change</th>
+              </tr>
+            </thead>
+            <tbody>
+              <sc-for list="{{config}}" as="c" hint-placeholder-count="9">
+                <tr style="border-top: 1px solid #232733; vertical-align: top">
+                  <td style="padding: 12px 20px; font-family: 'IBM Plex Mono', monospace; color: #c9cede; white-space: nowrap">{{c.key}}</td>
+                  <td style="padding: 12px; font-family: 'IBM Plex Mono', monospace; white-space: pre-line; overflow-wrap: anywhere">{{c.value}}</td>
+                  <td style="padding: 12px"><span style="font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: {{c.srcBg}}; color: {{c.srcFg}}; white-space: nowrap">{{c.source}}</span></td>
+                  <td style="padding: 12px 20px; color: #b9bfcc">{{c.change}}</td>
+                </tr>
+              </sc-for>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 10px">
+        <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">Saved tool defaults</h2>
+          <span style="font-size: 13px; color: #9aa1b2">The last validated parameters for each tool. Reset goes back to the tool's own defaults.</span>
+        </div>
+        <sc-for list="{{tools}}" as="t" hint-placeholder-count="3">
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-height: 52px; border-top: 1px solid #232733; padding-top: 8px">
+            <span style="flex: 1 1 260px; display: flex; flex-direction: column">
+              <span style="font-weight: 500">{{t.name}}</span>
+              <span style="font-size: 12px; color: #9aa1b2">{{t.detail}}</span>
+            </span>
+            <button type="button" onClick="{{t.reset}}" disabled="{{t.isDefault}}" class="ghost-btn" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; font-size: 13px; cursor: pointer">{{t.label}}</button>
+          </div>
+        </sc-for>
+      </section>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1200}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { quitting: false, reset: {} };
+  }
+  renderVals() {
+    const s = this.state;
+    const SRC = {
+      'default': ['default', '#1f2433', '#c9cede'],
+      'toml': ['console.toml', '#13243f', '#9cc3ff'],
+      'env': ['environment', '#2a2140', '#cbb8ff'],
+      'fixed': ['fixed', '#1f2433', '#9aa1b2']
+    };
+    const ROWS = [
+      ['server.host', '127.0.0.1', 'fixed', 'Not configurable'],
+      ['server.port', '8765', 'toml', 'Restart the server'],
+      ['paths.library', '\\\\tower\\media\\comics\nZ:\\comics', 'toml', 'Applies to new runs'],
+      ['paths.quarantine', 'Z:\\comics\\_resolver_quarantine', 'toml', 'Applies to new runs'],
+      ['paths.decensor_archive', 'F:\\ai-decensor-originals', 'toml', 'Applies to new runs'],
+      ['paths.readiness_hold', '(none): holds are off\nsuggested: C:\\Temp\\Mega\\_held_incomplete', 'toml', 'Applies to new runs; restart the watcher'],
+      ['paths.database', 'G:\\ComicAutomation\\database', 'toml', 'Applies to new runs'],
+      ['paths.plan_import', '(none; the console plans\\ folder is always allowed)', 'default', 'Applies to new imports'],
+      ['naming.number_style_registry', '%USERPROFILE%\\.cbz-automation\\number-styles.json\nsha256 3f9a1c0e…b41d · 6 roots: Manga, Comix, Graphic Novels on Tower and X:\nfrom CBZ_NUMBER_STYLE_REGISTRY', 'env', 'Applies to new runs (watcher needs a restart)'],
+      ['python.executable', 'C:\\Python311\\python.exe', 'default', 'Applies to new runs']
+    ];
+    const TOOLS = [
+      ['lm', 'Library Maintenance', 'Saved after your last run · Dry run, all 5 stages, 8 workers'],
+      ['watcher', 'CBZ Watcher', 'Saved at the last start · resolver on, threshold 0.95'],
+      ['plan', 'Canonical naming plan', 'Saved after the last plan run · Z:\\comics\\Manga, number style auto']
+    ];
+    return {
+      quitting: s.quitting,
+      notQuitting: !s.quitting,
+      askQuit: () => this.setState({ quitting: true }),
+      cancelQuit: () => this.setState({ quitting: false }),
+      config: ROWS.map((r) => ({ key: r[0], value: r[1], source: SRC[r[2]][0], srcBg: SRC[r[2]][1], srcFg: SRC[r[2]][2], change: r[3] })),
+      tools: TOOLS.map((t) => ({
+        name: t[1],
+        detail: s.reset[t[0]] ? 'Using the tool defaults' : t[2],
+        isDefault: !!s.reset[t[0]],
+        label: s.reset[t[0]] ? 'Reset' : 'Reset to defaults',
+        reset: () => this.setState({ reset: Object.assign({}, s.reset, { [t[0]]: true }) })
+      }))
+    };
+  }
+}
+</script>
+</body>
+</html>
