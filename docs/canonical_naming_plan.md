@@ -185,3 +185,9 @@ See `docs/media_aware_naming.md` for the complete policy, watcher behavior
 change, configuration/rollout requirement and the conservative Manga-volume
 fixpoint limitation. Existing plans must not be reused for this policy:
 generate a fresh read-only plan and obtain approval of its exact digest.
+
+Review 6423576221 additionally requires explicit style to retain the series-root
+folder conflict check. Auto refuses registered sub-library roots physically
+inside its scope, so a parent scan cannot assign issue syntax to nested Manga.
+The watcher has a separate activation boundary: an empty registry keeps its
+legacy naming path active; this does not relax the planner's strict auto rule.
