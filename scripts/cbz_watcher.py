@@ -2404,23 +2404,26 @@ def _move_loose_files(
     return dest_dir if moved else None
 
 
-def process_and_move_directory(dir_path: Path) -> None:
-    """
-    Recursively find all immediate directories containing .cbz files under
-    dir_path. For each one: clean dir name → process files → move to dest.
+def process_and_move_directory(dir_path: Path) -> bool:
+    """Claim the directory and run its recursive import pass.
+
+    Return False on processing contention so readiness can retry; True means
+    this invocation owned the pass, not that every archive landed successfully.
+    The pass cleans directory names, processes files and routes them as before.
     """
     with _processing_dirs_lock:
         # Claim atomically: a readiness hold can begin after dispatch's check.
         if any(dir_path == p or _is_subpath(dir_path, p) or _is_subpath(p, dir_path)
                for p in _processing_dirs):
             log.info("  Directory processing already owned: %s", dir_path)
-            return
+            return False
         _processing_dirs.add(dir_path)
     try:
         _process_and_move_directory_inner(dir_path)
     finally:
         with _processing_dirs_lock:
             _processing_dirs.discard(dir_path)
+    return True
 
 
 def _process_and_move_directory_inner(dir_path: Path) -> None:
@@ -2899,7 +2902,12 @@ def _process_directory_when_ready(
 
     if result.status == ZipReadiness.READY:
         tracker.readiness_holds.forget(dir_path)
-        process_and_move_directory(dir_path)
+        if process_and_move_directory(dir_path) is False:
+            # A hold may claim exclusion after this gate's readiness probe.
+            # Preserve this event, but never replace a newer notify() timer.
+            tracker._schedule_readiness_retry(
+                dir_path, expected_generation=readiness_generation,
+            )
         return
 
     if tracker._hold_stalled_archives(dir_path, result, readiness_generation):
