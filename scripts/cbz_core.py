@@ -483,7 +483,16 @@ def translate_metadata_text(text: str) -> tuple[str, str | None]:
 
     has_cjk = bool(_CJK_RE.search(value))
     translated, detected_language = _run_googletrans(value)
-    eligible = has_cjk or _looks_romanized_cjk(value, detected_language)
+    # Latin text is translated only when the backend itself read it as
+    # Japanese/Korean/Chinese. A romanization marker ("-sama", "no ... wa")
+    # is not enough: the translation always comes from the *detected*
+    # language, and for short romaji that guess is unstable. Google has read
+    # "Kaguya-sama" as Hiligaynon and returned "Together", which the
+    # watcher then wrote into ComicInfo <Series>.
+    eligible = has_cjk or (
+        detected_language in _TRANSLATABLE_LANGUAGE_CODES
+        and _looks_romanized_cjk(value, detected_language)
+    )
     if (
         eligible
         and translated
