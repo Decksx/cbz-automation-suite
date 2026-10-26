@@ -12,7 +12,9 @@ python -m scripts.cbz_watcher --readiness-stall-minutes 30 `
 ```
 
 The explicit holding directory must already exist, be writable, outside
-the watched tree, on the same volume and free of reparse components. Its
+the watched tree, on the same volume and free of reparse components. The
+two roots must be disjoint: the hold root cannot contain the watch root
+either, protecting incoming books from manual cleanup of the holding area. Its
 physical identity is pinned at startup. Startup validates actual write
 access before starting discovery or observers. No directory is selected
 automatically; an omitted root or zero minutes disables holds. Minutes
@@ -41,6 +43,9 @@ serialized with notifications through the rename. It revalidates source
 identity/size/mtime and root identities, including after receipt I/O.
 Reparse or unidentified sources/targets refuse. Normal processing also
 claims exclusion atomically, so it cannot enter during a holding operation.
+If a READY import loses that claim, it re-arms a generation-bound readiness
+retry rather than dropping the import event. A newer event's settle timer
+still takes precedence over that retry.
 
 Holding performs only a same-volume Windows no-replace rename into a
 new exclusive `readiness-*` attempt directory, retaining the archive's
