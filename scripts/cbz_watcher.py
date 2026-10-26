@@ -3460,13 +3460,31 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def _run_watcher(argv: list[str] | None = None):
     """Start the watcher with command-line-selected optional integrations."""
+    global _number_style_registry, _number_style_requested
+    args = build_argument_parser().parse_args(argv)
+    watch_path = Path(WATCH_FOLDER)
+    try:
+        os.makedirs(watch_path, exist_ok=True)
+    except OSError as exc:
+        raise WatcherInstanceRefused(f"Cannot prepare watch root {watch_path}: {exc}") from exc
+    with watcher_instance_lock(watch_path) as instance:
+        log.info("Watcher mutex acquired: %s; supplied=%s; resolved=%s; abandoned=%s",
+                 instance.mutex_name, instance.supplied_root, instance.resolved_root, instance.abandoned)
+        previous = _number_style_registry, _number_style_requested
+        try:
+            return _configure_and_watch(args, watch_path)
+        finally:
+            _number_style_registry, _number_style_requested = previous
+
+
+def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
+    """Apply session globals only after exclusive root ownership is held."""
     global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
     global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
     global _number_style_registry, _number_style_requested
-    args = build_argument_parser().parse_args(argv)
     try:
         _number_style_registry = NumberStyleRegistry.load(args.number_style_registry)
         _number_style_requested = args.number_style
@@ -3491,15 +3509,7 @@ def _run_watcher(argv: list[str] | None = None):
     SERIES_RESOLVER_REFRESH = args.resolver_refresh
     SERIES_RESOLVER_NORMALIZE_APOSTROPHES = args.resolver_normalize_apostrophes
 
-    watch_path = Path(WATCH_FOLDER)
-    try:
-        os.makedirs(watch_path, exist_ok=True)
-    except OSError as exc:
-        raise WatcherInstanceRefused(f"Cannot prepare watch root {watch_path}: {exc}") from exc
-    with watcher_instance_lock(watch_path) as instance:
-        log.info("Watcher mutex acquired: %s; supplied=%s; resolved=%s; abandoned=%s",
-                 instance.mutex_name, instance.supplied_root, instance.resolved_root, instance.abandoned)
-        return _watch_with_config(args, watch_path)
+    return _watch_with_config(args, watch_path)
 
 
 def _watch_with_config(args: argparse.Namespace, watch_path: Path):
@@ -3585,15 +3595,11 @@ def main(argv: list[str] | None = None):
     A stopped/failed CLI session must not configure later embedded callers
     or another session in the same process with stale policy state.
     """
-    global _number_style_registry, _number_style_requested
-    previous = _number_style_registry, _number_style_requested
     try:
         return _run_watcher(argv)
     except WatcherInstanceRefused as exc:
         log.error("Watcher start refused: %s", exc)
         return 3
-    finally:
-        _number_style_registry, _number_style_requested = previous
 
 
 if __name__ == "__main__":
