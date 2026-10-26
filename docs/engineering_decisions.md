@@ -1443,3 +1443,21 @@ Protocol, refusal/rollout limits and fixture coverage are in
 `docs/media_aware_naming.md`. No live library/DB/configuration changes are part
 of the implementation. Any Tower batch requires a new plan, verified backup
 and David's approval of the exact new digest.
+
+### #140 review follow-up: preserve arrivals and make watcher activation opt-in
+
+Claude's review 6423576221 of #142 at 3a5517f found four concrete gaps.
+Unconsumed bare filename numbers now retain the legacy arrival display instead
+of disappearing into an unnumbered canonical name. Same-file Windows case
+renames use two no-replace steps, restore on final failure and track the actual
+retained temporary path if rollback is also blocked. Explicit style keeps the
+planner's series-root conflict check, and auto detects registered roots nested
+physically below a scan scope, including through junction aliases.
+
+The review also supersedes the initial watcher empty-registry behavior above:
+an empty registry means media naming OFF and the complete legacy path remains
+available. A nonempty registry opts the watcher in; explicit style can override
+syntax after that. The planner retains its independent strict auto refusal.
+Configured-registry end-to-end witnesses now exercise this boundary alongside
+real normalization, ComicInfo rewriting and movement. Alias/year-folder holds
+and Western volume policy remain unchanged pending David's separate decisions.
