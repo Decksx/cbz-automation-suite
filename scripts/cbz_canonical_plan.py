@@ -40,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--number-style", choices=("auto", "issue", "chapter"), default="auto")
     parser.add_argument("--number-style-registry", type=Path,
                         default=DEFAULT_REGISTRY)
+    parser.add_argument("--series-folder-root", action="store_true",
+        help="Confirm that the scan root itself is the operator-chosen series folder.")
     args = parser.parse_args(argv)
     try:
         if args.output is not None:
@@ -49,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             accept_comicinfo_drop=args.accept_comicinfo_drop,
             temp_dir=args.temp_dir, max_held_bytes=args.max_held_bytes,
             max_copy_bytes=args.max_copy_bytes, number_style=args.number_style,
-            number_style_registry=args.number_style_registry)
+            number_style_registry=args.number_style_registry, series_folder_root=args.series_folder_root)
         payload = json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
         if args.output is not None:
             target = _output_target(args.output, args.library_root)
