@@ -75,6 +75,22 @@ def filename_series_year(filename: str, *titles: str | None) -> int | None:
     return int(match[2]) if display_key(match[1]) in keys else None
 
 
+def unconsumed_years(filename: str, *kept) -> None:
+    """Refuse to format away any parenthesised filename year (shared guard).
+
+    Each ``kept`` year (the decided series year, the issue year) consumes one
+    occurrence. Any other ``(YYYY)``, including one after a title the folder
+    replaced as an alias or typo, keeps the arrival name / holds the plan.
+    """
+    stem = re.sub(r"\.(?:cbz|zip)$", "", filename, flags=re.I)
+    years = [int(y) for y in re.findall(r"\(\s*([0-9]{4})\s*\)", stem)]
+    for year in kept:
+        if year is not None and int(year) in years:
+            years.remove(int(year))
+    if years:
+        raise KeepArrivalName(f"unconsumed filename year {years}; never formatted away")
+
+
 def decide_series_year(*, series: str, folder: str | None, filename: str,
                        ci_series: str | None = None, ci_volume=None) -> tuple[int | None, int | None]:
     """Decide the reboot series year; return ``(series_year, filename_year)``.
@@ -193,6 +209,7 @@ def media_fields(*, series: str, number: str | None, volume: str | None,
     # must not silently erase an already-present collected-edition marker.
     if tokens.collections and style != "issue":
         raise CanonicalNameError("Western collection marker conflicts with chapter style")
+    unconsumed_years(tokens.filename, series_year, year)
     chosen_series = split_series_year(series_display(series, folder))[0]
     return CanonicalFields(
         series=chosen_series, series_year=series_year, volume=volume,
@@ -239,8 +256,13 @@ def watcher_naming(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
     # The filename's series-position year is the decided series year, so only
     # a second year is an issue year (checked against ComicInfo Year below).
     display_years = [int(y) for y in display.years]
+    series_token = fn_year
     if fn_year is not None and fn_year in display_years:
         display_years.remove(fn_year)
+    elif series_year is not None and len(display_years) == 2 and display_years[0] == series_year:
+        # Folder year first, issue year second (e.g. a retry after the legacy
+        # display reordered the name): the first is the decided series year.
+        series_token = display_years.pop(0)
     if len(display_years) > 1 or len(display.editions) > 1 or len(display.versions) > 1:
         raise CanonicalNameError("conflicting arrival display tokens")
     number = parsed.chapter
@@ -293,7 +315,7 @@ def watcher_naming(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
         if year is None or (issue_years and str(year) != str(issue_years[0])):
             raise CanonicalNameError("arrival year conflicts or is invalid")
     paren_years = [int(y) for y in re.findall(r"\(\s*([0-9]{4})\s*\)", stem)]
-    for kept in (fn_year, int(issue_years[0]) if issue_years else None):
+    for kept in (series_token, int(issue_years[0]) if issue_years else None):
         if kept is not None and kept in paren_years:
             paren_years.remove(kept)
     if paren_years:
