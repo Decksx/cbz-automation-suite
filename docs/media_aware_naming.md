@@ -15,8 +15,8 @@ edition slot, so `Series v01 (TPB) (Colored).cbz` preserves both facts.
 
 The pure formatter requires a TPB to have a volume and no issue/chapter.
 Its parser and formatter enforce the same fixpoint, length, reserved-name
-and ambiguity guards. `Full` without a number remains held for review;
-David has not confirmed a default volume for it.
+and ambiguity guards. `Full` without a number defaults to volume 1 under David's #2991 decision;
+its operator-policy evidence remains bound to the original archive facts.
 
 ## Style registry
 
@@ -52,12 +52,13 @@ collected volume. Explicit TPB/Full markers conflict with chapter style.
 Different collection markers refuse a version family rather than authorizing
 supersession across issue/collection identity.
 
-Only after a series is resolved does a normalized-equal series folder win its
-display spelling. The narrow comparison folds case, spaces and punctuation,
+A confirmed operator-chosen series folder wins series identity and display
+even when ComicInfo uses a substantive alias or typo. The narrow comparison folds case, spaces and punctuation,
 retaining every letter/digit/combining mark and all meaningful words. Thus
 `ICECREAMMAN` becomes `Ice Cream Man`, and `68` can use folder `'68`.
-`HalloweeNight` versus `Halloween Night`, or `Series Uncensored` versus
-`Series`, is a substantive conflict and stays held. The chosen spelling retains
+`HalloweeNight` in a confirmed `Halloween Night` series folder uses the
+chosen folder spelling. Number, volume, decensor and content guards remain
+independent; a folder decision cannot override those facts. The chosen spelling retains
 Windows-legal punctuation; the shared formatter replaces illegal characters
 with spaces and retains its reserved-name/length/ambiguity guards.
 
@@ -67,8 +68,10 @@ whose new `vNN` spelling cannot re-establish its volume role remains held; for
 example, a single Vol-labelled book with only ComicInfo Number and no Volume
 can fail this guard. The policy does not certify a new filename as authority.
 Explicit number style also retains the folder comparison at a scan root;
-choosing syntax cannot bypass a substantive title conflict. Without registered
-root evidence the planner cannot classify that root as merely a category.
+choosing syntax cannot manufacture series-folder authority. Use
+`--series-folder-root` when an unregistered scan root is itself the chosen
+series folder. A matched registry category is a flat root, contributing no
+series identity; registered subfolder scans inherit series-folder context.
 
 Planner version 2 retains `canonical-naming-plan-v1` executor compatibility.
 Style selection and exact registry hash are in provenance, hence in the plan
@@ -132,3 +135,28 @@ explicit-style folder conflicts, nested scopes and retained-file recovery.
 No live library, database, watcher process or configuration is changed by
 this implementation. Claude owns exact-head review and deliberate rollout;
 the later Tower dry run must produce a fresh digest before any batch apply.
+
+
+## Final operator decisions (#2991, corrected by #2996)
+
+A reboot suffix is a separate `series_year` field in the pure grammar:
+`Batman (2016) #003` and `Batman (2026) #003` have distinct identity. The
+series year is the only filename year for these series. An issue year of
+2020 stays in ComicInfo `<Year>`; it is not appended to the 2016 name.
+Plain series without a reboot suffix retain their existing year display.
+
+Confirmed series-folder authority is explicit in field resolution, with the
+original ComicInfo Series retained as evidence. It applies to series only,
+not Number/Volume, protected identity or supersession. The planner reuses
+that authority through proposed-name resolution; the watcher preserves the
+reboot suffix through intake-directory cleanup, selected destination and
+ComicInfo rewrite. Flat roots cannot acquire a series identity from their
+category basename. An unregistered series-root scan declares
+`--series-folder-root`, which is sealed in provenance.
+
+An unnumbered Full is `v01 (TPB)`. Its default volume is an operator-policy
+fact derived from the original archive, not authority invented from its
+proposed filename; that same source-bound default is used in re-resolution.
+Literal titles such as Full Metal Panic retain their words. Explicit number
+or volume evidence still refuses conflicts. Bare Western volumes and the
+year-before-TPB ordering otherwise remain approved as implemented.
