@@ -328,6 +328,76 @@ def test_sidecar_failure_prevents_the_rename(env, monkeypatch):
     assert e.bad.exists() and not _payloads(e)
 
 
+@pytest.mark.parametrize("failure", ["open", "write", "fsync"])
+def test_receipt_failures_reuse_one_attempt_and_recover_only_after_fsync(env, monkeypatch, failure):
+    """Persistent receipt errors must not create an orphan every five seconds."""
+    e = env
+    before = e.bad.read_bytes()
+    with monkeypatch.context() as fault:
+        if failure == "open":
+            original = Path.open
+
+            def fail_open(path, *args, **kwargs):
+                if path.name.endswith(".held.json"):
+                    raise PermissionError("fixture receipt open denied")
+                return original(path, *args, **kwargs)
+
+            fault.setattr(Path, "open", fail_open)
+        elif failure == "write":
+            def partial(document, stream, **kwargs):
+                stream.write("{partial")
+                raise OSError("fixture interrupted receipt write")
+
+            fault.setattr(rh.json, "dump", partial)
+        else:
+            fault.setattr(rh.os, "fsync", Mock(side_effect=OSError("fixture receipt fsync denied")))
+        _expire(e)
+        _gate(e)
+        _gate(e)
+        assert len(list(e.holding.iterdir())) == 1
+        assert e.bad.read_bytes() == before and not _payloads(e)
+        e.process.assert_not_called()
+    # A transient failure can recover, but the incomplete receipt must first
+    # be rewritten and fsynced. The completed receipt retains first-attempt time.
+    e.clock.value = 1810
+    _gate(e)
+    (held,) = _payloads(e)
+    assert held.read_bytes() == before and not e.bad.exists()
+    assert len(list(e.holding.iterdir())) == 1
+    receipt = json.loads(held.with_name(held.name + ".held.json").read_text(encoding="utf-8"))
+    assert receipt["observed_elapsed_seconds"] == 1800
+
+
+def test_replaced_partial_receipt_is_never_truncated_or_adopted(env, monkeypatch):
+    e = env
+
+    def partial(document, stream, **kwargs):
+        stream.write("{partial")
+        raise OSError("fixture interrupted receipt write")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(rh.json, "dump", partial)
+        _expire(e)
+    (receipt,) = list(e.holding.glob("readiness-*/*.held.json"))
+    receipt.rename(receipt.with_name("previous-partial.json"))
+    receipt.write_bytes(b"foreign receipt occupant")
+    _gate(e)
+    assert e.bad.exists() and not _payloads(e)
+    assert receipt.read_bytes() == b"foreign receipt occupant"
+    assert len(list(e.holding.iterdir())) == 1
+
+
+def test_missing_completed_receipt_cannot_authorize_a_later_retry(env, monkeypatch):
+    e = env
+    with monkeypatch.context() as fault:
+        fault.setattr(rh, "_rename_no_replace", Mock(side_effect=PermissionError("fixture move denied")))
+        _expire(e)
+    (receipt,) = list(e.holding.glob("readiness-*/*.held.json"))
+    receipt.unlink()
+    _gate(e)
+    assert e.bad.exists() and not _payloads(e)
+
+
 def test_operator_intent_is_complete_and_fsynced_before_rename(env, monkeypatch):
     e = env
     events = []
