@@ -61,6 +61,15 @@ sidecar is for David to read; nothing automatically replays it. Receipt
 failure prevents movement. Paths and elapsed time refer to the first
 attempt; later retries do not rewrite that history.
 
+The attempt directory is tracked before receipt work, so persistent open,
+write or fsync failures reuse one attempt per unchanged archive instead of
+creating an orphan every five seconds. Partial receipts remain unready.
+A retry opens only its own identified receipt without truncation, checks
+the open handle's identity, then rewrites/truncates and fsyncs it before
+marking it ready. A replaced or unidentified file is never adopted or
+written. A completed receipt must still exist with the same identity on a
+later move retry. Recovery retains the first-attempt source/time fields.
+
 Ready siblings still wait for the directory gate. After a successful
 hold, a fresh recursive inventory/readiness probe decides whether the
 remaining siblings can proceed. The old result is never reused. Early
