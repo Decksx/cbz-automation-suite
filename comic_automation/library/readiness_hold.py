@@ -58,6 +58,9 @@ class _Stall:
     since: float
     attempt: Path | None = None
     attempt_identity: tuple[int, int] | None = None
+    receipt_identity: tuple[int, int] | None = None
+    receipt_ready: bool = False
+    receipt_elapsed: float | None = None
 
 
 class ReadinessHolds:
@@ -122,28 +125,45 @@ class ReadinessHolds:
 
     def _attempt(self, path: Path, state: _Stall, reason: str, elapsed: float) -> Path:
         if state.attempt is None:
-            attempt = Path(tempfile.mkdtemp(prefix="readiness-", dir=self.hold_root))
-            identity = _id(_plain(attempt, directory=True))
-            destination = attempt / path.name
+            # Retain the directory before any fallible receipt work, so a
+            # persistent write error cannot allocate a directory every retry.
+            state.attempt = Path(tempfile.mkdtemp(prefix="readiness-", dir=self.hold_root))
+            state.attempt_identity = _id(_plain(state.attempt, directory=True))
+            state.receipt_elapsed = elapsed
+        # Reuse failed attempts, but never adopt a replaced/uncertain directory.
+        if (_id(_plain(state.attempt, directory=True)) != state.attempt_identity
+                or _directory_chain(state.attempt.parent)[0] != self._roots[1]):
+            raise ValueError("readiness hold attempt directory changed")
+        destination = state.attempt / path.name
+        receipt_path = state.attempt / (path.name + ".held.json")
+        if not state.receipt_ready:
             receipt = {
                 "contract": "cbz-readiness-hold-v1", "source_path": str(path),
                 "destination_path": str(destination), "reason": reason,
-                "observed_elapsed_seconds": elapsed, "watcher_version": self.watcher_version,
+                "observed_elapsed_seconds": state.receipt_elapsed, "watcher_version": self.watcher_version,
                 "observed_fingerprint": list(state.fingerprint),
                 # This receipt survives a crash or a failed rename honestly.
                 "written_before_rename": True,
             }
-            with (attempt / (path.name + ".held.json")).open("x", encoding="utf-8", newline="\n") as stream:
+            # First create exclusively. Retry only the same file we created;
+            # r+ opens without truncation until its handle identity is checked.
+            mode = "x" if state.receipt_identity is None else "r+"
+            with receipt_path.open(mode, encoding="utf-8", newline="\n") as stream:
+                info = os.fstat(stream.fileno())
+                if (not info.st_ino or not stat.S_ISREG(info.st_mode)
+                        or (state.receipt_identity is not None and _id(info) != state.receipt_identity)):
+                    raise ValueError("readiness hold receipt identity changed or unavailable")
+                state.receipt_identity = _id(info)
+                stream.seek(0)
                 json.dump(receipt, stream, indent=2, ensure_ascii=False, allow_nan=False)
                 stream.write("\n")
+                stream.truncate()
                 stream.flush()
                 os.fsync(stream.fileno())
-            state.attempt, state.attempt_identity = attempt, identity
-        # Reuse a failed attempt, but never follow a replaced attempt directory.
-        if (_id(_plain(state.attempt, directory=True)) != state.attempt_identity
-                or _directory_chain(state.attempt.parent)[0] != self._roots[1]):
-            raise ValueError("readiness hold attempt directory changed")
-        return state.attempt / path.name
+            state.receipt_ready = True
+        if _id(_plain(receipt_path, directory=False)) != state.receipt_identity:
+            raise ValueError("readiness hold receipt identity changed")
+        return destination
 
     def consider(
         self, scope: Path, failures: Iterable[tuple[Path, str]], *,
