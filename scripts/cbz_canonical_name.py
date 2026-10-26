@@ -381,6 +381,9 @@ class CanonicalFields:
     with either: the §2.1 grammar admits ``v<VV> ch. <C>`` even though its
     prose describes chapters as the volume-less form.
 
+    ``series_year`` is reboot identity before primary numbering. The issue
+    year stays in ComicInfo and is omitted from this series-year filename.
+
     ``collection`` is a separate collected-edition marker (currently TPB),
     requiring a volume without an issue/chapter. It coexists with edition
     variants such as Colored, which must not disappear.
@@ -398,6 +401,7 @@ class CanonicalFields:
     special: str | None = None
     version: int | str | None = None
     collection: str | None = None
+    series_year: int | str | None = None
 
     def __post_init__(self) -> None:
         series = sanitize_series_name(self.series)
@@ -427,6 +431,11 @@ class CanonicalFields:
         set_(self, "chapter", _canonical_number(self.chapter, "chapter"))
         set_(self, "year", _canonical_year(self.year))
         set_(self, "version", _canonical_version(self.version))
+        set_(self, "series_year", _canonical_year(self.series_year))
+        if self.series_year is not None:
+            if all(v is None for v in (self.volume, self.issue, self.chapter)):
+                raise CanonicalNameError("series year requires primary numbering to distinguish it from issue year")
+            set_(self, "year", None)  # Reboot year is the only filename year; issue year stays in XML.
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +449,8 @@ _NUM = rf"{_ENDPOINT}(?:-{_ENDPOINT})?"
 # that safe, by refusing any series the non-greedy split would cut short.
 _CANONICAL_RE = re.compile(
     r"(?P<series>.+?)"
+    r"(?: \((?P<series_year>[0-9]{4})\)"
+    rf"(?= (?:(?:{_alternation(SPECIAL_WORDS)}) )?(?:v[0-9]|#[0-9]|ch\. [0-9])))?"
     rf"(?: (?P<special>{_alternation(SPECIAL_WORDS)}))?"
     rf"(?: v(?P<volume>{_NUM}))?"
     rf"(?: (?:#(?P<issue>{_NUM})|ch\. (?P<chapter>{_NUM})))?"
@@ -464,7 +475,7 @@ def _is_reserved(name: str) -> bool:
 
 
 def _assemble(fields: CanonicalFields) -> str:
-    parts = [fields.series]
+    parts = [fields.series + (f" ({fields.series_year})" if fields.series_year is not None else "")]
     if fields.special is not None:
         parts.append(fields.special)
     if fields.volume is not None:
