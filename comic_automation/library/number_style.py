@@ -14,7 +14,8 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_REGISTRY = Path(__file__).resolve().parents[2] / "config" / "number-styles.json"
+DEFAULT_REGISTRY = Path(os.environ.get("CBZ_NUMBER_STYLE_REGISTRY", str(
+    Path(__file__).resolve().parents[2] / "config" / "number-styles.json")))
 STYLES = ("issue", "chapter")
 
 
@@ -37,10 +38,14 @@ def _ancestors(path: Path) -> set[tuple[int, int]]:
     identities = set()
     for chain in dict.fromkeys((supplied, supplied.resolve())):
         current = chain
-        while not current.exists():
-            if current.parent == current:
-                raise NumberStyleRefused(f"no existing ancestor: {path}")
-            current = current.parent
+        while True:
+            try:
+                current.stat()
+                break
+            except FileNotFoundError:
+                if current.parent == current:
+                    raise NumberStyleRefused(f"no existing ancestor: {path}")
+                current = current.parent
         for ancestor in (current, *current.parents):
             identities.add(_identity(ancestor))
     return identities
@@ -56,6 +61,7 @@ class StyleSelection:
     registry_path: str
     registry_sha256: str
     matched_root: str | None = None
+    matched_identity: tuple[int, int] | None = None
 
     def as_dict(self) -> dict:
         """Return JSON provenance that the planner includes in its digest."""
@@ -105,8 +111,10 @@ class NumberStyleRegistry:
         if requested == "auto":
             try:
                 ancestors = _ancestors(Path(scope))
-                matches = [(root, style) for root, style in self.roots
-                           if _identity(root) in ancestors]
+                for root, style in self.roots:
+                    identity = _identity(root)
+                    if identity in ancestors:
+                        matches.append((root, style, identity))
             except OSError as exc:
                 raise NumberStyleRefused(f"cannot establish number-style root identity: {exc}") from exc
             if len(matches) != 1:
@@ -114,4 +122,5 @@ class NumberStyleRegistry:
             requested = matches[0][1]
         return StyleSelection(requested, "registry" if matches else "explicit",
                               str(Path(scope).absolute()), self.path, self.sha256,
-                              str(matches[0][0]) if matches else None)
+                              str(matches[0][0]) if matches else None,
+                              matches[0][2] if matches else None)
