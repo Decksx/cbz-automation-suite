@@ -39,7 +39,7 @@ from comic_automation.series_resolver import (
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
 from comic_automation.archive import field_resolution as _media_fr
-from comic_automation.library.media_naming import media_fields, watcher_fields, KeepArrivalName, split_series_year
+from comic_automation.library.media_naming import media_fields, watcher_naming, with_comicinfo_year, KeepArrivalName, split_series_year
 from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
 from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from comic_automation.library.exclusions import (
@@ -1280,7 +1280,7 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
             # Generic placeholders need the resolved directory number below.
             if not parsed.chapter and not parsed.volume and _PLACEHOLDER_STEM_RE.match(parsed.stem):
                 continue
-            fields = watcher_fields(parsed, fact, series=series_name, style=selection.style)
+            fields, xml_year = watcher_naming(parsed, fact, series=series_name, style=selection.style)
             name = format_canonical_name(fields)
             target = path.with_name(name)
             patched = _dataclasses_replace(parsed, filename=name, series=fields.series + (f" ({fields.series_year})" if fields.series_year else ""),
@@ -1294,6 +1294,8 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
                     raise CanonicalNameError("media destination already exists")
             parsed_by_path[path] = patched
             process_comicinfo(path, patched)
+            if xml_year is not None:
+                _record_comicinfo_year(path, xml_year)
         except KeepArrivalName as exc:
             # Keep the existing parsed/deferred display and its distinguishing
             # number; this is no new field or family authority.
@@ -1308,6 +1310,22 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
             log.warning("    REVIEW: media naming refused for %s: %s", path.name, exc)
             refused.add(path)
     return refused, selection
+
+
+def _record_comicinfo_year(cbz_path, year):
+    """Keep the issue year a reboot series-year filename omits in <Year>.
+
+    Runs after process_comicinfo, so the archive always has ComicInfo.xml.
+    An existing different Year refuses (ValueError) instead of replacing it.
+    """
+    with zipfile.ZipFile(cbz_path, "r") as zf:
+        entry = next((n for n in zf.namelist() if os.path.basename(n).lower() == "comicinfo.xml"), None)
+        xml_text = zf.read(entry).decode("utf-8", errors="replace") if entry else None
+    if entry is None:
+        raise ValueError(f"ComicInfo.xml missing; cannot record Year {year}")
+    new_xml = with_comicinfo_year(xml_text, year)
+    if new_xml is not None:
+        _rewrite_comicinfo(cbz_path, entry, new_xml)
 
 
 def _apply_fallback_naming(
@@ -2773,9 +2791,12 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 }
                 refused = set()
                 media_selection = None
+                refusal_kind = "fallback name refused for {} placeholder archive(s)"
                 if _media_naming_enabled():
                     refused, media_selection = _apply_media_naming(
                         parsed_by_path, media_originals, series_name, dest_folder)
+                    if refused:
+                        refusal_kind = "media naming refused for {} archive(s)"
                 media_options = ({"number_style": media_selection.style}
                                  if media_selection is not None else {})
                 if not refused:
@@ -2800,8 +2821,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     # stays in the import folder for review; nothing in it is
                     # moved, and the next settle pass or restart retries it.
                     log.warning(
-                        f"  Deferred '{comic_dir.name}' for review: fallback name "
-                        f"refused for {len(refused)} placeholder archive(s); "
+                        f"  Deferred '{comic_dir.name}' for review: "
+                        f"{refusal_kind.format(len(refused))}; "
                         f"left in the import folder.")
                     landed = None
                 elif has_nested_comic_dirs:
