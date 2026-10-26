@@ -17,6 +17,20 @@ from scripts import cbz_watcher as watcher
 from scripts.cbz_core import ALL_RULES, parse_comic_name
 
 
+@pytest.fixture(autouse=True)
+def recorded_translator(monkeypatch):
+    """Replay the live backend instead of calling it.
+
+    The real watcher path translates folder and ComicInfo text through
+    Google, whose language guess for short romaji drifts: CI job
+    121869904428 got "Kaguya-sama" read as Hiligaynon and translated to
+    "Together", 34 minutes after the same test passed. These are answers
+    the backend has given; anything else is echoed back as English.
+    """
+    replies = {"Kaguya-sama": ("Together", "hil"), "Kaguya-sama #3": ("Partnership #3", "hil")}
+    monkeypatch.setattr("scripts.cbz_core._run_googletrans", lambda text: replies.get(text, (text, "en")))
+
+
 @pytest.fixture
 def library(tmp_path):
     root = tmp_path / "library"
@@ -376,6 +390,20 @@ def test_real_planner_and_watcher_honor_selected_folder_and_reboot_identity(
     values = {landed: parse_comic_name(landed, rules=ALL_RULES - {"translate"}, display_tokens=True)}
     refused, _ = watcher._apply_media_naming(values, {landed: fr.archive_facts_from_file(landed)}, folder, configured_watcher)
     assert not refused and list(values) == [landed]
+
+
+@pytest.mark.parametrize("media_naming", [True, False])
+def test_a_romaji_folder_misread_as_another_language_keeps_its_name_and_series(
+        library, configured_watcher, tmp_path, monkeypatch, media_naming):
+    _, _, book = library
+    source = book("Kaguya-sama #3.cbz", series="Kaguya-sama", number="3")
+    rows = [{"path": str(configured_watcher), "style": "issue"}] if media_naming else []
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(config(tmp_path, rows)))
+    watcher.process_and_move_directory(source.parent)
+    (landed,) = configured_watcher.rglob("*.cbz")
+    assert landed.parent.name == "Kaguya-sama" and landed.name.startswith("Kaguya-sama ")
+    xml = fr.archive_facts_from_file(landed).comicinfo.fields
+    assert xml["Series"] == "Kaguya-sama" and "Partnership" not in xml.get("Title", "")
 
 
 @pytest.mark.parametrize("filename", ["Series Full.cbz", "Series (Full).cbz", "Full.cbz"])
