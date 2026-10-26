@@ -64,7 +64,7 @@ def env(tmp_path):
         return path
 
     def plan(**kwargs):
-        return cp.build_plan(root, database=db, quarantine_date="2026-10-24", **kwargs)
+        return cp.build_plan(root, database=db, quarantine_date="2026-10-24", number_style="chapter", **kwargs)
 
     return root, db, book, plan
 
@@ -187,7 +187,7 @@ def test_originals_root_is_refused_before_any_archive_is_derived(env, monkeypatc
 
     monkeypatch.setattr(cp.sv, "derive_archive", forbidden)
     with pytest.raises(cp.PlanningRefused, match="originals is preserved"):
-        cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
+        cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24", number_style="chapter")
 
 
 @pytest.mark.parametrize("originals", ["ai-decensor-originals", "AI-Decensor-Originals"])
@@ -264,7 +264,7 @@ def test_decensor_identity_in_root_or_comicinfo_alone_is_preserved(env, marker):
     root, db, book, plan = env
     if marker == "root":
         source = book(folder="Decensored")
-        report = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
+        report = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24", number_style="chapter")
     else:
         source = book(series="Series Decensored")
         report = plan()
@@ -277,7 +277,7 @@ def test_underscore_delimited_decensor_markers_still_require_pairing_evidence(en
     root, db, book, plan = env
     if marker == "root":
         source = book(folder="Series_Decensored")
-        report = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24")
+        report = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-24", number_style="chapter")
     elif marker == "comicinfo":
         book(series="Series_Decensored")
         report = plan()
@@ -305,8 +305,8 @@ def test_an_occupied_canonical_destination_is_held_even_with_identical_bytes(env
 
 def test_two_proposals_colliding_under_casefold_hold_both_units(env):
     root, db, book, plan = env
-    book("oldA Ch. 7.cbz", series="Straße")
-    book("oldB Ch. 7.cbz", series="STRASSE")
+    book("oldA Ch. 7.cbz", series="Straße", folder="STRASSE")
+    book("oldB Ch. 7.cbz", series="STRASSE", folder="STRASSE")
     report = plan()
     assert report["renames"] == []
     assert len(report["review"]) == 2
@@ -399,7 +399,7 @@ def test_case_only_rename_uses_windows_semantics_when_host_normcase_is_identity(
 
 def test_casefold_equivalence_alone_does_not_grant_the_case_only_exception(env):
     root, db, book, plan = env
-    book("Straße ch. 7.cbz", series="STRASSE")
+    book("Straße ch. 7.cbz", series="STRASSE", folder="STRASSE")
     report = plan()
     assert not report["renames"] and report["review"]
 
@@ -413,7 +413,7 @@ def test_conclusively_volume_classified_v_is_not_an_unresolved_version(env, numb
     source = book("Series v1.cbz" if number is None else "Series v1 Ch. 3.cbz", ci=ci)
     report = plan()
     assert not report["review"] and len(report["renames"]) == 1
-    expected = "Series v01.cbz" if number is None else "Series v01 #003.cbz"
+    expected = "Series v01.cbz" if number is None else "Series v01 ch. 3.cbz"
     assert report["renames"][0]["destination"] == str(source.with_name(expected))
 
 
@@ -446,7 +446,7 @@ def test_a_generated_volume_plan_applies_recovers_and_undoes_through_the_real_ex
     parsed = parse_plan(document)
     forward = executor.apply(parsed, library_root=root, database=db, quiescence=lambda _: None)
     assert forward.stopped is None and forward.units[0]["status"] == executor.UNIT_COMPLETED
-    assert plan()["unchanged"][0]["path"].endswith("Series v02 #012.cbz")
+    assert plan()["unchanged"][0]["path"].endswith("Series v02 ch. 12.cbz")
     recovered = executor.recover(parsed, library_root=root, database=db,
         attempt_id=forward.attempt_id, quiescence=lambda _: None)
     assert recovered.resolutions[0]["status"] == executor.RES_COMPLETE
@@ -505,7 +505,7 @@ def test_a_canonical_version_with_an_unverified_label_is_a_zero_exit_noop(env, c
     root, db, book, plan = env
     book("Series ch. 1 [v2].cbz", number="1")
     assert main(["--library-root", str(root), "--database", str(db),
-                 "--quarantine-date", "2026-10-24"]) == 0
+                 "--quarantine-date", "2026-10-24", "--number-style", "chapter"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["diagnostics"]["unverified_version_labels"] == 1
     assert not report["families"] and not report["renames"]
@@ -609,7 +609,7 @@ def test_quarantine_date_is_a_real_iso_date(env, day):
 def test_cli_prints_only_a_complete_plan_and_meaningful_exit_status(env, capsys, kind, expected):
     root, db, book, plan = env
     book(catalog=kind != "review")
-    args = ["--library-root", str(root), "--database", str(db), "--quarantine-date", "2026-10-24"]
+    args = ["--library-root", str(root), "--database", str(db), "--quarantine-date", "2026-10-24", "--number-style", "chapter"]
     if kind == "error":
         args[3] = str(db.with_name("missing.db"))
     assert main(args) == expected
@@ -630,17 +630,17 @@ def test_cli_unexpected_failure_never_masquerades_as_a_complete_review_plan(env,
 
     monkeypatch.setattr(cli, "build_plan", fail)
     assert cli.main(["--library-root", str(root), "--database", str(db),
-                     "--quarantine-date", "2026-10-24"]) == 2
+                     "--quarantine-date", "2026-10-24", "--number-style", "chapter"]) == 2
     streams = capsys.readouterr()
     assert not streams.out and "injected evaluation failure" in streams.err
 
 
 def test_cli_output_is_new_utf8_json_that_the_executor_can_read(env, tmp_path, capsys):
     root, db, book, plan = env
-    book(series="作品")
+    book(series="作品", folder="作品")
     output = tmp_path / "plan.json"
     args = ["--library-root", str(root), "--database", str(db),
-            "--quarantine-date", "2026-10-24", "--output", str(output)]
+            "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]
     assert main(args) == 0
     data = output.read_bytes()
     assert data.startswith(b"{") and "作品" in data.decode("utf-8")
@@ -654,7 +654,7 @@ def test_cli_never_writes_a_plan_into_the_library(env, capsys):
     root, db, book, plan = env
     output = root / "plan.json"
     assert main(["--library-root", str(root), "--database", str(db),
-                 "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+                 "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]) == 2
     assert not output.exists() and "outside the library" in capsys.readouterr().err
 
 
@@ -671,7 +671,7 @@ def test_cli_output_that_appears_during_planning_is_not_overwritten(env, tmp_pat
 
     monkeypatch.setattr(cli, "build_plan", appears)
     assert cli.main(["--library-root", str(root), "--database", str(db),
-                     "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+                     "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]) == 2
     assert output.read_bytes() == b"foreign occupant" and "already exists" in capsys.readouterr().err
 
 
@@ -688,7 +688,7 @@ def test_cli_exclusive_create_refuses_a_file_appearing_after_the_last_check(env,
 
     monkeypatch.setattr(Path, "open", appears)
     assert main(["--library-root", str(root), "--database", str(db),
-                 "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+                 "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]) == 2
     assert output.read_bytes() == b"late foreign occupant" and capsys.readouterr().err
 
 
@@ -706,7 +706,7 @@ def test_lone_label_is_scoped_to_its_identity_group(env, series, number):
     """Other chapters or series in one folder do not certify or block a label."""
     root, db, book, plan = env
     source = book("Series ch. 1 [v2].cbz", number="1")
-    book(f"{series} ch. {number}.cbz", series=series, number=number)
+    book(f"{series} ch. {number}.cbz", series=series, number=number, folder=series)
     report = plan()
     assert not report["review"] and not report["renames"] and not report["families"]
     assert report["diagnostics"] == {"unverified_version_labels": 1}
@@ -748,9 +748,9 @@ def test_proposed_names_must_survive_resolution_again(env, family):
     next plan in review; a family hold must also prevent quarantine.
     """
     root, db, book, plan = env
-    book("old Ch. 7 v1.cbz" if family else "old Ch. 7.cbz", series="Series Vol. 2")
+    book("old Ch. 7 v1.cbz" if family else "old Ch. 7.cbz", series="Series Vol. 2", folder="Series Vol. 2")
     if family:
-        book("old Ch. 7 v2.cbz", series="Series Vol. 2", pages=(b"a", b"b"))
+        book("old Ch. 7 v2.cbz", series="Series Vol. 2", folder="Series Vol. 2", pages=(b"a", b"b"))
     report = plan()
     assert report["review"] and not report["renames"] and not report["families"]
     assert any("fixpoint" in reason for item in report["review"] for reason in item["reasons"])
@@ -774,7 +774,7 @@ def test_catalog_inside_library_is_refused_before_any_read(env, tmp_path, monkey
 
     monkeypatch.setattr(cp, "read_consistent_snapshot", forbidden)
     with pytest.raises(cp.PlanningRefused, match="database.*outside the library"):
-        cp.build_plan(root, database=database, quarantine_date="2026-10-24")
+        cp.build_plan(root, database=database, quarantine_date="2026-10-24", number_style="chapter")
     assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
@@ -790,7 +790,7 @@ def test_originals_root_hidden_by_a_junction_is_refused(env, tmp_path, monkeypat
 
     monkeypatch.setattr(cp.sv, "derive_archive", forbidden)
     with pytest.raises(cp.PlanningRefused, match="originals is preserved"):
-        cp.build_plan(link, database=db, quarantine_date="2026-10-24")
+        cp.build_plan(link, database=db, quarantine_date="2026-10-24", number_style="chapter")
 
 
 def test_output_alias_into_library_is_refused_before_planning(env, tmp_path, monkeypatch, capsys):
@@ -807,7 +807,7 @@ def test_output_alias_into_library_is_refused_before_planning(env, tmp_path, mon
 
     monkeypatch.setattr(cli, "build_plan", forbidden)
     assert cli.main(["--library-root", str(root), "--database", str(db),
-                     "--quarantine-date", "2026-10-24", "--output", str(output)]) == 2
+                     "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]) == 2
     assert not output.exists() and "outside the library" in capsys.readouterr().err
 
 
@@ -817,7 +817,7 @@ def test_saved_receipt_preserves_nonzero_diagnostics(env, tmp_path, capsys):
     book("Series ch. 1 [v2].cbz", number="1")
     output = tmp_path / "report.json"
     assert main(["--library-root", str(root), "--database", str(db),
-                 "--quarantine-date", "2026-10-24", "--output", str(output)]) == 0
+                 "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]) == 0
     receipt = json.loads(capsys.readouterr().out)
     document = json.loads(output.read_text(encoding="utf-8"))
     assert receipt["diagnostics"] == document["diagnostics"] == {"unverified_version_labels": 1}
