@@ -228,9 +228,12 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
         raise PlanningRefused("multiple edition/special markers cannot fit the grammar")
     value = lambda field: fields[field].display_value or fields[field].value
     volume, number = value("volume"), value("number")
+    ci = resolution.comicinfo
     fields_to_format = media_fields(
         series=series, volume=volume, number=number, style=number_style,
         tokens=tokens, folder=folder, full_default=full,
+        ci_series=ci.fields["Series"] if ci.authoritative("Series") else None,
+        ci_volume=ci.fields["Volume"] if ci.authoritative("Volume") else None,
         year=value("year"), version=value("version") if unchanged_version is None else unchanged_version,
         edition=next(iter(editions), None), special=next(iter(markers.specials), None),
     )
@@ -240,6 +243,21 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
     if fields_to_format.edition is not None and fields_to_format.edition not in extract_display_tokens(name).editions:
         name = format_canonical_name(replace(fields_to_format, edition=None))
     return name
+
+
+def _applied_full_default(filename: str) -> bool:
+    """Recognize the exact name the unnumbered-Full policy produces.
+
+    ``Series v01 (TPB)`` with no issue/chapter is what an applied Full default
+    leaves behind; it re-establishes that same policy volume so the next plan
+    is a fixpoint. Any other volume or numbering gains no filename authority.
+    """
+    try:
+        canonical = parse_canonical_name(filename)
+    except CanonicalNameError:
+        return False
+    return (canonical.collection == "TPB" and canonical.volume == "1"
+            and canonical.issue is None and canonical.chapter is None)
 
 
 def _lone_canonical_unchanged(resolution: fr.ArchiveResolution, *, number_style="chapter", folder=None) -> bool:
@@ -456,7 +474,8 @@ def build_plan(
                 title = confirmed_series or (ci.fields.get("Series") if ci.authoritative("Series") else None)
                 if (style.style == "issue" and title and not ci.authoritative("Number")
                         and not ci.authoritative("Volume")
-                        and unnumbered_full(fr.parse_name_tokens(fact.filename), title, ci.fields.get("Series"))):
+                        and (unnumbered_full(fr.parse_name_tokens(fact.filename), title, ci.fields.get("Series"))
+                             or _applied_full_default(fact.filename))):
                     volume_defaults[fact.archive_key] = "1"
             resolved = fr.resolve_folder(fr.FolderFacts(confirmed_series, tuple(facts),
                 series_folder_wins=confirmed_series is not None, volume_defaults=volume_defaults))
