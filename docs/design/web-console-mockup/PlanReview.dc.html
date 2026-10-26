@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Plan review — CBZ Suite</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0e1016}
+a{color:#c9cede}a:hover{color:#ffffff}
+.nav-link:hover{background:#1b1f2a}
+.ghost-btn:hover{background:#232836}
+.skip{position:absolute;left:-9999px}.skip:focus{left:16px;top:8px;z-index:10;background:#ff5c72;color:#16080b;padding:8px 12px;border-radius:6px}
+input:focus,select:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:2px solid #ff5c72;outline-offset:2px}
+button:disabled{opacity:0.45;cursor:not-allowed}
+</style>
+</helmet>
+<div style="min-height: 1700px; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 14px; line-height: 1.45">
+  <a href="#main" class="skip">Skip to content</a>
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid #232733; background: #12141b">
+    <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; text-decoration: none; color: #ffffff">
+      <span style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; background: #ff5c72; color: #16080b">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h12a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z"></path><path d="M8 9h8M8 13h5"></path></svg>
+      </span>
+      <span style="font-weight: 700; font-size: 16px; letter-spacing: -0.01em">CBZ Suite</span>
+    </a>
+    <div style="flex: 1 1 280px; max-width: 480px; position: relative">
+      <label for="tool-search" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Search tools</label>
+      <input id="tool-search" type="search" placeholder="Search tools and scripts…" style="width: 100%; box-sizing: border-box; height: 38px; padding: 0 12px 0 36px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa1b2" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="position: absolute; left: 12px; top: 11px"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+    </div>
+    <div style="flex: 1 1 0"></div>
+    <a href="Dashboard.dc.html#watcher" style="display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: #10261d; border: 1px solid #1d4a37; color: #7fe0b5; text-decoration: none; font-size: 13px; font-weight: 500">
+      <span style="width: 8px; height: 8px; border-radius: 50%; background: #3fd18f"></span>
+      Watcher running
+    </a>
+    <a href="Settings.dc.html" class="ghost-btn" aria-label="Settings" style="width: 38px; height: 38px; box-sizing: border-box; border-radius: 8px; border: 1px solid #2a2f3d; color: #c9cede; display: flex; align-items: center; justify-content: center">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"></path></svg>
+    </a>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; align-items: flex-start">
+
+    <nav aria-label="Main" style="flex: 1 1 220px; max-width: 260px; box-sizing: border-box; padding: 20px 12px; display: flex; flex-direction: column; gap: 20px; border-right: 1px solid #232733; min-height: 1630px">
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Dashboard</a>
+        <a href="Dashboard.dc.html#jobs" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Jobs</a>
+        <a href="Dashboard.dc.html#catalog" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">All tools<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">43</span></a>
+        <a href="Settings.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Settings</a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Pinned</div>
+        <a href="Main.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #ff5c72"></span>Library Maintenance</a>
+        <a href="Dashboard.dc.html#watcher" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #5b9cff"></span>CBZ Watcher<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #10261d; color: #7fe0b5">Running</span></a>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Needs your decision</div>
+        <a href="PlanReview.dc.html" aria-current="page" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #ffffff; background: #222736; font-weight: 500">Plans to approve<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #13243f; color: #9cc3ff">{{planBadge}}</span></a>
+        <a href="Dashboard.dc.html#decisions" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Readiness holds<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">off</span></a>
+        <a href="Dashboard.dc.html#jobs" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Failed jobs<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #3a1a20; color: #ff8a9a">1</span></a>
+        <a href="SeriesReview.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #9aa1b2">Series Review<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">v1.1</span></a>
+      </div>
+    </nav>
+
+    <main id="main" style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32px 48px; display: flex; flex-direction: column; gap: 20px">
+
+      <div style="display: flex; flex-direction: column; gap: 8px">
+        <div style="font-size: 13px; color: #9aa1b2"><a href="Dashboard.dc.html#decisions" style="color: #9aa1b2">Needs your decision</a> / Plans</div>
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+          <h1 style="margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.02em">Canonical naming plan · Manga</h1>
+          <span style="font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px; background: {{stateBg}}; color: {{stateFg}}">{{stateLabel}}</span>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+          <span style="font-size: 13px; color: #9aa1b2">plan_digest</span>
+          <code style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; padding: 4px 8px; border-radius: 6px; background: #0a0c11; border: 1px solid #232733; overflow-wrap: anywhere">{{digest}}</code>
+          <button type="button" onClick="{{copyDigest}}" class="ghost-btn" style="min-height: 32px; padding: 0 10px; border-radius: 6px; border: 1px solid #2a2f3d; background: transparent; color: #c9cede; font: inherit; font-size: 12px; cursor: pointer">{{copyDigestLabel}}</button>
+        </div>
+      </div>
+
+      <section aria-label="Plan provenance" style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 18px 20px">
+        <dl style="margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 24px; font-size: 13px">
+          <div><dt style="color: #9aa1b2">Contract · planner</dt><dd style="margin: 2px 0 0; font-family: 'IBM Plex Mono', monospace">canonical-naming-plan-v1 · planner v2</dd></div>
+          <div><dt style="color: #9aa1b2">Library root</dt><dd style="margin: 2px 0 0; font-family: 'IBM Plex Mono', monospace">Z:\comics\Manga</dd></div>
+          <div><dt style="color: #9aa1b2">Quarantine root</dt><dd style="margin: 2px 0 0; font-family: 'IBM Plex Mono', monospace">Z:\comics\Manga\_canonical_quarantine\2026-10-26</dd></div>
+          <div><dt style="color: #9aa1b2">Database target (catalog the plan read)</dt><dd style="margin: 2px 0 0; font-family: 'IBM Plex Mono', monospace; overflow-wrap: anywhere">G:\ComicAutomation\TestDatabase\tower-manga-20261026.db</dd></div>
+          <div><dt style="color: #9aa1b2">Number style</dt><dd style="margin: 2px 0 0">chapter · auto, from registry · scope <span style="font-family: 'IBM Plex Mono', monospace">Z:\comics\Manga</span></dd></div>
+          <div><dt style="color: #9aa1b2">Registry</dt><dd style="margin: 2px 0 0; font-family: 'IBM Plex Mono', monospace; overflow-wrap: anywhere">%USERPROFILE%\.cbz-automation\number-styles.json · sha256 3f9a1c0e…b41d · 6 roots</dd></div>
+          <div><dt style="color: #9aa1b2">series_folder_root</dt><dd style="margin: 2px 0 0; font-family: 'IBM Plex Mono', monospace">Z:\comics\Manga</dd></div>
+          <div><dt style="color: #9aa1b2">accept_comicinfo_drop</dt><dd style="margin: 2px 0 0">false</dd></div>
+          <div><dt style="color: #9aa1b2">Snapshot · excluded</dt><dd style="margin: 2px 0 0">2026-10-26 15:58 · 3 paths excluded <a href="#lists" style="font-size: 12px">(.stfolder, .stversions, ai-decensor-originals)</a></dd></div>
+        </dl>
+        <p style="margin: 14px 0 0; padding-top: 12px; border-top: 1px solid #232733; font-size: 13px; color: #b9bfcc">Generated <strong style="color: #e6e8ee">2 hours ago</strong>. Approving records that you reviewed this exact document. It does not mean the plan is still current: the executor rechecks every action when the plan is applied.</p>
+      </section>
+
+      <div style="display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px">
+        <sc-for list="{{counts}}" as="c" hint-placeholder-count="6">
+          <div style="background: #161922; border: 1px solid #232733; border-radius: 10px; padding: 12px 14px">
+            <div style="font-size: 22px; font-weight: 600; font-family: 'IBM Plex Mono', monospace">{{c.n}}</div>
+            <div style="font-size: 12px; color: #9aa1b2">{{c.label}}</div>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; align-items: flex-start; gap: 20px">
+
+        <section id="lists" aria-label="Plan contents" style="flex: 999 1 600px; min-width: 0; background: #161922; border: 1px solid #232733; border-radius: 12px; overflow: hidden">
+          <div role="tablist" aria-label="Plan sections" style="display: flex; border-bottom: 1px solid #232733; overflow-x: auto">
+            <sc-for list="{{tabs}}" as="t" hint-placeholder-count="4">
+              <sc-if value="{{t.on}}" hint-placeholder-val="{{false}}">
+                <button type="button" role="tab" aria-selected="true" onClick="{{t.pick}}" style="min-height: 46px; padding: 0 18px; border: none; border-bottom: 2px solid #ff5c72; background: transparent; color: #ffffff; font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap">{{t.label}} <span style="color: #b9bfcc; font-weight: 500">{{t.count}}</span></button>
+              </sc-if>
+              <sc-if value="{{t.off}}" hint-placeholder-val="{{true}}">
+                <button type="button" role="tab" aria-selected="false" onClick="{{t.pick}}" style="min-height: 46px; padding: 0 18px; border: none; border-bottom: 2px solid transparent; background: transparent; color: #b9bfcc; font: inherit; cursor: pointer; white-space: nowrap">{{t.label}} <span style="color: #9aa1b2">{{t.count}}</span></button>
+              </sc-if>
+            </sc-for>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 16px; border-bottom: 1px solid #232733; background: #12141b">
+            <label for="folder-filter" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Folder</label>
+            <select id="folder-filter" style="height: 36px; padding: 0 10px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit; font-size: 13px">
+              <option>All folders</option>
+              <option>Berserk</option>
+              <option>Martial Evolution</option>
+              <option>Solo Leveling</option>
+            </select>
+            <label for="text-filter" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Filter by text</label>
+            <input id="text-filter" type="search" value="{{q}}" onChange="{{setQ}}" placeholder="Filter by name…" style="flex: 1 1 220px; height: 36px; box-sizing: border-box; padding: 0 12px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit; font-size: 13px">
+            <span style="align-self: center; font-size: 12px; color: #9aa1b2">200 per page, paged on the server</span>
+          </div>
+
+          <sc-if value="{{tabRenames}}" hint-placeholder-val="{{true}}">
+            <div style="display: flex; flex-direction: column">
+              <sc-for list="{{renames}}" as="r" hint-placeholder-count="5">
+                <div style="border-bottom: 1px solid #232733; padding: 12px 16px; display: flex; flex-direction: column; gap: 6px">
+                  <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; color: #9aa1b2">
+                    <span style="font-family: 'IBM Plex Mono', monospace">{{r.folder}}\</span>
+                    <span style="margin-left: auto; font-family: 'IBM Plex Mono', monospace">{{r.action}} · archive {{r.archive}} · sha256 {{r.sha}}</span>
+                  </div>
+                  <div style="display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; align-items: baseline; font-family: 'IBM Plex Mono', monospace; font-size: 13px">
+                    <span style="font-size: 11px; color: #9aa1b2">before</span>
+                    <span><sc-for list="{{r.before}}" as="s" hint-placeholder-count="2"><sc-if value="{{s.hl}}" hint-placeholder-val="{{false}}"><del style="background: #3a1a20; color: #ffb3bd; text-decoration: line-through; border-radius: 3px; padding: 0 2px">{{s.t}}</del></sc-if><sc-if value="{{s.plain}}" hint-placeholder-val="{{true}}"><span style="color: #c9cede">{{s.t}}</span></sc-if></sc-for></span>
+                    <span style="font-size: 11px; color: #9aa1b2">after</span>
+                    <span><sc-for list="{{r.after}}" as="s" hint-placeholder-count="2"><sc-if value="{{s.hl}}" hint-placeholder-val="{{false}}"><ins style="background: #12261f; color: #9ff0c8; text-decoration: none; border-radius: 3px; padding: 0 2px">{{s.t}}</ins></sc-if><sc-if value="{{s.plain}}" hint-placeholder-val="{{true}}"><span style="color: #ffffff">{{s.t}}</span></sc-if></sc-for></span>
+                  </div>
+                  <button type="button" aria-expanded="{{r.open}}" onClick="{{r.toggle}}" style="align-self: flex-start; min-height: 32px; padding: 0; border: none; background: transparent; color: #ff8a9a; font: inherit; font-size: 12px; cursor: pointer">{{r.toggleLabel}}</button>
+                  <sc-if value="{{r.open}}" hint-placeholder-val="{{false}}">
+                    <ul style="margin: 0; padding: 10px 12px 10px 28px; border-radius: 8px; background: #0a0c11; font-size: 12.5px; color: #c9cede; display: flex; flex-direction: column; gap: 4px">
+                      <sc-for list="{{r.evidence}}" as="e" hint-placeholder-count="3"><li>{{e}}</li></sc-for>
+                    </ul>
+                  </sc-if>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{tabFamilies}}" hint-placeholder-val="{{false}}">
+            <div style="display: flex; flex-direction: column">
+              <sc-for list="{{families}}" as="f" hint-placeholder-count="2">
+                <div style="border-bottom: 1px solid #232733; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px">
+                  <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px">
+                    <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9aa1b2">{{f.id}}</span>
+                    <span style="font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: #12261f; color: #7fe0b5">KEEPER</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px">{{f.keeper}}</span>
+                    <span style="color: #9aa1b2">→</span>
+                    <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #9ff0c8">{{f.renameTo}}</span>
+                  </div>
+                  <div style="overflow-x: auto">
+                    <table style="width: 100%; min-width: 640px; border-collapse: collapse; font-size: 12.5px">
+                      <thead><tr style="text-align: left; color: #9aa1b2"><th scope="col" style="padding: 6px 8px 6px 0; font-weight: 500">Dependant</th><th scope="col" style="padding: 6px 8px; font-weight: 500">Relation</th><th scope="col" style="padding: 6px 8px; font-weight: 500">Outcome</th><th scope="col" style="padding: 6px 0 6px 8px; font-weight: 500">quarantine_to</th></tr></thead>
+                      <tbody>
+                        <sc-for list="{{f.deps}}" as="d" hint-placeholder-count="2">
+                          <tr style="border-top: 1px solid #232733"><td style="padding: 8px 8px 8px 0; font-family: 'IBM Plex Mono', monospace">{{d.name}}</td><td style="padding: 8px">{{d.relation}}</td><td style="padding: 8px; color: #ffc27a">{{d.outcome}}</td><td style="padding: 8px 0 8px 8px; font-family: 'IBM Plex Mono', monospace; color: #b9bfcc; overflow-wrap: anywhere">{{d.to}}</td></tr>
+                        </sc-for>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{tabHeld}}" hint-placeholder-val="{{false}}">
+            <div style="display: flex; flex-direction: column">
+              <sc-for list="{{held}}" as="h" hint-placeholder-count="4">
+                <div style="border-bottom: 1px solid #232733; padding: 12px 16px; display: flex; flex-direction: column; gap: 6px">
+                  <sc-for list="{{h.paths}}" as="p" hint-placeholder-count="1"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px">{{p}}</span></sc-for>
+                  <ul style="margin: 0; padding-left: 18px; font-size: 13px; color: #ffc27a; display: flex; flex-direction: column; gap: 2px">
+                    <sc-for list="{{h.reasons}}" as="x" hint-placeholder-count="1"><li>{{x}}</li></sc-for>
+                  </ul>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{tabUnchanged}}" hint-placeholder-val="{{false}}">
+            <div style="display: flex; flex-direction: column">
+              <sc-for list="{{unchanged}}" as="u" hint-placeholder-count="3">
+                <div style="border-bottom: 1px solid #232733; padding: 12px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; flex: 1 1 320px">{{u.name}}</span>
+                  <sc-if value="{{u.diag}}" hint-placeholder-val="{{false}}"><span style="font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: #3a2410; color: #ffc27a; font-family: 'IBM Plex Mono', monospace">unverified_version_label</span></sc-if>
+                </div>
+              </sc-for>
+            </div>
+          </sc-if>
+
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 16px; font-size: 13px; color: #9aa1b2">
+            <span>{{pageLabel}}</span>
+            <div style="margin-left: auto; display: flex; gap: 6px">
+              <button type="button" disabled style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; font-size: 13px">Previous</button>
+              <button type="button" class="ghost-btn" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; font-size: 13px; cursor: pointer">Next</button>
+            </div>
+          </div>
+        </section>
+
+        <aside style="flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+          <sc-if value="{{pending}}" hint-placeholder-val="{{true}}">
+            <form aria-labelledby="approve-h" style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 14px">
+              <h2 id="approve-h" style="margin: 0; font-size: 15px; font-weight: 600">Approve this digest</h2>
+              <p style="margin: 0; font-size: 13px; color: #b9bfcc">Type the counts you reviewed. The server checks them against the stored plan before it records the approval.</p>
+              <div style="display: flex; flex-direction: column; gap: 6px">
+                <label for="exp-digest" style="font-size: 13px; font-weight: 500">expect_digest</label>
+                <input id="exp-digest" type="text" readonly value="{{digestShort}}" style="height: 38px; box-sizing: border-box; padding: 0 10px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0a0c11; color: #b9bfcc; font-family: 'IBM Plex Mono', monospace; font-size: 12px">
+              </div>
+              <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px">
+                <div style="display: flex; flex-direction: column; gap: 6px">
+                  <label for="exp-r" style="font-size: 13px; font-weight: 500">Renames</label>
+                  <input id="exp-r" type="text" inputmode="numeric" value="{{expR}}" onChange="{{setR}}" style="height: 38px; box-sizing: border-box; padding: 0 10px; border-radius: 8px; border: 1px solid {{rBorder}}; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Mono', monospace">
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 6px">
+                  <label for="exp-f" style="font-size: 13px; font-weight: 500">Families</label>
+                  <input id="exp-f" type="text" inputmode="numeric" value="{{expF}}" onChange="{{setF}}" style="height: 38px; box-sizing: border-box; padding: 0 10px; border-radius: 8px; border: 1px solid {{fBorder}}; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Mono', monospace">
+                </div>
+              </div>
+              <div style="font-size: 12px; color: {{matchColor}}">{{matchMsg}}</div>
+              <div style="display: flex; flex-direction: column; gap: 6px">
+                <label for="note" style="font-size: 13px; font-weight: 500">Note <span style="color: #9aa1b2; font-weight: 400">(optional)</span></label>
+                <textarea id="note" rows="2" style="box-sizing: border-box; padding: 8px 10px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit; font-size: 13px; resize: vertical"></textarea>
+              </div>
+              <button type="button" onClick="{{approve}}" disabled="{{cantApprove}}" style="min-height: 44px; border-radius: 8px; border: none; background: #ff5c72; color: #16080b; font: inherit; font-weight: 700; cursor: pointer">Approve this digest</button>
+            </form>
+          </sc-if>
+
+          <sc-if value="{{approved}}" hint-placeholder-val="{{false}}">
+            <section style="background: #161922; border: 1px solid #1d4a37; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 12px">
+              <h2 style="margin: 0; font-size: 15px; font-weight: 600">Apply from the command line</h2>
+              <p style="margin: 0; font-size: 13px; color: #b9bfcc">The console can't apply plans in v1. First stop the watcher and any other writers, check the backup is verified, and run the executor's own checks.</p>
+              <pre style="margin: 0; padding: 12px; border-radius: 8px; background: #0a0c11; border: 1px solid #232733; color: #c8f5d8; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere">{{applyCmd}}</pre>
+              <div style="display: flex; flex-wrap: wrap; gap: 8px">
+                <button type="button" onClick="{{copyCmd}}" class="ghost-btn" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; cursor: pointer">{{copyCmdLabel}}</button>
+                <button type="button" class="ghost-btn" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; cursor: pointer">Export receipt (JSON)</button>
+                <button type="button" onClick="{{revoke}}" class="ghost-btn" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid #4a2a30; background: transparent; color: #ff8a9a; font: inherit; cursor: pointer">Revoke approval</button>
+              </div>
+            </section>
+          </sc-if>
+
+          <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 10px">
+            <div style="display: flex; align-items: baseline; gap: 8px">
+              <h2 style="margin: 0; font-size: 15px; font-weight: 600">Decision history</h2>
+              <span style="font-size: 12px; color: #9aa1b2">append-only</span>
+            </div>
+            <sc-if value="{{noHistory}}" hint-placeholder-val="{{true}}">
+              <p style="margin: 0; font-size: 13px; color: #9aa1b2">No decisions on this digest yet.</p>
+            </sc-if>
+            <ol style="margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px">
+              <sc-for list="{{history}}" as="h" hint-placeholder-count="0">
+                <li style="display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border-radius: 8px; background: #0e1016; border: 1px solid #232733">
+                  <span style="font-weight: 600; color: {{h.color}}">{{h.decision}}</span>
+                  <span style="font-size: 12px; color: #b9bfcc">{{h.who}} · {{h.when}}</span>
+                  <span style="font-size: 12px; color: #9aa1b2; font-family: 'IBM Plex Mono', monospace">{{h.counts}}</span>
+                </li>
+              </sc-for>
+            </ol>
+          </section>
+        </aside>
+      </div>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1700}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { tab: 'renames', q: '', open: {}, expR: '', expF: '', history: [], copied: '' };
+  }
+  renderVals() {
+    const s = this.state;
+    const DIGEST = '1f3c9e4b7d20a6c58e19f03b2d7a4c61e8b05f9d3a72c6e14b8d09f5a3e207a9';
+    const N = { renames: 214, families: 9 };
+    const seg = (arr) => arr.map((x) => ({ t: x[0], hl: !!x[1], plain: !x[1] }));
+    const RENAMES = [
+      { folder: 'Berserk', action: 'a-000017', archive: '#20411', sha: '9c41…e2f0',
+        before: [['Berserk v01 ', 0], ['#003', 1], [' (2019)', 0], [' (English)', 1], [' [v2].cbz', 0]], after: [['Berserk v01 ', 0], ['ch. 3', 1], [' (2019) [v2].cbz', 0]],
+        evidence: ['Number style: chapter (registry, scope Z:\\comics\\Manga), so #003 becomes ch. 3', 'Volume and number: ComicInfo and filename agree', 'Edition token "English" hidden by the display-token helper', 'Version [v2] resolved by family evidence'] },
+      { folder: 'Solo Leveling', action: 'a-000052', archive: '#18342', sha: '07bd…41a9',
+        before: [['Solo Leveling ', 0], ['Ch.', 1], [' 4.cbz', 0]], after: [['Solo Leveling ', 0], ['ch.', 1], [' 4.cbz', 0]],
+        evidence: ['Number style: chapter (registry, scope Z:\\comics\\Manga)', 'Case-only rename: executor uses its two-step protocol'] },
+      { folder: 'Martial Evolution', action: 'a-000131', archive: '#25519', sha: '4f0d…a7c2',
+        before: [['Martial_Evolution Start-by ch', 1], [' 12.cbz', 0]], after: [['Martial Evolution ch.', 1], [' 12.cbz', 0]],
+        evidence: ['Series from the chosen folder "Martial Evolution" (ComicInfo said "Martial_Evolution Start-by")', 'Number style: chapter (registry)', 'Re-resolution of the proposed name is a fixpoint'] },
+      { folder: '[Series]', action: 'a-000190', archive: '#41203', sha: 'b81e…0d55',
+        before: [['[Series] ', 0], ['v1 Full', 1], ['.cbz', 0]], after: [['[Series] ', 0], ['v01', 1], ['.cbz', 0]],
+        evidence: ['Unnumbered Full defaults to volume 1: operator-policy evidence', 'Manga volumes omit (TPB)'] }
+    ];
+    const FAMILIES = [
+      { id: 'F-0007', keeper: 'Solo Leveling ch. 5 (s2).cbz', renameTo: 'Solo Leveling ch. 5 [v2].cbz',
+        deps: [{ name: 'Solo Leveling ch. 5.cbz', relation: 'strict prefix', outcome: 'quarantine', to: '_canonical_quarantine\\2026-10-26\\F-0007\\#18350\\Solo Leveling ch. 5.cbz' }] },
+      { id: 'F-0012', keeper: 'Berserk v01 #004 (2019) [v3].cbz', renameTo: 'Berserk v01 ch. 4 (2019) [v3].cbz',
+        deps: [
+          { name: 'Berserk v01 #004 (2019) [v2].cbz', relation: 'strict prefix', outcome: 'quarantine', to: '_canonical_quarantine\\2026-10-26\\F-0012\\#20418\\…[v2].cbz' },
+          { name: 'Berserk v01 #004 (2019).cbz', relation: 'strict prefix', outcome: 'quarantine', to: '_canonical_quarantine\\2026-10-26\\F-0012\\#20402\\…(2019).cbz' }
+        ] }
+    ];
+    const HELD = [
+      { paths: ['[Series] Uncensored\\[Series] ch. 1.cbz'], reasons: ['Decensor marker in the folder name; held until a pairing adapter exists'] },
+      { paths: ['[Series]\\[Series] ch. 7.cbz'], reasons: ['ComicInfo Tags contain camelia:black_bars'] },
+      { paths: ['[Series]\\[Series] #012.cbz', '[Series]\\[Series] 012.cbz'], reasons: ['Destination collision (NFC/casefold); the whole unit is held'] },
+      { paths: ['[Series]\\[Series] Vol. 2 ch. 3.cbz'], reasons: ['Not a fixpoint: the proposed name formats differently when resolved again', 'Unresolved volume candidate'] },
+      { paths: ['[Series]\\[file].cbz'], reasons: ['Not in the catalog'] }
+    ];
+    const UNCHANGED = [
+      { name: 'Series Name ch. 1 (2019) [v3].cbz', diag: true },
+      { name: 'Berserk v01 ch. 1 (2019).cbz', diag: false },
+      { name: 'Solo Leveling ch. 1.cbz', diag: false }
+    ];
+    const q = (s.q || '').toLowerCase();
+    const has = (txt) => !q || txt.toLowerCase().indexOf(q) !== -1;
+    const renames = RENAMES.filter((r) => has(r.folder + ' ' + r.before.map((x) => x[0]).join(''))).map((r) => ({
+      folder: r.folder, action: r.action, archive: r.archive, sha: r.sha, before: seg(r.before), after: seg(r.after), evidence: r.evidence,
+      open: !!s.open[r.action],
+      toggle: () => this.setState({ open: Object.assign({}, s.open, { [r.action]: !s.open[r.action] }) }),
+      toggleLabel: s.open[r.action] ? 'Hide evidence' : 'Show evidence'
+    }));
+    const last = s.history.length ? s.history[s.history.length - 1].kind : 'none';
+    const approved = last === 'approved';
+    const rOk = s.expR.trim() === String(N.renames), fOk = s.expF.trim() === String(N.families);
+    const typed = s.expR.trim() !== '' && s.expF.trim() !== '';
+    const now = () => 'just now';
+    const counts = 'renames ' + N.renames + ' · families ' + N.families;
+    const TABS = [['renames', 'Renames', 214], ['families', 'Families', 9], ['held', 'Held for review', 17], ['unchanged', 'Unchanged', 1832]];
+    const pageTotals = { renames: 214, families: 9, held: 17, unchanged: 1832 };
+    const shownN = { renames: renames.length, families: FAMILIES.length, held: HELD.length, unchanged: UNCHANGED.length }[s.tab];
+    return {
+      digest: DIGEST,
+      digestShort: DIGEST,
+      copyDigest: () => this.setState({ copied: 'digest' }),
+      copyDigestLabel: s.copied === 'digest' ? 'Copied' : 'Copy',
+      stateLabel: approved ? 'APPROVED' : (last === 'revoked' ? 'APPROVAL REVOKED' : 'AWAITING APPROVAL'),
+      stateBg: approved ? '#10261d' : (last === 'revoked' ? '#3a1a20' : '#13243f'),
+      stateFg: approved ? '#7fe0b5' : (last === 'revoked' ? '#ff8a9a' : '#9cc3ff'),
+      planBadge: approved ? '0' : '1',
+      counts: [
+        { n: 214, label: 'Renames' }, { n: 9, label: 'Families' }, { n: 11, label: 'Quarantines' },
+        { n: 9, label: 'Keeper renames' }, { n: 17, label: 'Held for review' }, { n: 4, label: 'Unverified version labels' }
+      ],
+      tabs: TABS.map((t) => ({ label: t[1], count: t[2], on: s.tab === t[0], off: s.tab !== t[0], pick: () => this.setState({ tab: t[0] }) })),
+      tabRenames: s.tab === 'renames', tabFamilies: s.tab === 'families', tabHeld: s.tab === 'held', tabUnchanged: s.tab === 'unchanged',
+      q: s.q, setQ: (e) => this.setState({ q: e.target.value }),
+      renames: renames, families: FAMILIES, held: HELD, unchanged: UNCHANGED,
+      pageLabel: 'Showing ' + shownN + ' sample rows of ' + pageTotals[s.tab].toLocaleString('en-US'),
+      pending: !approved, approved: approved,
+      expR: s.expR, expF: s.expF,
+      setR: (e) => this.setState({ expR: e.target.value }),
+      setF: (e) => this.setState({ expF: e.target.value }),
+      rBorder: s.expR && !rOk ? '#ff6b6b' : '#2a2f3d',
+      fBorder: s.expF && !fOk ? '#ff6b6b' : '#2a2f3d',
+      matchMsg: !typed ? 'Both counts are required.' : (rOk && fOk ? 'Counts match the stored plan.' : 'PLAN_COUNT_MISMATCH: these counts do not match the stored plan.'),
+      matchColor: !typed ? '#9aa1b2' : (rOk && fOk ? '#7fe0b5' : '#ff8a9a'),
+      cantApprove: !(rOk && fOk),
+      approve: () => this.setState({ history: s.history.concat([{ kind: 'approved' }]), expR: '', expF: '' }),
+      revoke: () => this.setState({ history: s.history.concat([{ kind: 'revoked' }]) }),
+      noHistory: s.history.length === 0,
+      history: s.history.slice().reverse().map((h, i) => ({
+        decision: h.kind === 'approved' ? 'Approved' : 'Revoked',
+        color: h.kind === 'approved' ? '#7fe0b5' : '#ff8a9a',
+        who: 'OFFICEPC\\david · session 3',
+        when: now(),
+        counts: counts
+      })),
+      applyCmd: 'python -m comic_automation.library.canonical_apply.cli apply --library-root Z:\\comics\\Manga --database G:\\ComicAutomation\\TestDatabase\\tower-manga-20261026.db --plan G:\\ComicAutomation\\web-console\\plans\\' + DIGEST + '.json --expect-digest ' + DIGEST + ' --expect-renames ' + N.renames + ' --expect-families ' + N.families + ' --attest-quiescent',
+      copyCmd: () => this.setState({ copied: 'cmd' }),
+      copyCmdLabel: s.copied === 'cmd' ? 'Copied' : 'Copy command'
+    };
+  }
+}
+</script>
+</body>
+</html>

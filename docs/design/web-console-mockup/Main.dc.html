@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Library Maintenance — CBZ Suite</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0e1016}
+a{color:#c9cede}a:hover{color:#ffffff}
+.nav-link:hover{background:#1b1f2a}
+.ghost-btn:hover{background:#232836}
+.chip:hover{border-color:#4a5168}
+button:disabled{opacity:0.45;cursor:not-allowed}
+.skip{position:absolute;left:-9999px}.skip:focus{left:16px;top:8px;z-index:10;background:#ff5c72;color:#16080b;padding:8px 12px;border-radius:6px}
+input:focus,select:focus,button:focus-visible,a:focus-visible{outline:2px solid #ff5c72;outline-offset:2px}
+</style>
+</helmet>
+<div style="min-height: 1560px; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 14px; line-height: 1.45">
+  <a href="#main" class="skip">Skip to content</a>
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid #232733; background: #12141b">
+    <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; text-decoration: none; color: #ffffff">
+      <span style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; background: #ff5c72; color: #16080b">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h12a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z"></path><path d="M8 9h8M8 13h5"></path></svg>
+      </span>
+      <span style="font-weight: 700; font-size: 16px; letter-spacing: -0.01em">CBZ Suite</span>
+    </a>
+    <div style="flex: 1 1 280px; max-width: 480px; position: relative">
+      <label for="tool-search" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Search tools</label>
+      <input id="tool-search" type="search" placeholder="Search tools and scripts…" style="width: 100%; box-sizing: border-box; height: 38px; padding: 0 12px 0 36px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa1b2" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="position: absolute; left: 12px; top: 11px"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+    </div>
+    <div style="flex: 1 1 0"></div>
+    <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: #10261d; border: 1px solid #1d4a37; color: #7fe0b5; text-decoration: none; font-size: 13px; font-weight: 500">
+      <span style="width: 8px; height: 8px; border-radius: 50%; background: #3fd18f"></span>
+      Watcher running
+    </a>
+    <a href="Settings.dc.html" class="ghost-btn" aria-label="Settings" style="width: 38px; height: 38px; box-sizing: border-box; border-radius: 8px; border: 1px solid #2a2f3d; color: #c9cede; display: flex; align-items: center; justify-content: center">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path></svg>
+    </a>
+  </header>
+
+  <div style="display: flex; flex-wrap: wrap; align-items: flex-start">
+
+    <nav aria-label="Main" style="flex: 1 1 220px; max-width: 260px; box-sizing: border-box; padding: 20px 12px; display: flex; flex-direction: column; gap: 20px; border-right: 1px solid #232733; min-height: 1490px">
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1"></rect><rect x="14" y="3" width="7" height="5" rx="1"></rect><rect x="14" y="12" width="7" height="9" rx="1"></rect><rect x="3" y="16" width="7" height="5" rx="1"></rect></svg>
+          Dashboard
+        </a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 12h4l3 8 4-16 3 8h4"></path></svg>
+          Jobs
+        </a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">All tools<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">43</span></a>
+        <a href="Settings.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Settings</a>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Pinned</div>
+        <a href="Main.dc.html" aria-current="page" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #ffffff; background: #222736; font-weight: 500">
+          <span style="width: 8px; height: 8px; border-radius: 2px; background: #ff5c72"></span>
+          Library Maintenance
+        </a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">
+          <span style="width: 8px; height: 8px; border-radius: 2px; background: #5b9cff"></span>
+          CBZ Watcher
+          <span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #10261d; color: #7fe0b5">Running</span>
+        </a>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Needs your decision</div>
+        <a href="PlanReview.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Plans to approve<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #13243f; color: #9cc3ff">1</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Readiness holds<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">off</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">Failed jobs<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #3a1a20; color: #ff8a9a">1</span></a>
+        <a href="SeriesReview.dc.html" class="nav-link" style="display: flex; align-items: center; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #9aa1b2">Series Review<span style="margin-left: auto; font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid #2f3546; color: #9aa1b2">v1.1</span></a>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <div style="padding: 0 12px 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa1b2">Domains</div>
+        <a href="Main.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede">
+          <span style="width: 8px; height: 8px; border-radius: 2px; background: #ff5c72"></span>Workflows<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">4</span>
+        </a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #5b9cff"></span>Watcher &amp; routing<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">4</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #b67ae0"></span>Naming &amp; classification<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">7</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #2fb5a5"></span>Archive integrity<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">10</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #9b86d6"></span>Decensor<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">3</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #f0a63a"></span>Reports &amp; audits<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">7</span></a>
+        <a href="Dashboard.dc.html" class="nav-link" style="display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; border-radius: 8px; text-decoration: none; color: #c9cede"><span style="width: 8px; height: 8px; border-radius: 2px; background: #8a93a8"></span>Database &amp; jobs<span style="margin-left: auto; font-size: 12px; color: #9aa1b2">8</span></a>
+      </div>
+    </nav>
+
+    <main id="main" style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32px 48px; display: flex; flex-direction: column; gap: 24px">
+
+      <div style="display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px">
+        <div style="flex: 1 1 420px; display: flex; flex-direction: column; gap: 6px">
+          <div style="font-size: 13px; color: #9aa1b2">Tools / Workflows · <span style="font-family: 'IBM Plex Mono', monospace">scripts/cbz_workflows.py maintenance</span></div>
+          <h1 style="margin: 0; font-size: 28px; font-weight: 600; letter-spacing: -0.02em">Library Maintenance</h1>
+          <p style="margin: 0; color: #b9bfcc; max-width: 680px">Run sanitization, archive cleanup, series organization, metadata repair, and name repair as one configurable workflow.</p>
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 4px; font-size: 12px; color: #9aa1b2">
+          <span style="font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px; background: #3a2410; color: #ffc27a">writes files</span>
+          <span>Form built from the tool's schema · last values saved</span>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; align-items: flex-start; gap: 24px">
+
+        <div style="flex: 999 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+
+          <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 18px">
+            <h2 style="margin: 0; font-size: 15px; font-weight: 600">Target</h2>
+            <div style="display: flex; flex-direction: column; gap: 6px">
+              <label for="lib-folder" style="font-weight: 500">Library folder</label>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap">
+                <input id="lib-folder" type="text" value="{{folder}}" onChange="{{setFolder}}" style="flex: 1 1 320px; min-width: 0; height: 40px; box-sizing: border-box; padding: 0 12px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font-family: 'IBM Plex Mono', monospace; font-size: 13px">
+                <button type="button" class="ghost-btn" style="min-height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid #2a2f3d; background: #1b1f2a; color: #e6e8ee; font: inherit; cursor: pointer">Browse…</button>
+              </div>
+              <div style="font-size: 13px; color: #9aa1b2">Every selected stage operates beneath this folder. Recent: <a href="#lib-folder">\\tower\media\comics\Manga</a></div>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 8px">
+              <div id="mode-label" style="font-weight: 500">Run mode</div>
+              <div role="group" aria-labelledby="mode-label" style="display: inline-flex; align-self: flex-start; padding: 4px; gap: 4px; border-radius: 10px; background: #0e1016; border: 1px solid #2a2f3d">
+                <sc-for list="{{modes}}" as="m" hint-placeholder-count="2">
+                  <sc-if value="{{m.on}}" hint-placeholder-val="{{false}}">
+                    <button type="button" aria-pressed="true" onClick="{{m.pick}}" style="min-height: 36px; padding: 0 16px; border-radius: 7px; border: none; background: #2a3042; color: #ffffff; font: inherit; font-weight: 600; cursor: pointer">{{m.label}}</button>
+                  </sc-if>
+                  <sc-if value="{{m.off}}" hint-placeholder-val="{{true}}">
+                    <button type="button" aria-pressed="false" onClick="{{m.pick}}" style="min-height: 36px; padding: 0 16px; border-radius: 7px; border: none; background: transparent; color: #b9bfcc; font: inherit; font-weight: 500; cursor: pointer">{{m.label}}</button>
+                  </sc-if>
+                </sc-for>
+              </div>
+              <div style="font-size: 13px; color: #9aa1b2">{{modeHint}}</div>
+            </div>
+          </section>
+
+          <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 14px">
+            <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px">
+              <h2 style="margin: 0; font-size: 15px; font-weight: 600">Stages</h2>
+              <span style="font-size: 13px; color: #9aa1b2">Run in canonical order — click to include or skip</span>
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px">
+              <sc-for list="{{stages}}" as="s" hint-placeholder-count="5">
+                <sc-if value="{{s.on}}" hint-placeholder-val="{{true}}">
+                  <button type="button" aria-pressed="true" onClick="{{s.toggle}}" style="min-height: 88px; text-align: left; display: flex; flex-direction: column; gap: 6px; padding: 12px; border-radius: 10px; border: 1px solid #ff5c72; background: #2a1419; color: #ffffff; font: inherit; cursor: pointer">
+                    <span style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #ffb3bd; font-family: 'IBM Plex Mono', monospace">
+                      <span style="display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: #ff5c72; color: #16080b; font-weight: 600">{{s.num}}</span>
+                      {{s.id}}
+                    </span>
+                    <span style="font-weight: 600">{{s.label}}</span>
+                    <span style="font-size: 12px; color: #d9c2c6">{{s.blurb}}</span>
+                  </button>
+                </sc-if>
+                <sc-if value="{{s.off}}" hint-placeholder-val="{{false}}">
+                  <button type="button" aria-pressed="false" onClick="{{s.toggle}}" class="chip" style="min-height: 88px; text-align: left; display: flex; flex-direction: column; gap: 6px; padding: 12px; border-radius: 10px; border: 1px dashed #353b4c; background: transparent; color: #9aa1b2; font: inherit; cursor: pointer">
+                    <span style="display: flex; align-items: center; gap: 8px; font-size: 12px; font-family: 'IBM Plex Mono', monospace">
+                      <span style="display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; border: 1px solid #4a5168; font-weight: 600">{{s.num}}</span>
+                      {{s.id}}
+                    </span>
+                    <span style="font-weight: 600; text-decoration: line-through">{{s.label}}</span>
+                    <span style="font-size: 12px">Skipped</span>
+                  </button>
+                </sc-if>
+              </sc-for>
+            </div>
+          </section>
+
+          <sc-if value="{{sanitizeOn}}" hint-placeholder-val="{{true}}">
+            <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 18px">
+              <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px">
+                <h2 style="margin: 0; font-size: 15px; font-weight: 600">Sanitizer settings</h2>
+                <span style="font-size: 13px; color: #9aa1b2">Only used by the sanitize stage</span>
+              </div>
+              <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px">
+                <div style="display: flex; flex-direction: column; gap: 6px">
+                  <label for="sort" style="font-weight: 500">Sort order</label>
+                  <select id="sort" value="{{sort}}" onChange="{{setSort}}" style="height: 40px; padding: 0 10px; border-radius: 8px; border: 1px solid #2a2f3d; background: #0e1016; color: #e6e8ee; font: inherit">
+                    <option value="newest">Newest first</option>
+                    <option value="oldest">Oldest first</option>
+                    <option value="alpha">Alphabetical</option>
+                    <option value="alpha-reverse">Reverse alphabetical</option>
+                  </select>
+                  <span style="font-size: 13px; color: #9aa1b2">Changes processing priority only.</span>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 10px; padding-top: 4px">
+                  <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+                    <input type="checkbox" checked="{{fullRescan}}" onChange="{{toggleFull}}" style="width: 18px; height: 18px; margin: 2px 0 0; accent-color: #ff5c72">
+                    <span><span style="font-weight: 500">Full rescan</span><br><span style="font-size: 13px; color: #9aa1b2">Ignore the incremental cutoff and inspect every CBZ.</span></span>
+                  </label>
+                  <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+                    <input type="checkbox" checked="{{restart}}" onChange="{{toggleRestart}}" style="width: 18px; height: 18px; margin: 2px 0 0; accent-color: #ff5c72">
+                    <span><span style="font-weight: 500">Clear progress before running</span><br><span style="font-size: 13px; color: #9aa1b2">Rebuild the progress tracker from scratch.</span></span>
+                  </label>
+                </div>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 8px">
+                <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px">
+                  <span id="rules-label" style="font-weight: 500">Cleanup rules</span>
+                  <span style="font-size: 13px; color: #9aa1b2">{{rulesHint}}</span>
+                  <button type="button" onClick="{{clearRules}}" style="margin-left: auto; min-height: 32px; padding: 0 10px; border: none; background: transparent; color: #ff8a9a; font: inherit; font-size: 13px; cursor: pointer">Use all rules</button>
+                </div>
+                <div role="group" aria-labelledby="rules-label" style="display: flex; flex-wrap: wrap; gap: 8px">
+                  <sc-for list="{{rules}}" as="r" hint-placeholder-count="10">
+                    <sc-if value="{{r.on}}" hint-placeholder-val="{{false}}">
+                      <button type="button" aria-pressed="true" onClick="{{r.toggle}}" style="min-height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid #ff5c72; background: #2a1419; color: #ffd0d6; font-family: 'IBM Plex Mono', monospace; font-size: 12px; cursor: pointer">✓ {{r.id}}</button>
+                    </sc-if>
+                    <sc-if value="{{r.off}}" hint-placeholder-val="{{true}}">
+                      <button type="button" aria-pressed="false" onClick="{{r.toggle}}" class="chip" style="min-height: 36px; padding: 0 12px; border-radius: 999px; border: 1px solid #2f3546; background: #11141b; color: #c9cede; font-family: 'IBM Plex Mono', monospace; font-size: 12px; cursor: pointer">{{r.id}}</button>
+                    </sc-if>
+                  </sc-for>
+                </div>
+              </div>
+            </section>
+          </sc-if>
+
+          <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 18px">
+            <h2 style="margin: 0; font-size: 15px; font-weight: 600">Matching &amp; performance</h2>
+            <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px">
+              <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+                <input type="checkbox" checked="{{dedupe}}" onChange="{{toggleDedupe}}" style="width: 18px; height: 18px; margin: 2px 0 0; accent-color: #ff5c72">
+                <span><span style="font-weight: 500">Match duplicates by ComicInfo metadata</span><br><span style="font-size: 13px; color: #9aa1b2">Catches differently named duplicate chapters at the cost of more reads.</span></span>
+              </label>
+              <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+                <input type="checkbox" checked="{{namesOnly}}" onChange="{{toggleNames}}" style="width: 18px; height: 18px; margin: 2px 0 0; accent-color: #ff5c72">
+                <span><span style="font-weight: 500">Name repair: skip ComicInfo</span><br><span style="font-size: 13px; color: #9aa1b2">Fix mojibake like <span style="font-family: 'IBM Plex Mono', monospace">Playere28099s</span> in names only.</span></span>
+              </label>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 8px">
+              <div id="workers-label" style="font-weight: 500">Parallel workers</div>
+              <div role="group" aria-labelledby="workers-label" style="display: inline-flex; flex-wrap: wrap; align-self: flex-start; padding: 4px; gap: 4px; border-radius: 10px; background: #0e1016; border: 1px solid #2a2f3d">
+                <sc-for list="{{workers}}" as="w" hint-placeholder-count="6">
+                  <sc-if value="{{w.on}}" hint-placeholder-val="{{false}}">
+                    <button type="button" aria-pressed="true" onClick="{{w.pick}}" style="min-width: 44px; min-height: 36px; border-radius: 7px; border: none; background: #2a3042; color: #ffffff; font-family: 'IBM Plex Mono', monospace; font-weight: 500; cursor: pointer">{{w.n}}</button>
+                  </sc-if>
+                  <sc-if value="{{w.off}}" hint-placeholder-val="{{true}}">
+                    <button type="button" aria-pressed="false" onClick="{{w.pick}}" style="min-width: 44px; min-height: 36px; border-radius: 7px; border: none; background: transparent; color: #b9bfcc; font-family: 'IBM Plex Mono', monospace; cursor: pointer">{{w.n}}</button>
+                  </sc-if>
+                </sc-for>
+              </div>
+              <div style="font-size: 13px; color: #9aa1b2">Higher values finish sooner but place more load on storage and CPU.</div>
+            </div>
+          </section>
+        </div>
+
+        <aside style="flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+          <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 16px">
+            <div style="display: flex; align-items: center; justify-content: space-between">
+              <h2 style="margin: 0; font-size: 15px; font-weight: 600">Run summary</h2>
+              <sc-if value="{{isDry}}" hint-placeholder-val="{{true}}">
+                <span style="font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; background: #13243f; color: #9cc3ff">DRY RUN</span>
+              </sc-if>
+              <sc-if value="{{isLive}}" hint-placeholder-val="{{false}}">
+                <span style="font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 6px; background: #3a2410; color: #ffc27a">WRITES CHANGES</span>
+              </sc-if>
+            </div>
+            <dl style="margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; font-size: 13px">
+              <dt style="color: #9aa1b2">Folder</dt>
+              <dd style="margin: 0; font-family: 'IBM Plex Mono', monospace; overflow-wrap: anywhere">{{folder}}</dd>
+              <dt style="color: #9aa1b2">Stages</dt>
+              <dd style="margin: 0">{{stageSummary}}</dd>
+              <dt style="color: #9aa1b2">Rules</dt>
+              <dd style="margin: 0">{{ruleSummary}}</dd>
+              <dt style="color: #9aa1b2">Workers</dt>
+              <dd style="margin: 0">{{workerCount}}</dd>
+            </dl>
+            <div style="display: flex; flex-direction: column; gap: 6px">
+              <div style="display: flex; align-items: center; justify-content: space-between">
+                <span style="font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #9aa1b2">Command <span style="text-transform: none; letter-spacing: 0; font-weight: 400">· built by the server</span></span>
+                <button type="button" style="min-height: 32px; padding: 0 8px; border: none; background: transparent; color: #ff8a9a; font: inherit; font-size: 13px; cursor: pointer">Copy</button>
+              </div>
+              <pre style="margin: 0; padding: 12px; border-radius: 8px; background: #0a0c11; border: 1px solid #232733; color: #c8f5d8; font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere">{{command}}</pre>
+            </div>
+            <div style="display: flex; gap: 8px">
+              <button type="button" onClick="{{run}}" style="flex: 1 1 auto; min-height: 44px; border-radius: 8px; border: none; background: #ff5c72; color: #16080b; font: inherit; font-weight: 700; font-size: 15px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4l14 8-14 8z"></path></svg>
+                {{runLabel}}
+              </button>
+              <button type="button" onClick="{{stop}}" disabled="{{stopLocked}}" style="min-height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid #2a2f3d; background: transparent; color: #e6e8ee; font: inherit; font-weight: 500; cursor: pointer">Stop</button>
+            </div>
+            <sc-if value="{{stopLocked}}" hint-placeholder-val="{{false}}">
+              <p style="margin: 0; font-size: 12px; color: #9aa1b2">Stopping a run that writes changes isn't enabled for this tool yet; it unlocks once the tool passes its interrupt check. Dry runs can always be stopped, and Stop ends the whole process tree.</p>
+            </sc-if>
+          </section>
+
+          <section style="background: #161922; border: 1px solid #232733; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 12px">
+            <h2 style="margin: 0; font-size: 15px; font-weight: 600">Recent runs of this tool</h2>
+            <div style="display: flex; flex-direction: column">
+              <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; min-height: 44px; border-bottom: 1px solid #232733; text-decoration: none; color: #e6e8ee">
+                <span style="width: 8px; height: 8px; border-radius: 50%; background: #3fd18f"></span>
+                <span style="flex: 1 1 auto"><span style="color: #7fe0b5; font-weight: 500">Succeeded</span> · Dry run · all stages</span>
+                <span style="font-size: 12px; color: #9aa1b2">Yesterday</span>
+              </a>
+              <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; min-height: 44px; border-bottom: 1px solid #232733; text-decoration: none; color: #e6e8ee">
+                <span style="width: 8px; height: 8px; border-radius: 50%; background: #3fd18f"></span>
+                <span style="flex: 1 1 auto"><span style="color: #7fe0b5; font-weight: 500">Succeeded</span> · Normal · sanitize, names</span>
+                <span style="font-size: 12px; color: #9aa1b2">3 days ago</span>
+              </a>
+              <a href="Dashboard.dc.html" style="display: flex; align-items: center; gap: 10px; min-height: 44px; text-decoration: none; color: #e6e8ee">
+                <span style="width: 8px; height: 8px; border-radius: 50%; background: #ff6b6b"></span>
+                <span style="flex: 1 1 auto"><span style="color: #ff8a9a; font-weight: 500">Failed (exit 2)</span> · Normal · archive</span>
+                <span style="font-size: 12px; color: #9aa1b2">Last week</span>
+              </a>
+            </div>
+          </section>
+        </aside>
+      </div>
+
+      <section aria-label="Output" style="background: #161922; border: 1px solid #232733; border-radius: 12px; overflow: hidden">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 14px 20px; border-bottom: 1px solid #232733">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">Output</h2>
+          <sc-if value="{{running}}" hint-placeholder-val="{{false}}">
+            <span style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ffc27a"><span style="width: 8px; height: 8px; border-radius: 50%; background: #f0a63a"></span>Running · organize stage · 412 / 1,280</span>
+          </sc-if>
+          <sc-if value="{{idle}}" hint-placeholder-val="{{true}}">
+            <span style="font-size: 13px; color: #9aa1b2">Idle — press {{runLabel}} to start</span>
+          </sc-if>
+          <div style="flex: 1 1 200px; height: 8px; border-radius: 999px; background: #0e1016; overflow: hidden">
+            <div style="height: 100%; width: {{progress}}; background: #f0a63a; border-radius: 999px"></div>
+          </div>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #c9cede">{{progressLabel}}</span>
+          <button type="button" class="ghost-btn" style="min-height: 32px; padding: 0 10px; border-radius: 6px; border: 1px solid #2a2f3d; background: transparent; color: #c9cede; font: inherit; font-size: 13px; cursor: pointer">Clear</button>
+        </div>
+        <div style="display: flex; gap: 0; border-bottom: 1px solid #232733; font-size: 13px; overflow-x: auto">
+          <button type="button" style="min-height: 40px; padding: 0 16px; border: none; border-bottom: 2px solid #ff5c72; background: transparent; color: #ffffff; font: inherit; font-weight: 500; cursor: pointer">All</button>
+          <button type="button" style="min-height: 40px; padding: 0 16px; border: none; border-bottom: 2px solid transparent; background: transparent; color: #b9bfcc; font: inherit; cursor: pointer">Changes</button>
+          <button type="button" style="min-height: 40px; padding: 0 16px; border: none; border-bottom: 2px solid transparent; background: transparent; color: #b9bfcc; font: inherit; cursor: pointer">Warnings</button>
+          <button type="button" style="min-height: 40px; padding: 0 16px; border: none; border-bottom: 2px solid transparent; background: transparent; color: #b9bfcc; font: inherit; cursor: pointer">Errors</button>
+        </div>
+        <div style="height: 240px; overflow: auto; padding: 12px 20px; background: #0a0c11; font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; line-height: 1.75">
+          <sc-if value="{{running}}" hint-placeholder-val="{{false}}">
+            <sc-for list="{{log}}" as="l" hint-placeholder-count="8">
+              <div style="display: flex; gap: 12px; white-space: nowrap">
+                <span style="color: #6f778a">{{l.t}}</span>
+                <span style="color: {{l.color}}; min-width: 84px">{{l.tag}}</span>
+                <span style="color: #d6dae3">{{l.msg}}</span>
+              </div>
+            </sc-for>
+          </sc-if>
+          <sc-if value="{{idle}}" hint-placeholder-val="{{true}}">
+            <div style="color: #9aa1b2">No output yet. Logs stream here live and are also saved to the Logs folder.</div>
+          </sc-if>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1560}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = {
+      folder: '\\\\tower\\media\\comics\\Comix',
+      mode: 'dry',
+      stages: { sanitize: true, archive: true, organize: true, metadata: true, names: true },
+      rules: {},
+      workers: '8',
+      sort: 'newest',
+      fullRescan: false,
+      restart: false,
+      dedupe: true,
+      namesOnly: false,
+      running: false
+    };
+  }
+  renderVals() {
+    const s = this.state;
+    const STAGES = [
+      { id: 'sanitize', label: 'Sanitize', blurb: 'Filenames &amp; ComicInfo'.replace('&amp;', '&') },
+      { id: 'archive', label: 'Archive clean', blurb: 'Dupes, loose folders' },
+      { id: 'organize', label: 'Organize', blurb: 'Merge split series' },
+      { id: 'metadata', label: 'Metadata', blurb: 'Title, chapter, volume' },
+      { id: 'names', label: 'Repair names', blurb: 'Fix mojibake' }
+    ];
+    const RULES = ['brackets', 'comicinfo', 'leading_nums', 'non_latin', 'normalize_stem', 'number_tokens', 'scan_groups', 'trailing_junk', 'translate', 'url'];
+    const WORKERS = ['1', '2', '4', '8', '12', '20'];
+    const selStages = STAGES.filter((x) => s.stages[x.id]).map((x) => x.id);
+    const selRules = RULES.filter((r) => s.rules[r]);
+    const isDry = s.mode === 'dry';
+
+    let cmd = 'python scripts\\cbz_workflows.py maintenance "' + s.folder + '"';
+    if (isDry) cmd += ' --dry-run';
+    if (s.stages.sanitize && s.restart) cmd += ' --restart';
+    if (s.stages.sanitize && s.fullRescan) cmd += ' --full';
+    if (s.stages.sanitize && selRules.length) cmd += ' --rules=' + selRules.slice().sort().join(',');
+    cmd += ' --stages=' + (selStages.join(',') || '(none)');
+    cmd += ' --workers ' + s.workers;
+    if (!s.dedupe) cmd += ' --no-metadata-dedupe';
+    if (s.namesOnly) cmd += ' --names-only';
+
+    const set = (patch) => () => this.setState(patch);
+    const LOG = [
+      { t: '18:02:11', tag: '[workflow]', color: '#9cc3ff', msg: 'Stages: ' + selStages.join(' → ') },
+      { t: '18:02:11', tag: '[sanitize]', color: '#c8f5d8', msg: 'Scanning ' + s.folder + ' (' + s.sort + ')' },
+      { t: '18:04:37', tag: '[sanitize]', color: '#c8f5d8', msg: 'Would rename 38 files, update 112 ComicInfo entries' },
+      { t: '18:04:38', tag: '[archive]', color: '#c8f5d8', msg: 'Would pack 3 loose image folders into CBZ' },
+      { t: '18:05:02', tag: '[archive]', color: '#ffc27a', msg: 'WARN duplicate kept larger file: [series]/Ch 012.cbz' },
+      { t: '18:05:40', tag: '[organize]', color: '#c8f5d8', msg: 'Merging split chapter folders…' },
+      { t: '18:06:15', tag: '[organize]', color: '#c8f5d8', msg: 'CBZ_PROGRESS 412/1280 32% organize' },
+      { t: '18:06:16', tag: '[organize]', color: '#d6dae3', msg: 'Processing [series name]…' }
+    ];
+
+    return {
+      folder: s.folder,
+      setFolder: (e) => this.setState({ folder: e.target.value }),
+      modes: [
+        { label: 'Dry run', on: isDry, off: !isDry, pick: set({ mode: 'dry' }) },
+        { label: 'Normal run', on: !isDry, off: isDry, pick: set({ mode: 'normal' }) }
+      ],
+      modeHint: isDry ? 'Preview only — no archive, filename, folder, or progress changes are written.' : 'Changes will be applied to the library. Run a dry run first if unsure.',
+      isDry: isDry,
+      isLive: !isDry,
+      stages: STAGES.map((x, i) => ({
+        id: x.id, label: x.label, blurb: x.blurb, num: i + 1,
+        on: !!s.stages[x.id], off: !s.stages[x.id],
+        toggle: () => this.setState({ stages: Object.assign({}, s.stages, { [x.id]: !s.stages[x.id] }) })
+      })),
+      sanitizeOn: !!s.stages.sanitize,
+      sort: s.sort,
+      setSort: (e) => this.setState({ sort: e.target.value }),
+      fullRescan: s.fullRescan,
+      restart: s.restart,
+      toggleFull: set({ fullRescan: !s.fullRescan }),
+      toggleRestart: set({ restart: !s.restart }),
+      rules: RULES.map((r) => ({
+        id: r, on: !!s.rules[r], off: !s.rules[r],
+        toggle: () => this.setState({ rules: Object.assign({}, s.rules, { [r]: !s.rules[r] }) })
+      })),
+      rulesHint: selRules.length ? 'Only the ' + selRules.length + ' selected rule' + (selRules.length > 1 ? 's' : '') + ' will run' : 'None selected — every rule runs',
+      clearRules: set({ rules: {} }),
+      dedupe: s.dedupe,
+      namesOnly: s.namesOnly,
+      toggleDedupe: set({ dedupe: !s.dedupe }),
+      toggleNames: set({ namesOnly: !s.namesOnly }),
+      workers: WORKERS.map((n) => ({ n: n, on: s.workers === n, off: s.workers !== n, pick: set({ workers: n }) })),
+      workerCount: s.workers,
+      stageSummary: selStages.length ? selStages.length + ' of 5 — ' + selStages.join(', ') : 'None selected',
+      ruleSummary: s.stages.sanitize ? (selRules.length ? selRules.join(', ') : 'All rules') : 'n/a (sanitize skipped)',
+      command: cmd,
+      runLabel: isDry ? 'Start dry run' : 'Run and apply',
+      run: set({ running: true }),
+      stop: set({ running: false }),
+      stopLocked: !isDry,
+      running: s.running,
+      idle: !s.running,
+      progress: s.running ? '32%' : '0%',
+      progressLabel: s.running ? '32%' : '—',
+      log: LOG
+    };
+  }
+}
+</script>
+</body>
+</html>
