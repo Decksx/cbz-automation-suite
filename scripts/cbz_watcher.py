@@ -3120,6 +3120,11 @@ class CBZHandler(FileSystemEventHandler):
         self.tracker = tracker
 
     def _handle(self, path: Path) -> None:
+        # Some move events can name an external destination. Opt-in holding
+        # must never feed those archives back into the import timers.
+        if (self.tracker.readiness_holds.enabled
+                and not path.absolute().is_relative_to(self.tracker.readiness_holds.watch_root)):
+            return
         if path.suffix.lower() != ".cbz":
             return
         if path_contains_excluded_directory(
