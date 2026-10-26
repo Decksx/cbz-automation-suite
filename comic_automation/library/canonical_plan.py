@@ -460,10 +460,9 @@ def build_plan(
                     problems.append("decensor identity/pairing adapter required")
                 try:
                     # A registered category root is not a series title. A scan
-                    # below that physical root is still a series-folder scan,
-                    # so narrowing scope must not erase a title conflict.
-                    series_scope = (style.source == "registry"
-                        and style.matched_identity != root_identity[:2])
+                    # below that physical root, or without root evidence when a
+                    # style is explicit, cannot discard its folder conflict.
+                    series_scope = style.matched_identity != root_identity[:2]
                     display_folder = (folder.name if folder != root or series_scope
                         or display_key(folder.name) == display_key(series) else None)
                     display_folders[key] = display_folder
