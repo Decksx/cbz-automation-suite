@@ -101,7 +101,7 @@ class NumberStyleRegistry:
     def select(self, scope: str | Path, requested: str = "auto") -> StyleSelection:
         """Select an explicit override or exactly one physical registered root.
 
-        Unknown, overlapping (even same-style), inaccessible or identity-less
+        Unknown, overlapping/nested (even same-style), inaccessible or identity-less
         roots refuse auto. Inaccessibility cannot prove that a second match
         is absent. Explicit overrides need no library filesystem access.
         """
@@ -111,8 +111,18 @@ class NumberStyleRegistry:
         if requested == "auto":
             try:
                 ancestors = _ancestors(Path(scope))
+                try:
+                    scope_identity = _identity(Path(scope))
+                except FileNotFoundError:
+                    scope_identity = None
                 for root, style in self.roots:
                     identity = _identity(root)
+                    # Ancestor-only matching cannot assign one style to a
+                    # parent scan that also contains a registered sub-library.
+                    # Inspect physical access/resolved chains, never strings.
+                    if (scope_identity is not None and identity != scope_identity
+                            and scope_identity in _ancestors(root)):
+                        raise NumberStyleRefused("nested registered root inside number-style scope")
                     if identity in ancestors:
                         matches.append((root, style, identity))
             except OSError as exc:
