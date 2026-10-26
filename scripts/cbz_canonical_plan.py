@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from comic_automation.library.canonical_plan import build_plan
+from comic_automation.library.number_style import DEFAULT_REGISTRY
 
 
 def _output_target(output: Path, root: Path) -> Path:
@@ -36,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-held-bytes", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--max-copy-bytes", type=int)
     parser.add_argument("--output", type=Path, help="exclusively create a UTF-8 plan outside the library")
+    parser.add_argument("--number-style", choices=("auto", "issue", "chapter"), default="auto")
+    parser.add_argument("--number-style-registry", type=Path,
+                        default=DEFAULT_REGISTRY)
     args = parser.parse_args(argv)
     try:
         if args.output is not None:
@@ -44,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
             quarantine_date=args.quarantine_date,
             accept_comicinfo_drop=args.accept_comicinfo_drop,
             temp_dir=args.temp_dir, max_held_bytes=args.max_held_bytes,
-            max_copy_bytes=args.max_copy_bytes)
+            max_copy_bytes=args.max_copy_bytes, number_style=args.number_style,
+            number_style_registry=args.number_style_registry)
         payload = json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
         if args.output is not None:
             target = _output_target(args.output, args.library_root)
