@@ -3,7 +3,7 @@
 import pytest
 
 from comic_automation.archive import field_resolution as fr
-from comic_automation.library.media_naming import media_fields, series_display
+from comic_automation.library.media_naming import KeepArrivalName, media_fields, series_display
 from scripts.cbz_canonical_name import CanonicalNameError, format_canonical_name
 
 
@@ -34,10 +34,14 @@ def test_a_conflicting_number_cannot_supply_collection_volume_authority(label):
     "Series Full (2019).cbz", "Series Full (Colored).cbz"])
 def test_unnumbered_full_defaults_to_one_while_literal_titles_keep_their_words(filename):
     tokens = fr.parse_name_tokens(filename)
-    result = media_fields(series="Series", number=None, volume=None, style="issue", tokens=tokens)
+    year = "2019" if "(2019)" in filename else None  # Callers pass the filename year; it is never dropped.
+    result = media_fields(series="Series", number=None, volume=None, style="issue", tokens=tokens, year=year)
     assert result.volume == "1" and result.collection == "TPB"
-    fields = media_fields(series="Series Full", number="1", volume=None, style="issue", tokens=tokens)
+    fields = media_fields(series="Series Full", number="1", volume=None, style="issue", tokens=tokens, year=year)
     assert fields.series == "Series Full"
+    if year:
+        with pytest.raises(KeepArrivalName):
+            media_fields(series="Series", number=None, volume=None, style="issue", tokens=tokens)
 
 
 @pytest.mark.parametrize("number", range(1, 7))
