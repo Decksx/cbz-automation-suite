@@ -12,7 +12,9 @@ watcher entry point.
 ## Acquisition and refusal
 
 The existing hard-coded `WATCH_FOLDER` remains unchanged. Argument parsing
-and help happen first. The watcher retains its existing creation of a missing
+and help happen first. Integration settings and media-policy save/restore
+happen only after ownership is acquired, so a refused embedded call cannot
+reconfigure an active session. The watcher retains its existing creation of a missing
 watch directory, then requires a successful directory stat with positive
 `st_dev` and `st_ino`. Symlinks and junctions are resolved and their target
 identity is checked against the supplied path. Identity is checked again
