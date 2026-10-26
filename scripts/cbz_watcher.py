@@ -6,6 +6,8 @@ immediate comic directory to the configured destination.
 """
 
 import os
+import hashlib
+from contextlib import contextmanager
 import argparse
 import re
 import gc
@@ -35,6 +37,7 @@ from comic_automation.series_resolver import (
     settle_file_conflict,
     unique_path,
 )
+from comic_automation.library.readiness_hold import ReadinessHolds
 from comic_automation.library.exclusions import (
     DEFAULT_EXCLUDED_DIRECTORIES,
     iter_files_excluding_directories,
@@ -2401,18 +2404,26 @@ def _move_loose_files(
     return dest_dir if moved else None
 
 
-def process_and_move_directory(dir_path: Path) -> None:
-    """
-    Recursively find all immediate directories containing .cbz files under
-    dir_path. For each one: clean dir name → process files → move to dest.
+def process_and_move_directory(dir_path: Path) -> bool:
+    """Claim the directory and run its recursive import pass.
+
+    Return False on processing contention so readiness can retry; True means
+    this invocation owned the pass, not that every archive landed successfully.
+    The pass cleans directory names, processes files and routes them as before.
     """
     with _processing_dirs_lock:
+        # Claim atomically: a readiness hold can begin after dispatch's check.
+        if any(dir_path == p or _is_subpath(dir_path, p) or _is_subpath(p, dir_path)
+               for p in _processing_dirs):
+            log.info("  Directory processing already owned: %s", dir_path)
+            return False
         _processing_dirs.add(dir_path)
     try:
         _process_and_move_directory_inner(dir_path)
     finally:
         with _processing_dirs_lock:
             _processing_dirs.discard(dir_path)
+    return True
 
 
 def _process_and_move_directory_inner(dir_path: Path) -> None:
@@ -2800,6 +2811,7 @@ def _is_subpath(child: Path, parent: Path) -> bool:
 # directory gets rechecked at a similar cadence to the settle timer itself,
 # rather than hammering the filesystem or waiting unreasonably long.
 READINESS_RETRY_DELAY_SECONDS = 5
+WATCHER_SOURCE_VERSION = "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def _log_directory_not_ready(
@@ -2837,7 +2849,9 @@ def _process_directory_when_ready(
     performs the actual renames/metadata edits/moves) once every archive
     reports READY.
 
-    If any archive is not ready, this performs no mutation of any kind and
+    If any archive is not ready, optional readiness holding may remove an
+    expired, structurally incomplete archive under processing exclusion. A
+    successful hold restarts this gate with a fresh inventory. Otherwise it
     schedules exactly one retry via `tracker` after
     READINESS_RETRY_DELAY_SECONDS. If that retry also finds something not
     ready, it schedules its own single retry in turn -- this is a normal
@@ -2852,6 +2866,7 @@ def _process_directory_when_ready(
         log.info(
             f"  Directory no longer exists, not probing: {dir_path}"
         )
+        tracker.readiness_holds.forget(dir_path)
         return
 
     cbz_files = sorted(
@@ -2865,6 +2880,7 @@ def _process_directory_when_ready(
             f"  No .cbz files found under '{dir_path.name}', "
             "not probing."
         )
+        tracker.readiness_holds.forget(dir_path)
         return
 
     if readiness_generation is None:
@@ -2885,7 +2901,20 @@ def _process_directory_when_ready(
         return
 
     if result.status == ZipReadiness.READY:
-        process_and_move_directory(dir_path)
+        tracker.readiness_holds.forget(dir_path)
+        if process_and_move_directory(dir_path) is False:
+            # A hold may claim exclusion after this gate's readiness probe.
+            # Preserve this event, but never replace a newer notify() timer.
+            tracker._schedule_readiness_retry(
+                dir_path, expected_generation=readiness_generation,
+            )
+        return
+
+    if tracker._hold_stalled_archives(dir_path, result, readiness_generation):
+        # Never process ready siblings using a probe that preceded a hold.
+        _process_directory_when_ready(
+            dir_path, tracker, readiness_generation=readiness_generation,
+        )
         return
 
     _log_directory_not_ready(dir_path, result)
@@ -2899,7 +2928,18 @@ def _process_directory_when_ready(
 # DIRECTORY SETTLE TRACKER
 # ─────────────────────────────────────────────
 class DirectorySettleTracker:
-    def __init__(self, settle_delay: float = SETTLE_DELAY):
+    """Coordinate settling, readiness retries and explicitly enabled holds."""
+
+    def __init__(
+        self, settle_delay: float = SETTLE_DELAY, *,
+        watch_root: Path | None = None, readiness_hold_root: Path | None = None,
+        readiness_stall_minutes: float = 30, clock=None,
+    ):
+        self.readiness_holds = ReadinessHolds(
+            watch_root if watch_root is not None else Path(WATCH_FOLDER),
+            hold_root=readiness_hold_root, stall_minutes=readiness_stall_minutes,
+            watcher_version=WATCHER_SOURCE_VERSION, clock=clock, logger=log,
+        )
         self.settle_delay = settle_delay
         self._timers: dict = {}
         # Pending single-shot readiness recheck timers, keyed by directory
@@ -2986,6 +3026,39 @@ class DirectorySettleTracker:
             readiness_generation=readiness_generation,
         )
 
+    @contextmanager
+    def _hold_commit_guard(self, dir_path: Path, generation: int):
+        # Serialize the final generation check and rename with notify().
+        with self._lock:
+            yield self._readiness_generations.get(dir_path, 0) == generation
+
+    def _hold_stalled_archives(
+        self, dir_path: Path, result: DirectoryReadinessResult, generation: int,
+    ) -> bool:
+        """Claim processing exclusion before considering any holding move."""
+        if not self.readiness_holds.enabled:
+            return False
+        with _processing_dirs_lock:
+            if any(dir_path == p or _is_subpath(dir_path, p) or _is_subpath(p, dir_path)
+                   for p in _processing_dirs):
+                return False
+            _processing_dirs.add(dir_path)
+        try:
+            def probe(path):
+                fresh = probe_cbz_zip_readiness(path)
+                return None if fresh.status == ZipReadiness.READY else fresh.reason
+
+            return self.readiness_holds.consider(
+                dir_path,
+                ((entry.path, entry.reason) for entry in result.entries
+                 if entry.status != ZipReadiness.READY),
+                probe=probe,
+                commit_guard=lambda: self._hold_commit_guard(dir_path, generation),
+            )
+        finally:
+            with _processing_dirs_lock:
+                _processing_dirs.discard(dir_path)
+
     def _current_readiness_generation(self, dir_path: Path) -> int:
         with self._lock:
             return self._readiness_generations.get(dir_path, 0)
@@ -3055,6 +3128,11 @@ class CBZHandler(FileSystemEventHandler):
         self.tracker = tracker
 
     def _handle(self, path: Path) -> None:
+        # Some move events can name an external destination. Opt-in holding
+        # must never feed those archives back into the import timers.
+        if (self.tracker.readiness_holds.enabled
+                and not path.absolute().is_relative_to(self.tracker.readiness_holds.watch_root)):
+            return
         if path.suffix.lower() != ".cbz":
             return
         if path_contains_excluded_directory(
@@ -3116,7 +3194,7 @@ def _discover_startup_directories(
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Build watcher CLI options for optional Camelia and series resolving."""
+    """Build watcher options for integrations and opt-in readiness holding."""
     parser = argparse.ArgumentParser(description="Watch and import incoming CBZ archives")
     parser.add_argument(
         "--series-resolver",
@@ -3195,6 +3273,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=AI_DECENSOR_ARCHIVE_DIR,
         help="Verified long-term original backups, grouped by series (default: F:\\ai-decensor-originals).",
     )
+    parser.add_argument(
+        "--readiness-stall-minutes", type=float, default=30,
+        help="Minutes without observed archive progress before holding (default: 30; 0 disables).",
+    )
+    parser.add_argument(
+        "--readiness-hold-root", type=Path,
+        help="Existing writable same-volume directory outside the watch tree; holds are disabled unless set.",
+    )
     return parser
 
 
@@ -3228,6 +3314,14 @@ def main(argv: list[str] | None = None):
     watch_path = Path(WATCH_FOLDER)
     os.makedirs(watch_path, exist_ok=True)
 
+    try:
+        tracker = DirectorySettleTracker(
+            watch_root=watch_path, readiness_hold_root=args.readiness_hold_root,
+            readiness_stall_minutes=args.readiness_stall_minutes,
+        )
+    except (OSError, ValueError) as exc:
+        build_argument_parser().error(str(exc))
+
     _load_routing()
     _load_routing_v2()
     _load_series_resolvers()
@@ -3259,7 +3353,11 @@ def main(argv: list[str] | None = None):
         log.info(f"  AI archive: {AI_DECENSOR_ARCHIVE_DIR}")
     log.info("=" * 60)
 
-    tracker = DirectorySettleTracker()
+    log.info(
+        "  Readiness holds: %s; inactivity %.1f minutes; root %s",
+        "enabled" if tracker.readiness_holds.enabled else "disabled",
+        args.readiness_stall_minutes, args.readiness_hold_root,
+    )
 
     _clean_up_stale_rewrite_files(watch_path)
 
