@@ -1285,6 +1285,10 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
             target = path.with_name(name)
             patched = _dataclasses_replace(parsed, filename=name, series=fields.series + (f" ({fields.series_year})" if fields.series_year else ""),
                 chapter=fields.issue or fields.chapter, volume=fields.volume)
+            if xml_year is not None:
+                # Persist and read back the issue year while the archive name
+                # still carries it; a failure refuses before any rename.
+                _record_comicinfo_year(path, xml_year)
             if name != path.name:
                 if not _defers_rename(path.stem, target.stem):
                     rename_arrival(path, target)
@@ -1294,8 +1298,6 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
                     raise CanonicalNameError("media destination already exists")
             parsed_by_path[path] = patched
             process_comicinfo(path, patched)
-            if xml_year is not None:
-                _record_comicinfo_year(path, xml_year)
         except KeepArrivalName as exc:
             # Keep the existing parsed/deferred display and its distinguishing
             # number; this is no new field or family authority.
@@ -1312,20 +1314,28 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
     return refused, selection
 
 
-def _record_comicinfo_year(cbz_path, year):
-    """Keep the issue year a reboot series-year filename omits in <Year>.
-
-    Runs after process_comicinfo, so the archive always has ComicInfo.xml.
-    An existing different Year refuses (ValueError) instead of replacing it.
-    """
+def _read_comicinfo_entry(cbz_path):
     with zipfile.ZipFile(cbz_path, "r") as zf:
         entry = next((n for n in zf.namelist() if os.path.basename(n).lower() == "comicinfo.xml"), None)
-        xml_text = zf.read(entry).decode("utf-8", errors="replace") if entry else None
-    if entry is None:
-        raise ValueError(f"ComicInfo.xml missing; cannot record Year {year}")
-    new_xml = with_comicinfo_year(xml_text, year)
+        return entry, (zf.read(entry).decode("utf-8", errors="replace") if entry else None)
+
+
+def _record_comicinfo_year(cbz_path, year):
+    """Persist the issue year a reboot series-year filename omits in <Year>.
+
+    Called before the media rename, while the arrival name still carries the
+    year. The writer can give up after its retries without raising, so the
+    Year is read back: if it is not there, OSError keeps the archive in intake
+    under its year-bearing name. An existing different Year refuses
+    (ValueError) instead of replacing it.
+    """
+    entry, xml_text = _read_comicinfo_entry(cbz_path)
+    new_xml = with_comicinfo_year(xml_text if entry else COMICINFO_TEMPLATE, year)
     if new_xml is not None:
-        _rewrite_comicinfo(cbz_path, entry, new_xml)
+        _write_cbz_with_comicinfo(cbz_path, new_xml, replace_entry=entry)
+    entry, xml_text = _read_comicinfo_entry(cbz_path)
+    if entry is None or with_comicinfo_year(xml_text, year) is not None:
+        raise OSError(f"ComicInfo Year {year} was not persisted; keeping the year-bearing name")
 
 
 def _apply_fallback_naming(
