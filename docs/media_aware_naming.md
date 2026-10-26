@@ -34,6 +34,9 @@ Auto selection compares `(st_dev, st_ino)` against both access-path and
 resolved-path ancestors. A root registered through UNC therefore matches a
 drive-letter subfolder scan. Exactly one registry entry must match; unknown,
 overlapping, duplicate, inaccessible or zero-identity roots refuse auto.
+An existing scope also refuses a registered root nested physically beneath
+it, including one reached through an outside junction: one parent scan cannot
+silently apply its style to a differently configured sub-library.
 An explicit issue/chapter override wins and does not probe registered roots.
 Every selection retains registry path, exact content SHA256, selected scope,
 style, source, matched root and its physical identity for digest provenance.
@@ -63,6 +66,9 @@ including when the scan root itself is the series subfolder. A Manga volume
 whose new `vNN` spelling cannot re-establish its volume role remains held; for
 example, a single Vol-labelled book with only ComicInfo Number and no Volume
 can fail this guard. The policy does not certify a new filename as authority.
+Explicit number style also retains the folder comparison at a scan root;
+choosing syntax cannot bypass a substantive title conflict. Without registered
+root evidence the planner cannot classify that root as merely a category.
 
 Planner version 2 retains `canonical-naming-plan-v1` executor compatibility.
 Style selection and exact registry hash are in provenance, hence in the plan
@@ -73,10 +79,13 @@ a new digest even when the proposed destination names happen to match.
 
 This is a deliberate live naming change: after deployment and configuration,
 new Western imports use `#003`, and collected editions use `v01 (TPB)`.
-Configure the shared registry or an explicit style before enabling the new
-watcher session. The empty fallback registry refuses auto for every root;
-it does not guess a style from a directory's basename. Unknown/overlapping
-destinations stay in intake for review. Normal staging cleanup can already
+The watcher enables media naming only with a nonempty shared registry. With
+an unset/empty registry it runs the complete legacy naming path, including
+when an explicit number-style flag was supplied; deploying code alone does
+not stall imports. Explicit style overrides syntax once a registry is configured.
+The planner independently keeps refusing auto without a matching registry.
+No caller guesses style from a directory's basename. With a configured registry,
+unknown/overlapping destinations stay in intake for review. Staging cleanup can already
 have run before the final destination/style decision; no library landing is
 authorized by a failed media decision.
 
@@ -87,6 +96,18 @@ year, collection and edition facts. Tag-sensitive deferred landing and
 no-overwrite refusals still apply. Placeholder fallback gets the same selected
 number style. A CLI session releases its policy on every exit, so it cannot
 silently configure a later embedded caller in the same process.
+
+The watcher never formats away unconsumed filename numbers. When the original
+stem has number text outside its decided series and consumed number/display
+tokens, it retains the existing legacy arrival/deferred display instead of
+guessing a chapter or issue. `Naruto 700` and `Naruto 701` therefore retain
+distinct names and can both land; this supplies no bulk-planner authority.
+
+A same-file case-only rename uses two steps through a unique temporary sibling,
+with Windows no-replace rename on both legs. An occupied unrelated destination
+refuses. A failed final step restores the original spelling; if rollback is
+also blocked, the archive remains at the logged temporary path and the caller
+tracks that retained path as refused. It never overwrites the interloper.
 
 Arrival filename-derived display fields retain the watcher's existing
 authority boundary; they never certify a bulk rename or a version family.
@@ -104,6 +125,9 @@ version-family separation. Caller witnesses exercise real planner output,
 real watcher renames, a final destination override, and a real watcher
 ComicInfo rewrite/import/re-scan. Focused guard mutants run only in memory.
 Exact-head full-suite, mutation and CI receipts are posted on the PR.
+Configured-registry end-to-end regressions cover bare numbers, successive and
+same-batch arrivals, Windows case renames, empty-registry legacy imports,
+explicit-style folder conflicts, nested scopes and retained-file recovery.
 
 No live library, database, watcher process or configuration is changed by
 this implementation. Claude owns exact-head review and deliberate rollout;
