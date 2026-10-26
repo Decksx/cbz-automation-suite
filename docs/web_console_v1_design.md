@@ -5,6 +5,11 @@ code. It records decisions and open questions for the first web console. The
 console replaces the Tk launcher (`apps/cbz_gui.py`) and adds a review screen
 for canonical rename plans.
 
+Revision 2 (2026-10-26) folds in codex-lead's CHANGES REQUESTED review of
+`11ebf94` (D1–D5, preview sealing, bootstrap token) and David's answers to
+Q1, Q3 and Q10, and records where the server is hosted. §15 lists what was
+decided and what is still open.
+
 Governing architecture: `docs/gui_architecture_implementation_roadmap.md`
 (cited below as "roadmap §n"). Visual reference: David's Claude Design mockup,
 https://claude.ai/code/artifact/03c76b76-f967-4f2b-9c06-c8011360086e
@@ -28,7 +33,7 @@ In v1:
    approves one exact `plan_digest`. The approval is append-only and tied to
    that version (roadmap §3.3).
 4. **Localhost only.** The server binds 127.0.0.1, and §2.6 security applies
-   anyway: a session token, Origin and Host checks, CSRF protection, a path
+   anyway: a one-time bootstrap code exchanged for a session, Origin and Host checks, CSRF protection, a path
    allowlist, and validation of every parameter.
 
 Not in v1: Series Review (it is next, as v1.1), phone or remote access, real
@@ -45,7 +50,7 @@ Measured on `master` at `f43174e`.
 | Tools | `TOOLS` lists 9 entries. They are: Series Workflow and Library Maintenance (`cbz_workflows.py`), Camelia Decensor, CBZ Watcher, Gap Checker, Apply Dry-Run Plan, Exclusions Log, Series Review (`propose-series`) and Stage Similar Series. | The watcher and maintenance schemas are in v1. The rest get schemas in M10, before the Tk GUI is retired. |
 | Process model | Runs one subprocess at a time, as `python -m scripts.<module>` with `cwd=REPO_ROOT` and env `CBZ_PROGRESS=1`, `PYTHONIOENCODING=UTF-8` and `PYTHONUNBUFFERED=1`. stdout and stderr are merged into one pipe. | The same invocation form and env, launched through a detached runner (§5). |
 | Watcher arguments | `--series-resolver` (on by default) with `--resolver-comix-root` (`Z:\comics\Comix`), `--resolver-manga-root` (`Z:\comics\Manga`), `--resolver-quarantine-root` (`Z:\comics\_resolver_quarantine`), `--resolver-threshold` (0.95/0.97/0.99), `--resolver-refresh` and `--resolver-normalize-apostrophes`. Also `--ai-decensor` with up to 4 ordered `--ai-decensor-model` stages, `--ai-decensor-archive-dir` (`F:\ai-decensor-originals`) and `--ai-decensor-reprocess`. | Everything here, plus the watcher flags the Tk GUI never exposed: `--readiness-hold-root`, `--readiness-stall-minutes`, `--number-style` and `--number-style-registry`. |
-| Stop | `proc.terminate()`. Camelia Decensor uses `taskkill /T /F` because its model workers would otherwise survive. Stopping a workflow leaves its `subprocess.run` children running. | Every stop is a process-tree stop through a Job Object (§5.4). |
+| Stop | `proc.terminate()`. Camelia Decensor uses `taskkill /T /F` because its model workers would otherwise survive. Stopping a workflow leaves its `subprocess.run` children running. | Every stop terminates the whole job object (§5.2). Stopping a writing run is enabled per tool after its interrupt gate (§5.5). |
 | Settings | **Nothing is persisted.** Every launch resets to the defaults in `TOOLS`. The only file the GUI writes is `series_decisions.json`, next to the proposal. `ROUTING_JSON` is defined but never used. | Last-used validated parameters are saved per tool, and a Settings page shows the effective configuration (§7.4). |
 | Log | An in-memory Tk text pane. Lines are tagged error, warn or success by keyword, and `CBZ_PROGRESS n/t p%` lines drive a progress bar. The log is lost when the window closes. | The log is a durable file for each job, streamed live. The same classification is used for display only, and progress is parsed on the server. |
 | Duplicate watchers | Nothing detects a watcher already started from another GUI window, the CLI or `config/CBZWatcher_Task.xml`. | A single-instance lock in the watcher, plus a process scan (§6). |
@@ -99,7 +104,7 @@ comic_automation/web/
   paths.py          path allowlist validation
   tools/
     schema.py       schema loader and meta-validation (fails closed)
-    argv.py         parameters -> argv builder, params digest
+    argv.py         parameters -> argv builder, preview seal
     registry.py     loaded schemas, saved defaults
   tool_schemas/
     watcher.json
@@ -123,25 +128,37 @@ This follows the repository layout standard: the package goes in
 `config/`. The standard's `docs/design/` folder does not exist in this repo
 yet, so this document sits in `docs/` (see Q12).
 
-### 4.2 Runtime state lives outside the repository and the library
+### 4.2 Runtime state on G:
 
-Standard rule 1.9 says data never lives in a checkout. The state directory is
-`%LOCALAPPDATA%\ComicAutomation\web-console\`, which `CBZ_WEB_CONSOLE_HOME`
-can override (see Q1):
+David decided (PR comment, 2026-10-26) that runtime state lives in
+`G:\ComicAutomation\web-console\`, with the other operational data (standard
+rule 1.9). `CBZ_WEB_CONSOLE_HOME` can override it for tests only.
 
 ```text
 console.toml        operator configuration (copied from the example on first run)
 console.sqlite3     jobs, job events, saved parameters, plans index, approvals
-console.lock        single-instance lock for the console server
-session.json        port, token and pid for the launcher (current user only)
-jobs/<job_id>/      command.json, output.log[.1..3], exit.json, stop.request
-plans/<digest>.json immutable copies of ingested plans
-console.log         the server's own log
+locks\              admission.lock, console.lock, jobs\<job_id>.runner.lock
+session.json        port, launcher secret and pid (ACL: the operator account only)
+jobs\<job_id>\      command.json (the sealed preview, §8.1), log\seg-*.log, exit.json
+plans\<digest>.json immutable copies of ingested plans
+plans\incoming\     planner --output targets (§8.4)
+backups\            daily SQLite backup of console.sqlite3, 7 kept
+console.log         the server's own log (secrets redacted, §9)
 ```
 
-The directory is created with the default per-user ACL. It is never under
-`X:\`, `Z:\`, `\\tower\` or `G:\ComicAutomation`. Paths in `console.toml` must
-not point to any of those roots either; the server refuses a config that does.
+**G: unavailable.** If G: or the state directory is missing, unwritable,
+or has changed physical identity (`st_dev`/`st_ino` pinned in
+`console.sqlite3` on first run) since the last start, the server refuses to
+start. The launcher shows the reason in a message box. There is no fallback
+location, because a second jobs database would split admission (§5.2).
+`console.sqlite3` holds the approval ledger, so it goes on the operator's
+G: backup checklist next to `comics.db`. The console never applies a plan,
+so backup-before-apply stays with the CLI apply.
+
+**Path rule.** The *state directory* must not lie inside any configured
+library, quarantine, watch, readiness-hold or decensor-archive root, or
+inside the repository. Path *parameters* are a separate matter: they may
+point into those roots. That is what the allowlist in §4.3 is for.
 
 ### 4.3 `console.toml`
 
@@ -154,8 +171,8 @@ library      = ['\\tower\media\comics', 'Z:\comics']
 quarantine   = ['Z:\comics\_resolver_quarantine']
 decensor_archive = ['F:\ai-decensor-originals']
 readiness_hold = []          # empty: holds stay off (the watcher's own default)
-plan_output  = []            # the console's plans/ directory is always allowed
-plan_import  = []
+database     = ['G:\ComicAutomation\database']   # planner --database
+plan_import  = []            # the console's plans\ directory is always allowed
 
 [naming]
 # Passed explicitly to every tool that takes --number-style-registry, so the
@@ -175,93 +192,213 @@ count, the same facts the planner records in its provenance.
 
 ## 5. Process and job model
 
-### 5.1 Jobs
+### 5.1 Jobs and states
 
-A job is one run of one tool with one set of validated parameters. The
-`jobs` table holds: `job_id` (ULID), `tool_id`, `tool_schema_sha256`,
-`params_json`, `params_digest`, `argv_json`, `dry_run`, `kind` (`task` or
-`service`), `state`, `created_at`, `started_at`, `ended_at`, `exit_code`,
-`outcome`, `runner_pid`, `runner_created_at`, `child_pid`, `operator`,
-`progress_json` and `stop_requested_at`.
+A job is one run of one tool with one sealed preview (§8.1). The `jobs`
+table holds:
 
-`job_events` is an append-only table: created, started, progress, stop
-requested, ended, reconciled. A trigger refuses `UPDATE` and `DELETE` on it,
-which follows roadmap §2.5 in spirit.
+- **identity:** `job_id` (ULID), `admission_seq`, `nonce` (128-bit random);
+- **request:** `tool_id`, `seal_json`, `seal_digest`, `dry_run`, `kind`
+  (`task` or `service`), `effects`, `operator`;
+- **runner:** `runner_pid`, `runner_created_at`;
+- **tool:** `child_pid`, `child_created_at`, `job_object_name`;
+- **lifecycle:** `state`, the timestamps, `exit_code`, `outcome`,
+  `progress_json`, `stop_requested_at`.
 
-States: `starting → running → succeeded | failed | stopped | lost`, plus
-`refused`, which is a validation or start failure that never spawned anything.
-`lost` means the runner vanished without writing `exit.json`, so the outcome is
-unknown. That is shown honestly and never guessed. A schema can map exit codes
-to outcomes. For example, the planner's exit 1 is `succeeded_with_holds`.
+`job_events` is append-only (a trigger refuses `UPDATE` and `DELETE`).
 
-Concurrency in v1 matches the Tk GUI: **one task job at a time**, plus the
-watcher service. A second task start returns `409 JOB_ACTIVE`. This is a UX
-guard only. It is not the authoritative exclusion; roadmap §2.4 keeps locking
-in the backend, such as the canonical-apply scope lock and the watcher's
-series locks.
+| State | Meaning | Holds admission? |
+|---|---|---|
+| `admitted` | The server committed the row and spawned a runner. No tool has started. | yes |
+| `claimed` | The runner committed its claim (§5.2) and is starting the tool. | yes |
+| `running` | The tool is running inside its job object. | yes |
+| `succeeded` / `failed` / `stopped` | Exit record verified (§5.2 step 6). `stopped` carries "the library may be partly changed" for writing tools (§5.5). | no |
+| `admission_expired` | Never claimed within 60 s, so no tool ever started (fenced). | no |
+| `lost` | The runner died. The job object is verified gone, so nothing of the run is alive, but the outcome is unknown. | no |
+| `uncertain` | Liveness or containment could not be verified. Kept until the operator resolves it with evidence. Never cleared automatically. | **yes** |
+| `refused` | Validation or start failure; nothing was spawned. | no |
 
-### 5.2 The detached runner (survives browser and server loss)
+A schema can map exit codes to outcomes; for example, the planner's exit 1
+is `succeeded_with_holds`.
 
-The server never holds a tool's pipe. For each job it starts
-`python -m comic_automation.web.jobs.runner <job_dir>` with
-`CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS`. The runner:
+### 5.2 Admission, claim and containment
 
-1. reads `command.json` (argv, cwd = repository root, env additions);
-2. creates a Windows **Job Object** with `KILL_ON_JOB_CLOSE`, starts the tool
-   with stdout and stderr redirected to `output.log` (a file handle, not a
-   pipe, so the tool never blocks or dies on a broken pipe), and assigns it to
-   the Job Object so grandchildren (workflow stages, Camelia workers) are
-   inside it;
-3. waits for the tool, polling for `stop.request` once a second;
-4. writes `exit.json` atomically (temporary file, fsync, `os.replace`) with the
-   exit code, the end time, and whether a stop was requested.
+The aim is that "one task at a time" and "never an uncontained tool" survive
+a crash of the server, the runner, or both, at any point.
 
-Closing the browser changes nothing. If the **server** exits, jobs keep
-running. On startup the server reconciles every `starting` or `running` job:
-it checks whether the runner pid is alive *and* whether its creation time
-matches `runner_created_at`, which guards against pid reuse. A job with
-`exit.json` is finalized, a job whose runner is alive stays running, and any
-other job becomes `lost`. This answers roadmap §2.7: the backend can rebuild
-the state, and an unknown outcome is shown as unknown.
+1. **Admission (server).** The server takes the OS lock `locks\admission.lock`
+   (`msvcrt.locking`, non-blocking with a short retry), then runs
+   `BEGIN IMMEDIATE`. Inside the transaction it checks the compatibility
+   rules (§5.4) against every row holding admission, and inserts the job as
+   `admitted` with a fresh nonce. It commits, releases the lock, and only
+   then spawns `python -m comic_automation.web.jobs.runner <job_id> <nonce>`
+   (detached: `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW`).
+   Two concurrent requests serialise on the lock and the transaction, so the
+   second one sees the first row and gets `409 JOB_ACTIVE`.
+2. **Claim (runner).** The runner takes `locks\jobs\<job_id>.runner.lock`.
+   If it cannot, a duplicate runner already holds it and this one exits.
+   Then, under `BEGIN IMMEDIATE`, it runs
+   `UPDATE jobs SET state='claimed', runner_pid=?, runner_created_at=? WHERE
+   job_id=? AND nonce=? AND state='admitted'`. Unless exactly one row
+   changes, it exits without starting anything. That fences runners that
+   are late (the row has already expired), duplicated, or stale (wrong
+   nonce). **A tool is never started before a committed claim.** So an
+   `admitted` row older than the 60 s claim deadline can safely be fenced to
+   `admission_expired`, by a transaction conditional on `state='admitted'`.
+3. **Containment before any tool code runs.** The runner creates a job
+   object named `Local\cbz-console-<job_id>` with
+   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Breakaway is not allowed (no
+   `BREAKAWAY_OK` or `SILENT_BREAKAWAY_OK`). The runner keeps the only handle,
+   which is not inheritable. It then starts the tool **atomically inside the
+   job**, using `CreateProcessW` (through ctypes) with a
+   `PROC_THREAD_ATTRIBUTE_JOB_LIST` attribute and a
+   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` that lets the child inherit only the
+   pipe's write end and a NUL stdin
+   ([Raymond Chen, 2023-02-09](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812/)).
+   Python's `subprocess` cannot set `JOB_LIST`, so M3 adds the ctypes call.
+   If that call fails, the job fails closed (`refused`, nothing ran). The
+   only fallback allowed is the suspended form of the agent-swarm relay's
+   `popen_contained` (`C:\swarm-prod\agent-swarm\lead_relay_backends.py`):
+   `CREATE_SUSPENDED`, assign, verify with `IsProcessInJob`, then resume.
+   That is prior art with one deliberate difference: the relay runs a child
+   *uncontained* when assignment fails, and here that case terminates the
+   still-suspended child and refuses. In the suspended form the
+   create-to-assign gap is recovered by identity. The runner commits
+   `child_pid` and `child_created_at` before resuming. On reconciliation, a
+   matching process that is not in the job is terminated by handle,
+   because it has not executed any tool code yet.
+4. **Running.** The runner commits `running` with `child_pid`,
+   `child_created_at` and `job_object_name`, conditional on its own claim
+   (`runner_pid`, `runner_created_at`, `nonce`). Every later write by the
+   runner carries the same condition.
+5. **Runner death kills the tree.** The runner holds the only handle to the
+   job object, so if the runner dies the kernel closes that handle and
+   `KILL_ON_JOB_CLOSE` ends every member. No tool outlives its supervisor,
+   and nothing ever kills a PID tree from a snapshot.
+6. **Finalisation only after verified descendant termination.** When the
+   root process exits, the runner waits for pipe EOF (every holder of the
+   write end has gone). It then queries
+   `JobObjectBasicAccountingInformation`. If `ActiveProcesses` is above 0
+   after a 10 s grace period, it calls `TerminateJobObject` and polls until
+   the count is 0. Only then does it write `exit.json` atomically (temp,
+   fsync, `os.replace`). That record holds `{job_id, nonce, runner_pid,
+   runner_created_at, child_pid, child_created_at, exit_code,
+   descendants_verified: true, stop_requested, ended_at}`. The runner also
+   commits the terminal state under its claim condition. `exit.json` is the
+   durable fallback if that commit fails (for example, a blip on G:).
 
-Service jobs (the watcher) rotate `output.log` at 10 MB and keep 3 files.
-Task logs are not rotated, but are capped at 200 MB; past the cap, writes go
-to a truncation notice.
+**Reconciliation.** This runs at server start and every 30 s. It holds the
+admission lock and handles jobs in `admission_seq` order:
 
-### 5.3 Log streaming
+1. **`exit.json` exists.** It is accepted only if `job_id`, `nonce` and both
+   runner fields match the claim; the job is then finalised. A mismatch
+   makes the job `uncertain`.
+2. **`admitted`, past its deadline.** The job becomes `admission_expired`
+   (the conditional update from step 2).
+3. **`claimed` or `running`, runner alive** (the pid is live and its
+   creation time equals `runner_created_at`). Nothing changes.
+4. **Runner dead.** The server opens `Local\cbz-console-<job_id>`:
+   - *not found:* the job becomes `lost`; there is no member left to stop;
+   - *found:* it should not exist once its only holder has died, so the job
+     becomes `uncertain` and stays that way;
+   - *access denied or any other error:* `uncertain`.
+5. **Pre-assignment gap** (suspended fallback only). This is handled by the
+   identity rule in step 3.
 
-`GET /api/jobs/{id}/stream` is a Server-Sent Events stream. The SSE event id
-is the byte offset in `output.log`, so a browser that reconnects with
-`Last-Event-ID` resumes exactly where it stopped, and a reload replays from 0
-or from the tail. The server tails the file every 250 ms and sends whole
-UTF-8 lines (decoded with `errors="replace"`). It also sends `state` events
-for job transitions and a heartbeat comment every 15 s. Concurrent streams
-are capped at 8. `GET /api/jobs/{id}/log?offset=&limit=` is the polling
-fallback and the paging API.
+An `uncertain` job blocks admission until the operator resolves it. The UI
+shows the evidence (pids, creation times, job-object query result), and
+resolving it appends an event. Nothing auto-clears it.
+
+### 5.3 Log pump and streaming
+
+The tool's stdout and stderr go to one anonymous pipe. A thread in the
+**runner** drains it continuously, so the tool never blocks on a slow disk
+and the server being down does not matter.
+
+- **Logical offsets.** Each byte gets a monotonic logical offset for the
+  whole job. Segments are named by their starting offset,
+  `log\seg-<start:016x>.log`, and each holds at most 8 MiB. The runner
+  closes a segment before it opens the next, so no open file is ever
+  renamed (this avoids the `WinError 32` codex-lead reproduced). Readers
+  open segments read-only with full sharing.
+- **Bounded lines.** A partial line is capped at 64 KiB. A longer line is
+  split, and the continuation is marked `[line continued]`.
+- **Retention.** Service jobs keep 4 segments (32 MiB). Task jobs keep up to
+  256 MiB. Beyond that the oldest segment is deleted and a `gap {from, to}`
+  record is appended to `log\gaps.jsonl`. If a write fails (disk full, G:
+  unavailable), the pump keeps draining, counts the dropped bytes, and
+  writes a gap record when writing works again.
+- **Cursors.** The SSE event id and the polling cursor are the logical
+  offset at the end of each line. On reconnect with `Last-Event-ID`, if the
+  offset is older than the oldest retained segment, the server sends a
+  `gap` event first and resumes at the oldest retained byte. Offsets never
+  alias across rotation.
+- **Streaming.** `GET /api/jobs/{id}/stream` (SSE) checks for new data every
+  250 ms and sends `line`, `gap`, `state` and `progress` events, plus a
+  heartbeat comment every 15 s. Concurrent streams are capped at 8.
+  `GET /api/jobs/{id}/log?cursor=&limit=` is the polling fallback and the
+  paging API.
 
 `CBZ_PROGRESS n/t p% label` lines are parsed on the server into
-`progress_json`, so the dashboard shows progress without opening a log. The
-error/warn/success keyword tagging stays in the browser, as presentation only,
-and is never used for state.
+`progress_json`. Keyword tagging (error, warn, success) is presentation only,
+in the browser.
 
-### 5.4 Stop
+### 5.4 Compatibility (what may run together)
 
-The roadmap says not to offer a generic cancel until a job type has a
-proven-safe cancellation contract (roadmap §5.9). Each schema declares one:
+The console has no shared exclusion protocol with the tools themselves. Its
+admission rules are therefore conservative, and they include externally
+started watchers (§6):
+
+| Running | May start | Refused with `409 INCOMPATIBLE` |
+|---|---|---|
+| nothing | anything | |
+| watcher (any owner) | read-only tasks: dry runs, the planner (§8.4), reports | maintenance normal run and other writing tasks |
+| a writing task | nothing else | another task, watcher start |
+| a read-only task | the watcher | another task |
+
+This is stricter than the Tk GUI, which let a normal maintenance run start
+beside a live watcher. These rules stay until a backend exclusion and
+recovery protocol shared by the watcher and maintenance is proven, which is a
+separate issue. The planner already refuses if the library inventory changes
+while it runs, so running it beside the watcher can at worst fail cleanly.
+
+### 5.5 Stop
+
+David's decision (Q3, 2026-10-26) sets the **target**: the console may stop a
+writing run mid-run by terminating its job object. The job ends `stopped`
+with the warning "the library may be partly changed", and the log is kept.
+Roadmap §5.9 still requires a proven cancellation contract per tool. So
+stopping is enabled **per tool, through an acceptance gate**:
 
 ```json
-"stop": { "mode": "terminate_tree", "confirm": "normal_run",
-          "contract": "Tk parity: abrupt tree stop; tool tolerates restart (see note)" }
+"stop": { "mode": "none", "gate": "M4-maintenance-interrupt",
+          "reason": "Stop is enabled once interruption/recovery tests pass for this tool" }
 ```
 
-`mode` is `terminate_tree` or `none`. `confirm` is `never`, `normal_run` or
-`always`. On stop, the server writes `stop.request`. The runner terminates the
-Job Object, which kills the whole tree; this matches what the Tk GUI already
-does, now including grandchildren. The job becomes `stopped` with the exit
-code recorded. If the runner has died, the server terminates the recorded
-child tree directly, after the same pid-plus-creation-time check. A graceful
-stop for the watcher (a stop file it polls) would need a watcher change and is
-a follow-up, not v1 (Q3).
+- `mode` is `none`, `terminate_job` or `graceful_then_terminate`. If it is
+  `none`, the Stop button is disabled and shows `reason`.
+- **Read-only runs** may be stopped from day one: dry runs, the planner and
+  reports. A stopped planner's partial `--output` file is discarded.
+- **A writing tool's gate** works like this. On temporary fixture libraries,
+  the tool's process tree is killed at several points (counted output
+  lines, and between file operations). The tool is then re-run, and the
+  test asserts that the library is recoverable:
+  - every archive's original bytes, by SHA-256, are still present in the
+    library or its quarantine;
+  - no `*.tmp.cbz` or `*.bak.cbz` is left that the tool's next run does not
+    clean up;
+  - a following dry run reports a consistent state.
+
+  The named tests, and a bypass that makes them fail, are recorded on the
+  PR. Only then does the schema switch to `terminate_job`.
+- **Watcher:** `graceful_then_terminate`. M1b adds a stop file that the
+  watcher polls, and it exits between directories. The terminate fallback
+  is enabled only after the watcher's own interrupt gate passes (kill during
+  rewrite or move, then restart cleanup via `_clean_up_stale_rewrite_files`
+  and readiness sidecars). This gate is part of M6's acceptance.
+- **Mechanism.** The server writes `stop.request`. The runner calls
+  `TerminateJobObject` and then finalises as in §5.2 step 6. If the runner is
+  dead, the kernel has already ended the tree (§5.2 step 5).
 
 ## 6. Watcher supervision: never two watchers
 
@@ -270,32 +407,59 @@ There are several ways to start a watcher: the Tk GUI, the CLI, the
 OfficePC as of 2026-10-26), and now the console. The console is only one of
 them, so it cannot be the place that enforces a single instance.
 
-1. **Authoritative: a single-instance lock in the watcher (M1).** Before its
-   startup discovery, `cbz_watcher` takes a non-blocking `msvcrt.locking`
-   byte-range lock, the same idiom as `canonical_apply/scope_lock.py`, on
-   `%LOCALAPPDATA%\ComicAutomation\locks\watcher-<h>.lock`. `<h>` is the first
-   16 hex digits of the SHA-256 of the normalized real path of the watch
-   root. Keying the lock to the watch root rather than the checkout means a
-   second checkout or worktree is excluded too. Windows releases the lock
-   when the process exits or is killed, so no stale-lock takeover logic is
-   needed. If the lock is held, the watcher logs the owner (from an
-   informational `.owner.json`: pid, start time, argv, source SHA) and exits
-   with code 3. Every launcher, the Tk GUI included, gets this protection
-   automatically.
-2. **Defence in depth: a process scan.** For watchers started before M1 is
-   deployed, the console lists processes whose command line contains
-   `scripts.cbz_watcher` or `cbz_watcher.py` (through `Get-CimInstance
-   Win32_Process`, cached for 5 s). It compares them with its own job's
-   `child_pid`.
-3. **Status** is one of: `running (console)`, `running (external: pid, command
-   line, lock owner)`, `stopped`, `unknown` (the scan failed). **Start** is
-   refused with `409 WATCHER_RUNNING` whenever the lock probe or the scan
-   finds a watcher. A probe that takes the lock and releases it at once is
-   only a pre-check; the watcher's own lock is the real exclusion, so if two
-   starts race, one watcher exits with code 3 and its job ends `failed` with
-   reason `already_running`. **Stop** applies only to the console's own
-   watcher job. An external watcher is shown with its pid and command line,
-   but the console does not stop it in v1 (Q4).
+**The M1 contract (codex-lead has offered to implement it, with claude-lead
+reviewing):**
+
+1. **The key is physical identity.** Before its startup discovery the watcher
+   calls `os.stat` on the watch root and requires a directory with nonzero
+   `st_dev` and `st_ino`, the same rule as `_identity` in
+   `comic_automation/library/number_style.py`. A failed stat, a zero value,
+   or a reparse-point root refuses startup. The key is
+   `<st_dev:x>-<st_ino:x>`. A path string is never part of the key, so
+   `C:\…`, `\\localhost\C$\…`, a mapped drive or a junction to the same
+   directory all give the same key. (codex-lead reproduced the path-hash
+   failure.)
+2. **The lock namespace is shared across Windows accounts.** The watcher
+   creates the named mutex `Global\CBZWatcher-<key>` and waits on it with a
+   timeout of 0.
+   - *Acquired, or `WAIT_ABANDONED`* (a previous holder died): it owns the
+     lock.
+   - *Held, or `ACCESS_DENIED`* (another account owns it): it refuses and
+     exits with code 3, logging what it can about the owner.
+
+   The kernel releases the mutex when the process dies, so no stale-lock
+   takeover is needed. M1's first test measures whether a standard user can
+   create a `Global\` mutex on OfficePC (`CLAUDE.md`: measure, don't infer).
+   If not, the fallback is an `msvcrt` byte-range lock in
+   `G:\ComicAutomation\web-console\locks\watcher-<key>.lock`, with an ACL
+   granting the operator accounts modify access. The measurement and the
+   choice go on the M1 PR.
+3. **Required witnesses.** Each pair is two real processes on a temporary
+   watch root:
+   - local path vs `\\localhost\C$` UNC;
+   - drive letter vs a `subst` or `net use` mapped drive;
+   - real path vs a junction (`mklink /J`, which needs no privilege);
+   - the same root from two different checkouts.
+
+   In every pair the second process exits with code 3. Two different roots
+   do not conflict. A killed holder releases the lock. A zero or failed
+   identity refuses startup.
+
+**What the console does.** It probes the same mutex. It also scans processes
+(`Get-CimInstance Win32_Process`, cached for 5 s) for command lines with
+`scripts.cbz_watcher` or `cbz_watcher.py`, which covers watchers started
+before M1. Status is one of:
+
+- `running (console)`;
+- `running (external: pid, command line)`;
+- `held by an unverified owner`: the mutex is held but no visible process
+  matches, as with another account;
+- `stopped`;
+- `unknown`.
+
+Every state except `stopped` refuses Start (`409 WATCHER_RUNNING`), and
+counts as "watcher running" for §5.4. The console stops only its own watcher
+job; it never stops an external one (Q4, accepted in review).
 
 ## 7. Screens
 
@@ -351,7 +515,7 @@ harmless because it is not operational truth.
 The effective configuration (§4.3) with its sources; saved default parameters
 for each tool (reset is available); the state directory; the server version
 and git SHA; and the operator identity. There is a Quit server button. It
-does not stop running jobs, because their runners are detached.
+does not stop running jobs, because their runners are detached (§5.2).
 
 ## 8. Tool schema format
 
@@ -377,15 +541,30 @@ Other fields: `when` (emit only when another parameter has a given value),
 (`description`, `example`, `expected_result`). At the tool level: `id`,
 `label`, `domain`, `module`, `subcommand`, `kind` (`task` or `service`),
 `effects` (`read_only`, `writes_files` or `service`), `dry_run`
-(`{"param": ..., "default": true}` or `"unsupported"`), `stop` (§5.4),
+(`{"param": ..., "default": true}` or `"unsupported"`), `stop` (§5.5),
 `exit_codes`, and `parser`, the dotted path of the tool's own
 `argparse` builder, used for the parity test in §12.
 
-The **params digest** is the SHA-256 of the canonical JSON of
-`{tool_id, tool_schema_sha256, params}` with defaults filled in. Preview
-returns it. A run must echo it back, which proves the operator was shown this
-exact command. A mismatch returns `409 PREVIEW_STALE`. This is the tool-level
-version of roadmap §3.3.
+**Preview sealing.** Preview returns a **seal** and its `seal_digest`, the
+SHA-256 of the seal's canonical JSON. The seal contains everything that
+decides what will run:
+
+- `tool_id` and `tool_schema_sha256`;
+- the params, with defaults filled in;
+- the **expanded argv**;
+- the interpreter's absolute path and `sys.version`;
+- the `cwd`;
+- the env additions;
+- the repository HEAD SHA, plus a dirty flag;
+- every `fixed` value with its source. For the number-style registry that
+  means the path *and its content SHA-256*, the fingerprint the planner
+  records.
+
+A run request echoes `seal_digest`. The server rebuilds the seal from current
+state, and if anything differs (for example, the registry bytes changed after
+the preview) it returns `409 PREVIEW_STALE` with the fields that differ. The
+stored seal goes into `command.json` and the job row, so the job record shows
+exactly what ran. This is the tool-level version of roadmap §3.3.
 
 ### 8.2 Worked example: maintenance (abridged)
 
@@ -396,8 +575,9 @@ version of roadmap §3.3.
   "parser": "scripts.cbz_workflows:build_parser",
   "kind": "task", "effects": "writes_files",
   "dry_run": { "param": "dry_run", "default": true },
-  "stop": { "mode": "terminate_tree", "confirm": "normal_run",
-            "contract": "Tk parity; see Q3" },
+  "stop": { "mode": "none", "read_only_runs": "terminate_job",
+            "gate": "M4-maintenance-interrupt",
+            "reason": "Stopping a writing run is enabled after the interrupt/recovery gate (5.5)" },
   "params": [
     { "key": "root", "type": "path", "role": "library", "kind": "dir",
       "must_exist": true, "emit": { "style": "positional" } },
@@ -441,8 +621,9 @@ and the executed argv is the list itself.
   "id": "watcher", "label": "CBZ Watcher", "domain": "watcher_routing",
   "module": "scripts.cbz_watcher", "parser": "scripts.cbz_watcher:build_argument_parser",
   "kind": "service", "effects": "service", "dry_run": "unsupported",
-  "stop": { "mode": "terminate_tree", "confirm": "always",
-            "contract": "Tk parity; startup cleans stale rewrite files (_clean_up_stale_rewrite_files)" },
+  "stop": { "mode": "graceful_then_terminate", "graceful": "stop_file (M1b)",
+            "gate": "M6-watcher-interrupt",
+            "reason": "Terminate fallback enabled after the watcher interrupt gate (5.5)" },
   "exit_codes": { "3": "already_running" },
   "params": [
     { "key": "series_resolver", "type": "bool", "default": true,
@@ -508,8 +689,22 @@ to today), `--number-style`, the fixed registry, `--series-folder-root`,
 `--max-held-bytes` and `--temp-dir`. `--output` is always generated by the
 server as `<state>/plans/incoming/<job_id>.json`, a new file outside the
 library, so the browser never names it. When the job ends with exit 0 or 1,
-the server ingests the file (§8.5). The planner reads every archive's bytes,
-which is expensive over SMB, so the form shows that warning (Q10).
+the server ingests the file (§8.5).
+
+David decided (Q10, 2026-10-26) that the console runs the planner itself, as
+well as importing plans produced on the CLI. The planner reads every
+archive's bytes, which is expensive over SMB, so it runs as a long read-only
+job:
+
+- **Stop.** It may be stopped at any time (`stop.mode: terminate_job`).
+  Cancelling is safe because it writes nothing to the library, and a
+  partial output file is discarded.
+- **Progress.** The planner emits no `CBZ_PROGRESS` lines today, so the
+  console shows an indeterminate progress bar and the live log. M8 adds
+  `CBZ_PROGRESS` lines to the planner's per-folder loop; that is a small,
+  separately reviewed change that does not alter its output or digest.
+- **Concurrency.** It is a read-only task under §5.4, so it may run beside
+  the watcher.
 
 ### 8.5 Plan review and approval
 
@@ -581,14 +776,27 @@ endpoint without changing the review model.
 
 - **Bind.** `127.0.0.1` only, and the bind host is not configurable. The
   server refuses to start if `console.lock` is held, so only one console runs.
-- **Session token.** At startup the server generates a 256-bit token
-  (`secrets.token_urlsafe(32)`) and writes it to `session.json`. The launcher
-  opens `http://127.0.0.1:<port>/login?token=…`. The server compares the
-  token in constant time, sets a `HttpOnly; SameSite=Strict; Path=/` session
-  cookie, and redirects to `/`, which removes the token from the address bar
-  and history. The token is regenerated every time the server starts. Every
-  route except `/login` and static assets requires the cookie, and failures
-  return 401.
+- **Three distinct secrets.** Each is 256 bits from `secrets`, compared in
+  constant time, and regenerated every time the server starts.
+  1. The *launcher secret* is kept in `session.json`, whose ACL allows only
+     the operator account. The launcher sends it in an `X-Launcher-Secret`
+     header to `POST /api/bootstrap`. This is the only endpoint exempt from
+     the Origin check; the Host check still applies.
+  2. That call returns a *bootstrap code*. It is single-use, expires after
+     60 s, and grants nothing except the exchange below. The launcher opens
+     `http://127.0.0.1:<port>/login?code=…`.
+  3. The server consumes the code, creates a *session* with its own random
+     id, sets it as a `HttpOnly; SameSite=Strict; Path=/` cookie, and
+     redirects (303) to `/`.
+
+  A login URL left in browser history is therefore inert: the code was used
+  once and has expired. The redirect clears the address bar but is not
+  relied on to erase history. Every route except `/login` and static assets
+  requires the session cookie; failures return 401.
+- **Redaction.** The access log and `console.log` never record query
+  strings on `/login`, any `Cookie`, `X-Launcher-Secret` or `X-CSRF-Token`
+  header, or the contents of `session.json`. A test scans the log output for
+  each secret's value.
 - **Host check.** Every request must have `Host` equal to `127.0.0.1:<port>`
   or `localhost:<port>`. Anything else gets 421. This blocks DNS rebinding.
 - **Origin and CSRF.** State-changing methods (POST, PUT, DELETE) must have
@@ -617,8 +825,12 @@ endpoint without changing the review model.
   `textContent`, never `innerHTML`.
 - **Attribution.** The operator is the Windows account running the server
   (`getpass.getuser()`), recorded with the session id on jobs and approvals.
-  That is the v1 identity model (Q5). Real authentication arrives with phone
-  access, before any non-loopback bind.
+  codex-lead accepted this for the localhost threat model (Q5).
+- **Hosting.** The server runs on OfficePC, beside the tools (David,
+  2026-10-26). Future phone access will go through the existing Cloudflare
+  tunnel and NPM to OfficePC. That needs a non-loopback bind, so it comes
+  only with a separate authentication milestone (real login plus roadmap
+  §2.6 authorization). Nothing in v1 listens beyond 127.0.0.1.
 
 ## 10. API
 
@@ -628,23 +840,25 @@ All API responses are JSON. Errors have the form `{"error": "CODE", "message":
 
 | Method and path | Request | Response |
 |---|---|---|
-| `GET /login?token=` | | 303 to `/`, sets the cookie |
+| `POST /api/bootstrap` | header `X-Launcher-Secret` | `{code, expires_in: 60}` |
+| `GET /login?code=` | | 303 to `/`, sets the session cookie; the code is consumed |
 | `GET /api/session` | | `{operator, csrf_token, server_version, git_sha, started_at}` |
-| `GET /api/health` | | `{ok, jobs_running, watcher_state}` (the launcher uses it with the cookie or token) |
+| `GET /api/health` | header `X-Launcher-Secret` or the session cookie | `{ok, jobs_running, watcher_state}` |
 | `GET /api/config` | | `{values: {key: {value, source, editable, restart_required}}}` |
 | `GET /api/tools` | | `[{id, label, domain, effects, kind, dry_run_supported, has_schema}]`, including CLI-only catalog entries |
 | `GET /api/tools/{id}` | | `{schema, saved_params, last_job}` |
 | `PUT /api/tools/{id}/defaults` | `{params}` | `{saved_params}` (validated first) |
-| `POST /api/tools/{id}/preview` | `{params}` | `{argv, display, params_digest, dry_run, effects, errors: [{key, code, message}]}` |
-| `POST /api/tools/{id}/runs` | `{params, params_digest, confirm_normal_run?}` | 202 `{job_id}`, or 409 `JOB_ACTIVE`, `PREVIEW_STALE` or `WATCHER_RUNNING` |
+| `POST /api/tools/{id}/preview` | `{params}` | `{seal, seal_digest, display, dry_run, effects, stop, errors: [{key, code, message}]}` |
+| `POST /api/tools/{id}/runs` | `{params, seal_digest, confirm_normal_run?}` | 202 `{job_id}`, or 409 `JOB_ACTIVE`, `INCOMPATIBLE`, `JOB_UNCERTAIN`, `PREVIEW_STALE` or `WATCHER_RUNNING` |
 | `GET /api/jobs` | `?state&tool&limit&before` | `{jobs: [summary], next}` |
 | `GET /api/jobs/{id}` | | `{job, events, progress, display_command}` |
-| `GET /api/jobs/{id}/log` | `?offset&limit` | `{offset, next_offset, lines, eof, state}` |
-| `GET /api/jobs/{id}/stream` | `Last-Event-ID` | SSE `line`, `state` and `progress` events |
-| `POST /api/jobs/{id}/stop` | `{confirm?}` | 202 `{state}`, or 409 `NOT_STOPPABLE` |
+| `GET /api/jobs/{id}/log` | `?cursor&limit` | `{cursor, next_cursor, lines, gaps, eof, state}` (logical offsets, §5.3) |
+| `GET /api/jobs/{id}/stream` | `Last-Event-ID` | SSE `line`, `gap`, `state` and `progress` events |
+| `POST /api/jobs/{id}/stop` | `{confirm?}` | 202 `{state}`, or 409 `NOT_STOPPABLE` with the gate `reason` |
 | `POST /api/jobs/{id}/acknowledge` | `{note?}` | `{acknowledged_at}` |
-| `GET /api/watcher` | | `{state, owner: console\|external\|none, pid, job_id, argv, display_command, lock_owner, scan_ok}` |
-| `POST /api/watcher/start` | `{params, params_digest}` | 202 `{job_id}` |
+| `POST /api/jobs/{id}/resolve-uncertain` | `{resolution: lost\|stopped, evidence_note}` | `{state}`; only for `uncertain` jobs, appends an event |
+| `GET /api/watcher` | | `{state, owner: console\|external\|unverified\|none, pid, job_id, display_command, identity_key, scan_ok}` |
+| `POST /api/watcher/start` | `{params, seal_digest}` | 202 `{job_id}` |
 | `POST /api/watcher/stop` | `{confirm: true}` | 202, or 409 `EXTERNAL_WATCHER` |
 | `GET /api/decisions` | | `{items: [{kind, id, title, detail, link, since}]}` |
 | `GET /api/plans` | | `[{digest, state, counts, library_root, ingested_at, latest_decision}]` |
@@ -714,14 +928,19 @@ leave room for a light theme later.
 ## 12. Testing
 
 The existing suite runs on `windows-latest` with Python 3.11. The console
-adds no dependencies, so CI does not change.
+adds no runtime dependencies. The one real-browser smoke test adds
+Playwright as a dev-only dependency in `.github/requirements-ci.txt`. It
+drives the Edge that the runner already has (`channel="msedge"`), so no
+browser is downloaded.
 
 - **Unit.**
   - Schema meta-validation: an unknown type, a duplicate key, a `when` that
     points at a missing parameter, or a bad emit rule each refuse startup.
   - The argv builder for every type and emit style, including `when` and
     `omit_empty`.
-  - Params-digest stability.
+  - Seal stability. Each sealed field (argv, interpreter, cwd, HEAD, the
+    registry's SHA-256) changes the digest, and a changed registry makes a
+    run return `PREVIEW_STALE`.
   - Progress-line parsing.
   - Config precedence (default, `console.toml`, environment).
   - The token-pair contrast check.
@@ -737,8 +956,15 @@ adds no dependencies, so CI does not change.
 - **API.** An in-process WSGI test client (about 40 lines of stdlib) drives
   every endpoint. One socket-level smoke test starts the real server on
   port 0.
+- **Real browser (one test).** Playwright drives the real server on port 0.
+  It covers the bootstrap code, the session cookie, a CSRF-protected POST
+  (rejected without the header), a cross-origin `fetch` refused by the
+  browser, an SSE stream that resumes after `page.reload()`, and a reused
+  bootstrap code being refused.
 - **Security.**
-  - No cookie gives 401; a wrong token, 401.
+  - No cookie gives 401. A wrong, reused or expired bootstrap code gives
+    401. The launcher secret is not accepted as a session.
+  - Secrets never appear in logs (redaction scan).
   - A foreign Host gives 421; a POST with a missing or foreign Origin, 403.
   - A missing or wrong CSRF header gives 403; a form content type, 415; an
     oversized body, 413.
@@ -751,22 +977,53 @@ adds no dependencies, so CI does not change.
   - A static check fails if any JS module uses `innerHTML`,
     `insertAdjacentHTML` or `eval`.
 - **Job lifecycle with fake tools** (`tests/web/fake_tools/`: print lines,
-  exit with code N, sleep, spawn a grandchild, ignore termination, emit
-  progress lines, write bytes that are not UTF-8):
-  - success, failure and exit-code mapping;
-  - stop kills the grandchild;
-  - the runner keeps running after the server object is dropped;
-  - reconciliation on restart finalizes, keeps running, or marks `lost`;
-  - a runner pid reused by another process (creation time differs) is
-    detected;
-  - log offsets resume exactly across reconnects;
-  - service log rotation;
-  - one task job at a time.
-- **Watcher single instance (M1).** Two processes on the same watch root: the
-  second exits with code 3 and names the owner. Different roots do not
-  conflict. The lock is released after a kill. The process scan detects a
-  fake process named like the watcher. Tests use temporary watch roots and
-  never import the watcher's `main` against real paths.
+  exit with code N, sleep, spawn a grandchild that starts at once, a
+  grandchild that outlives its parent, a tool that requests breakaway,
+  ignore termination, flood output, a 1 MiB line, progress lines, bytes that
+  are not UTF-8).
+  - *Containment:*
+    - a grandchild started as the tool's first instruction is inside the
+      job;
+    - a breakaway request fails;
+    - a failed `JOB_LIST` or assignment refuses the job, and nothing runs;
+    - the job handle is not inheritable;
+    - a job is finalised only once `ActiveProcesses == 0`, so a surviving
+      grandchild delays `exit.json` until it is terminated.
+  - *Admission and adoption (D3).* The server or the runner is killed at
+    each boundary (after admit, before spawn; after spawn, before claim;
+    after claim, before tool start; while running; after root exit, before
+    `exit.json`; after `exit.json`, before the commit), and reconciliation
+    gives the specified state each time. Also tested:
+    - a duplicate runner and a late runner after `admission_expired` are
+      both fenced;
+    - an `exit.json` with a foreign nonce or runner identity makes the job
+      `uncertain`;
+    - `uncertain` blocks admission until it is resolved;
+    - 20 concurrent run requests admit exactly one;
+    - "one task at a time" holds across a server restart.
+  - *Log pump (D4):*
+    - output over the cap produces `gap` events, and the tool never blocks;
+    - rotation during a disconnected client, then a reconnect with an old
+      `Last-Event-ID`, gives a gap followed by exact resumption, with no
+      aliasing;
+    - the server is down while the tool writes 50 MiB; the log is complete
+      when the server returns;
+    - a 1 MiB line is split into bounded parts;
+    - a write failure records the dropped-byte count.
+  - *Stop:*
+    - read-only runs stop and are marked `stopped`;
+    - a writing tool with `mode: none` returns `NOT_STOPPABLE` with its
+      reason;
+    - the compatibility matrix in §5.4 is enforced, including against an
+      external watcher.
+  - *Per-tool interrupt gates* (§5.5) for maintenance (M4) and the watcher
+    (M6). These are acceptance gates, not optional tests.
+- **Watcher single instance (M1).** The two-process witnesses listed in §6:
+  local vs UNC, mapped drive, junction, and two checkouts. Also: different
+  roots, release after a kill, refusal on zero or failed identity, the
+  `Global\` creation measurement, and the process scan detecting a fake
+  process named like the watcher. Tests use temporary watch roots and never
+  run the watcher against real paths.
 - **Plans.** Fixtures are built with `canonical_apply.plan.build_plan` in a
   temporary directory.
   - A tampered byte gives `PLAN_DIGEST_MISMATCH`.
@@ -778,7 +1035,7 @@ adds no dependencies, so CI does not change.
   guard is bypassed once and the named tests that should fail are recorded on
   the PR.
 - **Manual.** A checklist per frontend PR: keyboard-only pass, 200% zoom,
-  screen-reader spot check with NVDA. Browser automation is deferred (Q11).
+  screen-reader spot check with NVDA.
 
 ## 13. Desktop shortcut and rollout
 
@@ -790,7 +1047,8 @@ adds no dependencies, so CI does not change.
    `/api/health`, it opens the browser to the login URL. Otherwise it starts
    the server detached under `pythonw` and then opens the browser. The
    existing "CBZ Automation" Tk shortcut stays as it is. Once M1 is deployed,
-   both front ends can safely be pointed at the watcher.
+   both front ends can safely be pointed at the watcher. The server runs on
+   OfficePC (§9, Hosting).
 2. **Order of trust.** The console goes read-only first (dashboard, jobs,
    plan review). Then maintenance in dry run, then normal runs, then watcher
    control. Plan approval comes after review has been used on at least one
@@ -809,52 +1067,45 @@ adds no dependencies, so CI does not change.
 | # | PR | Notes |
 |---|---|---|
 | M0 | This design | Reviewed by codex-lead |
-| M1 | Watcher single-instance lock and exit code 3 | Watcher-only change. `cbz_watcher.py` has mixed line endings, so edits must be byte-exact. Rollout is deliberate. |
-| M2 | `comic_automation/web` skeleton: config, state directory, WSGI app, security, `/login`, `/api/session`, `/api/health`, static shell, launcher | Security tests; engineering-decision and `CLAUDE.md` scope updates |
-| M3 | Job store, detached runner, Job Object, reconciliation, stop, log and SSE API | Fake-tool lifecycle tests |
-| M4 | Schema format, registry, argv builder, path allowlist, preview and run API, `maintenance.json` | Argparse and Tk parity tests; extract the `cbz_canonical_plan` parser |
+| M1 | Watcher single-instance lock by physical identity (§6) and exit code 3 | codex-lead implements (offered in review) and claude-lead reviews, now that the contract is settled. Watcher-only change. `cbz_watcher.py` has mixed line endings, so edits must be byte-exact. Rollout is deliberate. |
+| M1b | Graceful watcher stop file | Watcher-only change |
+| M2 | `comic_automation/web` skeleton: config, G: state directory and refusal, WSGI app, security (bootstrap, session, redaction), static shell, launcher | Security tests plus the real-browser smoke test; engineering-decision and `CLAUDE.md` scope updates |
+| M3 | Job store, admission and claim, `JOB_LIST` containment, runner log pump, reconciliation, stop mechanism, log and SSE API | D2–D4 tests with fake tools |
+| M4 | Schema format, registry, argv builder, seal, path allowlist, compatibility matrix, preview and run API, `maintenance.json` | Argparse and Tk parity tests; extract the `cbz_canonical_plan` parser. **Gate:** maintenance interrupt/recovery tests before its stop is enabled |
 | M5 | Tool runner page, Jobs list and job page | Manual accessibility checklist |
-| M6 | `watcher.json`, watcher status (lock probe and process scan), start and stop, dashboard watcher card | |
+| M6 | `watcher.json`, watcher status (mutex probe and process scan), start and stop, dashboard watcher card | **Gate:** the watcher interrupt test before its terminate fallback is enabled |
 | M7 | Dashboard, Needs-your-decision queue, Settings | |
-| M8 | `canonical_plan.json`, plan ingest, read-only review screen | |
+| M8 | `canonical_plan.json` (cancellable), planner `CBZ_PROGRESS` lines, plan ingest, read-only review screen | |
 | M9 | Append-only approvals, revocation, apply-command and receipt export | |
 | M10 | Schemas for the remaining Tk tools: Series Workflow, Camelia Decensor, Gap Checker, Apply Dry-Run Plan, Exclusions Log | Needed before retirement |
 | M11 | Shortcut snippet, operator docs, coexistence notes | |
 | M12 | Retire the Tk GUI | After the §13 criteria |
 | v1.1 | Series Review (proposal, Yes/No/Skip, append-only decisions, `apply-series` through a plan) | Mockup `SeriesReview.dc.html` |
 
-## 15. Open questions
+## 15. Decisions recorded and open questions
 
-- **Q1. State directory.** `%LOCALAPPDATA%\ComicAutomation\web-console`
-  (proposed) or `G:\ComicAutomation\web-console`, which would sit with the
-  other operational data under layout rule 1.9 but on the production drive?
-- **Q2. Watcher lock ownership.** M1 changes the watcher. Who implements it,
-  who reviews it, and is keying the lock to the watch root's real path
-  (§6, item 1) acceptable?
-- **Q3. Stopping a maintenance normal run.** The proposal is Tk parity (an
-  abrupt tree stop after a confirmation). The alternative is to forbid it
-  until each stage has a written cancellation contract (roadmap §5.9). The
-  same question applies to a graceful watcher stop file.
-- **Q4. External watchers.** Should the console be able to stop a watcher it
-  did not start? The proposal is no, in v1.
-- **Q5. Operator identity.** Is the Windows account plus a session id enough
-  attribution for localhost approvals until real authentication arrives?
+**Answered** (2026-10-26):
+
+| Q | Answer | By |
+|---|---|---|
+| Q1 state directory | `G:\ComicAutomation\web-console\`; refuse to start if it is unavailable (§4.2) | David |
+| Q2 M1 ownership | codex-lead implements, claude-lead reviews; the key is physical identity (§6) | codex-lead review |
+| Q3 stopping a writing run | Allowed mid-run, recorded as `stopped` with "the library may be partly changed"; enabled per tool after its interrupt gate (§5.5) | David; gate from codex-lead review |
+| Q4 external watchers | The console does not stop them | accepted in codex-lead review |
+| Q5 operator identity | Windows account plus session id, for localhost | accepted in codex-lead review |
+| Q8 approval receipts | Export only, with no network calls | accepted in codex-lead review |
+| Q9 framework | stdlib WSGI; no objection | codex-lead review |
+| Q10 planner in the console | Yes, as a long read-only, cancellable job with progress (§8.4) | David |
+| Q11 browser tests | One real-browser smoke test (§12) | codex-lead review |
+| Q12 document location | Stays at `docs/web_console_v1_design.md` | codex-lead review |
+| Hosting | OfficePC; phone access later via Cloudflare tunnel and NPM, with real auth (§9) | David |
+
+**Still open:**
+
 - **Q6. Fonts.** Vendor IBM Plex as WOFF2 under the OFL (about 300 KB of
   binaries in the repo), or use a system font stack?
 - **Q7. Port.** A fixed 8765 (proposed; the launcher finds it through
   `session.json`) or an ephemeral port?
-- **Q8. Plan approval and the hive.** Should an approval also be posted
-  somewhere outside the console (a PR comment, the hive)? The proposal is to
-  export only, with no network calls.
-- **Q9. Framework.** Is the stdlib choice (§3) acceptable to the reviewer,
-  given that roadmap §12 names FastAPI as its preference?
-- **Q10. Running the planner from the console.** Should v1 run the planner,
-  which reads every archive in full and is expensive over SMB, or only
-  import plan files the operator produces from the CLI?
-- **Q11. Browser tests.** Is a manual checklist enough for v1, or should a
-  Playwright smoke test (a new dev dependency) be added?
-- **Q12. Location of this document.** `docs/web_console_v1_design.md` as
-  requested, or the layout standard's `docs/design/web_console_v1.md`?
 - **Q13. Watch folder.** `WATCH_FOLDER` is hard-coded in the watcher. Should
   it become a CLI flag, so the console can show and set it? That would be a
   watcher change, outside v1.
