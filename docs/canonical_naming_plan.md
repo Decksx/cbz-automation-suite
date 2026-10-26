@@ -191,3 +191,13 @@ folder conflict check. Auto refuses registered sub-library roots physically
 inside its scope, so a parent scan cannot assign issue syntax to nested Manga.
 The watcher has a separate activation boundary: an empty registry keeps its
 legacy naming path active; this does not relax the planner's strict auto rule.
+
+
+David's #2991/#2996 policy supersedes the earlier substantive-name and Full
+holds: a confirmed chosen series folder wins aliases/typos and its reboot
+year is distinct identity (`Batman (2016) #003`). An issue year remains in
+ComicInfo and is omitted from reboot filenames. Unnumbered Full defaults to
+`v01 (TPB)` with original-source operator-policy evidence. Registered category
+roots remain flat; an unregistered series root uses `--series-folder-root`.
+Both the folder assertion and collection policy evidence are sealed in the
+plan, and reused during proposed-name validation. See media_aware_naming.md.
