@@ -96,3 +96,21 @@ The running watcher, its settings, live libraries, database, relay and Codex
 state were untouched. A pre-M1 process holds no mutex and must be stopped
 deliberately before eventual first-live rollout. Claude reviews the final
 exact head; merge and runtime activation need their own receipts.
+
+### Final review follow-up: configuration belongs inside ownership
+
+Self-review found that the first M1 candidate still assigned integration
+globals before acquiring the mutex. A refused embedded second session could
+change the active session's AI/resolver settings. The new regression failed
+against that candidate (**1 failed / 33 passed** in the focused run).
+
+Configuration assignments and media-policy save/restore now happen only
+inside the owned context. A refusal cannot restore a stale policy snapshot
+over another session's initialization. The updated focused run passed
+**34/34** (33 new tests plus the existing policy-cleanup case).
+The original 20 guard checks are rerun, with a 21st replay of the earlier
+configuration ordering. Updated full-suite and exact-head continuous
+integration receipts are recorded on #146; the earlier 4,327/10 measurement
+above remains bound to its original code/test candidate. The watcher now
+has **2,764 CRLF / 842 bare LF**, with the moved configuration block retaining
+its original mixed endings.
