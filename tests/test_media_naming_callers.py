@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -24,16 +25,19 @@ def library(tmp_path):
     with database_connection(db) as connection:
         apply_migrations(connection, Path(cp.__file__).parents[1] / "database/migrations")
 
-    def book(name, series="Series", number="1", year=None, folder=None, volume=None):
+    def book(name, series="Series", number="1", year=None, folder=None, volume=None,
+             page=b"fixture page", title=None):
         path = root / (folder or series) / name
         path.parent.mkdir(parents=True, exist_ok=True)
         xml = f"<ComicInfo><Series>{series}</Series><Number>{number}</Number>"
+        if title is not None:
+            xml += f"<Title>{title}</Title>"
         if year:
             xml += f"<Year>{year}</Year>"
         if volume:
             xml += f"<Volume>{volume}</Volume>"
         with zipfile.ZipFile(path, "w") as archive:
-            archive.writestr("page.png", b"fixture page")
+            archive.writestr("page.png", page)
             archive.writestr("ComicInfo.xml", (xml + "</ComicInfo>").encode())
         with database_connection(db) as connection:
             aid = connection.execute("INSERT INTO archive_files(file_size) VALUES (?)", (path.stat().st_size,)).lastrowid
@@ -206,3 +210,139 @@ def test_real_watcher_processing_preserves_tpb_year_and_its_rescan_fixpoint(libr
     values = {landed: parse_comic_name(landed, rules=ALL_RULES - {"translate"}, display_tokens=True)}
     refused, _ = watcher._apply_media_naming(values, {landed: fact}, "Series", dest)
     assert not refused and list(values) == [landed]
+
+
+@pytest.fixture
+def configured_watcher(library, tmp_path, monkeypatch):
+    """Real normalization, XML rewriting and moves with media naming enabled."""
+    root, _, _ = library
+    dest = tmp_path / "destination"
+    dest.mkdir()
+    registry = config(tmp_path, [{"path": str(dest), "style": "chapter"}])
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(root))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(dest))
+    monkeypatch.setattr(watcher, "_series_resolvers", {})
+    monkeypatch.setattr(watcher, "_router", None)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
+    monkeypatch.setattr(watcher, "_note_move", lambda *a: None)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda p: True)
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(registry))
+    monkeypatch.setattr(watcher, "_number_style_requested", "auto")
+    return dest
+
+
+@pytest.mark.parametrize("series,name,style,expected", [
+    ("Naruto", "Naruto 700.cbz", "chapter", "Naruto 700.cbz"),
+    ("Naruto", "Naruto - 700 [Scans].cbz", "chapter", "Naruto - 700.cbz"),
+    ("Saga", "Saga 054 (2018) (Digital) (Zone-Empire).cbz", "issue", "Saga 054 (2018).cbz"),
+])
+def test_configured_real_watcher_never_discards_an_unconsumed_bare_number(
+        library, configured_watcher, monkeypatch, series, name, style, expected):
+    _, _, book = library
+    source = book(name, series=series, number="", title=Path(name).stem)
+    monkeypatch.setattr(watcher, "_number_style_requested", style)
+    watcher.process_and_move_directory(source.parent)
+    landed = configured_watcher / series / expected
+    assert landed.is_file() and not source.exists()
+    with zipfile.ZipFile(landed) as archive:
+        assert archive.read("page.png") == b"fixture page"
+
+
+@pytest.mark.parametrize("separate_batches", [False, True])
+def test_two_bare_number_arrivals_keep_distinct_names_and_both_land(
+        library, configured_watcher, separate_batches):
+    _, _, book = library
+    first = book("Naruto 700.cbz", series="Naruto", number="", page=b"chapter700")
+    if separate_batches:
+        watcher.process_and_move_directory(first.parent)
+    second = book("Naruto 701.cbz", series="Naruto", number="", page=b"chapter701")
+    watcher.process_and_move_directory(second.parent)
+    assert {p.name for p in (configured_watcher / "Naruto").glob("*.cbz")} == {
+        "Naruto 700.cbz", "Naruto 701.cbz"}
+    assert not first.exists() and not second.exists()
+    for number in (700, 701):
+        with zipfile.ZipFile(configured_watcher / "Naruto" / f"Naruto {number}.cbz") as archive:
+            assert archive.read("page.png") == f"chapter{number}".encode()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive rename witness")
+@pytest.mark.parametrize("name,style,expected", [
+    ("Series Ch. 3.cbz", "chapter", "Series ch. 3.cbz"),
+    ("series #003.cbz", "issue", "Series #003.cbz"),
+])
+def test_configured_real_watcher_lands_case_only_names_through_two_steps(
+        library, configured_watcher, monkeypatch, name, style, expected):
+    _, _, book = library
+    source = book(name, number="3")
+    assert source.with_name(expected).samefile(source)
+    monkeypatch.setattr(watcher, "_number_style_requested", style)
+    original = Path.rename
+    steps = []
+
+    def observe(path, target):
+        if path.name.startswith(".media-case-") or Path(target).name.startswith(".media-case-"):
+            steps.append((path, Path(target)))
+        return original(path, target)
+
+    monkeypatch.setattr(Path, "rename", observe)
+    watcher.process_and_move_directory(source.parent)
+    landed = configured_watcher / "Series" / expected
+    assert landed.is_file() and landed.name in [p.name for p in landed.parent.iterdir()]
+    assert len(steps) == 2 and steps[0][1] == steps[1][0]
+    assert not list(configured_watcher.parent.rglob(".media-case-*"))
+
+
+@pytest.mark.parametrize("series,folder", [("Tales for a HalloweeNight", "Tales for a Halloween Night"),
+    ("Batman", "Batman (2016)")])
+@pytest.mark.parametrize("style", ["issue", "chapter"])
+def test_explicit_style_never_erases_series_root_display_conflict(library, style, series, folder):
+    _, db, book = library
+    source = book("old #1.cbz", series=series, folder=folder)
+    doc = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-26", number_style=style)
+    assert doc["review"] and not doc["renames"] and not doc["families"]
+
+
+def test_parent_plan_refuses_a_nested_registered_style_before_reading_archives(library, tmp_path, monkeypatch):
+    root, db, book = library
+    book("One Piece #3.cbz", series="One Piece", folder="Manga/One Piece", number="3")
+    path = config(tmp_path, [{"path": str(root), "style": "issue"},
+                             {"path": str(root / "Manga"), "style": "chapter"}])
+    monkeypatch.setattr(cp.sv, "derive_archive", lambda *a, **kw: pytest.fail("nested scope was not refused before archive reads"))
+    with pytest.raises(cp.PlanningRefused, match="nested"):
+        cp.build_plan(root, database=db, quarantine_date="2026-10-26", number_style_registry=path)
+
+
+def test_empty_registry_runs_real_legacy_watcher_import_without_stalling(library, configured_watcher, tmp_path, monkeypatch):
+    _, _, book = library
+    source = book("Series Ch. 3.cbz", number="3")
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(config(tmp_path, [])))
+    monkeypatch.setattr(watcher, "_apply_media_naming", lambda *a: pytest.fail("empty registry enabled media naming"))
+    monkeypatch.setattr(watcher._media_fr, "archive_facts_from_file", lambda *a: pytest.fail("legacy pass read media facts"))
+    watcher.process_and_move_directory(source.parent)
+    assert not source.exists() and len(list(configured_watcher.rglob("*.cbz"))) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows no-replace rollback protocol")
+def test_media_refusal_tracks_the_retained_archive_after_case_rollback_collision(
+        library, configured_watcher, monkeypatch):
+    _, _, book = library
+    source = book("Series Ch. 3.cbz", number="3")
+    facts = {source: fr.archive_facts_from_file(source)}
+    values = {source: parse_comic_name(source, rules=ALL_RULES - {"translate"}, display_tokens=True)}
+    original = Path.rename
+
+    def collide(path, destination):
+        if path.name.startswith(".media-case-") and Path(destination).name == "Series ch. 3.cbz":
+            source.write_bytes(b"interloper")
+            raise PermissionError("final step blocked")
+        return original(path, destination)
+
+    monkeypatch.setattr(Path, "rename", collide)
+    refused, _ = watcher._apply_media_naming(values, facts, "Series", configured_watcher)
+    assert refused == set(values) and len(refused) == 1
+    retained = next(iter(refused))
+    assert retained != source and retained.name.startswith(".media-case-")
+    with zipfile.ZipFile(retained) as archive:
+        assert archive.read("page.png") == b"fixture page"
+    assert source.read_bytes() == b"interloper"
