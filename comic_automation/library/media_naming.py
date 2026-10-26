@@ -13,6 +13,14 @@ from comic_automation.archive import field_resolution as fr
 from scripts.cbz_canonical_name import CanonicalFields, CanonicalNameError
 
 
+class KeepArrivalName(CanonicalNameError):
+    """Media formatting would lose unclassified numbering; keep legacy display.
+
+    This does not authorize a number or a planner rename. The watcher can
+    continue its existing tag-sensitive landing with its intact arrival name.
+    """
+
+
 def display_key(text: str) -> str:
     """Fold only case, spacing and punctuation, retaining every letter/mark.
 
@@ -102,6 +110,7 @@ def watcher_fields(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
     if len(display.years) > 1 or len(display.editions) > 1 or len(display.versions) > 1:
         raise CanonicalNameError("conflicting arrival display tokens")
     resolved_series = ci.fields["Series"] if ci.authoritative("Series") else series
+    series_display(resolved_series, series)  # Keeping a name cannot bypass title conflict.
     number = parsed.chapter
     if number is None and tokens.primary_numbers:
         number = tokens.primary_spellings[0]
@@ -119,6 +128,22 @@ def watcher_fields(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
                 number = offered
             else:
                 volume = offered
+    # Number-like text is never disposable merely because it has no parsed
+    # field. Remove only the decided title, bracket display/source tokens,
+    # and number occurrences actually consumed by the arrival parsers.
+    stem = re.sub(r"\.(?:cbz|zip)$", "", fact.filename, flags=re.I)
+    body = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem)
+    key, title = display_key(body), display_key(resolved_series)
+    remaining = key[len(title):] if title and key.startswith(title) else key
+    consumed = list(tokens.primary_spellings) + list(tokens.volume_spellings)
+    if not tokens.primary_numbers and parsed.chapter is not None:
+        consumed.append(parsed.chapter)
+    if not tokens.volume_tokens and parsed.volume is not None:
+        consumed.append(parsed.volume)
+    for spelling in consumed:
+        remaining = remaining.replace(display_key(str(spelling)), "", 1)
+    if any(c.isdigit() for c in remaining):
+        raise KeepArrivalName("unconsumed filename number; retaining legacy arrival name")
     year = display.years[0] if display.years else None
     if ci.authoritative("Year"):
         year = fr.normalize_year(ci.fields["Year"])
