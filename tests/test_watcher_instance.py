@@ -344,6 +344,21 @@ def test_main_refusal_preserves_policy_and_never_enters_work(tmp_path, monkeypat
     assert "already running" in caplog.text
 
 
+def test_refused_embedded_session_cannot_reconfigure_live_integrations(tmp_path, monkeypatch):
+    from scripts import cbz_watcher as watcher
+
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(tmp_path))
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_MODELS", ["white_bars"])
+    monkeypatch.setattr(watcher, "SERIES_RESOLVER_ENABLED", False)
+    with wi.watcher_instance_lock(tmp_path):
+        assert watcher.main(["--ai-decensor", "--ai-decensor-model", "black_bars",
+                             "--series-resolver"]) == 3
+        assert watcher.AI_DECENSOR_ENABLED is False
+        assert watcher.AI_DECENSOR_MODELS == ["white_bars"]
+        assert watcher.SERIES_RESOLVER_ENABLED is False
+
+
 def test_main_refuses_an_inaccessible_watch_root_without_doing_work(tmp_path, monkeypatch, caplog):
     from scripts import cbz_watcher as watcher
 
