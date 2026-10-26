@@ -139,6 +139,28 @@ def test_outward_junction_keeps_the_catalog_access_path_guarded(catalog_paths, t
         link.rmdir()  # Remove the junction only, preserving the target fixture.
 
 
+@pytest.mark.parametrize("direction", ["unc-root", "unc-database"])
+def test_external_junction_into_nested_library_requires_resolved_ancestors(catalog_paths, tmp_path, monkeypatch, direction):
+    """The supplied ancestors alone miss the physical library root.
+
+    The junction names library/metadata, not the library itself. Its supplied
+    parent chain therefore never names the root. Only resolving the target
+    and checking that path's ancestors finds it through the other spelling.
+    Unlike file symlinks, this Windows junction needs no symlink privilege.
+    """
+    root, inside, _ = catalog_paths
+    _unc(root)
+    link = tmp_path / "external-catalog-access"
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(inside.parent)],
+                   check=True, capture_output=True)
+    try:
+        database = link / inside.name
+        alias_root, chosen = (_unc(root), database) if direction == "unc-root" else (root, _unc(database))
+        _refuses_before_open(alias_root, chosen, root, monkeypatch)
+    finally:
+        link.rmdir()
+
+
 @pytest.mark.parametrize("alias", ["local", "unc", "mapped"])
 def test_external_catalog_still_plans_with_a_library_alias(catalog_paths, request, alias):
     """A common parent or device does not make an external catalog internal."""
