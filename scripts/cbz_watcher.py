@@ -39,7 +39,7 @@ from comic_automation.series_resolver import (
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
 from comic_automation.archive import field_resolution as _media_fr
-from comic_automation.library.media_naming import media_fields, watcher_fields, KeepArrivalName
+from comic_automation.library.media_naming import media_fields, watcher_fields, KeepArrivalName, split_series_year
 from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
 from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from comic_automation.library.exclusions import (
@@ -1283,7 +1283,7 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
             fields = watcher_fields(parsed, fact, series=series_name, style=selection.style)
             name = format_canonical_name(fields)
             target = path.with_name(name)
-            patched = _dataclasses_replace(parsed, filename=name, series=fields.series,
+            patched = _dataclasses_replace(parsed, filename=name, series=fields.series + (f" ({fields.series_year})" if fields.series_year else ""),
                 chapter=fields.issue or fields.chapter, volume=fields.volume)
             if name != path.name:
                 if not _defers_rename(path.stem, target.stem):
@@ -2187,6 +2187,10 @@ def _resolve_series_dir_name(
     generic name.
     """
     cleaned = clean_directory_name(comic_dir.name) or comic_dir.name
+    if _media_naming_enabled():
+        base, reboot_year = split_series_year(comic_dir.name)
+        if reboot_year is not None:
+            cleaned = f"{clean_directory_name(base) or base} ({reboot_year})"
 
     kw_base = series_base_name(cleaned, bare_numbers=False)
     if kw_base:
@@ -2500,6 +2504,10 @@ def process_and_move_directory(dir_path: Path) -> bool:
 def _process_and_move_directory_inner(dir_path: Path) -> None:
     # Clean the top-level watched directory name first.
     clean_top    = clean_directory_name(dir_path.name)
+    if _media_naming_enabled():
+        base, reboot_year = split_series_year(dir_path.name)
+        if reboot_year is not None:
+            clean_top = f"{clean_directory_name(base) or base} ({reboot_year})"
     old_dir_path = dir_path  # keep original for lock update
     if clean_top and clean_top != dir_path.name:
         new_top = dir_path.parent / clean_top
@@ -2553,6 +2561,10 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         route_category, legacy_dest = _resolve_route(comic_dir)
         incoming_series_alias = comic_dir.name
         clean_dir_name = clean_directory_name(comic_dir.name)
+        if _media_naming_enabled():
+            base, reboot_year = split_series_year(comic_dir.name)
+            if reboot_year is not None:
+                clean_dir_name = f"{clean_directory_name(base) or base} ({reboot_year})"
         preliminary_title = clean_dir_name or comic_dir.name
         _, dest_folder, _, active_resolver = (
             _resolve_import_target(route_category, preliminary_title, legacy_dest)
@@ -2695,7 +2707,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 metadata_name = _consistent_comicinfo_series(
                     list(parsed_by_path.keys())
                 )
-                if metadata_name and _series_key(metadata_name) != _series_key(name):
+                if (metadata_name and _series_key(metadata_name) != _series_key(name)
+                        and not (_media_naming_enabled() and split_series_year(name)[1] is not None)):
                     # process_cbz_file translates native and confidently romanized
                     # titles before this read. Prefer that English ComicInfo value
                     # only in resolver mode, leaving legacy watcher naming intact.
