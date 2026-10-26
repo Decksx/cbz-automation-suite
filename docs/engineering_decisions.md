@@ -1461,3 +1461,21 @@ syntax after that. The planner retains its independent strict auto refusal.
 Configured-registry end-to-end witnesses now exercise this boundary alongside
 real normalization, ComicInfo rewriting and movement. Alias/year-folder holds
 and Western volume policy remain unchanged pending David's separate decisions.
+
+
+### #140 operator update: chosen folder identity and reboot year
+
+David's decisions forwarded in hive #2991, with year correction #2996,
+supersede the earlier name-conflict and unnumbered-Full holds. Confirmed
+series folders win series identity/display including aliases and typos.
+Number, Volume and protected-content rules remain independent; original
+ComicInfo evidence stays recorded. Registered roots are categories; an
+unregistered root scan declares --series-folder-root instead of guessing.
+
+The formatter has a separate series_year slot before primary numbering.
+Batman (2016) #003 always uses the reboot year alone: even an issue year
+2020 stays only in ComicInfo. The selected series-year identity survives
+watcher cleanup/rescan and planner re-resolution. Unnumbered Full defaults
+to volume1 with an explicit operator_policy field-evidence source, bound to
+the original Full observation and reused for the proposed-state check.
+No historical human/controller approval is fabricated by that policy fact.
