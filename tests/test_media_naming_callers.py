@@ -92,7 +92,7 @@ def test_planner_preserves_normalized_equal_folder_display(library, series, fold
     assert not doc["review"] and Path(doc["renames"][0]["destination"]).name == expected
 
 
-@pytest.mark.parametrize("kind", ["Full", "typo", "unknown_style"])
+@pytest.mark.parametrize("kind", ["unknown_style"])
 def test_uncertainty_produces_no_rename_or_quarantine(library, kind):
     root, db, book = library
     source = book("Series Full.cbz" if kind == "Full" else "old #1.cbz",
@@ -130,13 +130,14 @@ def test_a_series_subfolder_scan_keeps_the_same_display_and_style_as_the_whole_r
     assert part["renames"] == whole["renames"]
 
 
-def test_a_subfolder_scan_cannot_bypass_a_substantive_folder_conflict(library, tmp_path):
+def test_parent_and_registered_subfolder_choose_the_same_authoritative_folder(library, tmp_path):
     root, db, book = library
     source = book("old #1.cbz", series="Tales for a HalloweeNight", folder="Tales for a Halloween Night")
     path = config(tmp_path, [{"path": str(root), "style": "issue"}])
     for scope in (root, source.parent):
         doc = cp.build_plan(scope, database=db, quarantine_date="2026-10-26", number_style_registry=path)
-        assert doc["review"] and not doc["renames"] and not doc["families"]
+        assert not doc["review"] and len(doc["renames"]) == 1
+        assert Path(doc["renames"][0]["destination"]).name == "Tales for a Halloween Night #001.cbz"
 
 
 def test_wired_watcher_uses_final_destination_after_category_override(library, tmp_path, monkeypatch):
@@ -346,3 +347,75 @@ def test_media_refusal_tracks_the_retained_archive_after_case_rollback_collision
     with zipfile.ZipFile(retained) as archive:
         assert archive.read("page.png") == b"fixture page"
     assert source.read_bytes() == b"interloper"
+
+
+@pytest.mark.parametrize("series,folder,year,expected", [
+    ("English Alias", "Kaguya-sama", None, "Kaguya-sama #003.cbz"),
+    ("Tales for a HalloweeNight", "Tales for a Halloween Night", None, "Tales for a Halloween Night #003.cbz"),
+    ("Batman", "Batman (2016)", None, "Batman (2016) #003.cbz"),
+    ("Batman", "Batman (2016)", "2016", "Batman (2016) #003.cbz"),
+    ("Batman", "Batman (2016)", "2020", "Batman (2016) #003.cbz"),
+])
+def test_real_planner_and_watcher_honor_selected_folder_and_reboot_identity(
+        library, configured_watcher, tmp_path, monkeypatch, series, folder, year, expected):
+    root, db, book = library
+    source = book("old #3.cbz", series=series, folder=folder, number="3", year=year)
+    path = config(tmp_path, [{"path": str(root), "style": "issue"},
+                             {"path": str(configured_watcher), "style": "issue"}])
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(path))
+    doc = cp.build_plan(root, database=db, quarantine_date="2026-10-26", number_style_registry=path)
+    assert not doc["review"], doc["review"]
+    assert Path(doc["renames"][0]["destination"]).name == expected
+    watcher.process_and_move_directory(source.parent)
+    landed = configured_watcher / folder / expected
+    assert landed.is_file()
+    written = fr.archive_facts_from_file(landed).comicinfo
+    assert written.fields["Series"] == folder
+    if year is not None:
+        assert written.fields["Year"] == year
+    values = {landed: parse_comic_name(landed, rules=ALL_RULES - {"translate"}, display_tokens=True)}
+    refused, _ = watcher._apply_media_naming(values, {landed: fr.archive_facts_from_file(landed)}, folder, configured_watcher)
+    assert not refused and list(values) == [landed]
+
+
+@pytest.mark.parametrize("filename", ["Series Full.cbz", "Series (Full).cbz", "Full.cbz"])
+def test_unnumbered_full_default_is_bound_to_source_and_survives_real_watcher_rewrite(
+        library, configured_watcher, tmp_path, monkeypatch, filename):
+    root, db, book = library
+    source = book(filename, number="")
+    path = config(tmp_path, [{"path": str(root), "style": "issue"},
+                             {"path": str(configured_watcher), "style": "issue"}])
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(path))
+    doc = cp.build_plan(root, database=db, quarantine_date="2026-10-26", number_style_registry=path)
+    assert not doc["review"], doc["review"]
+    assert Path(doc["renames"][0]["destination"]).name == "Series v01 (TPB).cbz"
+    assert doc["renames"][0]["evidence"]["fields"]["volume"]["source"] == fr.SOURCE_POLICY
+    watcher.process_and_move_directory(source.parent)
+    assert (configured_watcher / "Series/Series v01 (TPB).cbz").is_file()
+
+
+def test_unregistered_explicit_series_root_requires_and_records_its_scope_assertion(library):
+    _, db, book = library
+    source = book("old #3.cbz", series="Batman", folder="Batman (2016)", number="3")
+    doc = cp.build_plan(source.parent, database=db, quarantine_date="2026-10-26",
+                        number_style="issue", series_folder_root=True)
+    assert not doc["review"] and doc["provenance"]["series_folder_root"] is True
+    assert Path(doc["renames"][0]["destination"]).name == "Batman (2016) #003.cbz"
+
+
+def test_reboots_in_two_folders_produce_distinct_plan_units(library):
+    root, db, book = library
+    for year in (2016, 2026):
+        book("old #3.cbz", series="Batman", folder=f"Batman ({year})", number="3")
+    doc = cp.build_plan(root, database=db, quarantine_date="2026-10-26", number_style="issue")
+    assert not doc["review"] and len(doc["renames"]) == 2
+    assert {Path(r["destination"]).name for r in doc["renames"]} == {
+        "Batman (2016) #003.cbz", "Batman (2026) #003.cbz"}
+
+
+def test_registered_flat_root_never_becomes_series_authority(library, tmp_path):
+    root, db, book = library
+    book("old #3.cbz", series="", folder=".", number="3")
+    path = config(tmp_path, [{"path": str(root), "style": "issue"}])
+    doc = cp.build_plan(root, database=db, quarantine_date="2026-10-26", number_style_registry=path)
+    assert doc["review"] and not doc["renames"]
