@@ -10,6 +10,12 @@ Revision 2 (2026-10-26) folds in codex-lead's CHANGES REQUESTED review of
 Q1, Q3 and Q10, and records where the server is hosted. §15 lists what was
 decided and what is still open.
 
+Revision 3 (2026-10-26) answers codex-lead's re-review of `45c04ee` (R1 to R4,
+plus the seal and watcher-lock notes): no suspended-start fallback, a defined
+order for draining output and ending the tree, a fresh check before an
+`uncertain` job is released, a bounded log queue with a segment map, source
+content in the seal, and one frozen lock backend.
+
 Governing architecture: `docs/gui_architecture_implementation_roadmap.md`
 (cited below as "roadmap §n"). Visual reference: David's Claude Design mockup,
 https://claude.ai/code/artifact/03c76b76-f967-4f2b-9c06-c8011360086e
@@ -215,7 +221,7 @@ table holds:
 | `succeeded` / `failed` / `stopped` | Exit record verified (§5.2 step 6). `stopped` carries "the library may be partly changed" for writing tools (§5.5). | no |
 | `admission_expired` | Never claimed within 60 s, so no tool ever started (fenced). | no |
 | `lost` | The runner died. The job object is verified gone, so nothing of the run is alive, but the outcome is unknown. | no |
-| `uncertain` | Liveness or containment could not be verified. Kept until the operator resolves it with evidence. Never cleared automatically. | **yes** |
+| `uncertain` | Liveness or containment could not be verified. Kept until a recheck freshly proves termination (§5.2). Never cleared automatically. | **yes** |
 | `refused` | Validation or start failure; nothing was spawned. | no |
 
 A schema can map exit codes to outcomes; for example, the planner's exit 1
@@ -256,17 +262,19 @@ a crash of the server, the runner, or both, at any point.
    pipe's write end and a NUL stdin
    ([Raymond Chen, 2023-02-09](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812/)).
    Python's `subprocess` cannot set `JOB_LIST`, so M3 adds the ctypes call.
-   If that call fails, the job fails closed (`refused`, nothing ran). The
-   only fallback allowed is the suspended form of the agent-swarm relay's
-   `popen_contained` (`C:\swarm-prod\agent-swarm\lead_relay_backends.py`):
-   `CREATE_SUSPENDED`, assign, verify with `IsProcessInJob`, then resume.
-   That is prior art with one deliberate difference: the relay runs a child
-   *uncontained* when assignment fails, and here that case terminates the
-   still-suspended child and refuses. In the suspended form the
-   create-to-assign gap is recovered by identity. The runner commits
-   `child_pid` and `child_created_at` before resuming. On reconciliation, a
-   matching process that is not in the job is terminated by handle,
-   because it has not executed any tool code yet.
+   If that call fails, or the attribute isn't supported, the job fails
+   closed (`refused`, nothing ran). **There is no suspended-start fallback in
+   v1.** The suspended-start pattern (`CREATE_SUSPENDED`, then assign,
+   then resume) leaves a gap where a crash orphans a suspended process
+   outside any job, before its identity can be recorded. `JOB_LIST` has no
+   such gap: the child is a job member from the moment it exists. If the
+   runner dies at any point after `CreateProcessW` returns, even before it
+   records the child's pid, the kernel closes the runner's job handle and
+   kills the child (step 5). So losing the child's identity in a crash can't
+   leave anything running. The agent-swarm relay's `popen_contained`
+   (`C:\swarm-prod\agent-swarm\lead_relay_backends.py`) is related prior
+   art, but it uses the suspended form and runs a child uncontained when
+   assignment fails, so it is deliberately not copied.
 4. **Running.** The runner commits `running` with `child_pid`,
    `child_created_at` and `job_object_name`, conditional on its own claim
    (`runner_pid`, `runner_created_at`, `nonce`). Every later write by the
@@ -275,13 +283,28 @@ a crash of the server, the runner, or both, at any point.
    job object, so if the runner dies the kernel closes that handle and
    `KILL_ON_JOB_CLOSE` ends every member. No tool outlives its supervisor,
    and nothing ever kills a PID tree from a snapshot.
-6. **Finalisation only after verified descendant termination.** When the
-   root process exits, the runner waits for pipe EOF (every holder of the
-   write end has gone). It then queries
-   `JobObjectBasicAccountingInformation`. If `ActiveProcesses` is above 0
-   after a 10 s grace period, it calls `TerminateJobObject` and polls until
-   the count is 0. Only then does it write `exit.json` atomically (temp,
-   fsync, `os.replace`). That record holds `{job_id, nonce, runner_pid,
+6. **Finalisation only after verified descendant termination.** The runner
+   closes its own copy of the pipe's write end as soon as `CreateProcessW`
+   returns, so only job members can hold it. The pipe is drained by the
+   reader thread (§5.3) the whole time, so the end of the pipe is never a
+   precondition for anything else. In order:
+   1. **The root process exits.** The runner records the exit code and
+      starts a 10 s grace period at once. It does not wait for end of file
+      first, because a grandchild that outlives its parent can keep the
+      write end open forever.
+   2. **During the grace period** it polls
+      `JobObjectBasicAccountingInformation` every 250 ms. If
+      `ActiveProcesses` reaches 0, it goes straight to step 4.
+   3. **At the deadline** it calls `TerminateJobObject`, then polls until
+      `ActiveProcesses == 0`. If the count isn't 0 after 30 s, the job
+      becomes `uncertain` and holds admission (§5.2 reconciliation). The
+      runner never reports a terminal state it hasn't verified.
+   4. **Finish the drain, with a time limit.** With no members left, every
+      write end is closed, so end of file normally arrives at once. The
+      reader is given 5 s; if it hasn't reached end of file by then, the
+      runner closes the read end and records a `drain_timeout` gap.
+   5. Only then does it write `exit.json` atomically (temp,
+      fsync, `os.replace`). That record holds `{job_id, nonce, runner_pid,
    runner_created_at, child_pid, child_created_at, exit_code,
    descendants_verified: true, stop_requested, ended_at}`. The runner also
    commits the terminal state under its claim condition. `exit.json` is the
@@ -302,37 +325,72 @@ admission lock and handles jobs in `admission_seq` order:
    - *found:* it should not exist once its only holder has died, so the job
      becomes `uncertain` and stays that way;
    - *access denied or any other error:* `uncertain`.
-5. **Pre-assignment gap** (suspended fallback only). This is handled by the
-   identity rule in step 3.
 
-An `uncertain` job blocks admission until the operator resolves it. The UI
-shows the evidence (pids, creation times, job-object query result), and
-resolving it appends an event. Nothing auto-clears it.
+An `uncertain` job blocks admission, and nothing auto-clears it. The UI
+shows the evidence: pids, creation times, and the job-object query result.
+
+**Rechecking an `uncertain` job.** The operator can't choose the outcome. The
+only action is `POST /api/jobs/{id}/recheck {nonce, state_version, note}`,
+which asks the backend to prove termination again. `state_version` goes up
+on every change to the row. Under the admission lock the server:
+
+1. refuses `409 STALE` if the nonce or `state_version` doesn't match;
+2. checks that the runner (pid plus creation time) and the child (pid plus
+   creation time) are both gone;
+3. opens `Local\cbz-console-<job_id>`, which must come back *not found*;
+4. only if every check passes, moves the job to `lost`. The operator's note
+   and each check's result are appended as an event.
+
+Anything inconclusive leaves the job `uncertain`, with the result appended:
+a live matching process, an existing job object, access denied, or any
+other error. If a live member is found, the operator deals with it outside
+the console (for example in Task Manager) and then rechecks. The console
+offers no kill-by-PID.
 
 ### 5.3 Log pump and streaming
 
-The tool's stdout and stderr go to one anonymous pipe. A thread in the
-**runner** drains it continuously, so the tool never blocks on a slow disk
-and the server being down does not matter.
+The tool's stdout and stderr go to one anonymous pipe, owned by the
+**runner**, so the server being down doesn't matter. Inside the runner, a
+**reader** thread and a **writer** thread are joined by a bounded queue (256
+chunks of up to 64 KiB each, 16 MiB in total):
 
-- **Logical offsets.** Each byte gets a monotonic logical offset for the
-  whole job. Segments are named by their starting offset,
-  `log\seg-<start:016x>.log`, and each holds at most 8 MiB. The runner
-  closes a segment before it opens the next, so no open file is ever
-  renamed (this avoids the `WinError 32` codex-lead reproduced). Readers
-  open segments read-only with full sharing.
+- **The reader never blocks on disk.** It reads the pipe, assigns logical
+  offsets, splits lines (see bounded lines below), and puts chunks on the
+  queue without waiting. If the queue is full, it drops the chunk but still
+  advances the logical offset, and it adds the byte range to a pending
+  `dropped` gap. The tool's pipe is therefore always drained, even when G:
+  stalls.
+- **The writer** takes chunks off the queue and appends them to the current
+  segment. When a write fails or stalls (disk full, G: unavailable), it
+  retries with backoff. Meanwhile the queue fills and the reader starts
+  dropping. That is the only way bytes are lost, and every lost byte is
+  inside a recorded gap.
+
+- **Logical offsets and the segment map.** Each byte gets a monotonic
+  logical offset for the whole job. Segments are named by their starting
+  offset, `log\seg-<start:016x>.log`, and each holds at most 8 MiB. **A
+  segment is always contiguous**: after any gap (dropped bytes or a failed
+  write), the writer closes the current segment and starts a new one whose
+  name is the logical offset of the first byte after the gap. A segment
+  therefore never holds bytes on both sides of a gap, and
+  `segment_start + file_offset` is always the true logical offset. Readers
+  build the map from the directory listing (each segment's start and size)
+  plus `log\gaps.jsonl` (`{from, to, reason}`, where `reason` is
+  `dropped`, `retention` or `drain_timeout`). A cursor falls either inside
+  one segment or inside one gap. The runner closes a segment before it
+  opens the next, so no open file is ever renamed (this avoids the
+  `WinError 32` codex-lead reproduced). Readers open segments read-only
+  with full sharing.
 - **Bounded lines.** A partial line is capped at 64 KiB. A longer line is
   split, and the continuation is marked `[line continued]`.
 - **Retention.** Service jobs keep 4 segments (32 MiB). Task jobs keep up to
-  256 MiB. Beyond that the oldest segment is deleted and a `gap {from, to}`
-  record is appended to `log\gaps.jsonl`. If a write fails (disk full, G:
-  unavailable), the pump keeps draining, counts the dropped bytes, and
-  writes a gap record when writing works again.
+  256 MiB. Beyond that the oldest segment is deleted and a `retention` gap
+  covering its range is appended to `log\gaps.jsonl`.
 - **Cursors.** The SSE event id and the polling cursor are the logical
   offset at the end of each line. On reconnect with `Last-Event-ID`, if the
-  offset is older than the oldest retained segment, the server sends a
-  `gap` event first and resumes at the oldest retained byte. Offsets never
-  alias across rotation.
+  offset falls inside a gap, or before the oldest retained segment, the
+  server sends a `gap` event first and resumes at the start of the next
+  segment. Offsets never alias across rotation or gaps.
 - **Streaming.** `GET /api/jobs/{id}/stream` (SSE) checks for new data every
   250 ms and sends `line`, `gap`, `state` and `progress` events, plus a
   heartbeat comment every 15 s. Concurrent streams are capped at 8.
@@ -361,6 +419,12 @@ beside a live watcher. These rules stay until a backend exclusion and
 recovery protocol shared by the watcher and maintenance is proven, which is a
 separate issue. The planner already refuses if the library inventory changes
 while it runs, so running it beside the watcher can at worst fail cleanly.
+
+**Limitation.** These rules govern only what the console itself admits,
+plus the watchers it can detect (§6). They don't exclude other writers, such
+as a maintenance run started from the CLI or the Tk GUI. When a tool's
+writing runs are enabled (§5.5), its runner page and the operator docs say
+so.
 
 ### 5.5 Stop
 
@@ -413,8 +477,11 @@ reviewing):**
 1. **The key is physical identity.** Before its startup discovery the watcher
    calls `os.stat` on the watch root and requires a directory with nonzero
    `st_dev` and `st_ino`, the same rule as `_identity` in
-   `comic_automation/library/number_style.py`. A failed stat, a zero value,
-   or a reparse-point root refuses startup. The key is
+   `comic_automation/library/number_style.py`. A failed stat or a zero value
+   refuses startup. **A junction or symlink given as the root is resolved,
+   not rejected:** `os.stat` follows it, so the key is the target's
+   identity, and the watcher logs both the supplied and the resolved path.
+   Rejecting it would let an alias dodge the lock. The key is
    `<st_dev:x>-<st_ino:x>`. A path string is never part of the key, so
    `C:\…`, `\\localhost\C$\…`, a mapped drive or a junction to the same
    directory all give the same key. (codex-lead reproduced the path-hash
@@ -428,24 +495,41 @@ reviewing):**
      exits with code 3, logging what it can about the owner.
 
    The kernel releases the mutex when the process dies, so no stale-lock
-   takeover is needed. M1's first test measures whether a standard user can
-   create a `Global\` mutex on OfficePC (`CLAUDE.md`: measure, don't infer).
-   If not, the fallback is an `msvcrt` byte-range lock in
-   `G:\ComicAutomation\web-console\locks\watcher-<key>.lock`, with an ACL
-   granting the operator accounts modify access. The measurement and the
-   choice go on the M1 PR.
+   takeover is needed.
+
+   **The backend is frozen: the `Global\` mutex only.** There is no lock-file
+   alternative. If two launchers could each pick a different backend, they
+   could both "hold the lock" at once. The mutex is preferred over a lock
+   file on G: because the watcher shouldn't depend on G: being available
+   (the watcher doesn't use G: today), and the kernel cleans it up when its
+   owner dies.
+
+   Measured on OfficePC on 2026-10-26, as `david` with a medium-integrity
+   token (Administrators deny-only, no `SeCreateGlobalPrivilege`):
+   - `CreateMutexW("Global\…")` succeeded;
+   - a second process got `ERROR_ALREADY_EXISTS` (183), and its zero-timeout
+     wait returned `WAIT_TIMEOUT`.
+
+   Cross-account behaviour was not measured, because there is only one
+   account. **Stop-and-ask point:** if M1 finds that a supported account
+   can't create or open the mutex, M1 stops and asks David. It doesn't fall
+   back to anything automatically.
 3. **Required witnesses.** Each pair is two real processes on a temporary
    watch root:
    - local path vs `\\localhost\C$` UNC;
    - drive letter vs a `subst` or `net use` mapped drive;
-   - real path vs a junction (`mklink /J`, which needs no privilege);
+   - real path vs a junction given as the root (`mklink /J`, which needs no
+     privilege), which resolves to the same key;
    - the same root from two different checkouts.
 
    In every pair the second process exits with code 3. Two different roots
    do not conflict. A killed holder releases the lock. A zero or failed
    identity refuses startup.
 
-**What the console does.** It probes the same mutex. It also scans processes
+**What the console does.** It probes the mutex with `OpenMutexW(SYNCHRONIZE)`
+and never waits on it, so a probe can never take ownership. *Not found*
+means no watcher holds it, and *access denied* means another account does.
+It also scans processes
 (`Get-CimInstance Win32_Process`, cached for 5 s) for command lines with
 `scripts.cbz_watcher` or `cbz_watcher.py`, which covers watchers started
 before M1. Status is one of:
@@ -555,7 +639,11 @@ decides what will run:
 - the interpreter's absolute path and `sys.version`;
 - the `cwd`;
 - the env additions;
-- the repository HEAD SHA, plus a dirty flag;
+- the **source fingerprint**: the SHA-256 over sorted `(relative path,
+  SHA-256 of content)` for every `*.py` under `scripts/`, `comic_automation/`
+  and `apps/`, tracked or not (excluding `__pycache__`). The HEAD SHA is
+  recorded for display only. Two different dirty trees always produce
+  different seals, so a dirty tree is allowed but sealed by content;
 - every `fixed` value with its source. For the number-style registry that
   means the path *and its content SHA-256*, the fingerprint the planner
   records.
@@ -564,7 +652,13 @@ A run request echoes `seal_digest`. The server rebuilds the seal from current
 state, and if anything differs (for example, the registry bytes changed after
 the preview) it returns `409 PREVIEW_STALE` with the fields that differ. The
 stored seal goes into `command.json` and the job row, so the job record shows
-exactly what ran. This is the tool-level version of roadmap §3.3.
+exactly what ran. **The runner checks the seal again** immediately before
+`CreateProcessW`. It recomputes the argv, the interpreter path and the
+SHA-256 of its executable, the registry's SHA-256, and the source
+fingerprint. On any mismatch the job is `refused` (`SEAL_CHANGED`) and
+nothing runs. A file changing between that check and Python importing it
+is still possible; that window is accepted and documented, not closed.
+This is the tool-level version of roadmap §3.3.
 
 ### 8.2 Worked example: maintenance (abridged)
 
@@ -856,7 +950,7 @@ All API responses are JSON. Errors have the form `{"error": "CODE", "message":
 | `GET /api/jobs/{id}/stream` | `Last-Event-ID` | SSE `line`, `gap`, `state` and `progress` events |
 | `POST /api/jobs/{id}/stop` | `{confirm?}` | 202 `{state}`, or 409 `NOT_STOPPABLE` with the gate `reason` |
 | `POST /api/jobs/{id}/acknowledge` | `{note?}` | `{acknowledged_at}` |
-| `POST /api/jobs/{id}/resolve-uncertain` | `{resolution: lost\|stopped, evidence_note}` | `{state}`; only for `uncertain` jobs, appends an event |
+| `POST /api/jobs/{id}/recheck` | `{nonce, state_version, note}` | `{state, checks}`; only for `uncertain` jobs. Moves to `lost` only when termination is freshly proven (§5.2); otherwise it stays `uncertain`. 409 `STALE` |
 | `GET /api/watcher` | | `{state, owner: console\|external\|unverified\|none, pid, job_id, display_command, identity_key, scan_ok}` |
 | `POST /api/watcher/start` | `{params, seal_digest}` | 202 `{job_id}` |
 | `POST /api/watcher/stop` | `{confirm: true}` | 202, or 409 `EXTERNAL_WATCHER` |
@@ -938,9 +1032,11 @@ browser is downloaded.
     points at a missing parameter, or a bad emit rule each refuse startup.
   - The argv builder for every type and emit style, including `when` and
     `omit_empty`.
-  - Seal stability. Each sealed field (argv, interpreter, cwd, HEAD, the
-    registry's SHA-256) changes the digest, and a changed registry makes a
-    run return `PREVIEW_STALE`.
+  - Seal stability. Each sealed field (argv, interpreter, cwd, source
+    fingerprint, the registry's SHA-256) changes the digest. Two different
+    dirty trees give different seals. A changed registry makes a run return
+    `PREVIEW_STALE`, and a change between admission and launch makes the
+    runner refuse with `SEAL_CHANGED`.
   - Progress-line parsing.
   - Config precedence (default, `console.toml`, environment).
   - The token-pair contrast check.
@@ -985,10 +1081,14 @@ browser is downloaded.
     - a grandchild started as the tool's first instruction is inside the
       job;
     - a breakaway request fails;
-    - a failed `JOB_LIST` or assignment refuses the job, and nothing runs;
+    - a failed or unsupported `JOB_LIST` refuses the job, and nothing runs;
+    - the runner is killed immediately after `CreateProcessW` returns,
+      before it records the child; no tool process survives;
     - the job handle is not inheritable;
-    - a job is finalised only once `ActiveProcesses == 0`, so a surviving
-      grandchild delays `exit.json` until it is terminated.
+    - a job is finalised only once `ActiveProcesses == 0`;
+    - a grandchild that holds the pipe open and never exits: the grace
+      period starts at root exit, the job is terminated at the deadline,
+      and the drain finishes within its time limit (no hang).
   - *Admission and adoption (D3).* The server or the runner is killed at
     each boundary (after admit, before spawn; after spawn, before claim;
     after claim, before tool start; while running; after root exit, before
@@ -998,11 +1098,19 @@ browser is downloaded.
       both fenced;
     - an `exit.json` with a foreign nonce or runner identity makes the job
       `uncertain`;
-    - `uncertain` blocks admission until it is resolved;
+    - `uncertain` blocks admission. A recheck moves the job to `lost` only
+      after fresh proof. It stays `uncertain` with a live matching owner or
+      when the job-object query is denied. A stale `state_version` gets 409.
+      A recheck racing a new admission is serialised by the admission lock;
     - 20 concurrent run requests admit exactly one;
     - "one task at a time" holds across a server restart.
   - *Log pump (D4):*
     - output over the cap produces `gap` events, and the tool never blocks;
+    - a blocked writer (stalled disk) fills the queue: the reader keeps
+      draining, dropped bytes are counted in a gap, and the first write
+      after the gap starts a new segment at the right offset;
+    - a reconnect with a cursor before, inside, and after a gap resumes
+      correctly each time;
     - rotation during a disconnected client, then a reconnect with an old
       `Last-Event-ID`, gives a gap followed by exact resumption, with no
       aliasing;
@@ -1019,10 +1127,10 @@ browser is downloaded.
   - *Per-tool interrupt gates* (§5.5) for maintenance (M4) and the watcher
     (M6). These are acceptance gates, not optional tests.
 - **Watcher single instance (M1).** The two-process witnesses listed in §6:
-  local vs UNC, mapped drive, junction, and two checkouts. Also: different
-  roots, release after a kill, refusal on zero or failed identity, the
-  `Global\` creation measurement, and the process scan detecting a fake
-  process named like the watcher. Tests use temporary watch roots and never
+  local vs UNC, mapped drive, junction given as the root, and two
+  checkouts. Also: different roots, release after a kill, refusal on zero
+  or failed identity, a console probe that never takes ownership, and the
+  process scan detecting a fake process named like the watcher. Tests use temporary watch roots and never
   run the watcher against real paths.
 - **Plans.** Fixtures are built with `canonical_apply.plan.build_plan` in a
   temporary directory.
