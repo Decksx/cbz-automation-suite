@@ -237,6 +237,11 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
         year=value("year"), version=value("version") if unchanged_version is None else unchanged_version,
         edition=next(iter(editions), None), special=next(iter(markers.specials), None),
     )
+    if (fields_to_format.series_year is not None and value("year") is not None
+            and fr.normalize_year(ci.fields.get("Year") if ci.authoritative("Year") else None) != str(value("year"))):
+        # A series-year name omits the issue year; the rename-only executor
+        # cannot write it, so it must already be in ComicInfo Year.
+        raise PlanningRefused("issue year is not in ComicInfo Year; a series-year name would drop it")
     name = format_canonical_name(fields_to_format)
     # The shared display policy owns language/edition visibility. Resolution
     # still retains those distinctions when establishing a version family.
