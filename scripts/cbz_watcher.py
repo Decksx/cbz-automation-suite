@@ -39,7 +39,8 @@ from comic_automation.series_resolver import (
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
 from comic_automation.archive import field_resolution as _media_fr
-from comic_automation.library.media_naming import media_fields, watcher_fields
+from comic_automation.library.media_naming import media_fields, watcher_fields, KeepArrivalName
+from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
 from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from comic_automation.library.exclusions import (
     DEFAULT_EXCLUDED_DIRECTORIES,
@@ -1247,6 +1248,15 @@ def _fallback_display_stem(
     return name[: -len(CANONICAL_EXTENSION)]
 
 
+def _media_naming_enabled():
+    """An empty registry keeps the complete legacy watcher path enabled.
+
+    A loaded nonempty registry opts arrivals into media naming, including
+    explicit syntax overrides. The planner has its independent strict default.
+    """
+    return _number_style_registry is not None and bool(_number_style_registry.roots)
+
+
 def _apply_media_naming(parsed_by_path, originals, series_name, destination):
     """Name arrivals under the final resolved destination's media policy.
 
@@ -1254,6 +1264,8 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
     refusal keeps the archive in intake for review. Existing tag-sensitive
     landing and no-overwrite rules still own the actual rename.
     """
+    if not _media_naming_enabled():
+        return set(), None
     try:
         selection = _number_style_registry.select(destination, _number_style_requested)
     except (OSError, NumberStyleRefused) as exc:
@@ -1274,14 +1286,24 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
             patched = _dataclasses_replace(parsed, filename=name, series=fields.series,
                 chapter=fields.issue or fields.chapter, volume=fields.volume)
             if name != path.name:
-                if target.exists():
-                    raise CanonicalNameError("media destination already exists")
                 if not _defers_rename(path.stem, target.stem):
-                    path.rename(target)
+                    rename_arrival(path, target)
                     del parsed_by_path[path]
                     path = target
+                elif target.exists():
+                    raise CanonicalNameError("media destination already exists")
             parsed_by_path[path] = patched
             process_comicinfo(path, patched)
+        except KeepArrivalName as exc:
+            # Keep the existing parsed/deferred display and its distinguishing
+            # number; this is no new field or family authority.
+            log.info("    Media naming kept legacy arrival %s: %s", path.name, exc)
+        except CaseRenameRecoveryError as exc:
+            retained = exc.retained_path
+            del parsed_by_path[path]
+            parsed_by_path[retained] = _dataclasses_replace(parsed, filename=retained.name)
+            refused.add(retained)
+            log.warning("    REVIEW: %s", exc)
         except (OSError, ValueError, KeyError) as exc:
             log.warning("    REVIEW: media naming refused for %s: %s", path.name, exc)
             refused.add(path)
@@ -2620,7 +2642,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 override = fallback_names.get(cbz)
                 if override:
                     log.info(f"    Empty stem fallback: '{cbz.name}' -> '{override}'")
-                if _number_style_registry is not None:
+                if _media_naming_enabled():
                     try:
                         media_originals[cbz] = _media_fr.archive_facts_from_file(cbz)
                     except (OSError, ValueError, zipfile.BadZipFile) as exc:
@@ -2738,7 +2760,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 }
                 refused = set()
                 media_selection = None
-                if _number_style_registry is not None:
+                if _media_naming_enabled():
                     refused, media_selection = _apply_media_naming(
                         parsed_by_path, media_originals, series_name, dest_folder)
                 media_options = ({"number_style": media_selection.style}
@@ -3345,8 +3367,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--readiness-hold-root", type=Path,
         help="Existing writable same-volume directory outside the watch tree; holds are disabled unless set.",
     )
-    parser.add_argument("--number-style", choices=("auto", "issue", "chapter"), default="auto")
-    parser.add_argument("--number-style-registry", type=Path, default=DEFAULT_REGISTRY)
+    parser.add_argument("--number-style", choices=("auto", "issue", "chapter"), default="auto",
+                        help="Number syntax used when a nonempty registry enables media naming.")
+    parser.add_argument("--number-style-registry", type=Path, default=DEFAULT_REGISTRY,
+                        help="Shared media roots; an empty registry keeps legacy watcher naming.")
     return parser
 
 
@@ -3400,6 +3424,7 @@ def _run_watcher(argv: list[str] | None = None):
 
     log.info("=" * 60)
     log.info("CBZ Watcher started")
+    log.info("  Media naming: %s", "configured registry" if _media_naming_enabled() else "off (legacy naming)")
     log.info(f"  Watching : {WATCH_FOLDER}")
     log.info(f"  Routing  : {ROUTING_FILE}")
     if _router is not None:
