@@ -66,6 +66,42 @@ def _under(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _directory_identity(path: Path) -> tuple[int, int]:
+    """Require usable physical identity; query failure is not separation."""
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise PlanningRefused(f"cannot establish directory identity for {path}: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode) or not info.st_ino:
+        raise PlanningRefused(f"cannot establish directory identity for {path}")
+    return info.st_dev, info.st_ino
+
+
+def _require_external_database(root: Path, database: str | Path) -> None:
+    """Refuse catalog access paths or targets physically inside the library.
+
+    Windows drive, UNC and mapped-drive spellings may resolve differently
+    while naming the same directory. Check ancestor file identities before
+    SQLite can create WAL/SHM. Keep both access and resolved paths: resolving
+    a file symlink must not erase an in-library access path.
+    """
+    supplied = Path(os.path.abspath(database))
+    if _under(supplied, root):
+        raise PlanningRefused("database must be outside the library")
+    try:
+        resolved = supplied.resolve(strict=True)
+        real_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise PlanningRefused(f"cannot establish database directory identity: {exc}") from exc
+    if _under(resolved, real_root):
+        raise PlanningRefused("database must be outside the library")
+    root_id = _directory_identity(root)
+    for access in dict.fromkeys((supplied, resolved)):
+        for ancestor in access.parents:
+            if _directory_identity(ancestor) == root_id:
+                raise PlanningRefused("database must be outside the library")
+
+
 def _reparse(info: os.stat_result) -> bool:
     return stat.S_ISLNK(info.st_mode) or bool(
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
@@ -335,9 +371,8 @@ def build_plan(
     if any(part.casefold() == "ai-decensor-originals" for part in (*root.parts, *root.resolve().parts)):
         raise PlanningRefused("ai-decensor-originals is preserved and outside planner scope")
     # Even mode=ro SQLite may create WAL/SHM sidecars. Refuse before the
-    # first database open, including an external alias into the library.
-    if _under(Path(database).resolve(), root.resolve()):
-        raise PlanningRefused("database must be outside the library")
+    # first database open, including drive/UNC aliases into the library.
+    _require_external_database(root, database)
     temporary = Path(temp_dir if temp_dir is not None else tempfile.gettempdir()).resolve(strict=True)
     if not temporary.is_dir() or _under(temporary, root.resolve(strict=True)):
         raise PlanningRefused("private temporary copies must be outside the library")

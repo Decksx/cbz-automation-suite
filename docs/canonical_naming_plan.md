@@ -22,9 +22,22 @@ holds can contain other independently actionable units; the holds are
 carried in the digested document and never executed.
 
 No library, database row, schema, lock, owner file, journal or quarantine
-directory is written. The database must resolve outside the library,
-including through directory aliases; this is checked before any database
-open. SQLite may create/touch WAL/SHM sidecars beside that external catalog
+directory is written. Both the supplied database access path and its resolved
+target must be outside the library. Before the first SQLite open, retain the
+lexical/resolved path checks and compare the library root's `(st_dev, st_ino)`
+against every ancestor directory of both database paths. This catches local
+drive, UNC and mapped-drive aliases even when `resolve()` preserves different
+strings. An identity query failure, non-directory ancestor or zero file id
+refuses the run; an uncertain identity is not evidence of separation.
+
+An in-library file symlink or outward directory junction is also refused,
+even when its target is external: resolving the target must not erase the
+supplied access path. A file symlink outside the library targeting an internal
+catalog refuses too. Actual file-symlink tests are host-dependent and must
+report missing Windows symlink privilege as a skip, not a successful witness.
+Directory identity checks observe containment before opening the catalog;
+they do not provide an atomic fence against concurrent path retargeting.
+SQLite may create/touch WAL/SHM sidecars beside that external catalog
 when opening read-only; this is the established DAL read contract. An archive
 above `--max-held-bytes` (default 512 MiB) is bound through the existing
 step-5 private-copy mechanism. `--temp-dir` must resolve outside the
