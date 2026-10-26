@@ -10,6 +10,8 @@ season/episode/part token extraction, and translation of native-language
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from scripts.cbz_core import (
     clean_directory_name,
     clean_filename,
@@ -172,6 +174,21 @@ def test_romanized_japanese_title_is_translated_when_language_is_detected():
             "Attack on Titan",
             "Shingeki no Kyojin",
         )
+
+
+@pytest.mark.parametrize("text,backend", [
+    ("Kaguya-sama", ("Together", "hil")),
+    ("Kaguya-sama #3", ("Partnership #3", "hil")),
+    ("Doujinshi", ("Doujinshi sample", "vi")),
+])
+def test_romanization_marker_alone_never_accepts_a_non_cjk_translation(text, backend):
+    """A "-sama"/"no ... wa" marker does not make another language's
+    translation usable: the backend translated from the language it
+    detected, not from Japanese. Google read "Kaguya-sama" as Hiligaynon
+    and returned "Together" (CI job 121869904428).
+    """
+    with patch("scripts.cbz_core._run_googletrans", return_value=backend):
+        assert translate_metadata_text(text) == (text, None)
 
 
 def test_mixed_title_with_existing_english_segment_is_not_translated():
