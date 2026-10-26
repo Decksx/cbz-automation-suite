@@ -166,6 +166,7 @@ SOURCE_HUMAN = "human_decision"
 SOURCE_COMICINFO = "comicinfo"
 SOURCE_FOLDER = "folder_context"
 SOURCE_FAMILY = "version_family"
+SOURCE_POLICY = "operator_policy"
 SOURCE_FILENAME = "filename"
 
 # Precedence for reporting. SOURCE_FAMILY sits at the folder-context level:
@@ -175,6 +176,7 @@ PRECEDENCE = (
     SOURCE_COMICINFO,
     SOURCE_FOLDER,
     SOURCE_FAMILY,
+    SOURCE_POLICY,
     SOURCE_FILENAME,
 )
 
@@ -961,10 +963,11 @@ def _canonical_tokens(filename: str) -> NameTokens | None:
         fields.series
     ):
         return None
-    head = fields.series + (f" {fields.special}" if fields.special else "")
+    canonical_series = fields.series + (f" ({fields.series_year})" if fields.series_year is not None else "")
+    head = canonical_series + (f" {fields.special}" if fields.special else "")
     tail = _EXTENSION_RE.sub("", filename[len(head):])
     numbers = _number_fields(_number_tokens(_BRACKET_GROUP_RE.sub(" ", tail)))
-    series, run = _split_marker_run(fields.series)
+    series, run = _split_marker_run(canonical_series)
     if fields.special:
         run = (*run, (MARKER_SPECIAL, fields.special))
     edition = frozenset({fields.edition}) if fields.edition else frozenset()
@@ -1263,11 +1266,16 @@ class FolderFacts:
     resolved it as a series folder (the series index's decision, not this
     module's). None means the folder contributes no series evidence.
     ``archives`` are all the archives in the folder; siblings are judged
-    among them.
+    among them. ``series_folder_wins`` records a caller-confirmed series
+    folder chosen by the operator; original metadata evidence remains visible.
+    ``volume_defaults`` carries approved Full defaults bound to original source
+    facts, and is reused during proposed-name validation, never inferred there.
     """
 
     series_folder: str | None
     archives: tuple[ArchiveFacts, ...]
+    series_folder_wins: bool = False
+    volume_defaults: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1647,7 +1655,7 @@ def _resolve(
     deciding = [
         item
         for item in ordered
-        if item.source in (SOURCE_COMICINFO, SOURCE_FOLDER, SOURCE_FAMILY)
+        if item.source in (SOURCE_COMICINFO, SOURCE_FOLDER, SOURCE_FAMILY, SOURCE_POLICY)
     ]
     if deciding:
         if len({same(item.value) for item in deciding}) == 1:
@@ -1900,6 +1908,7 @@ def _classify_v_token(
     run_volume: str | None,
     in_family: bool,
     human_conflict: bool = False,
+    policy_volume: str | None = None,
 ) -> VTokenClassification:
     """Classify one ``v<N>`` token under §3.2.
 
@@ -1936,6 +1945,8 @@ def _classify_v_token(
 
     if not (volume_why or version_why):
         if not bracketed:
+            if policy_volume == value:
+                volume_why.append("approved original-source collection policy agrees")
             if comicinfo_volume == value:
                 volume_why.append("ComicInfo Volume agrees")
             if run_volume == value:
@@ -2010,6 +2021,9 @@ def resolve_folder(
                 Evidence(SOURCE_FILENAME, token.series, "filename prefix")
             )
         series[key] = _resolve(FIELD_SERIES, evidence, same=series_key)
+        if folder.series_folder_wins and folder.series_folder and not _human_evidence(human[key], FIELD_SERIES):
+            series[key] = FieldResolution(FIELD_SERIES, folder.series_folder, SOURCE_FOLDER,
+                tuple(evidence), "resolved", folder.series_folder)
 
         evidence = _human_evidence(human[key], FIELD_NUMBER)
         evidence += _comicinfo_evidence(
@@ -2181,6 +2195,7 @@ def resolve_folder(
                 run_volume=volume_run.values.get(key),
                 in_family=in_family,
                 human_conflict=token_conflict,
+                policy_volume=folder.volume_defaults.get(key),
             )
             for value, bracketed in candidates
         ]
@@ -2189,6 +2204,9 @@ def resolve_folder(
         evidence += _comicinfo_evidence(
             archive.comicinfo, "Volume", normalize_number
         )
+        if key in folder.volume_defaults:
+            evidence.append(Evidence(SOURCE_POLICY, folder.volume_defaults[key],
+                "approved unnumbered Full default bound to original archive facts"))
         if collected_number is not None:
             evidence.append(Evidence(number[key].source, collected_number,
                 "resolved primary Number agrees with explicit collected-volume label",
