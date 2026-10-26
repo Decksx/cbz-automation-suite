@@ -34,7 +34,7 @@ from scripts.cbz_canonical_name import (
     CanonicalFields, CanonicalNameError, format_canonical_name, parse_canonical_name,
 )
 from scripts.cbz_core import extract_display_tokens
-from comic_automation.library.media_naming import media_fields, display_key
+from comic_automation.library.media_naming import media_fields, display_key, unnumbered_full
 from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from scripts.cbz_routing import NON_SERIES_DIRECTORIES
 
@@ -219,8 +219,10 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
             raise PlanningRefused(f"{field.field} unresolved ({field.reason})")
     series = fields["series"].display_value or fields["series"].value
     markers = fr.effective_markers(tokens, series)
-    if markers.ambiguity or tokens.other_tags:
-        raise PlanningRefused(markers.ambiguity or f"unclassified tags: {sorted(tokens.other_tags)}")
+    full = unnumbered_full(tokens, series, resolution.comicinfo.fields.get("Series"))
+    other_tags = tokens.other_tags - ({"full"} if full else set())
+    if markers.ambiguity or other_tags:
+        raise PlanningRefused(markers.ambiguity or f"unclassified tags: {sorted(other_tags)}")
     editions = markers.editions
     if len(editions) > 1 or len(markers.specials) > 1:
         raise PlanningRefused("multiple edition/special markers cannot fit the grammar")
@@ -228,7 +230,7 @@ def _destination(resolution: fr.ArchiveResolution, *, unchanged_version: int | N
     volume, number = value("volume"), value("number")
     fields_to_format = media_fields(
         series=series, volume=volume, number=number, style=number_style,
-        tokens=tokens, folder=folder,
+        tokens=tokens, folder=folder, full_default=full,
         year=value("year"), version=value("version") if unchanged_version is None else unchanged_version,
         edition=next(iter(editions), None), special=next(iter(markers.specials), None),
     )
@@ -273,7 +275,7 @@ def _identity_group_key(resolution: fr.ArchiveResolution) -> tuple | None:
 
 
 def _fixpoint_problems(facts: list[fr.ArchiveFacts], destinations: dict[str, str],
-                       *, number_style="chapter", folder=None, display_folders=None) -> dict[str, str]:
+                       *, number_style="chapter", folder=None, display_folders=None, series_folder=None, volume_defaults=None) -> dict[str, str]:
     """Reject proposals that fail resolution under their proposed names.
 
     Reuse the same ComicInfo and byte-bound page facts, with all offered
@@ -284,7 +286,8 @@ def _fixpoint_problems(facts: list[fr.ArchiveFacts], destinations: dict[str, str
     """
     proposed = tuple(replace(fact, filename=Path(destinations[fact.archive_key]).name)
                      if fact.archive_key in destinations else fact for fact in facts)
-    resolved = fr.resolve_folder(fr.FolderFacts(None, proposed)).by_key()
+    resolved = fr.resolve_folder(fr.FolderFacts(series_folder, proposed,
+        series_folder_wins=series_folder is not None, volume_defaults=volume_defaults or {})).by_key()
     problems = {}
     for fact in facts:
         destination = destinations.get(fact.archive_key)
@@ -359,10 +362,12 @@ def build_plan(
     max_held_bytes: int = sv.DEFAULT_MAX_HELD_BYTES,
     max_copy_bytes: int | None = None, temp_dir: str | Path | None = None,
     number_style: str = "auto", number_style_registry: str | Path = DEFAULT_REGISTRY,
+    series_folder_root: bool = False,
 ) -> dict[str, Any]:
     """Produce a sealed executor-compatible plan; read only, no live locks.
 
-    No folder name is promoted to decided series authority. Human decision
+    Only confirmed series folders supply series authority; a flat category
+    root contributes none. Unregistered series roots must be declared. Human decision
     manifests and decensor pairing adapters are not implemented; uncertain
     fields and decensor-marked paths are held. All supplied paths are exact
     catalog spellings (drive/UNC aliases are not guessed). Any concurrent DB
@@ -442,7 +447,19 @@ def build_plan(
                     sv.stored_rows_verdict(bound, pages.get(archive_id), archive_id))
                 facts.append(fr.ArchiveFacts(key, path.name,
                     fr.comicinfo_facts(bound.comicinfo_documents), bound.page_evidence()))
-            resolved = fr.resolve_folder(fr.FolderFacts(None, tuple(facts)))
+            confirmed_series = (folder.name if folder != root or series_folder_root or
+                (style.source == "registry" and style.matched_identity != root_identity[:2])
+                else None)
+            volume_defaults = {}
+            for fact in facts:
+                ci = fact.comicinfo
+                title = confirmed_series or (ci.fields.get("Series") if ci.authoritative("Series") else None)
+                if (style.style == "issue" and title and not ci.authoritative("Number")
+                        and not ci.authoritative("Volume")
+                        and unnumbered_full(fr.parse_name_tokens(fact.filename), title, ci.fields.get("Series"))):
+                    volume_defaults[fact.archive_key] = "1"
+            resolved = fr.resolve_folder(fr.FolderFacts(confirmed_series, tuple(facts),
+                series_folder_wins=confirmed_series is not None, volume_defaults=volume_defaults))
             resolutions = resolved.by_key()
             group_sizes = Counter(_identity_group_key(item) for item in resolutions.values())
             reasons, destinations, unverified_noops = {}, {}, set()
@@ -458,13 +475,12 @@ def build_plan(
                 identity_text = " ".join((root.name, str(path.relative_to(root)), series))
                 if _decensor_marker(identity_text):
                     problems.append("decensor identity/pairing adapter required")
+                display_folder = confirmed_series
                 try:
-                    # A registered category root is not a series title. A scan
-                    # below that physical root, or without root evidence when a
-                    # style is explicit, cannot discard its folder conflict.
-                    series_scope = style.matched_identity != root_identity[:2]
-                    display_folder = (folder.name if folder != root or series_scope
-                        or display_key(folder.name) == display_key(series) else None)
+                    if (folder == root and confirmed_series is None and style.source == "explicit"
+                            and display_key(folder.name) != display_key(series)):
+                        raise PlanningRefused("unregistered root requires --series-folder-root for folder authority")
+                    display_folder = confirmed_series
                     display_folders[key] = display_folder
                     destinations[key] = str(path.with_name(_destination(resolutions[key],
                         number_style=style.style, folder=display_folder)))
@@ -480,7 +496,8 @@ def build_plan(
                         problems.append(str(exc))
                 reasons[key] = problems
             for key, problem in _fixpoint_problems(facts, destinations,
-                    number_style=style.style, display_folders=display_folders).items():
+                    number_style=style.style, display_folders=display_folders,
+                    series_folder=confirmed_series, volume_defaults=volume_defaults).items():
                 reasons[key].append(problem)
             claimed = set()
             for family in resolved.families:
@@ -559,7 +576,8 @@ def build_plan(
             "planner_version": PLANNER_VERSION, "inventory": before,
             "number_style": style.as_dict(),
             "excluded": excluded, "catalog": catalog,
-            "series_folder_authority": "none; directory names are not decisions",
+            "series_folder_authority": "operator-chosen series folders; registered flat roots contribute none",
+            "series_folder_root": series_folder_root,
             "filesystem_snapshot": "non-atomic observation; apply revalidates strong hashes",
             "accept_comicinfo_drop": accept_comicinfo_drop,
             "max_held_bytes": max_held_bytes, "max_copy_bytes": max_copy_bytes,
