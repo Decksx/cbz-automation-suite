@@ -126,6 +126,15 @@ def test_a_series_subfolder_scan_keeps_the_same_display_and_style_as_the_whole_r
     assert part["renames"] == whole["renames"]
 
 
+def test_a_subfolder_scan_cannot_bypass_a_substantive_folder_conflict(library, tmp_path):
+    root, db, book = library
+    source = book("old #1.cbz", series="Tales for a HalloweeNight", folder="Tales for a Halloween Night")
+    path = config(tmp_path, [{"path": str(root), "style": "issue"}])
+    for scope in (root, source.parent):
+        doc = cp.build_plan(scope, database=db, quarantine_date="2026-10-26", number_style_registry=path)
+        assert doc["review"] and not doc["renames"] and not doc["families"]
+
+
 def test_wired_watcher_uses_final_destination_after_category_override(library, tmp_path, monkeypatch):
     source_root, db, book = library
     source = book("Series #3.cbz", number="3")
