@@ -64,3 +64,7 @@ komga-1.24.4-fork-0.1.5.jar
 
 # ── Claude Code local state (per-machine permission grants) ───
 .claude/settings.local.json
+
+# Local-only satellites and archives (docs: agent-swarm workspace layout standard)
+/_related/
+/_archive/
