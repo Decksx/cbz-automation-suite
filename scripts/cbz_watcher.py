@@ -38,6 +38,7 @@ from comic_automation.series_resolver import (
     unique_path,
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
+from comic_automation.library.watcher_instance import watcher_instance_lock, WatcherInstanceRefused
 from comic_automation.archive import field_resolution as _media_fr
 from comic_automation.library.media_naming import media_fields, watcher_naming, with_comicinfo_year, KeepArrivalName, split_series_year
 from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
@@ -3082,6 +3083,39 @@ class DirectorySettleTracker:
         # that were already running when a newer filesystem event arrived.
         self._readiness_generations: dict[Path, int] = {}
         self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
+        self._closed = False
+        self._active_callbacks = 0
+
+    def close(self) -> None:
+        """Cancel pending work and drain active callbacks before root unlock."""
+        with self._idle:
+            self._closed = True
+            for timer in (*self._timers.values(), *self._readiness_retry_timers.values()):
+                timer.cancel()
+            self._timers.clear()
+            self._readiness_retry_timers.clear()
+            while self._active_callbacks:
+                try:
+                    self._idle.wait()
+                except KeyboardInterrupt:
+                    log.warning("Waiting for active import callbacks before releasing watcher ownership.")
+
+    def _tracked_callback(self, callback):
+        # A callback is counted before it can leave the tracker lock. close()
+        # either prevents it entering or waits until all its file work ends.
+        def invoke(*args):
+            with self._idle:
+                if self._closed:
+                    return
+                self._active_callbacks += 1
+            try:
+                return callback(*args)
+            finally:
+                with self._idle:
+                    self._active_callbacks -= 1
+                    self._idle.notify_all()
+        return invoke
 
     def notify(self, dir_path: Path) -> None:
         """Reset the settle timer each time a file event fires.
@@ -3092,6 +3126,8 @@ class DirectorySettleTracker:
         readiness retry firing later on stale information.
         """
         with self._lock:
+            if self._closed:
+                return
             existing = self._timers.get(dir_path)
             if existing:
                 existing.cancel()
@@ -3101,7 +3137,7 @@ class DirectorySettleTracker:
             self._readiness_generations[dir_path] = (
                 self._readiness_generations.get(dir_path, 0) + 1
             )
-            timer = threading.Timer(self.settle_delay, self._on_settled, args=[dir_path])
+            timer = threading.Timer(self.settle_delay, self._tracked_callback(self._on_settled), args=[dir_path])
             self._timers[dir_path] = timer
             timer.start()
 
@@ -3116,10 +3152,12 @@ class DirectorySettleTracker:
                     f"Directory '{dir_path.name}' settled but minimum age not reached "
                     f"({int(age)}s / {MIN_AGE}s) — waiting {int(wait)}s more."
                 )
-                timer = threading.Timer(wait, self._on_settled, args=[dir_path])
+                timer = threading.Timer(wait, self._tracked_callback(self._on_settled), args=[dir_path])
                 with self._lock:
+                    if self._closed:
+                        return
                     self._timers[dir_path] = timer
-                timer.start()
+                    timer.start()
                 return
         log.info(f"Directory ready: '{dir_path.name}' (settled + minimum age {MIN_AGE}s met)")
         self._dispatch(dir_path)
@@ -3208,6 +3246,8 @@ class DirectorySettleTracker:
         expected_generation: int | None = None,
     ) -> bool:
         with self._lock:
+            if self._closed:
+                return False
             current_generation = self._readiness_generations.get(
                 dir_path,
                 0,
@@ -3225,7 +3265,7 @@ class DirectorySettleTracker:
             self._readiness_generations[dir_path] = retry_generation
             timer = threading.Timer(
                 READINESS_RETRY_DELAY_SECONDS,
-                self._on_readiness_retry,
+                self._tracked_callback(self._on_readiness_retry),
                 args=[dir_path, retry_generation],
             )
             self._readiness_retry_timers[dir_path] = timer
@@ -3420,13 +3460,31 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def _run_watcher(argv: list[str] | None = None):
     """Start the watcher with command-line-selected optional integrations."""
+    global _number_style_registry, _number_style_requested
+    args = build_argument_parser().parse_args(argv)
+    watch_path = Path(WATCH_FOLDER)
+    try:
+        os.makedirs(watch_path, exist_ok=True)
+    except OSError as exc:
+        raise WatcherInstanceRefused(f"Cannot prepare watch root {watch_path}: {exc}") from exc
+    with watcher_instance_lock(watch_path) as instance:
+        log.info("Watcher mutex acquired: %s; supplied=%s; resolved=%s; abandoned=%s",
+                 instance.mutex_name, instance.supplied_root, instance.resolved_root, instance.abandoned)
+        previous = _number_style_registry, _number_style_requested
+        try:
+            return _configure_and_watch(args, watch_path)
+        finally:
+            _number_style_registry, _number_style_requested = previous
+
+
+def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
+    """Apply session globals only after exclusive root ownership is held."""
     global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
     global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
     global _number_style_registry, _number_style_requested
-    args = build_argument_parser().parse_args(argv)
     try:
         _number_style_registry = NumberStyleRegistry.load(args.number_style_registry)
         _number_style_requested = args.number_style
@@ -3451,9 +3509,11 @@ def _run_watcher(argv: list[str] | None = None):
     SERIES_RESOLVER_REFRESH = args.resolver_refresh
     SERIES_RESOLVER_NORMALIZE_APOSTROPHES = args.resolver_normalize_apostrophes
 
-    watch_path = Path(WATCH_FOLDER)
-    os.makedirs(watch_path, exist_ok=True)
+    return _watch_with_config(args, watch_path)
 
+
+def _watch_with_config(args: argparse.Namespace, watch_path: Path):
+    """Run startup and the observer while the caller owns the root mutex."""
     try:
         tracker = DirectorySettleTracker(
             watch_root=watch_path, readiness_hold_root=args.readiness_hold_root,
@@ -3462,6 +3522,14 @@ def _run_watcher(argv: list[str] | None = None):
     except (OSError, ValueError) as exc:
         build_argument_parser().error(str(exc))
 
+    try:
+        return _watch_session(args, watch_path, tracker)
+    finally:
+        tracker.close()
+
+
+def _watch_session(args: argparse.Namespace, watch_path: Path, tracker: DirectorySettleTracker):
+    """Keep discovery and observer work inside the tracker's draining lifetime."""
     _load_routing()
     _load_routing_v2()
     _load_series_resolvers()
@@ -3506,17 +3574,18 @@ def _run_watcher(argv: list[str] | None = None):
 
     handler  = CBZHandler(tracker)
     observer = Observer()
-    observer.schedule(handler, str(watch_path), recursive=True)
-    observer.start()
-
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        log.info("Shutting down watcher...")
+        observer.schedule(handler, str(watch_path), recursive=True)
+        observer.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            log.info("Shutting down watcher...")
+    finally:
         observer.stop()
-
-    observer.join()
+        if observer.ident is not None:
+            observer.join()
     log.info("CBZ Watcher stopped.")
 
 
@@ -3526,13 +3595,12 @@ def main(argv: list[str] | None = None):
     A stopped/failed CLI session must not configure later embedded callers
     or another session in the same process with stale policy state.
     """
-    global _number_style_registry, _number_style_requested
-    previous = _number_style_registry, _number_style_requested
     try:
         return _run_watcher(argv)
-    finally:
-        _number_style_registry, _number_style_requested = previous
+    except WatcherInstanceRefused as exc:
+        log.error("Watcher start refused: %s", exc)
+        return 3
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

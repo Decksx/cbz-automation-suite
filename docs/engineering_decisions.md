@@ -1479,3 +1479,25 @@ watcher cleanup/rescan and planner re-resolution. Unnumbered Full defaults
 to volume1 with an explicit operator_policy field-evidence source, bound to
 the original Full observation and reused for the proposed-state check.
 No historical human/controller approval is fabricated by that policy fact.
+
+
+### Web console M1: physical-root watcher ownership (2026-10-26)
+
+The accepted web-console design section 6 uses a Windows Global named mutex
+keyed only by the watch directory's stat device/inode identity. Every launcher
+uses this watcher-side gate before startup cleanup, routing, discovery and
+observer activity. Unknown/zero identity or uncertain/busy mutex ownership
+refuses with exit code 3; there is no alternate lock backend. Aliases share
+one key and a crashed holder can be acquired through WAIT_ABANDONED.
+
+The lifetime includes observer shutdown and settle/readiness callback draining.
+This prevents releasing the root while an old callback is still importing.
+It does not add the later stop-file protocol, safe arbitrary cancellation or
+destination-wide writer exclusion. The root and its access ancestors must not
+be retargeted during a session. Cross-account access remains unmeasured; the
+current OfficePC non-elevated token passed the native mutex witnesses.
+
+Protocol, tests, limitations and deliberate old-watcher-first rollout are in
+docs/watcher_single_instance.md. Implementation alone does not change the
+running watcher or retrofit its lock. M1 is developed from master 4cf01a8;
+Claude reviews the implementation and owns any later rollout.
