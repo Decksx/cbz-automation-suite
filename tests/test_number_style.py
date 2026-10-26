@@ -126,3 +126,26 @@ assert planner.main(['--library-root', '.', '--database', 'unopened.db',
     result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
     assert result.stdout.splitlines() == [str(path), str(path)]
     assert result.stderr.strip() == "Plan not produced: registry=" + str(path)
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_parent_scope_refuses_physical_nested_roots_including_an_outside_junction(tmp_path, alias):
+    root, child = tmp_path / "Comics", tmp_path / "Comics/Manga"
+    child.mkdir(parents=True)
+    registered = child
+    junction = tmp_path / "outside-alias"
+    if alias:
+        if os.name == "nt":
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(child)],
+                           check=True, capture_output=True)
+        else:
+            junction.symlink_to(child, target_is_directory=True)
+        registered = junction
+    try:
+        config = registry(tmp_path, [{"path": str(root), "style": "issue"},
+                                     {"path": str(registered), "style": "chapter"}])
+        with pytest.raises(ns.NumberStyleRefused, match="nested"):
+            config.select(root)
+    finally:
+        if alias:
+            junction.rmdir() if os.name == "nt" else junction.unlink()
