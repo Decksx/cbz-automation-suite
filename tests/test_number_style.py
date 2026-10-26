@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -104,3 +105,24 @@ def test_invalid_registry_never_silently_drops_rows(tmp_path, document):
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(ns.NumberStyleRefused):
         ns.NumberStyleRegistry.load(path)
+
+
+def test_one_external_registry_default_is_shared_by_both_cli_parsers(tmp_path, monkeypatch):
+    path = tmp_path / "operator-registry.json"
+    monkeypatch.setenv("CBZ_NUMBER_STYLE_REGISTRY", str(path))
+    # Fresh process models a GUI/CLI launch; no running watcher is reconfigured.
+    code = """
+from comic_automation.library.number_style import DEFAULT_REGISTRY
+from scripts.cbz_watcher import build_argument_parser
+from scripts import cbz_canonical_plan as planner
+print(DEFAULT_REGISTRY)
+print(build_argument_parser().parse_args([]).number_style_registry)
+def capture(*args, **kwargs):
+    raise RuntimeError('registry=' + str(kwargs['number_style_registry']))
+planner.build_plan = capture
+assert planner.main(['--library-root', '.', '--database', 'unopened.db',
+                     '--quarantine-date', '2026-10-26']) == 2
+"""
+    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+    assert result.stdout.splitlines() == [str(path), str(path)]
+    assert result.stderr.strip() == "Plan not produced: registry=" + str(path)
