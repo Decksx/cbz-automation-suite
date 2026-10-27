@@ -8,6 +8,7 @@ would let two launchers each believe they exclusively own the same intake.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import stat
 import threading
@@ -21,6 +22,11 @@ _WAIT_ABANDONED = 0x80
 _WAIT_TIMEOUT = 0x102
 _owners_lock = threading.Lock()
 _owned_names: set[str] = set()
+log = logging.getLogger(__name__)
+
+
+class WatcherInstanceCleanupError(RuntimeError):
+    """Watcher ownership cleanup failed after an acquisition attempt."""
 
 
 class WatcherInstanceRefused(RuntimeError):
@@ -88,6 +94,7 @@ def watcher_instance_lock(root: str | Path) -> Iterator[WatcherInstance]:
     handle = None
     acquired = False
     registered = False
+    primary_error = None
     try:
         # Win32 mutexes are recursive for their owning thread. Reject a second
         # embedded watcher in that same thread as well as other processes.
@@ -122,14 +129,41 @@ def watcher_instance_lock(root: str | Path) -> Iterator[WatcherInstance]:
         except OSError as exc:
             raise WatcherInstanceRefused(f"Cannot recheck watch root {supplied}: {exc}") from exc
         yield WatcherInstance(supplied, resolved, identity, name, outcome == _WAIT_ABANDONED)
+    except BaseException as exc:
+        # Capture this context's error explicitly. sys.exception() in finally
+        # could instead see an unrelated exception handled by an outer caller.
+        primary_error = exc
+        raise
     finally:
+        errors = []
+        released, closed = not acquired, not handle
         with _owners_lock:
             try:
-                if acquired and not api.ReleaseMutex(handle):
-                    error = ctypes.get_last_error()
-                    raise WatcherInstanceRefused(f"Cannot release watcher mutex {name}: WinError {error}")
+                if acquired:
+                    try:
+                        released = bool(api.ReleaseMutex(handle))
+                        if not released:
+                            errors.append(f"Cannot release watcher mutex {name}: WinError {ctypes.get_last_error()}")
+                    except Exception as exc:
+                        errors.append(f"Cannot release watcher mutex {name}: {exc}")
             finally:
-                if handle:
-                    api.CloseHandle(handle)
-                if registered:
-                    _owned_names.discard(name)
+                try:
+                    if handle:
+                        try:
+                            closed = bool(api.CloseHandle(handle))
+                            if not closed:
+                                errors.append(f"Cannot close watcher mutex {name}: WinError {ctypes.get_last_error()}")
+                        except Exception as exc:
+                            errors.append(f"Cannot close watcher mutex {name}: {exc}")
+                finally:
+                    # Closing a handle alone does not prove ownership released.
+                    # Keep uncertain roots blocked for this process's lifetime.
+                    if registered and released and closed:
+                        _owned_names.discard(name)
+        if errors:
+            cleanup_error = WatcherInstanceCleanupError("; ".join(errors))
+            if primary_error is not None:
+                primary_error.add_note(str(cleanup_error))
+                log.error("%s; preserving primary %s", cleanup_error, type(primary_error).__name__)
+            else:
+                raise cleanup_error
