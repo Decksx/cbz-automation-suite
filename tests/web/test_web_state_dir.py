@@ -455,6 +455,64 @@ def test_check_private_refuses_paths_outside_the_home(state, tmp_path):
     sd.check_private(state, [state / "jobs" / "missing" / "command.json"])  # absent paths are skipped
 
 
+@windows_only
+def test_check_private_refuses_a_job_path_through_a_junction(state, tmp_path):
+    """codex-lead's review of #154: jobs/<id> as a junction to a folder outside
+    the home made check_private accept a file that is physically elsewhere."""
+    import _winapi
+
+    outside = tmp_path / "outside-job"
+    outside.mkdir()
+    (outside / "command.json").write_text("{}")
+    (state / "jobs").mkdir()
+    _winapi.CreateJunction(str(outside), str(state / "jobs" / "01JUNCTION"))
+    with pytest.raises(StateDirRefused, match="link or junction"):
+        sd.check_private(state, [state / "jobs" / "01JUNCTION" / "command.json"])
+
+
+@windows_only
+def test_a_junction_in_place_of_locks_is_refused_before_enumerating(state, tmp_path):
+    import _winapi
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _winapi.CreateJunction(str(elsewhere), str(state / "locks"))
+    listed = []
+    real_iterdir = sd.Path.iterdir
+
+    def recording(self):
+        listed.append(os.path.normcase(str(self)))
+        return real_iterdir(self)
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(sd.Path, "iterdir", recording):
+        with pytest.raises(StateDirRefused, match="link or junction"):
+            open_state_dir(state, environ={})
+    # Refused before following it: the junction's target was never listed.
+    assert os.path.normcase(str(state / "locks")) not in listed
+
+
+def test_the_entry_ceiling_stops_reading_at_the_first_entry_over(state, monkeypatch):
+    """codex-lead: the bound was checked after the whole listing was read. A
+    flood must be cut off while iterating, not held in memory first."""
+    consumed = []
+    real_iterdir = sd.Path.iterdir
+
+    def flood(self):
+        if self == state:
+            for n in range(100_000):
+                consumed.append(n)
+                yield self / f"stray-{n}"
+        else:
+            yield from real_iterdir(self)
+
+    monkeypatch.setattr(sd.Path, "iterdir", flood)
+    with pytest.raises(StateDirRefused, match="top-level entries"):
+        sd._fixed_entries(state)
+    assert len(consumed) == sd.MAX_FIXED_ENTRIES + 1
+
+
 def test_stray_top_level_clutter_has_its_own_ceiling(state):
     for n in range(sd.MAX_FIXED_ENTRIES + 1):
         (state / f"stray-{n}.txt").write_text("")
