@@ -308,6 +308,7 @@ def test_kernel_errors_refuse_without_fallback_or_releasing_unowned_handles(tmp_
 
 @pytest.mark.parametrize("failure", ["changed", "stat-error", "body", "release"])
 def test_acquired_handle_is_released_and_closed_on_every_exit(tmp_path, monkeypatch, failure):
+    monkeypatch.setattr(wi, "_owned_names", set())
     api = FakeKernel(outcome=0x80, release=failure != "release")
     monkeypatch.setattr(wi, "_kernel32", lambda: api)
     original = wi._directory_identity
@@ -322,14 +323,15 @@ def test_acquired_handle_is_released_and_closed_on_every_exit(tmp_path, monkeypa
         return (found[0], found[1] + 1) if count >= 3 and failure == "changed" else found
 
     monkeypatch.setattr(wi, "_directory_identity", identity)
-    error = ValueError if failure == "body" else wi.WatcherInstanceRefused
+    error = (ValueError if failure == "body" else wi.WatcherInstanceCleanupError
+             if failure == "release" else wi.WatcherInstanceRefused)
     with pytest.raises(error):
         with wi.watcher_instance_lock(tmp_path) as evidence:
             assert evidence.abandoned
             if failure == "body":
                 raise ValueError("body failed")
     assert api.calls[-2:] == [("release", 123), ("close", 123)]
-    assert not wi._owned_names
+    assert bool(wi._owned_names) == (failure == "release")
 
 
 def test_main_refusal_preserves_policy_and_never_enters_work(tmp_path, monkeypatch, caplog):
@@ -529,3 +531,110 @@ def test_observer_and_tracker_cleanup_finish_while_mutex_is_still_owned(tmp_path
     assert events == (["stop", "close"] if exit_point == "start-error" else ["stop", "join", "close"])
     with wi.watcher_instance_lock(tmp_path):
         pass
+
+
+@pytest.mark.parametrize("body_error", [ValueError("primary watcher failure"), KeyboardInterrupt(), SystemExit(7)])
+def test_cleanup_failure_preserves_primary_exception_and_blocks_embedded_retry(tmp_path, monkeypatch, caplog, body_error):
+    """Cleanup must not replace the primary exception or claim ownership is free."""
+    api = FakeKernel(release=False)
+    monkeypatch.setattr(wi, "_kernel32", lambda: api)
+    monkeypatch.setattr(wi, "_owned_names", set())
+    with pytest.raises(type(body_error)) as caught:
+        with wi.watcher_instance_lock(tmp_path):
+            raise body_error
+    assert caught.value is body_error
+    assert any("Cannot release" in note for note in caught.value.__notes__)
+    assert "Cannot release" in caplog.text
+    assert api.calls[-2:] == [("release", 123), ("close", 123)]
+    assert len(wi._owned_names) == 1
+    calls = list(api.calls)
+    with pytest.raises(wi.WatcherInstanceRefused, match="already running"):
+        with wi.watcher_instance_lock(tmp_path):
+            pytest.fail("uncertain ownership admitted another embedded session")
+    assert api.calls == calls
+
+
+@pytest.mark.parametrize("fault", ["release", "close", "release-exception"])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_main_cleanup_error_classification_and_policy_restoration(tmp_path, monkeypatch, caplog, fault, body_fails):
+    from scripts import cbz_watcher as watcher
+
+    api = FakeKernel(release=fault != "release")
+    if fault == "close":
+        def close(handle):
+            api.calls.append(("close", handle))
+            return False
+        api.CloseHandle = close
+    elif fault == "release-exception":
+        def release(handle):
+            api.calls.append(("release", handle))
+            raise OSError("injected release failure")
+        api.ReleaseMutex = release
+    monkeypatch.setattr(wi, "_kernel32", lambda: api)
+    monkeypatch.setattr(wi, "_owned_names", set())
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(tmp_path))
+    sentinel = object()
+    monkeypatch.setattr(watcher, "_number_style_registry", sentinel)
+    monkeypatch.setattr(watcher, "_number_style_requested", "auto")
+    entered = []
+    def session(*args):
+        entered.append(True)
+        watcher._number_style_registry = None
+        if body_fails:
+            raise ValueError("primary watcher failure")
+    monkeypatch.setattr(watcher, "_watch_with_config", session)
+    if body_fails:
+        with pytest.raises(ValueError, match="primary watcher failure") as caught:
+            watcher.main([])
+        assert any("Cannot" in note for note in caught.value.__notes__)
+    else:
+        assert watcher.main([]) == 4
+        assert "Watcher shutdown failed" in caplog.text
+    assert entered == [True]
+    assert "Watcher start refused" not in caplog.text
+    assert watcher._number_style_registry is sentinel
+    assert watcher._number_style_requested == "auto"
+    assert api.calls[-2:] == [("release", 123), ("close", 123)]
+    assert wi._owned_names
+
+
+def test_unrelated_handled_error_does_not_hide_cleanup_only_failure(tmp_path, monkeypatch):
+    """An outer except block is not an exception from the protected body."""
+    monkeypatch.setattr(wi, "_kernel32", lambda: FakeKernel(release=False))
+    monkeypatch.setattr(wi, "_owned_names", set())
+    try:
+        raise ValueError("already handled")
+    except ValueError:
+        with pytest.raises(wi.WatcherInstanceCleanupError, match="Cannot release"):
+            with wi.watcher_instance_lock(tmp_path):
+                pass
+
+
+@pytest.mark.parametrize("body_fails,exit_code", [(False, 4), (True, 1)])
+def test_cli_cleanup_diagnostic_and_exit_code(tmp_path, body_fails, exit_code):
+    """A real interpreter must expose the primary traceback and cleanup note."""
+    child = r"""
+import sys
+from scripts import cbz_watcher as watcher
+from comic_automation.library import watcher_instance as wi
+class Kernel:
+    def CreateMutexW(self, *args): return 123
+    def WaitForSingleObject(self, *args): return 0
+    def ReleaseMutex(self, *args): return False
+    def CloseHandle(self, *args): return True
+wi._kernel32 = Kernel
+watcher.WATCH_FOLDER = sys.argv[1]
+def session(*args):
+    if sys.argv[2] == "yes": raise ValueError("primary watcher failure")
+watcher._watch_with_config = session
+raise SystemExit(watcher.main([]))
+"""
+    result = subprocess.run([sys.executable, "-c", child, str(tmp_path), "yes" if body_fails else "no"],
+                            cwd=REPO, capture_output=True, text=True, timeout=20)
+    assert result.returncode == exit_code, result.stderr
+    assert "Cannot release" in result.stderr
+    assert "Watcher start refused" not in result.stderr
+    if body_fails:
+        assert "ValueError: primary watcher failure" in result.stderr
+    else:
+        assert "Watcher shutdown failed" in result.stderr

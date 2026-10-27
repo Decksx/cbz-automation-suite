@@ -1501,3 +1501,13 @@ Protocol, tests, limitations and deliberate old-watcher-first rollout are in
 docs/watcher_single_instance.md. Implementation alone does not change the
 running watcher or retrofit its lock. M1 is developed from master 4cf01a8;
 Claude reviews the implementation and owns any later rollout.
+
+### Watcher cleanup failures keep the primary error (#147, 2026-10-27)
+
+Mutex startup refusal remains exit 3. A cleanup-only release/close error is
+exit 4; it cannot claim startup was refused after a session ran. An existing
+exception remains primary, with the cleanup diagnostic logged and attached as a
+note. All cleanup paths attempt handle close. Uncertain release or close keeps
+the root blocked for this process's lifetime, without inferring release from
+handle closure or retrying in-process. Protocol: docs/watcher_single_instance.md.
+Graceful stopping and forced interruption remain separate milestones.
