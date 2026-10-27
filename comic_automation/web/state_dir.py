@@ -31,6 +31,7 @@ Checks, in the order :func:`open_state_dir` applies them:
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import sqlite3
@@ -160,6 +161,32 @@ def _acquire_console_lock(state: Path) -> IO[bytes]:
     return handle
 
 
+MAX_CONTENT_ACL_CHECKS = 2000
+
+
+def _refuse_loosened_contents(state: Path) -> None:
+    """Refuse when anything inside the private directory grants access more widely.
+
+    A private directory only sets the *default* for what is created in it: an
+    explicit grant on a file inside (``icacls console.sqlite3 /grant Users:R``)
+    still opens that file. Inheriting from the private directory is fine; an
+    extra allow entry or a foreign owner is not. Bounded so a huge tree cannot
+    stall start-up; past the bound, start-up refuses rather than skipping.
+    """
+    for count, entry in enumerate(state.rglob("*"), 1):
+        if count > MAX_CONTENT_ACL_CHECKS:
+            raise StateDirRefused(f"{state} holds more than {MAX_CONTENT_ACL_CHECKS} entries; cannot check them all.")
+        try:
+            problems = [p for p in acl.privacy_problems(entry) if p != "inherits access from its parent folder"]
+        except acl.AclError as exc:
+            raise StateDirRefused(str(exc)) from None
+        if problems:
+            raise StateDirRefused(
+                f"{entry} inside the state directory is not private to you ({'; '.join(problems)}). "
+                "Remove the extra access, or run `--init-state-dir` and remove it by hand."
+            )
+
+
 # ------------------------------------------------------------ path rule
 def _norm(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
@@ -184,30 +211,160 @@ def _is_network(root: str) -> bool:
     return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4  # DRIVE_REMOTE
 
 
+REMOTE_CHECK_TIMEOUT_SECONDS = 5
+
+
+def _bounded(fn, *args):
+    """Run ``fn`` with a time limit; raise TimeoutError if it does not finish.
+
+    Used for the few calls that can block on the network (name resolution, a
+    stat through a share). A call that overruns is abandoned in its daemon
+    thread; start-up then refuses, so nothing waits on it.
+    """
+    import concurrent.futures
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(fn, *args).result(timeout=REMOTE_CHECK_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} took over {REMOTE_CHECK_TIMEOUT_SECONDS} s") from None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _unc_of(root: str) -> str | None:
+    """The UNC form of a network root: itself if UNC, else its mapped drive's share."""
+    if root.startswith(("\\\\", "//")):
+        return root
+    drive = os.path.splitdrive(root)[0]
+    if os.name != "nt" or not drive:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    size = wintypes.DWORD(1024)
+    buf = ctypes.create_unicode_buffer(size.value)
+    # WNetGetConnectionW reads the local mapping table; it does not contact the server.
+    if ctypes.windll.mpr.WNetGetConnectionW(drive, buf, ctypes.byref(size)) != 0:
+        return None
+    return buf.value + root[len(drive):]
+
+
+@functools.lru_cache(maxsize=1)
+def _local_addresses() -> frozenset[str]:
+    import socket
+
+    # Not getfqdn(): it took 1.3 s on OfficePC. A fully qualified local name is
+    # still recognised, through _host_is_this_machine's lookup of its address.
+    names = {"localhost", ".", "?", "127.0.0.1", "::1"}
+    name = socket.gethostname()
+    names.add(name.lower())
+    try:
+        names.update(socket.gethostbyname_ex(name)[2])  # this machine's own addresses
+    except OSError:
+        pass
+    return frozenset(names)
+
+
+@functools.lru_cache(maxsize=64)
+def _host_is_this_machine(host: str) -> bool:
+    """True if a UNC host names this machine; TimeoutError/OSError if it cannot be told.
+
+    Known local names and addresses are matched without the network. Any other
+    name is resolved (bounded): addresses that are all elsewhere mean another
+    machine, and an unresolvable name is an error, not a guess.
+    """
+    import socket
+
+    local = _local_addresses()
+    host = host.lower().strip("[]")
+    if host in local or host.startswith("127."):
+        return True
+    infos = _bounded(socket.getaddrinfo, host, None)
+    addresses = {info[4][0] for info in infos}
+    return any(a in local or a.startswith("127.") or a == "::1" for a in addresses)
+
+
+def _identity(path: str) -> tuple[int, int] | None:
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino) if st.st_dev and st.st_ino else None
+
+
+def _ancestor_identities(state: Path) -> set[tuple[int, int]]:
+    """Physical identities of ``state`` and every directory above it, by both spellings."""
+    ids = set()
+    for start in {Path(os.path.abspath(state)), Path(os.path.realpath(state))}:
+        for p in (start, *start.parents):
+            try:
+                ident = _identity(str(p))
+            except OSError:
+                continue
+            if ident:
+                ids.add(ident)
+    return ids
+
+
 def _containing_root(state: Path, roots: list[tuple[str, str]]) -> tuple[str, str] | None:
-    """The first (label, root) that contains ``state``, checked lexically and resolved.
+    """The first (label, root) that contains ``state``; StateDirRefused if one cannot be checked.
 
-    Both forms are checked, following the planner's containment idiom: the
-    lexical check catches a root spelled the same way, the resolved one a
-    junction or mapped path that leads into the root under another name.
+    Three tests, any of which is a hit:
 
-    Network roots (UNC, or a drive mapped to a share such as Z: on Tower) are
-    compared lexically only. Resolving one blocks for 20 s or more when the
-    server is offline, which would stall start-up. That is sound only because
-    :func:`open_state_dir` refuses a state directory on a network location
-    first: a network root cannot contain a local directory.
+    1. **Lexical**, on the written and resolved forms of both paths, following
+       the planner's containment idiom.
+    2. **Physical identity**: the root's ``(st_dev, st_ino)`` equals the state
+       directory's or one of its ancestors'. This catches every alias that
+       spelling cannot: junctions, ``subst`` drives, and a share that exposes
+       a local folder (``\\\\localhost\\C$\\…``, measured to report the same
+       identity as the local path).
+    3. **Network roots** are never resolved or stat'ed through a server that
+       is not this machine. Doing so blocks 20 s or more when Tower is offline,
+       and the state directory is local (refused otherwise in
+       :func:`open_state_dir`), so a share on another machine cannot contain
+       it. Whether the host is this machine is decided from local names and
+       addresses, or a bounded name lookup; a root whose host cannot be
+       determined is refused, never assumed to be disjoint.
     """
     lexical = _norm(str(state))
     resolved = _norm(os.path.realpath(state))
+    ancestors: set[tuple[int, int]] | None = None  # computed on first need
     for label, root in roots:
+        network = _is_network(root)
         candidates = {_norm(root)}
-        if not _is_network(root):
+        if not network:
             try:
                 candidates.add(_norm(os.path.realpath(root)))
             except (OSError, ValueError):
                 pass
+        # Spelling first: free, and needs no server or name lookup.
         for r in candidates:
             if _inside(lexical, r) or _inside(resolved, r):
+                return label, root
+        check_identity = True
+        stat_target = root
+        if network:
+            unc = _unc_of(root)
+            stat_target = unc or root  # a mapped drive is stat'ed through its share
+            host = unc.lstrip("\\/").replace("/", "\\").split("\\", 1)[0] if unc else ""
+            try:
+                if not host:
+                    raise OSError("cannot tell which server it is on")
+                check_identity = _host_is_this_machine(host)
+            except (OSError, TimeoutError) as exc:
+                raise StateDirRefused(f"Cannot check whether the state directory is inside {label} ({root}): {exc}. "
+                                      "Fix the configured path or the name lookup.") from None
+        if check_identity:
+            try:
+                ident = _bounded(_identity, stat_target) if _is_network(root) else _identity(root)
+            except FileNotFoundError:
+                continue  # a root that does not exist cannot contain the state directory
+            except (OSError, TimeoutError) as exc:
+                raise StateDirRefused(f"Cannot check whether the state directory is inside {label} ({root}): {exc}.") from None
+            if ident is None and _is_network(root):
+                raise StateDirRefused(f"Cannot check whether the state directory is inside {label} ({root}): "
+                                      "the share reports no file identity.")
+            if ancestors is None:
+                ancestors = _ancestor_identities(state)
+            if ident and ident in ancestors:
                 return label, root
     return None
 
@@ -280,6 +437,7 @@ def open_state_dir(path: Path, environ: Mapping[str, str] | None = None) -> Stat
             "launcher secret and the approval ledger. Run `python -m comic_automation.web.server "
             "--init-state-dir` to make it private."
         )
+    _refuse_loosened_contents(path)
 
     lock = _acquire_console_lock(path)
     try:
