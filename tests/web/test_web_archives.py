@@ -81,6 +81,36 @@ def test_new_hot_source_member_is_not_silently_discarded(source):
     assert (job.root / "late-file").read_bytes() == b"must be preserved"
 
 
+def test_partial_hot_cleanup_can_be_verified_without_ignoring_remaining_files(source):
+    directory, job = source
+    receipt = ar.write_batch(directory, BATCH_ID, [job], 1000)
+    path = directory / receipt.file_name
+    (job.root / "command.json").unlink()
+    with pytest.raises(ar.ArchiveRefused, match="member set changed"):
+        ar.verify_batch(path, receipt.sha256, jobs={JOB_ID: job}, check_sources=True)
+    ar.verify_batch(path, receipt.sha256, jobs={JOB_ID: job}, check_sources=True, allow_missing_sources=True)
+    (job.root / "log" / "seg-0.log").write_bytes(b"corrupt")
+    with pytest.raises(ar.ArchiveRefused, match="Source changed|byte limit"):
+        ar.verify_batch(path, receipt.sha256, jobs={JOB_ID: job}, check_sources=True, allow_missing_sources=True)
+
+
+def test_cleanup_mode_still_refuses_new_hot_members(source):
+    directory, job = source
+    receipt = ar.write_batch(directory, BATCH_ID, [job], 1000)
+    (job.root / "command.json").unlink()
+    (job.root / "unexpected").write_bytes(b"keep")
+    with pytest.raises(ar.ArchiveRefused, match="member set changed"):
+        ar.verify_batch(directory / receipt.file_name, receipt.sha256, jobs={JOB_ID: job},
+                        check_sources=True, allow_missing_sources=True)
+
+
+def test_cleanup_mode_requires_explicit_source_and_ledger_evidence(source):
+    directory, job = source
+    receipt = ar.write_batch(directory, BATCH_ID, [job], 1000)
+    with pytest.raises(ar.ArchiveRefused, match="source and ledger"):
+        ar.verify_batch(directory / receipt.file_name, receipt.sha256, allow_missing_sources=True)
+
+
 def test_command_digest_must_match_the_ledger_on_write_and_read(source):
     directory, job = source
     bad = ar.ArchiveJob(job.job_id, job.state, "0" * 64, job.root)
