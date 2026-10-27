@@ -1574,7 +1574,13 @@ not spell out:
   whatever then holds the port would receive the launcher secret. The launcher
   sends a random challenge first and needs an HMAC under the secret back
   before sending the secret. The endpoint is open; its answer reveals nothing.
-  `/login` also sends `Clear-Site-Data` to drop anything planted on the origin.
+  `/login` also sends `Clear-Site-Data: "cache"`. Not `"storage"`: measured
+  in Edge, it empties every other console tab's `sessionStorage` and so signs
+  those tabs out.
+- **One cookie name per session** (`cbz_console_<public id>`). With one shared
+  name, a second sign-in overwrote the cookie that older tabs paired with their
+  own browser key, locking them out (found by the automated PR review). The
+  browser key selects the session, and that session's own cookie must match.
 - **Network roots compared lexically only.** Resolving `\\tower\…` or a drive
   mapped to it took 21 s with Tower offline. A network root cannot contain a
   local state directory.
