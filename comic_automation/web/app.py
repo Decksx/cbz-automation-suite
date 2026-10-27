@@ -171,7 +171,7 @@ class ConsoleApp:
             if not self.secrets.check_launcher_secret(req.environ.get("HTTP_X_LAUNCHER_SECRET")):
                 raise RequestRefused(401, "UNAUTHENTICATED", "Launcher secret required.")
             return
-        req.session = self.secrets.session_for(security.cookie_value(req.environ),
+        req.session = self.secrets.session_for(security.request_cookies(req.environ),
                                                req.environ.get("HTTP_X_SESSION_KEY"))
         if req.session is None:
             if (req.method, req.path) in (("GET", "/api/health"), ("HEAD", "/api/health")) and self.secrets.check_launcher_secret(
@@ -223,13 +223,16 @@ class ConsoleApp:
         # code leaves the address bar (history is not relied on, §9). The
         # browser key rides in the fragment, which never reaches a server or
         # log; the page moves it to sessionStorage and clears it from the URL.
-        # Clear-Site-Data drops anything left on this origin from before,
-        # including a service worker another program might have planted while
-        # it held the port.
+        # Clear-Site-Data "cache" drops cached responses from before. Not
+        # "storage": measured in Edge, it also empties every other open console
+        # tab's sessionStorage, which signs those tabs out. The case "storage"
+        # would cover (a service worker planted by a program that held the
+        # port) needs the launcher to open that program's page, which the
+        # launcher-hello check prevents.
         return Response(303, b"", "text/plain", [
             ("Location", f"/#k={session.browser_key}"),
             ("Set-Cookie", security.session_cookie_header(session)),
-            ("Clear-Site-Data", '"cache", "storage"'),
+            ("Clear-Site-Data", '"cache"'),
         ])
 
     def session_info(self, req: Request) -> Response:
