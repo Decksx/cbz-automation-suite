@@ -72,6 +72,15 @@ def test_changed_hot_source_refuses_cleanup_verification(source):
     assert job.root.is_dir()
 
 
+def test_new_hot_source_member_is_not_silently_discarded(source):
+    directory, job = source
+    receipt = ar.write_batch(directory, BATCH_ID, [job], 1000)
+    (job.root / "late-file").write_bytes(b"must be preserved")
+    with pytest.raises(ar.ArchiveRefused, match="member set changed"):
+        ar.verify_batch(directory / receipt.file_name, receipt.sha256, jobs={JOB_ID: job}, check_sources=True)
+    assert (job.root / "late-file").read_bytes() == b"must be preserved"
+
+
 def test_command_digest_must_match_the_ledger_on_write_and_read(source):
     directory, job = source
     bad = ar.ArchiveJob(job.job_id, job.state, "0" * 64, job.root)
