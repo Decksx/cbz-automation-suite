@@ -7,9 +7,11 @@ without touching it (§3).
 
 Every request passes these checks, in this order:
 
-1. **Host** must be ``127.0.0.1:<port>`` or ``localhost:<port>`` (else 421).
-   This runs first, even for static files, because it is what defeats DNS
-   rebinding.
+1. **Host** must be this run's browser host, ``<random label>.localhost:<port>``
+   (else 421). The launcher's three endpoints (hello, bootstrap, health) also
+   accept ``127.0.0.1:<port>`` and ``localhost:<port>``. This runs first, even
+   for static files: it defeats DNS rebinding, and it keeps every browser page
+   on an origin no earlier program can have left state on (see security.py).
 2. **Authentication.** ``/login``, ``/``, ``/static/...`` and
    ``/api/launcher/hello`` are open; ``POST /api/bootstrap`` takes only the
    launcher secret; ``GET /api/health`` takes the launcher secret or a
@@ -102,11 +104,18 @@ class ConsoleApp:
     so the server sets it after binding; tests construct the app directly.
     """
 
+    # The only endpoints the launcher calls; they also answer on 127.0.0.1 so
+    # the launcher needs no name resolution. None of them uses cookies.
+    LAUNCHER_ROUTES = frozenset({("GET", "/api/launcher/hello"), ("POST", "/api/bootstrap"),
+                                 ("GET", "/api/health"), ("HEAD", "/api/health")})
+
     def __init__(self, *, config: ConsoleConfig, secrets: SecretStore, port: int,
-                 started_at: str, git_sha: str | None, static_dir: Path = STATIC_DIR):
+                 started_at: str, git_sha: str | None, static_dir: Path = STATIC_DIR,
+                 origin_label: str | None = None):
         self.config = config
         self.secrets = secrets
         self.port = port
+        self.origin_label = origin_label or security.new_origin_label()
         self.started_at = started_at
         self.git_sha = git_sha
         self.static_dir = static_dir
@@ -118,6 +127,16 @@ class ConsoleApp:
             ("GET", "/api/health"): self.health,
             ("GET", "/api/config"): self.config_report,
         }
+
+    @property
+    def browser_host(self) -> str:
+        """``<label>.localhost:<port>``: the host every browser page uses this run."""
+        return f"{self.origin_label}.localhost:{self.port}"
+
+    def allowed_hosts(self, method: str, path: str) -> frozenset[str]:
+        if (method, path) in self.LAUNCHER_ROUTES:
+            return frozenset({self.browser_host, f"127.0.0.1:{self.port}", f"localhost:{self.port}"})
+        return frozenset({self.browser_host})
 
     # ------------------------------------------------------------ WSGI entry
     def __call__(self, environ: dict, start_response: Callable) -> Iterable[bytes]:
@@ -141,7 +160,7 @@ class ConsoleApp:
         path = environ.get("PATH_INFO", "/") or "/"
         req = Request(method, path, parse_qs(environ.get("QUERY_STRING", "")), environ)
 
-        if not security.host_ok(environ, self.port):
+        if not security.host_ok(environ, self.allowed_hosts(method, path)):
             return error_response(421, "HOST_REFUSED", "Unexpected Host header.")
 
         if method in ("GET", "HEAD") and (path == "/" or path.startswith("/static/")):
@@ -210,8 +229,9 @@ class ConsoleApp:
         return json_response({"proof": security.hello_proof(self.secrets.launcher_secret, challenge)})
 
     def bootstrap(self, req: Request) -> Response:
-        return json_response({"code": self.secrets.issue_bootstrap_code(),
-                              "expires_in": security.BOOTSTRAP_TTL_SECONDS})
+        code = self.secrets.issue_bootstrap_code()
+        return json_response({"code": code, "expires_in": security.BOOTSTRAP_TTL_SECONDS,
+                              "login_url": f"http://{self.browser_host}/login?code={code}"})
 
     def login(self, req: Request) -> Response:
         code = (req.query.get("code") or [None])[0]
@@ -225,10 +245,9 @@ class ConsoleApp:
         # log; the page moves it to sessionStorage and clears it from the URL.
         # Clear-Site-Data "cache" drops cached responses from before. Not
         # "storage": measured in Edge, it also empties every other open console
-        # tab's sessionStorage, which signs those tabs out. The case "storage"
-        # would cover (a service worker planted by a program that held the
-        # port) needs the launcher to open that program's page, which the
-        # launcher-hello check prevents.
+        # tab's sessionStorage, which signs those tabs out. State an earlier
+        # program left in the browser cannot reach this origin anyway: the
+        # browser host's random label is new every run.
         return Response(303, b"", "text/plain", [
             ("Location", f"/#k={session.browser_key}"),
             ("Set-Cookie", security.session_cookie_header(session)),
