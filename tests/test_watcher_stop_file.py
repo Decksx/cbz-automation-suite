@@ -8,6 +8,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -192,6 +193,85 @@ def test_stop_cancels_pending_timers_and_fences_late_callbacks_and_direct_gate(t
         for timer in timers:
             timer.cancel()
             timer.join(timeout=2)
+
+
+def test_direct_directory_entry_observes_request_before_any_callback_poll(tmp_path, monkeypatch):
+    """A direct caller must close admission even without a timer's earlier poll."""
+    stop = tmp_path / "stop.request"
+    directory = book(tmp_path, "direct-arrival")
+    tracker = w.DirectorySettleTracker(watch_root=tmp_path, stop_file=stop)
+    monkeypatch.setattr(w, "probe_cbz_directory_readiness", lambda *args: pytest.fail("stopped direct entry probed archives"))
+    monkeypatch.setattr(w, "process_and_move_directory", lambda *args: pytest.fail("stopped direct entry moved archives"))
+    try:
+        assert not tracker._closed and not tracker._stop_latched
+        stop.touch()
+        # Do not call stop_requested or enter a tracked callback first: the
+        # directory-admission poll itself must notice this newly present request.
+        w._process_directory_when_ready(directory, tracker)
+        assert tracker._closed and tracker._stop_latched
+        assert tracker._active_directories == 0
+    finally:
+        tracker.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows no-replace readiness holding")
+def test_stop_latched_after_real_hold_still_finishes_ready_siblings(tmp_path, monkeypatch):
+    """Reprobing after a hold belongs to the admitted unit, without re-admission."""
+    root, holding = tmp_path / "intake", tmp_path / "holding"
+    root.mkdir()
+    holding.mkdir()
+    directory = book(root, "Lookism")
+    ready = directory / "book.cbz"
+    # A complete ZIP provides the ready sibling. A truncated local-header
+    # prefix models the incomplete Lookism arrival that the hold path handles.
+    with zipfile.ZipFile(directory / "source.zip", "w") as archive:
+        for index in range(7):
+            archive.writestr(f"{index}.jpg", bytes([index + 1]) * 1000)
+    payload = (directory / "source.zip").read_bytes()
+    (directory / "source.zip").unlink()
+    bad = directory / "Lookism part1.cbz"
+    original_bad = payload[:len(payload) // 7]
+    bad.write_bytes(original_bad)
+    original_ready = ready.read_bytes()
+    stop = tmp_path / "stop.request"
+    clock = [0.0]
+    monkeypatch.setattr(w.threading, "Timer", lambda *args, **kwargs: Mock())
+    original_probe = w.probe_cbz_zip_readiness
+    monkeypatch.setattr(w, "probe_cbz_zip_readiness",
+                        lambda path, **kwargs: original_probe(path, settle_interval=0))
+    processed = []
+    monkeypatch.setattr(w, "process_and_move_directory",
+                        lambda folder: processed.append((folder, tuple(folder.glob("*.cbz")))))
+    tracker = w.DirectorySettleTracker(watch_root=root, readiness_hold_root=holding,
+                                       stop_file=stop, clock=lambda: clock[0])
+    original_hold = tracker._hold_stalled_archives
+    latched_between_hold_and_siblings = []
+    def hold_then_stop(*args):
+        moved = original_hold(*args)
+        if moved:
+            assert tracker._active_directories == 1
+            assert not bad.exists()
+            stop.touch()
+            assert tracker.stop_requested()
+            latched_between_hold_and_siblings.append(True)
+        return moved
+    monkeypatch.setattr(tracker, "_hold_stalled_archives", hold_then_stop)
+    try:
+        w._process_directory_when_ready(directory, tracker)
+        assert not processed and bad.exists() and not stop.exists()
+        clock[0] = 1800
+        w._process_directory_when_ready(directory, tracker)
+        assert latched_between_hold_and_siblings == [True]
+        assert processed == [(directory, (ready,))]
+        (held,) = holding.glob("readiness-*/*.cbz")
+        assert held.read_bytes() == original_bad
+        assert held.with_name(held.name + ".held.json").is_file()
+        assert ready.read_bytes() == original_ready
+        assert tracker._closed and tracker._stop_latched
+        assert tracker._active_directories == 0
+        assert stop.exists()
+    finally:
+        tracker.close()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows mutex ownership")
