@@ -27,6 +27,13 @@ def test_the_shipped_example_loads_and_every_value_has_a_source():
     assert all({"value", "source", "editable", "restart_required"} <= set(v) for v in report.values())
 
 
+def test_the_default_port_is_a_new_one_each_start(tmp_path):
+    """0 = OS-chosen, so the console's origin changes every start (codex-lead R3)."""
+    assert DEFAULT_PORT == 0
+    assert load_console_config(EXAMPLE_CONFIG, environ={}).port == 0
+    assert load_console_config(write_config(tmp_path, "[server]\nport = 8765\n"), environ={}).port == 8765
+
+
 def test_an_empty_file_gives_defaults(tmp_path):
     cfg = load_console_config(write_config(tmp_path), environ={})
     assert cfg.port == DEFAULT_PORT
