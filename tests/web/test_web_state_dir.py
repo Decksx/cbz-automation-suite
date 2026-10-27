@@ -104,7 +104,10 @@ def test_an_extra_grant_on_a_private_directory_is_refused(state):
         open_state_dir(state, environ={})
 
 
-def test_first_open_copies_the_example_config_and_pins_identity(state):
+def test_first_open_copies_the_example_config_and_pins_identity(tmp_path):
+    """Also the one state-directory test that opens with the example's real
+    network roots (\\\\tower, Z:), so their checks run as in production."""
+    state = private_dir(tmp_path / "web-console", config=None)
     opened = open_state_dir(state, environ={})
     try:
         assert (state / "console.toml").read_bytes() == sd.EXAMPLE_CONFIG.read_bytes()
@@ -214,11 +217,12 @@ def test_a_junction_into_a_root_is_caught_on_the_resolved_path(tmp_path):
         open_state_dir(link / "web-console", environ={})
 
 
-def test_network_roots_are_never_resolved(state, monkeypatch):
-    """Resolving a UNC root blocks for 20 s+ when the server is down; a network
-    root is compared lexically only."""
+def test_network_roots_on_another_server_are_never_resolved(state, monkeypatch):
+    """Resolving a UNC root blocks for 20 s+ when the server is down; a root on
+    another machine is compared by spelling only."""
     _toml(state, "[paths]\nlibrary = ['\\\\tower-is-offline\\media\\comics']\n")
     assert "\\\\tower-is-offline\\media" in (state / "console.toml").read_text()  # one UNC prefix, as written
+    monkeypatch.setattr(sd, "_host_is_this_machine", lambda host: False)
     real = sd.os.path.realpath
 
     def guarded(p, *a, **k):
@@ -251,6 +255,89 @@ def test_a_state_directory_on_a_network_location_is_refused(state, monkeypatch, 
     with pytest.raises(StateDirRefused, match="network location"):
         open_state_dir(state, environ={})
     assert not (state / "locks").exists()  # refused before writing anything
+
+
+def _localhost_share_of(local: os.PathLike) -> str | None:
+    """``\\\\localhost\\C$\\...`` for a local path, or None if the admin share is unavailable."""
+    drive, rest = os.path.splitdrive(str(local))
+    unc = "\\\\localhost\\" + drive.rstrip(":") + "$" + rest
+    return unc if os.path.isdir(unc) else None
+
+
+@windows_only
+def test_a_local_state_dir_inside_a_library_given_as_a_localhost_share_is_refused(tmp_path):
+    """codex-lead's R1 on #151: the library root is written as a share that
+    exposes a local folder, and the state directory is written locally inside
+    it. Both spellings have the same physical identity; the ledger must not be
+    created inside the library."""
+    library = tmp_path / "library"
+    library.mkdir()
+    unc = _localhost_share_of(library)
+    if unc is None:
+        pytest.skip("the C$ admin share is not available to this account")
+    state = private_dir(library / "console-state")
+    _toml(state, f"[paths]\nlibrary = ['{unc}']\n")
+    with pytest.raises(StateDirRefused, match="inside paths.library"):
+        open_state_dir(state, environ={})
+    assert not (state / "console.sqlite3").exists()
+
+
+@windows_only
+def test_a_mapped_drive_onto_a_local_folder_is_checked_through_its_share(tmp_path, monkeypatch):
+    """The mapped-drive form of R1: Q:\\ maps to a share on this machine. The
+    drive letter itself need not be mapped where the console runs; the share is."""
+    library = tmp_path / "library"
+    library.mkdir()
+    unc = _localhost_share_of(library)
+    if unc is None:
+        pytest.skip("the C$ admin share is not available to this account")
+    state = private_dir(library / "console-state")
+    _toml(state, "[paths]\nlibrary = ['Q:\\lib']\n")
+    real_is_network = sd._is_network
+    monkeypatch.setattr(sd, "_is_network", lambda p: p.startswith("Q:") or real_is_network(p))
+    monkeypatch.setattr(sd, "_unc_of", lambda p: unc if p.startswith("Q:") else p)
+    with pytest.raises(StateDirRefused, match="inside paths.library"):
+        open_state_dir(state, environ={})
+
+
+def test_a_share_on_another_machine_is_never_touched(state, monkeypatch):
+    """Tower offline must not stall start-up: a root on another server is
+    neither resolved nor stat'ed, since it cannot contain a local folder."""
+    _toml(state, "[paths]\nlibrary = ['\\\\tower\\media\\comics']\n")
+    monkeypatch.setattr(sd, "_host_is_this_machine", lambda host: False)
+
+    def no_stat(p):
+        assert "tower" not in str(p).lower(), "a remote share was stat'ed"
+        return sd.__dict__["_real_identity"](p)
+
+    monkeypatch.setitem(sd.__dict__, "_real_identity", sd._identity)
+    monkeypatch.setattr(sd, "_identity", no_stat)
+    open_state_dir(state, environ={}).close()
+
+
+def test_a_share_whose_server_cannot_be_identified_is_refused(state):
+    """Unknown is not the same as disjoint (codex-lead's R1 guidance)."""
+    _toml(state, "[paths]\nlibrary = ['\\\\no-such-host.invalid\\share\\comics']\n")
+    with pytest.raises(StateDirRefused, match="Cannot check whether the state directory is inside paths.library"):
+        open_state_dir(state, environ={})
+    assert not (state / "console.sqlite3").exists()
+
+
+def test_local_host_names_are_recognised_without_the_network():
+    import socket
+
+    for host in ("localhost", "127.0.0.1", socket.gethostname(), socket.gethostname().upper()):
+        assert sd._host_is_this_machine(host), host
+
+
+@windows_only
+def test_a_file_inside_with_a_broader_grant_is_refused(state):
+    """codex-lead's follow-up on #151: the directory being private does not stop
+    an explicit grant on a file inside it."""
+    open_state_dir(state, environ={}).close()
+    subprocess.run(["icacls", str(state / "console.sqlite3"), "/grant", "*S-1-5-11:R"], check=True, capture_output=True)
+    with pytest.raises(StateDirRefused, match="console.sqlite3 inside the state directory is not private"):
+        open_state_dir(state, environ={})
 
 
 def test_is_network_recognises_unc_paths():
