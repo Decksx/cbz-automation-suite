@@ -1637,3 +1637,41 @@ Not in M2: jobs and SSE (M3), the path-parameter allowlist and schemas (M4),
 and watcher status (M6, so `/api/health` reports `watcher_state: unknown`).
 The browser smoke test's SSE resume check waits for M3. Fonts are not
 vendored yet; the shell falls back to system fonts.
+
+## 2026-10-27: M3a durable console admission and runner inspection
+
+M3a follows the approved M3 implementation plan (#150) on M2 merge8f1f0ff.
+It adds a store/admission library, not a run route or tool launcher. Production
+submission still requires M4's trusted schema/seal verifier; a missing verifier
+refuses. Watcher observation is also a trusted dependency: unknown blocks
+writers and watcher starts. It never means that no watcher exists.
+
+The runner's lock-free state inspection shares M2's privacy and containment
+guards. It requires an existing config, ledger and matching physical identity
+pin, read through the shared database layer including committed WAL contents.
+Inspection cannot initialize a replacement ledger or acquire console.lock.
+
+The console schema lives under console_meta.schema_version, independently of
+the operational comic database. Store writes use the shared database layer
+with FULL synchronous durability. Admission/claim/expiry and their append-only
+events are one transaction; an event write failure rolls the state change back.
+Creation timestamps are exact integer FILETIMEs stored as text, with process
+and Windows session identity retained. Claiming checks its own60-second
+deadline. A clock high-water mark refuses rollback rather than releasing work.
+
+Ordering refinement for review: the bounded command artifact is prepared,
+flushed, fsynced and read back while the admission OS lock is held, before
+BEGIN IMMEDIATE. This differs from the plan's prepare-before-lock proposal:
+it prevents a concurrent privacy scan from racing our own temporary files.
+It retains artifact-before-row ordering and keeps disk synchronization outside
+the database transaction. Known incompatibility is checked before preparation,
+then checked again in the insertion transaction. A failed preparation cannot
+create a runnable row and an orphan directory is never reused.
+
+The runner's separate byte-lock lease remains held after its conditional claim
+commits. Closing the lease releases that OS lock, not durable admission.
+Claimed and uncertain work cannot expire. Uncertainty requires a matching
+nonce/version to enter and has no automatic-clear method in this slice.
+Native creation/terminal proof, logs and reconciliation remain later M3 work.
+The single-task rules do not exclude arbitrary external CLI writers. No live
+watcher, library, intake, operational database or runtime is changed by M3a.
