@@ -86,6 +86,34 @@ def test_runner_inspection_rechecks_child_permissions(opened):
         inspect(opened)
 
 
+@pytest.mark.skipif(sd.os.name != "nt", reason="native Windows permissions")
+def test_runner_inspection_directly_refuses_a_broad_root_grant(opened):
+    acl._icacls(str(opened.path), "/grant", "*S-1-5-11:R")
+    with pytest.raises(sd.StateDirRefused, match="not private"):
+        inspect(opened)
+
+
+def test_runner_inspection_directly_refuses_a_network_location(opened, monkeypatch):
+    real = sd._is_network
+    monkeypatch.setattr(sd, "_is_network", lambda p: str(p) == str(opened.path) or real(p))
+    with pytest.raises(sd.StateDirRefused, match="network location"):
+        inspect(opened)
+
+
+def test_runner_inspection_directly_refuses_zero_identity(opened, monkeypatch):
+    real = sd.os.stat
+    def zero_identity(path, *args, **kwargs):
+        value = real(path, *args, **kwargs)
+        if str(path) == str(opened.path):
+            fields = list(value)
+            fields[1] = fields[2] = 0
+            return sd.os.stat_result(fields)
+        return value
+    monkeypatch.setattr(sd.os, "stat", zero_identity)
+    with pytest.raises(sd.StateDirRefused, match="identity changed or is unusable"):
+        inspect(opened)
+
+
 def test_runner_inspection_sees_a_committed_wal_pin(opened):
     # Keep a writer open so the committed pin is genuinely in WAL, not merely
     # a checkpointed database file that an immutable reader could also see.
