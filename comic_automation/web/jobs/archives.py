@@ -70,10 +70,12 @@ def _hash(stream, *, limit: int = MAX_BATCH_BYTES) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _files(root: Path) -> list[Path]:
+def _files(root: Path, directories: list[Path] | None = None) -> list[Path]:
     if not stat.S_ISDIR(_plain(root).st_mode):
         raise ArchiveRefused("Job archive source is not a directory")
     pending, files, count = [root], [], 0
+    if directories is not None:
+        directories.append(root)
     while pending:
         for entry in pending.pop().iterdir():
             count += 1
@@ -82,6 +84,8 @@ def _files(root: Path) -> list[Path]:
             mode = _plain(entry).st_mode
             if stat.S_ISDIR(mode):
                 pending.append(entry)
+                if directories is not None:
+                    directories.append(entry)
             elif stat.S_ISREG(mode):
                 files.append(entry)
             else:
@@ -221,7 +225,8 @@ def _verify(path: Path, expected_digest: str, jobs: Mapping[str, ArchiveJob] | N
                     if jobs is None:
                         raise ArchiveRefused("Source evidence required")
                     root = jobs[job_id].root
-                    current = {job_id + "/" + source.relative_to(root).as_posix() for source in _files(root)}
+                    current = (set() if allow_missing_sources and not os.path.lexists(root) else
+                        {job_id + "/" + source.relative_to(root).as_posix() for source in _files(root)})
                     expected = {member["path"] for member in members}
                     if (not allow_missing_sources and current != expected) or not current.issubset(expected):
                         raise ArchiveRefused("Hot source member set changed during archiving")
