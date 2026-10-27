@@ -423,12 +423,8 @@ def _pin_identity(database: Path, identity: tuple[int, int]) -> None:
         raise StateDirRefused(f"Cannot open {database}: {exc}") from None
 
 
-def open_state_dir(path: Path, environ: Mapping[str, str] | None = None) -> StateDir:
-    """Validate ``path`` as the state directory and take the single-console lock.
-
-    Raises :class:`StateDirRefused` with an operator-readable reason. On any
-    refusal after the lock is taken, the lock is released again.
-    """
+def _validate_home(path: Path) -> None:
+    """Shared location and privacy checks, before opening trusted state."""
     if not path.exists():
         raise StateDirRefused(
             f"The console state directory {path} does not exist. If this is the first run, create it with "
@@ -436,10 +432,9 @@ def open_state_dir(path: Path, environ: Mapping[str, str] | None = None) -> Stat
         )
     if not path.is_dir():
         raise StateDirRefused(f"{path} is not a directory.")
-    # A local volume only. SQLite's locking is unreliable over SMB, and it is
-    # what makes the lexical-only comparison of network roots sound: a network
-    # root cannot contain a local directory. Without this, a state directory
-    # spelled \\tower\media\comics\... would slip past a root spelled Z:\comics.
+    # Local storage only: SQLite's locking is unreliable over SMB. This does
+    # not establish disjointness from network roots: a share may expose a
+    # local directory, so containment also compares physical identities.
     if _is_network(str(path)) or _is_network(os.path.realpath(path)):
         raise StateDirRefused(f"The state directory {path} is on a network location; it must be on a local drive.")
     # Checked before anything is written into it, including the lock file.
@@ -455,6 +450,49 @@ def open_state_dir(path: Path, environ: Mapping[str, str] | None = None) -> Stat
         )
     _refuse_loosened_contents(path)
 
+
+def inspect_state_dir(path: Path, *, expected_identity: tuple[int, int],
+                      environ: Mapping[str, str] | None = None) -> StateDir:
+    """Check an existing home without taking the console lock or initializing it.
+
+    Runners use this while the HTTP server owns ``console.lock``. Configuration
+    and the identity pin must already exist. The returned view owns no lock;
+    closing it cannot release the server's lock. SQLite is opened through the
+    read-only DAL policy, including its WAL-aware view of the committed pin.
+    """
+    _validate_home(path)
+    st = os.stat(path)
+    identity = (st.st_dev, st.st_ino)
+    if not all(identity) or identity != expected_identity:
+        raise StateDirRefused(f"The state directory's identity changed or is unusable: {identity}.")
+    try:
+        config = load_console_config(path / "console.toml", environ)
+    except ConfigError as exc:
+        raise StateDirRefused(f"console.toml is invalid: {exc}") from None
+    hit = _containing_root(path, _forbidden_roots(config))
+    if hit:
+        raise StateDirRefused(f"The state directory {path} is inside {hit[0]} ({hit[1]}); move it out.")
+    try:
+        with dal.connection_scope(path / "console.sqlite3", readonly=True) as db:
+            row = db.execute("SELECT value FROM console_meta WHERE key = 'state_dir_identity'").fetchone()
+        pinned = f"{identity[0]}:{identity[1]}"
+        if row is None or row[0] != pinned:
+            raise StateDirRefused("The existing state-directory identity pin is missing or changed.")
+    except (sqlite3.Error, OSError) as exc:
+        raise StateDirRefused(f"Cannot inspect the existing console ledger: {exc}") from None
+    st = os.stat(path)
+    if (st.st_dev, st.st_ino) != identity:
+        raise StateDirRefused("The state directory changed during inspection.")
+    return StateDir(path=path, config=config, identity=identity, _lock=None)
+
+
+def open_state_dir(path: Path, environ: Mapping[str, str] | None = None) -> StateDir:
+    """Validate ``path`` and own its single-console lock until close.
+
+    Unlike runner inspection, the server initializes missing configuration and
+    the initial identity pin. Refusal releases any lock acquired by this call.
+    """
+    _validate_home(path)
     lock = _acquire_console_lock(path)
     try:
         probe = path / f".write-probe-{uuid.uuid4().hex}"
