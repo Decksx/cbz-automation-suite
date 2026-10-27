@@ -46,8 +46,8 @@ the public interfaces that land, rather than editing its uncommitted package.
 The runner entry point remains `python -m comic_automation.web.jobs.runner
 <job_id> <nonce>`. It resolves state through the same M2 configuration contract,
 with temporary state only through M2's explicit test facility. No browser
-supplies a filesystem location, interpreter, environment, argv, stop mode or
-claim identity. Job IDs are canonical [ULIDs][ulid] (Universally Unique Lexicographically Sortable Identifiers),
+authors a launch filesystem location, interpreter, environment, argv, stop
+mode or new claim identity. Recheck only echoes the stored nonce/version. Job IDs are canonical [ULIDs][ulid] (Universally Unique Lexicographically Sortable Identifiers),
 validated before constructing any path. The 128-bit random nonce fences a
 claim; it does not replace session authentication.
 
@@ -245,7 +245,9 @@ After a gap, close the old segment and start at the next retained byte's actual
 offset. A short/partial write must preserve only its verified prefix, with the
 remainder accounted for before a later segment is published. Readers see a
 nonoverlapping map of segments and half-open gap intervals. Commit a retention
-gap before deleting a closed segment; never rename an open log file. Bound and
+gap before deleting a closed segment; never rename an open log file. Open
+segment readers read-only with full read/write/delete sharing and close each
+bounded read, so a reader cannot pin retention files indefinitely. Bound and
 compact gap metadata while preserving the old-prefix retention interval, so a
 long-running service does not fill the disk with `gaps.jsonl` alone.
 
@@ -339,7 +341,7 @@ bypasses, full Windows suite and fresh exact-head review/CI before merge.
 | Sub-PR | Files/concern | Gate to the next step |
 |---|---|---|
 | M3a | `jobs/store.py`, admission/claim primitives and events; fake clock/process evidence | 20 concurrent request processes admit exactly one; claim-vs-expiry race; duplicate/late nonce fencing; event immutability |
-| M3b | `jobs/logs.py`, bounded reader/writer, segments/gaps and cursor codec | Stalled writer leaves reader draining; alternating overflow bounds metadata; short writes, rotation, retention and reconnect offsets exact |
+| M3b | `jobs/logs.py`, bounded reader/writer, segments/gaps, cursor codec and minimal Windows shared-read helpers | Stalled writer leaves reader draining; alternating overflow bounds metadata; short writes, rotation, retention and reconnect offsets exact |
 | M3c | `jobs/win32.py`, `runner.py`; integrate claims, seal checks, containment and logs | Immediate grandchild contained; breakaway refused; native create failure starts nothing; killed runner before child-record commit leaves no survivor; verified-zero finalization |
 | M3d | `jobs/supervisor.py`, reconciliation, stop and protected job routes; M2 app hook | Full boundary-death matrix, restart adoption, strict uncertain recheck, stop gates, API/SSE/browser integration; trusted M4 seam remains closed until supplied |
 
