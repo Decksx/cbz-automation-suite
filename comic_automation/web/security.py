@@ -28,6 +28,13 @@ cookie must match. One shared cookie name would let a second sign-in overwrite
 the cookie every open console tab relies on, while each tab keeps its own
 browser key, so the older tabs would be locked out for good.
 
+Browser pages live on a host unique to this server run,
+``<128-bit random label>.localhost:<port>`` (browsers send ``*.localhost``
+straight to loopback, without DNS). Browser state belongs to an origin, which
+includes the host, so nothing an earlier program left in the browser (a
+service worker, storage) can apply to the console, even on a reused port. Only
+the launcher's three endpoints also answer on ``127.0.0.1``/``localhost``.
+
 The launcher secret is never accepted as a session, and a session is never
 accepted where the launcher secret is required (except ``/api/health``, which
 takes either). Before the launcher sends its secret at all, it checks that the
@@ -188,14 +195,17 @@ def session_cookie_header(session: Session) -> str:
     return f"{session.cookie_name}={session.session_id}; HttpOnly; SameSite=Strict; Path=/"
 
 
-def allowed_hosts(port: int) -> tuple[str, str]:
-    return (f"127.0.0.1:{port}", f"localhost:{port}")
+def new_origin_label() -> str:
+    """The random first label of this run's browser host, ``<label>.localhost``."""
+    return secrets.token_hex(16)
 
 
-def host_ok(environ: Mapping[str, str], port: int) -> bool:
-    """The Host header names this server on loopback; anything else is a DNS
-    rebinding attempt or a misdirected request (421)."""
-    return environ.get("HTTP_HOST", "").lower() in allowed_hosts(port)
+def host_ok(environ: Mapping[str, str], allowed: frozenset[str]) -> bool:
+    """The Host header is one this server answers to (lower-case ``host:port``).
+
+    Anything else is a DNS-rebinding attempt or a misdirected request (421).
+    """
+    return environ.get("HTTP_HOST", "").lower() in allowed
 
 
 class RequestRefused(Exception):
