@@ -1511,3 +1511,13 @@ note. All cleanup paths attempt handle close. Uncertain release or close keeps
 the root blocked for this process's lifetime, without inferring release from
 handle closure or retrying in-process. Protocol: docs/watcher_single_instance.md.
 Graceful stopping and forced interruption remain separate milestones.
+
+### Web console M1b: cooperative watcher stop (#3194, 2026-10-27)
+
+The optional absolute --stop-file is a caller-owned per-session presence signal.
+Its parent must already exist. The watcher never deletes it; first observation
+latches stop, closes directory admission and cancels pending timers. Admitted
+units finish, the observer joins and callbacks/units drain before M1 releases
+root ownership. Polling errors warn once and keep running, as agreed with Claude
+in hive3204. This adds no forced termination or runtime activation. Protocol,
+log contract and unbounded active-operation latency: docs/watcher_graceful_stop.md.

@@ -2970,6 +2970,20 @@ def _process_directory_when_ready(
     *,
     readiness_generation: int | None = None,
 ) -> None:
+    """Admit one whole directory before probing or changing its archives."""
+    with tracker._directory_admission() as admitted:
+        if admitted:
+            _process_admitted_directory(
+                dir_path, tracker, readiness_generation=readiness_generation,
+            )
+
+
+def _process_admitted_directory(
+    dir_path: Path,
+    tracker: "DirectorySettleTracker",
+    *,
+    readiness_generation: int | None = None,
+) -> None:
     """
     Readiness gate in front of process_and_move_directory().
 
@@ -3043,7 +3057,7 @@ def _process_directory_when_ready(
 
     if tracker._hold_stalled_archives(dir_path, result, readiness_generation):
         # Never process ready siblings using a probe that preceded a hold.
-        _process_directory_when_ready(
+        _process_admitted_directory(
             dir_path, tracker, readiness_generation=readiness_generation,
         )
         return
@@ -3058,14 +3072,27 @@ def _process_directory_when_ready(
 # ─────────────────────────────────────────────
 # DIRECTORY SETTLE TRACKER
 # ─────────────────────────────────────────────
+def _validated_stop_file(value: Path | None) -> Path | None:
+    """Require a caller-owned absolute stop path in an existing directory."""
+    if value is None:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("--stop-file must be an absolute path")
+    if not path.parent.is_dir():
+        raise ValueError(f"--stop-file parent directory does not exist: {path.parent}")
+    return path
+
+
 class DirectorySettleTracker:
-    """Coordinate settling, readiness retries and explicitly enabled holds."""
+    """Coordinate directory admission, graceful stopping, readiness and holds."""
 
     def __init__(
         self, settle_delay: float = SETTLE_DELAY, *,
         watch_root: Path | None = None, readiness_hold_root: Path | None = None,
-        readiness_stall_minutes: float = 30, clock=None,
+        readiness_stall_minutes: float = 30, clock=None, stop_file: Path | None = None,
     ):
+        self._stop_file = _validated_stop_file(stop_file)
         self.readiness_holds = ReadinessHolds(
             watch_root if watch_root is not None else Path(WATCH_FOLDER),
             hold_root=readiness_hold_root, stall_minutes=readiness_stall_minutes,
@@ -3086,16 +3113,67 @@ class DirectorySettleTracker:
         self._idle = threading.Condition(self._lock)
         self._closed = False
         self._active_callbacks = 0
+        self._active_directories = 0
+        self._stop_latched = False
+        self._stop_poll_warned = False
+
+    def _cancel_pending_locked(self) -> None:
+        for timer in (*self._timers.values(), *self._readiness_retry_timers.values()):
+            timer.cancel()
+        self._timers.clear()
+        self._readiness_retry_timers.clear()
+
+    def _poll_stop_locked(self) -> bool:
+        # Polling and admission share the tracker lock, so after the request
+        # is latched no other directory can start. Already-admitted units finish.
+        if self._stop_latched:
+            return True
+        if self._stop_file is None:
+            return False
+        try:
+            try:
+                self._stop_file.stat()
+            except FileNotFoundError:
+                if self._stop_file.parent.is_dir():
+                    return False
+                raise
+        except OSError as exc:
+            if not self._stop_poll_warned:
+                log.warning("Cannot poll watcher stop file %s; continuing: %s", self._stop_file, exc)
+                self._stop_poll_warned = True
+            return False
+        self._stop_latched = True
+        self._closed = True
+        self._cancel_pending_locked()
+        log.info("Watcher stop request seen: %s; %d admitted directories still finishing.",
+                 self._stop_file, self._active_directories)
+        return True
+
+    def stop_requested(self) -> bool:
+        """Latch a present request; transient poll errors warn once and keep running."""
+        with self._idle:
+            return self._poll_stop_locked()
+
+    @contextmanager
+    def _directory_admission(self):
+        with self._idle:
+            admitted = not self._closed and not self._poll_stop_locked()
+            if admitted:
+                self._active_directories += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._idle:
+                    self._active_directories -= 1
+                    self._idle.notify_all()
 
     def close(self) -> None:
-        """Cancel pending work and drain active callbacks before root unlock."""
+        """Cancel pending work and drain callbacks/directory units before root unlock."""
         with self._idle:
             self._closed = True
-            for timer in (*self._timers.values(), *self._readiness_retry_timers.values()):
-                timer.cancel()
-            self._timers.clear()
-            self._readiness_retry_timers.clear()
-            while self._active_callbacks:
+            self._cancel_pending_locked()
+            while self._active_callbacks or self._active_directories:
                 try:
                     self._idle.wait()
                 except KeyboardInterrupt:
@@ -3106,7 +3184,7 @@ class DirectorySettleTracker:
         # either prevents it entering or waits until all its file work ends.
         def invoke(*args):
             with self._idle:
-                if self._closed:
+                if self._closed or self._poll_stop_locked():
                     return
                 self._active_callbacks += 1
             try:
@@ -3126,7 +3204,7 @@ class DirectorySettleTracker:
         readiness retry firing later on stale information.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._poll_stop_locked():
                 return
             existing = self._timers.get(dir_path)
             if existing:
@@ -3154,7 +3232,7 @@ class DirectorySettleTracker:
                 )
                 timer = threading.Timer(wait, self._tracked_callback(self._on_settled), args=[dir_path])
                 with self._lock:
-                    if self._closed:
+                    if self._closed or self._poll_stop_locked():
                         return
                     self._timers[dir_path] = timer
                     timer.start()
@@ -3246,7 +3324,7 @@ class DirectorySettleTracker:
         expected_generation: int | None = None,
     ) -> bool:
         with self._lock:
-            if self._closed:
+            if self._closed or self._poll_stop_locked():
                 return False
             current_generation = self._readiness_generations.get(
                 dir_path,
@@ -3354,7 +3432,11 @@ def _discover_startup_directories(
     probe_cbz_directory_readiness() check as one that arrives while it's
     running.
     """
+    if tracker.stop_requested():
+        return
     for subdir in sorted(watch_path.iterdir()):
+        if tracker.stop_requested():
+            return
         if subdir.is_dir() and any(
             path.suffix.casefold() == ".cbz"
             for path in iter_files_excluding_directories(subdir)
@@ -3364,7 +3446,7 @@ def _discover_startup_directories(
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Build watcher options for integrations and opt-in readiness holding."""
+    """Build watcher integration, graceful stop and opt-in holding options."""
     parser = argparse.ArgumentParser(description="Watch and import incoming CBZ archives")
     parser.add_argument(
         "--series-resolver",
@@ -3455,13 +3537,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         help="Number syntax used when a nonempty registry enables media naming.")
     parser.add_argument("--number-style-registry", type=Path, default=DEFAULT_REGISTRY,
                         help="Shared media roots; an empty registry keeps legacy watcher naming.")
+    parser.add_argument("--stop-file", type=Path, default=None,
+                        help="Absolute per-session stop request path; its parent must exist.")
     return parser
 
 
 def _run_watcher(argv: list[str] | None = None):
     """Start the watcher with command-line-selected optional integrations."""
     global _number_style_registry, _number_style_requested
-    args = build_argument_parser().parse_args(argv)
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.stop_file = _validated_stop_file(args.stop_file)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     watch_path = Path(WATCH_FOLDER)
     try:
         os.makedirs(watch_path, exist_ok=True)
@@ -3517,7 +3606,7 @@ def _watch_with_config(args: argparse.Namespace, watch_path: Path):
     try:
         tracker = DirectorySettleTracker(
             watch_root=watch_path, readiness_hold_root=args.readiness_hold_root,
-            readiness_stall_minutes=args.readiness_stall_minutes,
+            readiness_stall_minutes=args.readiness_stall_minutes, stop_file=args.stop_file,
         )
     except (OSError, ValueError) as exc:
         build_argument_parser().error(str(exc))
@@ -3526,10 +3615,16 @@ def _watch_with_config(args: argparse.Namespace, watch_path: Path):
         return _watch_session(args, watch_path, tracker)
     finally:
         tracker.close()
+        if tracker._stop_latched:
+            log.info("CBZ Watcher stopped by stop-file request: %s", tracker._stop_file)
+        else:
+            log.info("CBZ Watcher stopped.")
 
 
 def _watch_session(args: argparse.Namespace, watch_path: Path, tracker: DirectorySettleTracker):
     """Keep discovery and observer work inside the tracker's draining lifetime."""
+    if tracker.stop_requested():
+        return
     _load_routing()
     _load_routing_v2()
     _load_series_resolvers()
@@ -3568,17 +3663,21 @@ def _watch_session(args: argparse.Namespace, watch_path: Path, tracker: Director
         args.readiness_stall_minutes, args.readiness_hold_root,
     )
 
+    if tracker.stop_requested():
+        return
     _clean_up_stale_rewrite_files(watch_path)
 
     _discover_startup_directories(watch_path, tracker)
 
+    if tracker.stop_requested():
+        return
     handler  = CBZHandler(tracker)
     observer = Observer()
     try:
         observer.schedule(handler, str(watch_path), recursive=True)
         observer.start()
         try:
-            while True:
+            while not tracker.stop_requested():
                 time.sleep(1)
         except KeyboardInterrupt:
             log.info("Shutting down watcher...")
@@ -3586,7 +3685,6 @@ def _watch_session(args: argparse.Namespace, watch_path: Path, tracker: Director
         observer.stop()
         if observer.ident is not None:
             observer.join()
-    log.info("CBZ Watcher stopped.")
 
 
 def main(argv: list[str] | None = None):
