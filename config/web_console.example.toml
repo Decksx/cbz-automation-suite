@@ -7,11 +7,11 @@
 
 [server]
 # Bound on 127.0.0.1 only; the host is not configurable.
-# 0 (recommended): a free port chosen at every start. Browser state left on an
-# old address (for example a service worker another program registered while
-# it held that port) then reaches the console only if the same port happens to
-# come round again, so there is no fixed address to target. A fixed port
-# (1024-65535) gives a stable address but makes that target permanent.
+# 0 (the default): a free port chosen at every start. A fixed port (1024-65535)
+# also works. Either way the browser uses a new random <label>.localhost name
+# every run, so nothing another program left in the browser on an earlier
+# address can reach the console. Nothing depends on the port being stable:
+# the launcher reads it from session.json.
 port = 0
 
 [paths]                      # path parameters must sit under a root of their role
