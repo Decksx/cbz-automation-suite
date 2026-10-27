@@ -1692,3 +1692,11 @@ stray files can reach. Per-job paths are checked by `state_dir.check_private`
 when a job is used (the store's half of #153). A loosened artifact of a job
 that is never read again is therefore not refused at start-up; such an
 artifact is immutable and not trusted by anything that does not read it.
+
+The console never creates junctions or links in its home, so any reparse point
+below it is refused, checked with `lstat` before anything follows or lists it:
+`check_private` checks every component from the home down to the path, and
+the fixed scan refuses a junctioned `locks/` before listing it. Otherwise a
+junction at `jobs/<id>` made a file elsewhere pass as private (codex-lead's
+review of #154). The 200-entry ceiling is enforced while listing, so a flooded
+directory is never read in full.
