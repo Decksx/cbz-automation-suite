@@ -1,2 +1,4 @@
 pytest
 pytest-xdist>=3.8,<4
+# Web console browser smoke test only (tests/web); drives the runner's Edge, no browser download.
+playwright==1.48.0

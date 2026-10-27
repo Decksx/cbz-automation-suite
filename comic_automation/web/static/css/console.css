@@ -1,0 +1,56 @@
+/* CBZ Console. Tokens follow David's Claude Design mockup (docs/design/web-console-mockup,
+   design §11). Dark only in v1; the tokens leave room for a light theme later.
+   No inline styles anywhere: the CSP (default-src 'self') blocks them. */
+:root {
+  color-scheme: dark;
+  --bg: #0e1016;
+  --panel: #12141b;
+  --panel-2: #161922;
+  --border: #232733;
+  --text: #e6e8ee;
+  --muted: #9aa1b2;
+  --accent: #ff5c72;
+  --ok: #3fd18f;
+  --warn: #f0a63a;
+  --info: #5b9cff;
+  --font: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--font); }
+a { color: var(--info); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.skip-link { position: absolute; left: -999px; top: 0; padding: .5rem 1rem; background: var(--panel-2); color: var(--text); }
+.skip-link:focus { left: 1rem; top: 1rem; z-index: 10; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+.shell { display: grid; grid-template-columns: 14rem 1fr; min-height: 100vh; }
+.sidenav { background: var(--panel); border-right: 1px solid var(--border); padding: 1.25rem 1rem; }
+.sidenav ul { list-style: none; margin: 1rem 0; padding: 0; }
+.sidenav a { display: block; padding: .4rem .6rem; border-radius: 6px; color: var(--text); text-decoration: none; }
+.sidenav a[aria-current="page"] { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--accent); }
+.brand { font-weight: 700; letter-spacing: .02em; margin: 0; }
+.nav-note { color: var(--muted); font-size: .85rem; }
+
+main { padding: 1.25rem 2rem 3rem; max-width: 72rem; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+h1 { font-size: 1.6rem; margin: 0; }
+h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+.pill { border: 1px solid var(--border); border-radius: 999px; padding: .2rem .75rem; color: var(--muted); font-size: .85rem; }
+.pill.ok { color: var(--ok); border-color: var(--ok); }
+.notice { background: #2a1418; border: 1px solid var(--accent); border-radius: 8px; padding: .75rem 1rem; }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+.hint { color: var(--muted); margin-top: 0; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.5rem; margin: 0; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.grid { width: 100%; border-collapse: collapse; font-size: .9rem; }
+.grid th, .grid td { text-align: left; padding: .45rem .5rem; border-top: 1px solid var(--border); vertical-align: top; }
+.grid th { color: var(--muted); font-weight: 600; border-top: 0; }
+.grid td:nth-child(2) { font-family: var(--mono); overflow-wrap: anywhere; }
+
+@media (max-width: 48rem) { .shell { grid-template-columns: 1fr; } .sidenav { border-right: 0; border-bottom: 1px solid var(--border); } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }

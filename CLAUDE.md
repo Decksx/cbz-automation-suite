@@ -308,5 +308,9 @@ the code as it finally landed rather than as it was first written.
 - Deferred until a concrete need justifies them: FastAPI control plane,
   remote/GPU workers, distributed tracing, message brokers,
   microservices, PostgreSQL, an SPA frontend, workflow orchestrators.
+  The exception is the local web console (`comic_automation/web`, design
+  `docs/web_console_v1_design.md`): a stdlib WSGI app on 127.0.0.1 with a
+  no-build static frontend, in scope since 2026-10-26. It does not lift
+  the FastAPI or SPA deferral.
   Job-queue leases and fencing tokens are deferred deliberately and must
   not be bundled into other queue work.

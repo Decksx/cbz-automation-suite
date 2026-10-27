@@ -1521,3 +1521,119 @@ units finish, the observer joins and callbacks/units drain before M1 releases
 root ownership. Polling errors warn once and keep running, as agreed with Claude
 in hive3204. This adds no forced termination or runtime activation. Protocol,
 log contract and unbounded active-operation latency: docs/watcher_graceful_stop.md.
+
+### Web console M2: a stdlib loopback skeleton with no fallback state (2026-10-27)
+
+This lifts part of the "deferred until a concrete need" line in `CLAUDE.md`:
+David asked for a local web console on 2026-10-26, so a control plane now has
+that need. It is the narrow one design §3 chose, a stdlib WSGI app
+(`comic_automation/web`) served by `wsgiref` with a threading mixin. It adds
+no runtime dependency; FastAPI and an SPA framework stay deferred. Behaviour
+lives in service modules so the transport can change later without touching it.
+
+The bind host is a constant, `127.0.0.1`. A `server.host` in `console.toml`
+other than that refuses startup instead of being ignored, and so does any
+unknown key, because a typo in a path allowlist would otherwise silently change
+what the console may touch.
+
+Runtime state has exactly one home, `G:\ComicAutomation\web-console`, and no
+fallback: a second state directory would be a second jobs database, which would
+split admission (design §5.2). For the same reason a missing directory is
+refused, not created. A remounted or absent G: must not get a fresh, empty
+ledger, so creating it is an explicit operator step (`--init-state-dir`, which
+also refuses when the parent is missing). The directory's `st_dev`/`st_ino`
+is pinned in `console.sqlite3` on first run and a change refuses startup; a
+zero identity is refused, as in M1. A byte lock on `locks\console.lock` keeps
+one console per state directory.
+
+Security follows design §9 on loopback: three distinct per-start secrets
+(launcher secret in an operator-only `session.json`, single-use 60 s bootstrap
+code, session cookie with a per-session CSRF token), a Host check before
+everything including static files, and Origin, fetch-metadata, JSON-only and
+CSRF checks before routing. Because the checks precede routing, a POST to a
+path with no handler still answers 403 without the token; the tests and the
+one Edge smoke test use that instead of a test-only endpoint.
+
+An independent review of the first draft added four things design §9/§10 did
+not spell out:
+
+- **A private state directory.** `G:\ComicAutomation` grants Authenticated
+  Users Modify (measured with `icacls`), so a directory created under it lets
+  any account read `session.json` or edit `console.toml` and the ledger.
+  `--init-state-dir` sets a protected DACL (operator, SYSTEM, Administrators,
+  by SID), and start-up refuses a directory that inherits or grants anything
+  else. Re-running `--init-state-dir` is the repair.
+- **A second session half.** Cookies are not port-scoped, so the browser sends
+  the session cookie to every listener on 127.0.0.1. `/login` therefore also
+  issues a browser key in the redirect's fragment (never sent to a server or
+  logged). The page keeps it in `sessionStorage` and sends it as
+  `X-Session-Key`, and a session needs both. A console tab opened by hand
+  instead of through the launcher has no key and must sign in again; that is
+  intended.
+- **`GET /api/launcher/hello`.** `session.json` is stale after every reboot, so
+  whatever then holds the port would receive the launcher secret. The launcher
+  sends a random challenge first and needs an HMAC under the secret back
+  before sending the secret. The endpoint is open; its answer reveals nothing.
+  `/login` also sends `Clear-Site-Data: "cache"`. Not `"storage"`: measured
+  in Edge, it empties every other console tab's `sessionStorage` and so signs
+  those tabs out.
+- **One cookie name per session** (`cbz_console_<public id>`). With one shared
+  name, a second sign-in overwrote the cookie that older tabs paired with their
+  own browser key, locking them out (found by the automated PR review). The
+  browser key selects the session, and that session's own cookie must match.
+- **Containment by physical identity, with network roots handled by host.**
+  Resolving `\\tower\…` or a drive mapped to it took 21 s with Tower offline,
+  so spelling alone was used for network roots at first. codex-lead's review
+  found both ways that fails:
+  - A state directory spelled `\\tower\media\comics\…` slipped past a root
+    spelled `Z:\comics`. The state directory must now be on a local volume,
+    checked on its written and resolved paths. SQLite locking over SMB is
+    unreliable anyway.
+  - A share can expose a *local* folder: a root spelled `\\localhost\C$\…\library`
+    did not catch a local state directory inside that library, and the ledger
+    was created there.
+
+  Containment now also compares `(st_dev, st_ino)` of each root against the
+  state directory and its ancestors; the share and local spellings were
+  measured to report the same identity. A network root's server is found
+  without network access: a mapped drive through `WNetGetConnectionW`, then
+  the host matched against this machine's names and addresses, with a bounded
+  lookup otherwise. A root on another machine is neither resolved nor
+  stat'ed. A root on this machine is stat'ed through its share. A root whose
+  server cannot be determined refuses start-up rather than being assumed
+  disjoint. Checking `\\tower` costs a ~2.7 s name lookup per start.
+- **Contents checked too.** A private directory is only the default for new
+  files; an explicit grant on `console.sqlite3` inside it still opened the
+  ledger (codex-lead). Every entry is checked for extra grants or a foreign
+  owner before config or ledger are read, bounded at 2,000 entries.
+- **A browser host unique to each run: `<random label>.localhost:<port>`.**
+  A service worker registered on `127.0.0.1:<port>` by whatever held that port
+  earlier intercepts a later console's `/login` before any response header can
+  act (codex-lead, measured in Edge). A new port per start (`port = 0`, still
+  the default) only made the address unpredictable, not new: an OS-chosen port
+  can be one used before (codex-lead's R3 follow-up). So every browser page is
+  served on a host whose first label is 128 random bits, chosen per run.
+  Browsers send `*.localhost` to loopback without DNS (measured in Edge, which
+  also treats it as a secure context), and browser state is per origin, host
+  included, so no earlier program can have left state there, even on the same
+  port. The browser test registers a worker on `127.0.0.1` and `localhost` at
+  a port, starts the console on that same port, shows the worker still answers
+  the old spelling, and signs in through the new host untouched. Only the
+  launcher's endpoints (hello, bootstrap, health, no cookies) also answer on
+  `127.0.0.1`. The bootstrap reply carries the sign-in URL, and the launcher
+  opens it only if it is `http://<…>.localhost:<port>/login`.
+- **Bounded lookups that do not hold the process.** Name lookups and stats
+  through a share run in a daemon thread with a 5 s limit. A
+  `ThreadPoolExecutor` would be joined at exit, keeping a refused process
+  alive until the blocked call returned, and this machine's own-address lookup
+  was at first unbounded (codex-lead's R4). A timeout refuses start-up; it is
+  never read as "no addresses". `TimeoutError` is an `OSError`, which a
+  regression test caught.
+
+The launcher also bypasses proxy settings, which urllib otherwise applies to
+127.0.0.1. The access log drops every query string, not only `/login`'s.
+
+Not in M2: jobs and SSE (M3), the path-parameter allowlist and schemas (M4),
+and watcher status (M6, so `/api/health` reports `watcher_state: unknown`).
+The browser smoke test's SSE resume check waits for M3. Fonts are not
+vendored yet; the shell falls back to system fonts.
