@@ -26,3 +26,22 @@ The added/replaced regions account for both deltas; unchanged line bytes and
 existing mixed endings are retained. Each commit changes one file. No live
 watcher, launcher, intake, library, database, relay or Codex state was changed.
 M6 still owns forced-interruption safety; the web package remains Claude's M2.
+
+## Independent review follow-up: two narrow test gaps
+
+Claude's review 6450347316 at 807a69e approved the code and found two surviving
+test bypasses. A new direct-entry witness creates the stop request, then calls
+the directory gate without any prior timer or explicit stop poll. It proves
+the admission poll itself is needed. A second witness uses a real incomplete
+ZIP, an expired readiness budget, the real holding rename and sidecar, then
+latches stop between that hold and its ready-sibling pass. The ready sibling
+must still be processed within the already-admitted unit.
+
+The updated stop-file tests pass **19/19 in 3.85 s**. Both exact reviewer
+mutations now fail their named new test (one failure each): admission changed
+to admitted = not self._closed, and the hold path re-enters
+_process_directory_when_ready. The preceding 15 guard checks are rerun
+alongside those two in the separate scratch copy. Final full-suite and
+exact-head CI receipts are on PR #149. The earlier 17-case counts above remain
+historical measurements. Watcher source and its mixed bytes are unchanged;
+the follow-up changes tests and this log only. No rollout.
