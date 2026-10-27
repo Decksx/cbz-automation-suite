@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
+import subprocess
+import sys
 import urllib.request
 
 import pytest
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
-from test_web_server import _reap, _start, _wait_for_session  # noqa: E402  (shared server start-up)
+from test_web_server import REPO, _reap, _start, _wait_for_session  # noqa: E402  (shared server start-up)
 from web_support import private_dir  # noqa: E402
 
 
@@ -43,6 +46,87 @@ def browser():
             pytest.skip(f"Edge not available: {exc}")
         yield b
         b.close()
+
+
+_SW_PAGE = b"""<!doctype html><script>
+navigator.serviceWorker.register('/sw.js', {scope: '/'}).then(() => navigator.serviceWorker.ready)
+  .then(() => { document.title = 'registered'; });
+</script>"""
+# Answers every request on its origin with a marker, without contacting the server.
+_SW_SCRIPT = b"""self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => e.respondWith(new Response('SERVICE-WORKER-MARKER',
+  {headers: {'Content-Type': 'text/html'}})));"""
+
+
+def _register_worker_on_fresh_port(context) -> int:
+    """Play the earlier listener: serve a page that installs a service worker on
+    127.0.0.1:<port>, let the browser register it, then free the port."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    class Earlier(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body, ctype = (_SW_SCRIPT, "text/javascript") if self.path == "/sw.js" else (_SW_PAGE, "text/html")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    earlier = ThreadingHTTPServer(("127.0.0.1", 0), Earlier)
+    threading.Thread(target=earlier.serve_forever, daemon=True).start()
+    port = earlier.server_address[1]
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/")
+    page.wait_for_function("document.title === 'registered'")
+    page.close()
+    earlier.shutdown()
+    earlier.server_close()
+    return port
+
+
+def test_a_service_worker_left_on_an_old_address_cannot_reach_the_console(browser, tmp_path):
+    """codex-lead's R3 on #151. Browser state belongs to an origin, port
+    included. A worker registered by whatever held a port earlier intercepts a
+    console later started on that same fixed port (the control half of this
+    test shows the risk is real). The default, a new port at every start,
+    gives the console an origin no earlier listener has had."""
+    context = browser.new_context()
+    old_port = _register_worker_on_fresh_port(context)
+
+    # Control: a console on the reused fixed port is intercepted before it sees /login.
+    fixed = private_dir(tmp_path / "fixed")
+    proc = _start(fixed, "--port", str(old_port))  # the later --port wins over _start's 0
+    try:
+        session = _wait_for_session(fixed, proc)
+        assert session["port"] == old_port
+        page = context.new_page()
+        response = page.goto(_login_url(session))
+        assert response.from_service_worker and "SERVICE-WORKER-MARKER" in page.content()
+        page.close()
+    finally:
+        _reap(proc)
+
+    # Default: a new port, so the old worker's origin never matches.
+    fresh = private_dir(tmp_path / "fresh")
+    (fresh / "console.toml").write_text("")  # the defaults, as a first run gets them
+    proc = subprocess.Popen([sys.executable, "-m", "comic_automation.web.server"], cwd=REPO,
+                            env={**os.environ, "CBZ_WEB_CONSOLE_HOME": str(fresh)},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        session = _wait_for_session(fresh, proc)
+        assert session["port"] != old_port
+        page = context.new_page()
+        response = page.goto(_login_url(session))
+        assert not response.from_service_worker
+        sync_api.expect(page.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
+    finally:
+        _reap(proc)
+    context.close()
 
 
 def _login_url(session: dict) -> str:
