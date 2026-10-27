@@ -63,6 +63,8 @@ CLI writers. M6 supplies the production watcher observer.
 runner lock. It then conditionally commits an admitted-to-claimed update with
 the exact nonce, deadline and process identity. Creation time is an integer
 Windows FILETIME, stored as text to preserve all bits; session ID is retained.
+These primitives validate integer fields, not native process liveness. M3c
+collects and verifies the real Windows evidence; tests here inject identities.
 The returned `RunnerClaim` keeps the runner lock until close. Closing it does
 not finish the job or release the durable admission hold.
 
@@ -77,5 +79,8 @@ Database triggers refuse updates and deletes of events.
 Native creation, terminal proof, logs, stop, reconciliation and protected job
 routes belong to later M3 slices. This store does not launch a runner or tool.
 Production submission remains unwired until M4's trusted adapter is present.
+M2's privacy scan still refuses more than 2,000 state entries. This slice does
+not garbage-collect job history or orphan artifacts; retention needs to account
+for that ceiling before production submission is enabled.
 The source-change window, live watcher interruption gates and manual UI checks
 retain their accepted limits; this slice does not claim those gates passed.
