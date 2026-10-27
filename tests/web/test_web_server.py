@@ -13,6 +13,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import urllib.parse
 import subprocess
 import sys
 import threading
@@ -83,14 +84,24 @@ def server(tmp_path):
         yield state, _wait_for_session(state, proc), proc
 
 
-def _full_login(port: int, secret: str) -> tuple[str, dict, str]:
-    """(bootstrap code, auth headers, csrf) through the real socket."""
+def _bootstrap(port: int, secret: str) -> tuple[str, str]:
+    """(bootstrap code, this run's browser host), asked for on 127.0.0.1 like the launcher does."""
     status, _, body = _req(port, "POST", "/api/bootstrap", {"X-Launcher-Secret": secret})
     assert status == 200
-    code = json.loads(body)["code"]
-    status, headers, _ = _req(port, "GET", f"/login?code={code}")
+    reply = json.loads(body)
+    host = urllib.parse.urlsplit(reply["login_url"]).netloc
+    assert host.endswith(f".localhost:{port}")
+    return reply["code"], host
+
+
+def _full_login(port: int, secret: str) -> tuple[str, dict, str]:
+    """(bootstrap code, auth headers, csrf) through the real socket. The auth
+    headers carry the browser host, since session routes answer only there."""
+    code, host = _bootstrap(port, secret)
+    status, headers, _ = _req(port, "GET", f"/login?code={code}", {"Host": host})
     assert status == 303
-    auth = {"Cookie": headers["set-cookie"].split(";", 1)[0], "X-Session-Key": headers["location"][len("/#k="):]}
+    auth = {"Host": host, "Cookie": headers["set-cookie"].split(";", 1)[0],
+            "X-Session-Key": headers["location"][len("/#k="):]}
     status, _, body = _req(port, "GET", "/api/session", auth)
     assert status == 200
     return code, auth, json.loads(body)["csrf_token"]
@@ -104,7 +115,7 @@ def test_real_server_round_trip_and_loopback_bind(server):
     assert status == 200 and json.loads(body)["ok"] is True
     _, auth, csrf = _full_login(port, session["launcher_secret"])
     status, _, _ = _req(port, "POST", "/api/nothing", {**auth, "X-CSRF-Token": csrf,
-                                                       "Origin": f"http://127.0.0.1:{port}",
+                                                       "Origin": f"http://{auth['Host']}",
                                                        "Content-Type": "application/json"}, b"{}")
     assert status == 404  # every guard passed; there is simply no such endpoint
     # Nothing answers on a non-loopback address of this machine.
@@ -139,17 +150,18 @@ def test_encoded_traversal_is_refused_by_the_real_server(server, path):
     """wsgiref decodes the path before the app sees it, so only a real socket
     tests the decoded form."""
     _, session, _ = server
-    assert _req(session["port"], "GET", path)[0] == 404
+    _, host = _bootstrap(session["port"], session["launcher_secret"])
+    assert _req(session["port"], "GET", path, {"Host": host})[0] == 404
 
 
 def test_secrets_never_reach_the_log(server):
     state, session, _ = server
     port = session["port"]
     code, auth, csrf = _full_login(port, session["launcher_secret"])
-    _req(port, "POST", "/api/nothing", {**auth, "X-CSRF-Token": csrf, "Origin": f"http://127.0.0.1:{port}",
+    _req(port, "POST", "/api/nothing", {**auth, "X-CSRF-Token": csrf, "Origin": f"http://{auth['Host']}",
                                         "Content-Type": "application/json"}, b"{}")
-    _req(port, "GET", "/login?code=" + code)    # a replayed code is logged too, still redacted
-    _req(port, "GET", "/%6Cogin?code=" + code)  # and one spelled to dodge a path-specific pattern
+    _req(port, "GET", "/login?code=" + code, {"Host": auth["Host"]})    # a replayed code is logged too, redacted
+    _req(port, "GET", "/%6Cogin?code=" + code, {"Host": auth["Host"]})  # and one spelled to dodge a path pattern
     time.sleep(0.3)
     log = (state / "console.log").read_text(encoding="utf-8")
     assert "/login?<redacted>" in log  # the requests were logged...
@@ -219,6 +231,25 @@ class _Impostor(BaseHTTPRequestHandler):
         pass
 
 
+@pytest.mark.parametrize("login_url", [
+    "http://127.0.0.1:{port}/login?code=x",          # the shared loopback origin, not this run's
+    "http://evil.example:{port}/login?code=x",
+    "https://abc.localhost:{port}/login?code=x",
+    "http://abc.localhost:1/login?code=x",            # wrong port
+    "http://abc.localhost:{port}/elsewhere",
+    "",
+])
+def test_launcher_opens_only_this_runs_localhost_sign_in_url(monkeypatch, login_url):
+    sys.path.insert(0, str(REPO / "apps"))
+    import web_console
+
+    monkeypatch.setattr(web_console, "_request", lambda *a, **k: {"login_url": login_url.format(port=5000)})
+    with pytest.raises(web_console.LaunchError, match="unexpected sign-in address"):
+        web_console.login_url({"port": 5000, "launcher_secret": "s"})
+    monkeypatch.setattr(web_console, "_request", lambda *a, **k: {"login_url": "http://abc.localhost:5000/login?code=x"})
+    assert web_console.login_url({"port": 5000, "launcher_secret": "s"}) == "http://abc.localhost:5000/login?code=x"
+
+
 def test_launcher_never_sends_its_secret_to_an_impostor(tmp_path):
     sys.path.insert(0, str(REPO / "apps"))
     import web_console
@@ -258,4 +289,5 @@ def test_launcher_reuses_a_real_console_and_ignores_proxy_settings(server, tmp_p
     found = web_console.live_console(state / "session.json")
     assert found is not None and found["port"] == session["port"]
     url = web_console.login_url(found)
-    assert url.startswith(f"http://127.0.0.1:{session['port']}/login?code=")
+    parts = urllib.parse.urlsplit(url)
+    assert parts.hostname.endswith(".localhost") and parts.port == session["port"] and parts.path == "/login"
