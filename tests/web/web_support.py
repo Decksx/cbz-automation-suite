@@ -20,7 +20,9 @@ from comic_automation.web.config import load_console_config
 from comic_automation.web.security import SESSION_COOKIE_PREFIX, SecretStore
 
 PORT = 8765
-ORIGIN = f"http://127.0.0.1:{PORT}"
+LABEL = "testlabel"  # in-process apps get a fixed browser-host label
+HOST = f"{LABEL}.localhost:{PORT}"
+ORIGIN = f"http://{HOST}"
 
 
 @dataclass
@@ -36,7 +38,7 @@ class Result:
 
 
 def call(app: ConsoleApp, method: str, path: str, *, headers: dict[str, str] | None = None,
-         body: bytes | str | dict | None = None, host: str = f"127.0.0.1:{PORT}") -> Result:
+         body: bytes | str | dict | None = None, host: str = HOST) -> Result:
     if isinstance(body, dict):
         body = json.dumps(body)
     if isinstance(body, str):
@@ -71,7 +73,7 @@ def make_app(tmp_path: Path, clock=None) -> ConsoleApp:
     config = load_console_config(write_config(tmp_path), environ={})
     secrets = SecretStore(operator="tester", **({"clock": clock} if clock else {}))
     return ConsoleApp(config=config, secrets=secrets, port=PORT, started_at="2026-10-27T00:00:00+00:00",
-                      git_sha="abc123")
+                      git_sha="abc123", origin_label=LABEL)
 
 
 def login(app: ConsoleApp) -> tuple[dict[str, str], str]:
