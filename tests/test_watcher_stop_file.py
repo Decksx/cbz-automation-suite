@@ -77,8 +77,9 @@ def test_request_latches_even_if_caller_removes_it(tmp_path, monkeypatch, caplog
         with caplog.at_level(logging.INFO):
             assert tracker.stop_requested()
             stop.unlink()
-            monkeypatch.setattr(Path, "stat", lambda *args, **kwargs: pytest.fail("latched stop was polled again"))
-            assert tracker.stop_requested()
+            with monkeypatch.context() as patch:
+                patch.setattr(Path, "stat", lambda *args, **kwargs: pytest.fail("latched stop was polled again"))
+                assert tracker.stop_requested()
         assert caplog.text.count("Watcher stop request seen:") == 1
     finally:
         tracker.close()
@@ -114,10 +115,11 @@ def test_transient_poll_error_warns_once_and_a_later_request_still_stops(tmp_pat
 def test_no_stop_file_keeps_legacy_admission_without_polling(tmp_path, monkeypatch):
     tracker = w.DirectorySettleTracker(watch_root=tmp_path)
     try:
-        monkeypatch.setattr(Path, "stat", lambda *args, **kwargs: pytest.fail("disabled stop interface polled storage"))
-        assert not tracker.stop_requested()
-        with tracker._directory_admission() as admitted:
-            assert admitted
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "stat", lambda *args, **kwargs: pytest.fail("disabled stop interface polled storage"))
+            assert not tracker.stop_requested()
+            with tracker._directory_admission() as admitted:
+                assert admitted
     finally:
         tracker.close()
 
