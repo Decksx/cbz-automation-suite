@@ -47,7 +47,44 @@ later cleanup. Missing archives after a storage failure refuse cleanup rather
 than deleting evidence. The archive is included with the state ledger in the
 operator's existing backup responsibility.
 
-## Current implementation checkpoint
+## Store integration
+
+The prerequisite helper merged as
+`fecddf3694bd3744166a48c9134655d900a3602d` after exact-head review at63db21b.
+Store operations now check only the selected job's directories, command,
+receipt, stop path and runner lock. Locks and their parents are checked before
+opening them, so inspection cannot discover an escaping lock path too late.
+No get/event operation enumerates other jobs or archives.
+
+Runner-lock creation and cleanup both hold admission exclusion. Cleanup checks
+the opened file's identity again after close before unlinking its name. The
+durable claim still holds admission. If cleanup fails while the body raises,
+the body error propagates with a cleanup note. Closed failed-claim locks can
+remain; archive maintenance removes them when handling the terminal job.
+
+`jobs.history.JobHistory.initialize()` explicitly prepares the private archive
+directory. `archive()` implements the200-job/7-day policy in bounded batches,
+packing by bytes so large jobs do not make every batch exceed its limit. It
+skips active or held-runner rows. The verified batch is published first; an
+immutable pointer and an archived event commit together; only then does hot
+removal begin. No job row or old event is removed. This additive schema keeps
+version1 and adds archive pointers plus query indexes; old terminal claims are
+still fenced and no existing column is reinterpreted.
+
+`cleanup()` re-verifies committed batches and their remaining hot files before
+resuming interrupted removal. Cleanup acknowledgments are append-only events,
+so completed older batches cannot starve later recovery. No pointer means no
+cleanup authority; orphan batches remain untouched. Recursive removal verifies
+the resolved absolute job path remains in the pinned jobs directory.
+
+`read_command()` verifies a hot command or the committed batch and ledger digest
+through a single opened batch handle. When both copies exist, either digest
+failure refuses the read; no fallback hides corruption. Cold log paging belongs
+to M3b, using the same sealed-batch verification. M3d must schedule idle cleanup
+and retention before M4 enables production submissions. This library does not
+start background workers or run maintenance on the live state home.
+
+## Verification checkpoints
 
 The three M3a surviving mutations now have direct witnesses and each fails
 its new test: stale uncertain version on an eligible source row, complete
@@ -57,9 +94,17 @@ zero identity. The two files pass63/63 before archive integration.
 
 The independent archive codec passes17 focused cases, including corruption,
 changed sources, fsync failure, resource bounds and a real Windows junction.
-Store/private-helper integration and ledger-first cleanup follow after the
-helper's exact-head review and merge. This checkpoint is not a claim that the
-complete #153 fix is ready or that production archival is enabled.
+The integrated four-file focus passed104 cases before the added byte-packing
+case, which also passed. Final full-suite/guard results are recorded in the
+development log and PR handoff; CI and independent review still gate merge.
+
+The1,001-job fixture creates more than2,000 job entries, successfully restarts,
+archives to exactly200 hot jobs across five batches, and retains readable cold
+commands. Its measured privacy-check count stays13 before/after growth; one
+sample measured36.347 ms and58.503 ms. Timings vary; the structural check-count
+bound is the stable assertion. No claim of constant SQL cost or total archive
+byte retention is made. Cold audit history grows and future roll-up remains
+separate. Production archival is not enabled by this library-only slice.
 
 Cleanup verification has a separate missing-source mode for interrupted hot
 removal after the archive pointer has committed. Missing members are then
