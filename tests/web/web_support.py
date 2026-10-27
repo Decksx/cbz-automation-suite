@@ -100,8 +100,17 @@ def post_headers(auth: dict[str, str], csrf: str, **extra: str) -> dict[str, str
     return headers
 
 
-def private_dir(path: Path) -> Path:
-    """A state directory prepared the way the operator's --init-state-dir does."""
+def private_dir(path: Path, config: str | None = "") -> Path:
+    """A state directory prepared the way the operator's --init-state-dir does.
+
+    ``config`` is written as console.toml. The default, empty, keeps the
+    example's network roots (\\\\tower, Z:) out of tests that are not about
+    them: checking those costs a ~3 s name lookup per start. Pass None to leave
+    the file absent, so the first open copies the example, as in production.
+    """
     from comic_automation.web.state_dir import init_state_dir
 
-    return init_state_dir(path)
+    init_state_dir(path)
+    if config is not None:
+        (path / "console.toml").write_text(config, encoding="utf-8")
+    return path
