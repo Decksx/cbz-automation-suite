@@ -193,9 +193,9 @@ def _containing_root(state: Path, roots: list[tuple[str, str]]) -> tuple[str, st
 
     Network roots (UNC, or a drive mapped to a share such as Z: on Tower) are
     compared lexically only. Resolving one blocks for 20 s or more when the
-    server is offline, which would stall start-up. A network root cannot
-    contain a local state directory, and if the state directory itself is on
-    the share, its own lexical and resolved forms are still compared.
+    server is offline, which would stall start-up. That is sound only because
+    :func:`open_state_dir` refuses a state directory on a network location
+    first: a network root cannot contain a local directory.
     """
     lexical = _norm(str(state))
     resolved = _norm(os.path.realpath(state))
@@ -263,6 +263,12 @@ def open_state_dir(path: Path, environ: Mapping[str, str] | None = None) -> Stat
         )
     if not path.is_dir():
         raise StateDirRefused(f"{path} is not a directory.")
+    # A local volume only. SQLite's locking is unreliable over SMB, and it is
+    # what makes the lexical-only comparison of network roots sound: a network
+    # root cannot contain a local directory. Without this, a state directory
+    # spelled \\tower\media\comics\... would slip past a root spelled Z:\comics.
+    if _is_network(str(path)) or _is_network(os.path.realpath(path)):
+        raise StateDirRefused(f"The state directory {path} is on a network location; it must be on a local drive.")
     # Checked before anything is written into it, including the lock file.
     try:
         problems = acl.privacy_problems(path)
