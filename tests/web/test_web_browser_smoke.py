@@ -14,16 +14,14 @@ from __future__ import annotations
 
 import getpass
 import json
-import os
-import subprocess
-import sys
+import urllib.parse
 import urllib.request
 
 import pytest
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
-from test_web_server import REPO, _reap, _start, _wait_for_session  # noqa: E402  (shared server start-up)
+from test_web_server import _reap, _start, _wait_for_session  # noqa: E402  (shared server start-up)
 from web_support import private_dir  # noqa: E402
 
 
@@ -60,8 +58,9 @@ self.addEventListener('fetch', e => e.respondWith(new Response('SERVICE-WORKER-M
 
 
 def _register_worker_on_fresh_port(context) -> int:
-    """Play the earlier listener: serve a page that installs a service worker on
-    127.0.0.1:<port>, let the browser register it, then free the port."""
+    """Play an earlier listener: install a service worker on 127.0.0.1:<port>
+    and localhost:<port> (every spelling a console used to answer on), then
+    free the port."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
 
@@ -80,61 +79,52 @@ def _register_worker_on_fresh_port(context) -> int:
     earlier = ThreadingHTTPServer(("127.0.0.1", 0), Earlier)
     threading.Thread(target=earlier.serve_forever, daemon=True).start()
     port = earlier.server_address[1]
-    page = context.new_page()
-    page.goto(f"http://127.0.0.1:{port}/")
-    page.wait_for_function("document.title === 'registered'")
-    page.close()
+    for host in ("127.0.0.1", "localhost"):
+        page = context.new_page()
+        page.goto(f"http://{host}:{port}/")
+        page.wait_for_function("document.title === 'registered'")
+        page.close()
     earlier.shutdown()
     earlier.server_close()
     return port
 
 
-def test_a_service_worker_left_on_an_old_address_cannot_reach_the_console(browser, tmp_path):
-    """codex-lead's R3 on #151. Browser state belongs to an origin, port
-    included. A worker registered by whatever held a port earlier intercepts a
-    console later started on that same fixed port (the control half of this
-    test shows the risk is real). The default, a new port at every start,
-    gives the console an origin no earlier listener has had."""
+def test_a_service_worker_left_on_a_reused_port_cannot_reach_the_console(browser, tmp_path):
+    """codex-lead's R3 on #151, the strong form: even on the *same* port an
+    earlier program used, its service worker cannot touch the console. Browser
+    pages use <random label>.localhost:<port>, an origin new each run; the old
+    worker belongs to 127.0.0.1/localhost:<port>. The control step shows the
+    old worker is still installed and active on that port."""
     context = browser.new_context()
     old_port = _register_worker_on_fresh_port(context)
-
-    # Control: a console on the reused fixed port is intercepted before it sees /login.
-    fixed = private_dir(tmp_path / "fixed")
-    proc = _start(fixed, "--port", str(old_port))  # the later --port wins over _start's 0
+    state = private_dir(tmp_path / "web-console")
+    proc = _start(state, "--port", str(old_port))  # the later --port wins over _start's 0
     try:
-        session = _wait_for_session(fixed, proc)
+        session = _wait_for_session(state, proc)
         assert session["port"] == old_port
-        page = context.new_page()
-        response = page.goto(_login_url(session))
-        assert response.from_service_worker and "SERVICE-WORKER-MARKER" in page.content()
-        page.close()
-    finally:
-        _reap(proc)
 
-    # Default: a new port, so the old worker's origin never matches.
-    fresh = private_dir(tmp_path / "fresh")
-    (fresh / "console.toml").write_text("")  # the defaults, as a first run gets them
-    proc = subprocess.Popen([sys.executable, "-m", "comic_automation.web.server"], cwd=REPO,
-                            env={**os.environ, "CBZ_WEB_CONSOLE_HOME": str(fresh)},
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        session = _wait_for_session(fresh, proc)
-        assert session["port"] != old_port
+        control = context.new_page()  # the worker still answers on the old spelling
+        response = control.goto(f"http://127.0.0.1:{old_port}/anything")
+        assert response.from_service_worker and "SERVICE-WORKER-MARKER" in control.content()
+        control.close()
+
         page = context.new_page()
         response = page.goto(_login_url(session))
         assert not response.from_service_worker
         sync_api.expect(page.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
+        assert page.evaluate("navigator.serviceWorker.controller") is None
     finally:
         _reap(proc)
     context.close()
 
 
 def _login_url(session: dict) -> str:
+    """The sign-in URL the server returns, on this run's <label>.localhost host."""
     port = session["port"]
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/bootstrap", method="POST",
                                  headers={"X-Launcher-Secret": session["launcher_secret"]})
     with urllib.request.urlopen(req, timeout=10) as res:
-        return f"http://127.0.0.1:{port}/login?code={json.load(res)['code']}"
+        return json.load(res)["login_url"]
 
 
 def test_browser_sign_in_csrf_cross_origin_and_code_reuse(console, browser):
@@ -145,7 +135,8 @@ def test_browser_sign_in_csrf_cross_origin_and_code_reuse(console, browser):
 
     # Bootstrap code -> session cookie -> the shell loads its session.
     page.goto(url)
-    assert page.url == f"http://127.0.0.1:{port}/"
+    host = urllib.parse.urlsplit(url).netloc
+    assert host.endswith(f".localhost:{port}") and page.url == f"http://{host}/"
     sync_api.expect(page.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
     cookie = next(c for c in context.cookies() if c["name"].startswith("cbz_console_"))
     assert cookie["httpOnly"] and cookie["sameSite"] == "Strict"
@@ -169,13 +160,13 @@ def test_browser_sign_in_csrf_cross_origin_and_code_reuse(console, browser):
     # A page on another origin cannot read the API or post to it: the browser
     # blocks it (no CORS headers), before the server's own Origin check.
     other = context.new_page()
-    other.goto(f"http://localhost:{port}/")
+    other.goto(f"http://127.0.0.1:{port}/api/health")  # same server, different origin
     blocked = other.evaluate(f"""async () => {{
         const results = [];
         for (const init of [{{credentials: 'include'}},
                             {{method: 'POST', credentials: 'include', body: '{{}}',
                               headers: {{'Content-Type': 'application/json'}}}}]) {{
-            try {{ await fetch('http://127.0.0.1:{port}/api/session', init); results.push('allowed'); }}
+            try {{ await fetch('http://{host}/api/session', init); results.push('allowed'); }}
             catch (e) {{ results.push('blocked'); }}
         }}
         return results;
