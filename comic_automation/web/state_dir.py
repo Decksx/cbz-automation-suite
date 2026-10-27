@@ -34,6 +34,7 @@ from __future__ import annotations
 import functools
 import os
 import shutil
+import threading
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -218,18 +219,27 @@ def _bounded(fn, *args):
     """Run ``fn`` with a time limit; raise TimeoutError if it does not finish.
 
     Used for the few calls that can block on the network (name resolution, a
-    stat through a share). A call that overruns is abandoned in its daemon
-    thread; start-up then refuses, so nothing waits on it.
+    stat through a share). The call runs in a *daemon* thread, which an
+    overrun leaves behind. Not a ThreadPoolExecutor: Python joins executor
+    threads at exit, so a refused start-up would still hang until the blocked
+    call returned (codex-lead's R4 on #151).
     """
-    import concurrent.futures
+    outcome: dict[str, object] = {}
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        return pool.submit(fn, *args).result(timeout=REMOTE_CHECK_TIMEOUT_SECONDS)
-    except concurrent.futures.TimeoutError:
-        raise TimeoutError(f"{getattr(fn, '__name__', fn)} took over {REMOTE_CHECK_TIMEOUT_SECONDS} s") from None
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+    def target() -> None:
+        try:
+            outcome["value"] = fn(*args)
+        except BaseException as exc:  # handed to the caller below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, name=f"bounded-{getattr(fn, '__name__', 'call')}", daemon=True)
+    worker.start()
+    worker.join(REMOTE_CHECK_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} took over {REMOTE_CHECK_TIMEOUT_SECONDS} s")
+    if "error" in outcome:
+        raise outcome["error"]  # type: ignore[misc]
+    return outcome["value"]
 
 
 def _unc_of(root: str) -> str | None:
@@ -256,13 +266,19 @@ def _local_addresses() -> frozenset[str]:
 
     # Not getfqdn(): it took 1.3 s on OfficePC. A fully qualified local name is
     # still recognised, through _host_is_this_machine's lookup of its address.
+    # The own-address lookup can block like any other (codex-lead's R4), so it
+    # is bounded too. A timeout propagates: without this machine's addresses a
+    # share on it could be mistaken for a remote one, so start-up refuses. Only
+    # a successful result is cached.
     names = {"localhost", ".", "?", "127.0.0.1", "::1"}
     name = socket.gethostname()
     names.add(name.lower())
     try:
-        names.update(socket.gethostbyname_ex(name)[2])  # this machine's own addresses
+        names.update(_bounded(socket.gethostbyname_ex, name)[2])  # this machine's own addresses
+    except TimeoutError:
+        raise  # a subclass of OSError, so caught first: a stall is not "no addresses"
     except OSError:
-        pass
+        pass  # the name has no addresses; the loopback names above still apply
     return frozenset(names)
 
 
