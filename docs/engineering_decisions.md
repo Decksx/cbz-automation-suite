@@ -1606,14 +1606,29 @@ not spell out:
   files; an explicit grant on `console.sqlite3` inside it still opened the
   ledger (codex-lead). Every entry is checked for extra grants or a foreign
   owner before config or ledger are read, bounded at 2,000 entries.
-- **A new port at every start (`port = 0`, the default).** A service worker
-  registered on `127.0.0.1:<port>` by whatever held that port earlier
-  intercepts a later console's `/login` before any response header can act
-  (codex-lead, measured in Edge; the browser test reproduces it on a reused
-  fixed port as its control). Browser state is per origin, port included, so a
-  fresh port gives the console an origin nothing earlier has had. The launcher
-  reads the port from `session.json`, so nothing depends on a fixed one. A
-  fixed port remains configurable, with that trade-off stated in the example.
+- **A browser host unique to each run: `<random label>.localhost:<port>`.**
+  A service worker registered on `127.0.0.1:<port>` by whatever held that port
+  earlier intercepts a later console's `/login` before any response header can
+  act (codex-lead, measured in Edge). A new port per start (`port = 0`, still
+  the default) only made the address unpredictable, not new: an OS-chosen port
+  can be one used before (codex-lead's R3 follow-up). So every browser page is
+  served on a host whose first label is 128 random bits, chosen per run.
+  Browsers send `*.localhost` to loopback without DNS (measured in Edge, which
+  also treats it as a secure context), and browser state is per origin, host
+  included, so no earlier program can have left state there, even on the same
+  port. The browser test registers a worker on `127.0.0.1` and `localhost` at
+  a port, starts the console on that same port, shows the worker still answers
+  the old spelling, and signs in through the new host untouched. Only the
+  launcher's endpoints (hello, bootstrap, health, no cookies) also answer on
+  `127.0.0.1`. The bootstrap reply carries the sign-in URL, and the launcher
+  opens it only if it is `http://<…>.localhost:<port>/login`.
+- **Bounded lookups that do not hold the process.** Name lookups and stats
+  through a share run in a daemon thread with a 5 s limit. A
+  `ThreadPoolExecutor` would be joined at exit, keeping a refused process
+  alive until the blocked call returned, and this machine's own-address lookup
+  was at first unbounded (codex-lead's R4). A timeout refuses start-up; it is
+  never read as "no addresses". `TimeoutError` is an `OSError`, which a
+  regression test caught.
 
 The launcher also bypasses proxy settings, which urllib otherwise applies to
 127.0.0.1. The access log drops every query string, not only `/login`'s.
