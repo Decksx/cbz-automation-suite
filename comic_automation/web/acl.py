@@ -21,8 +21,6 @@ from pathlib import Path
 
 SYSTEM_SID = "S-1-5-18"
 ADMINISTRATORS_SID = "S-1-5-32-544"
-# SDDL writes some well-known SIDs as two-letter aliases.
-_ALIASES = {"SY": SYSTEM_SID, "BA": ADMINISTRATORS_SID}
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -49,6 +47,7 @@ if os.name == "nt":
     _advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
                                             ctypes.POINTER(wintypes.DWORD)]
     _advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    _advapi.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     _advapi.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
                                               ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
                                               ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
@@ -56,6 +55,31 @@ if os.name == "nt":
     _advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
     _advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
         ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
+
+    def _sid_text(sid_ptr) -> str:
+        text = wintypes.LPWSTR()
+        if not _advapi.ConvertSidToStringSidW(sid_ptr, ctypes.byref(text)):
+            raise AclError(f"ConvertSidToStringSid failed: WinError {ctypes.get_last_error()}")
+        try:
+            return text.value
+        finally:
+            _kernel.LocalFree(text)
+
+    def canonical_sid(sid: str) -> str:
+        """``sid`` as a full ``S-1-…`` string.
+
+        SDDL writes well-known accounts as two-letter aliases, and which ones
+        depends on the machine: the built-in Administrator account (the CI
+        runner's) is ``LA``, SYSTEM is ``SY``, Administrators is ``BA``. Windows
+        resolves them, rather than a hand-kept table that misses one.
+        """
+        ptr = ctypes.c_void_p()
+        if not _advapi.ConvertStringSidToSidW(sid, ctypes.byref(ptr)):
+            return sid  # not a SID Windows knows; compared as written
+        try:
+            return _sid_text(ptr)
+        finally:
+            _kernel.LocalFree(ptr)
 
     def operator_sid() -> str:
         """The SID of the account running this process, from its own token."""
@@ -69,13 +93,7 @@ if os.name == "nt":
             if not _advapi.GetTokenInformation(token, _TOKEN_USER, buf, size, ctypes.byref(size)):
                 raise AclError(f"GetTokenInformation failed: WinError {ctypes.get_last_error()}")
             sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]  # TOKEN_USER.User.Sid
-            text = wintypes.LPWSTR()
-            if not _advapi.ConvertSidToStringSidW(sid_ptr, ctypes.byref(text)):
-                raise AclError(f"ConvertSidToStringSid failed: WinError {ctypes.get_last_error()}")
-            try:
-                return text.value
-            finally:
-                _kernel.LocalFree(text)
+            return _sid_text(sid_ptr)
         finally:
             _kernel.CloseHandle(token)
 
@@ -117,7 +135,7 @@ if os.name == "nt":
         allowed = {me, SYSTEM_SID, ADMINISTRATORS_SID}
         problems = []
         owner = re.search(r"O:([^:]+?)(?=[GDS]:|$)", text)
-        owner_sid = _ALIASES.get(owner.group(1), owner.group(1)) if owner else None
+        owner_sid = canonical_sid(owner.group(1)) if owner else None
         if owner_sid not in allowed:
             problems.append(f"owned by {owner_sid}, not by the operator")
         dacl = re.search(r"D:([A-Z]*)(\(.*)?$", text)
@@ -128,7 +146,7 @@ if os.name == "nt":
         for ace in re.findall(r"\(([^)]*)\)", dacl.group(2) or ""):
             fields = ace.split(";")
             if fields[0] in ("A", "OA"):  # allow entries; deny entries only take access away
-                sid = _ALIASES.get(fields[5], fields[5])
+                sid = canonical_sid(fields[5])
                 if sid not in allowed:
                     problems.append(f"grants access to {sid}")
         return problems
