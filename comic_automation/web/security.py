@@ -22,6 +22,12 @@ fragment (``/#k=…``; fragments never reach a server or a log). The page keeps
 it in ``sessionStorage`` and sends it as ``X-Session-Key`` on every API call.
 A session needs both.
 
+Each session's cookie has its own name (``cbz_console_<public id>``; the id is
+not a secret). The browser key selects the session and that session's own
+cookie must match. One shared cookie name would let a second sign-in overwrite
+the cookie every open console tab relies on, while each tab keeps its own
+browser key, so the older tabs would be locked out for good.
+
 The launcher secret is never accepted as a session, and a session is never
 accepted where the launcher secret is required (except ``/api/health``, which
 takes either). Before the launcher sends its secret at all, it checks that the
@@ -44,7 +50,7 @@ from typing import Callable, Mapping
 
 BOOTSTRAP_TTL_SECONDS = 60
 MAX_BODY_BYTES = 64 * 1024
-SESSION_COOKIE = "cbz_console_session"
+SESSION_COOKIE_PREFIX = "cbz_console_"
 # A body naming any of these is refused outright (§9 "Input"): the browser never
 # sends a command, the server always builds it from validated parameters.
 COMMAND_FIELDS = frozenset({"argv", "cmd", "command"})
@@ -90,6 +96,11 @@ class Session:
     browser_key: str
     operator: str
     created_at: float
+    public_id: str  # names this session's cookie; not a secret
+
+    @property
+    def cookie_name(self) -> str:
+        return SESSION_COOKIE_PREFIX + self.public_id
 
 
 @dataclass
@@ -134,18 +145,22 @@ class SecretStore:
             return True
 
     def create_session(self) -> Session:
-        session = Session(new_secret(), new_secret(), new_secret(), self.operator, self.clock())
+        session = Session(new_secret(), new_secret(), new_secret(), self.operator, self.clock(),
+                          secrets.token_hex(8))
         with self._lock:
             self._sessions.append(session)
         return session
 
-    def session_for(self, session_id: str | None, browser_key: str | None) -> Session | None:
-        """The session matching both the cookie and the browser key, else None."""
+    def session_for(self, cookies: Mapping[str, str], browser_key: str | None) -> Session | None:
+        """The session whose browser key matches and whose own cookie is present and matches.
+
+        ``cookies`` maps every cookie name the request carried to its value.
+        """
         with self._lock:
             found = None
             for s in self._sessions:
-                # Both compared for every session, so timing reveals neither.
-                if same(session_id, s.session_id) & same(browser_key, s.browser_key):
+                # Both halves compared for every session, so timing reveals neither.
+                if same(browser_key, s.browser_key) & same(cookies.get(s.cookie_name), s.session_id):
                     found = s
             return found
 
@@ -156,21 +171,21 @@ class SecretStore:
                     *(s.csrf_token for s in self._sessions), *(s.browser_key for s in self._sessions)]
 
 
-def cookie_value(environ: Mapping[str, str], name: str = SESSION_COOKIE) -> str | None:
+def request_cookies(environ: Mapping[str, str]) -> dict[str, str]:
+    """Every cookie the request carried, by name; empty when absent or malformed."""
     raw = environ.get("HTTP_COOKIE")
     if not raw:
-        return None
+        return {}
     try:
         jar = SimpleCookie()
         jar.load(raw)
     except CookieError:
-        return None
-    morsel = jar.get(name)
-    return morsel.value if morsel else None
+        return {}
+    return {name: morsel.value for name, morsel in jar.items()}
 
 
 def session_cookie_header(session: Session) -> str:
-    return f"{SESSION_COOKIE}={session.session_id}; HttpOnly; SameSite=Strict; Path=/"
+    return f"{session.cookie_name}={session.session_id}; HttpOnly; SameSite=Strict; Path=/"
 
 
 def allowed_hosts(port: int) -> tuple[str, str]:
