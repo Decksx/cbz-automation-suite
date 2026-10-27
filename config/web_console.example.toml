@@ -6,7 +6,12 @@
 # what the console is allowed to touch.
 
 [server]
-port = 8765                  # bound on 127.0.0.1 only; the host is not configurable
+# Bound on 127.0.0.1 only; the host is not configurable.
+# 0 (recommended): a new free port at every start, so browser state left on an
+# old address (for example a service worker another program registered while
+# it held that port) can never intercept the console's pages. A fixed port
+# (1024-65535) gives a stable address but gives up that protection.
+port = 0
 
 [paths]                      # path parameters must sit under a root of their role
 library      = ['\\tower\media\comics', 'Z:\comics']
