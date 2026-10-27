@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from comic_automation.web.security import BOOTSTRAP_TTL_SECONDS, MAX_BODY_BYTES, SESSION_COOKIE
+from comic_automation.web.security import BOOTSTRAP_TTL_SECONDS, MAX_BODY_BYTES, SESSION_COOKIE_PREFIX
 from web_support import ORIGIN, PORT, call, login, make_app, post_headers
 
 
@@ -55,7 +55,7 @@ def test_login_sets_a_strict_httponly_cookie_and_redirects(app):
     cookie = res.headers["set-cookie"]
     for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
         assert flag in cookie
-    assert cookie.startswith(SESSION_COOKIE + "=")
+    assert cookie.startswith(SESSION_COOKIE_PREFIX)
 
 
 def test_a_bootstrap_code_works_once(app):
@@ -79,7 +79,7 @@ def test_an_expired_code_is_refused(tmp_path):
 
 def test_the_launcher_secret_is_not_a_session(app):
     secret = app.secrets.launcher_secret
-    assert call(app, "GET", "/api/session", headers={"Cookie": f"{SESSION_COOKIE}={secret}"}).status == 401
+    assert call(app, "GET", "/api/session", headers={"Cookie": f"{SESSION_COOKIE_PREFIX}x={secret}"}).status == 401
     assert call(app, "GET", "/api/session", headers={"X-Launcher-Secret": secret}).status == 401
     # ...except for the health check, which the launcher needs before it has a session.
     assert call(app, "GET", "/api/health", headers={"X-Launcher-Secret": secret}).json["ok"] is True
@@ -216,6 +216,17 @@ def test_the_cookie_alone_is_not_a_session(app):
     assert call(app, "GET", "/api/session", headers={"X-Session-Key": auth["X-Session-Key"]}).status == 401
 
 
+def test_signing_in_again_keeps_earlier_sessions_working(app):
+    """A second launch adds a session with its own cookie name; the browser
+    keeps both cookies, so a tab that signed in earlier is not locked out."""
+    first, _ = login(app)
+    second, _ = login(app)
+    both_cookies = f'{first["Cookie"]}; {second["Cookie"]}'
+    for auth in (first, second):
+        res = call(app, "GET", "/api/session", headers={"Cookie": both_cookies, "X-Session-Key": auth["X-Session-Key"]})
+        assert res.status == 200
+
+
 def test_a_browser_key_from_another_session_is_refused(app):
     first, _ = login(app)
     second, _ = login(app)
@@ -226,7 +237,9 @@ def test_a_browser_key_from_another_session_is_refused(app):
 def test_login_clears_old_site_data_and_keeps_the_key_out_of_the_query(app):
     code = call(app, "POST", "/api/bootstrap", headers={"X-Launcher-Secret": app.secrets.launcher_secret}).json["code"]
     res = call(app, "GET", f"/login?code={code}")
-    assert res.headers["clear-site-data"] == '"cache", "storage"'
+    # "cache" only: "storage" would also empty other console tabs' sessionStorage
+    # (their browser keys), as the browser smoke test's two-tab check shows.
+    assert res.headers["clear-site-data"] == '"cache"'
     assert res.headers["location"].startswith("/#k=") and "?" not in res.headers["location"]
 
 
