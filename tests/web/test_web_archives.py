@@ -139,7 +139,9 @@ def test_manifest_and_member_evidence_are_verified(source, fault):
     receipt = ar.write_batch(directory, BATCH_ID, [job], 1000)
     target = directory / receipt.file_name
     def change(manifest, members):
-        entry = manifest["jobs"][0]["members"][0]
+        # Exercise member hashing/path validation independently of the separate
+        # command-vs-ledger guard, which intentionally provides redundancy.
+        entry = manifest["jobs"][0]["members"][1 if fault in ("member_digest", "path_escape") else 0]
         if fault == "member_digest":
             entry["sha256"] = "0" * 64
         elif fault == "member_size":
@@ -147,7 +149,9 @@ def test_manifest_and_member_evidence_are_verified(source, fault):
         elif fault == "extra_member":
             members[JOB_ID + "/extra"] = b"unlisted"
         else:
+            old_path = entry["path"]
             entry["path"] = JOB_ID + "/../escape"
+            members[entry["path"]] = members.pop(old_path)
     rewrite_batch(target, change)
     with pytest.raises(ar.ArchiveRefused):
         ar.verify_batch(target, digest(target))
