@@ -71,6 +71,18 @@ def test_a_directory_that_inherits_shared_access_is_refused(tmp_path):
 
 
 @windows_only
+def test_sddl_aliases_resolve_to_full_sids():
+    """The CI runner is the built-in Administrator, which SDDL writes as LA; a
+    hand-kept alias table that missed it refused the operator's own folder."""
+    assert acl.canonical_sid("SY") == acl.SYSTEM_SID
+    assert acl.canonical_sid("BA") == acl.ADMINISTRATORS_SID
+    la = acl.canonical_sid("LA")
+    assert la.startswith("S-1-5-21-") and la.endswith("-500")
+    me = acl.operator_sid()
+    assert acl.canonical_sid(me) == me
+
+
+@windows_only
 def test_inheriting_is_refused_even_when_the_parent_is_private(tmp_path):
     """Isolates the protected-DACL check: every inherited entry is an allowed
     account, so 'inherits access' is the only problem. Inheritance means a later
