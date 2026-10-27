@@ -1581,9 +1581,14 @@ not spell out:
   name, a second sign-in overwrote the cookie that older tabs paired with their
   own browser key, locking them out (found by the automated PR review). The
   browser key selects the session, and that session's own cookie must match.
-- **Network roots compared lexically only.** Resolving `\\tower\…` or a drive
-  mapped to it took 21 s with Tower offline. A network root cannot contain a
-  local state directory.
+- **Network roots compared lexically only, and a network state directory
+  refused.** Resolving `\\tower\…` or a drive mapped to it took 21 s with Tower
+  offline. Lexical comparison alone let a state directory spelled
+  `\\tower\media\comics\web-console` slip past a root spelled `Z:\comics`
+  (found by codex-lead's review). So the state directory must be on a local
+  volume, checked on both its written and resolved paths. SQLite locking over
+  SMB is unreliable anyway, and a network root cannot contain a local
+  directory.
 
 The launcher also bypasses proxy settings, which urllib otherwise applies to
 127.0.0.1. The access log drops every query string, not only `/login`'s.
