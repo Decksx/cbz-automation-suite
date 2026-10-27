@@ -67,6 +67,9 @@ def test_a_directory_that_inherits_shared_access_is_refused(tmp_path):
         open_state_dir(plain, environ={})
     assert not (plain / "locks").exists()  # refused before writing anything
     init_state_dir(plain)                  # the documented repair
+    # No example config: its \\tower root needs that name to resolve, which the
+    # CI runner cannot do, and this test is about privacy, not containment.
+    (plain / "console.toml").write_text("", encoding="utf-8")
     open_state_dir(plain, environ={}).close()
 
 
@@ -104,9 +107,13 @@ def test_an_extra_grant_on_a_private_directory_is_refused(state):
         open_state_dir(state, environ={})
 
 
-def test_first_open_copies_the_example_config_and_pins_identity(tmp_path):
+def test_first_open_copies_the_example_config_and_pins_identity(tmp_path, monkeypatch):
     """Also the one state-directory test that opens with the example's real
-    network roots (\\\\tower, Z:), so their checks run as in production."""
+    network roots (\\\\tower, Z:), so their checks run as in production. Only
+    the name lookup is replaced: "tower" resolves on OfficePC but not on the CI
+    runner, where the console rightly refuses an unresolvable server."""
+    real = sd._host_is_this_machine
+    monkeypatch.setattr(sd, "_host_is_this_machine", lambda host: False if host.lower() == "tower" else real(host))
     state = private_dir(tmp_path / "web-console", config=None)
     opened = open_state_dir(state, environ={})
     try:
