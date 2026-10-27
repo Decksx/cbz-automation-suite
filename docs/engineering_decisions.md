@@ -1581,14 +1581,39 @@ not spell out:
   name, a second sign-in overwrote the cookie that older tabs paired with their
   own browser key, locking them out (found by the automated PR review). The
   browser key selects the session, and that session's own cookie must match.
-- **Network roots compared lexically only, and a network state directory
-  refused.** Resolving `\\tower\…` or a drive mapped to it took 21 s with Tower
-  offline. Lexical comparison alone let a state directory spelled
-  `\\tower\media\comics\web-console` slip past a root spelled `Z:\comics`
-  (found by codex-lead's review). So the state directory must be on a local
-  volume, checked on both its written and resolved paths. SQLite locking over
-  SMB is unreliable anyway, and a network root cannot contain a local
-  directory.
+- **Containment by physical identity, with network roots handled by host.**
+  Resolving `\\tower\…` or a drive mapped to it took 21 s with Tower offline,
+  so spelling alone was used for network roots at first. codex-lead's review
+  found both ways that fails:
+  - A state directory spelled `\\tower\media\comics\…` slipped past a root
+    spelled `Z:\comics`. The state directory must now be on a local volume,
+    checked on its written and resolved paths. SQLite locking over SMB is
+    unreliable anyway.
+  - A share can expose a *local* folder: a root spelled `\\localhost\C$\…\library`
+    did not catch a local state directory inside that library, and the ledger
+    was created there.
+
+  Containment now also compares `(st_dev, st_ino)` of each root against the
+  state directory and its ancestors; the share and local spellings were
+  measured to report the same identity. A network root's server is found
+  without network access: a mapped drive through `WNetGetConnectionW`, then
+  the host matched against this machine's names and addresses, with a bounded
+  lookup otherwise. A root on another machine is neither resolved nor
+  stat'ed. A root on this machine is stat'ed through its share. A root whose
+  server cannot be determined refuses start-up rather than being assumed
+  disjoint. Checking `\\tower` costs a ~2.7 s name lookup per start.
+- **Contents checked too.** A private directory is only the default for new
+  files; an explicit grant on `console.sqlite3` inside it still opened the
+  ledger (codex-lead). Every entry is checked for extra grants or a foreign
+  owner before config or ledger are read, bounded at 2,000 entries.
+- **A new port at every start (`port = 0`, the default).** A service worker
+  registered on `127.0.0.1:<port>` by whatever held that port earlier
+  intercepts a later console's `/login` before any response header can act
+  (codex-lead, measured in Edge; the browser test reproduces it on a reused
+  fixed port as its control). Browser state is per origin, port included, so a
+  fresh port gives the console an origin nothing earlier has had. The launcher
+  reads the port from `session.json`, so nothing depends on a fixed one. A
+  fixed port remains configurable, with that trade-off stated in the example.
 
 The launcher also bypasses proxy settings, which urllib otherwise applies to
 127.0.0.1. The access log drops every query string, not only `/login`'s.
