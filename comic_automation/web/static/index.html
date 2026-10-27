@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CBZ Console</title>
+  <link rel="stylesheet" href="/static/css/console.css">
+  <script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="shell">
+    <nav class="sidenav" aria-label="Console">
+      <p class="brand">CBZ Console</p>
+      <ul>
+        <li><a href="/" aria-current="page">Dashboard</a></li>
+      </ul>
+      <p class="nav-note">Jobs, tools and plan review arrive in later milestones.</p>
+    </nav>
+    <main id="main" tabindex="-1">
+      <header class="topbar">
+        <h1>Dashboard</h1>
+        <span id="who" class="pill">Connecting…</span>
+      </header>
+      <p id="notice" class="notice" role="alert" hidden></p>
+      <section class="card" aria-labelledby="server-heading">
+        <h2 id="server-heading">Server</h2>
+        <dl id="server" class="facts"></dl>
+      </section>
+      <section class="card" aria-labelledby="config-heading">
+        <h2 id="config-heading">Effective configuration</h2>
+        <p class="hint">Read from console.toml at startup. Edit that file and restart the console to change a value.</p>
+        <table class="grid">
+          <thead><tr><th scope="col">Setting</th><th scope="col">Value</th><th scope="col">Source</th></tr></thead>
+          <tbody id="config"></tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+  <div id="live" class="visually-hidden" aria-live="polite"></div>
+</body>
+</html>
