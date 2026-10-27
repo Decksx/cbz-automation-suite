@@ -1521,3 +1521,68 @@ units finish, the observer joins and callbacks/units drain before M1 releases
 root ownership. Polling errors warn once and keep running, as agreed with Claude
 in hive3204. This adds no forced termination or runtime activation. Protocol,
 log contract and unbounded active-operation latency: docs/watcher_graceful_stop.md.
+
+### Web console M2: a stdlib loopback skeleton with no fallback state (2026-10-27)
+
+This lifts part of the "deferred until a concrete need" line in `CLAUDE.md`:
+David asked for a local web console on 2026-10-26, so a control plane now has
+that need. It is the narrow one design §3 chose, a stdlib WSGI app
+(`comic_automation/web`) served by `wsgiref` with a threading mixin. It adds
+no runtime dependency; FastAPI and an SPA framework stay deferred. Behaviour
+lives in service modules so the transport can change later without touching it.
+
+The bind host is a constant, `127.0.0.1`. A `server.host` in `console.toml`
+other than that refuses startup instead of being ignored, and so does any
+unknown key, because a typo in a path allowlist would otherwise silently change
+what the console may touch.
+
+Runtime state has exactly one home, `G:\ComicAutomation\web-console`, and no
+fallback: a second state directory would be a second jobs database, which would
+split admission (design §5.2). For the same reason a missing directory is
+refused, not created. A remounted or absent G: must not get a fresh, empty
+ledger, so creating it is an explicit operator step (`--init-state-dir`, which
+also refuses when the parent is missing). The directory's `st_dev`/`st_ino`
+is pinned in `console.sqlite3` on first run and a change refuses startup; a
+zero identity is refused, as in M1. A byte lock on `locks\console.lock` keeps
+one console per state directory.
+
+Security follows design §9 on loopback: three distinct per-start secrets
+(launcher secret in an operator-only `session.json`, single-use 60 s bootstrap
+code, session cookie with a per-session CSRF token), a Host check before
+everything including static files, and Origin, fetch-metadata, JSON-only and
+CSRF checks before routing. Because the checks precede routing, a POST to a
+path with no handler still answers 403 without the token; the tests and the
+one Edge smoke test use that instead of a test-only endpoint.
+
+An independent review of the first draft added four things design §9/§10 did
+not spell out:
+
+- **A private state directory.** `G:\ComicAutomation` grants Authenticated
+  Users Modify (measured with `icacls`), so a directory created under it lets
+  any account read `session.json` or edit `console.toml` and the ledger.
+  `--init-state-dir` sets a protected DACL (operator, SYSTEM, Administrators,
+  by SID), and start-up refuses a directory that inherits or grants anything
+  else. Re-running `--init-state-dir` is the repair.
+- **A second session half.** Cookies are not port-scoped, so the browser sends
+  the session cookie to every listener on 127.0.0.1. `/login` therefore also
+  issues a browser key in the redirect's fragment (never sent to a server or
+  logged). The page keeps it in `sessionStorage` and sends it as
+  `X-Session-Key`, and a session needs both. A console tab opened by hand
+  instead of through the launcher has no key and must sign in again; that is
+  intended.
+- **`GET /api/launcher/hello`.** `session.json` is stale after every reboot, so
+  whatever then holds the port would receive the launcher secret. The launcher
+  sends a random challenge first and needs an HMAC under the secret back
+  before sending the secret. The endpoint is open; its answer reveals nothing.
+  `/login` also sends `Clear-Site-Data` to drop anything planted on the origin.
+- **Network roots compared lexically only.** Resolving `\\tower\…` or a drive
+  mapped to it took 21 s with Tower offline. A network root cannot contain a
+  local state directory.
+
+The launcher also bypasses proxy settings, which urllib otherwise applies to
+127.0.0.1. The access log drops every query string, not only `/login`'s.
+
+Not in M2: jobs and SSE (M3), the path-parameter allowlist and schemas (M4),
+and watcher status (M6, so `/api/health` reports `watcher_state: unknown`).
+The browser smoke test's SSE resume check waits for M3. Fonts are not
+vendored yet; the shell falls back to system fonts.
