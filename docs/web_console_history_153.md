@@ -55,8 +55,13 @@ orphan-directory reuse, and root identity refusal before lock-file creation.
 Direct runner-inspection tests also cover root access, a network location and
 zero identity. The two files pass63/63 before archive integration.
 
-The independent archive codec passes14 focused cases, including corruption,
+The independent archive codec passes17 focused cases, including corruption,
 changed sources, fsync failure, resource bounds and a real Windows junction.
 Store/private-helper integration and ledger-first cleanup follow after the
 helper's exact-head review and merge. This checkpoint is not a claim that the
 complete #153 fix is ready or that production archival is enabled.
+
+Cleanup verification has a separate missing-source mode for interrupted hot
+removal after the archive pointer has committed. Missing members are then
+acceptable; remaining members must match and new/unlisted files still refuse.
+The codec does not supply or replace the caller's durable-pointer proof.
