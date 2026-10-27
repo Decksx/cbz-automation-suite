@@ -24,12 +24,10 @@ from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG = REPO_ROOT / "config" / "web_console.example.toml"
-# 0: a free port chosen by the OS at every start. Browser state such as a
-# service worker belongs to an origin, which includes the port, so state left
-# by whatever held some earlier port only reaches the console if the OS
-# happens to hand out that same port. That makes the console's origin
-# unpredictable rather than guaranteed new: it removes the fixed target. The
-# launcher reads the port from session.json, so nothing needs it fixed.
+# 0: a free port chosen by the OS at every start. Origin isolation does not
+# depend on it: browser pages use a random <label>.localhost host that is new
+# every run (see security.py), whatever the port. The launcher reads the port
+# from session.json, so nothing needs it fixed.
 DEFAULT_PORT = 0
 LOOPBACK_HOST = "127.0.0.1"
 
