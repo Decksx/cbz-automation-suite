@@ -10,7 +10,8 @@ The "CBZ Console" shortcut runs this under ``pythonw``. It:
 2. otherwise starts ``python -m comic_automation.web.server`` detached and
    waits for its ``session.json`` and health check;
 3. asks the console for a single-use bootstrap code (``POST /api/bootstrap``
-   with ``X-Launcher-Secret``) and opens the browser at ``/login?code=…``.
+   with ``X-Launcher-Secret``) and opens the browser at the sign-in URL it
+   returns, on this run's own ``<label>.localhost`` host.
 
 If the server refuses to start (G: missing, another console running, bad
 ``console.toml``), the server's own reason is shown in a message box, since a
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -131,7 +133,14 @@ def login_url(session: dict) -> str:
     port = session["port"]
     reply = _request(f"http://127.0.0.1:{port}/api/bootstrap", "POST", 10,
                      {"X-Launcher-Secret": session["launcher_secret"]})
-    return f"http://127.0.0.1:{port}/login?code={reply['code']}"
+    # The server names this run's browser host (<label>.localhost:<port>). Only
+    # a server that passed the hello check gets here, but the URL is still
+    # checked before a browser is pointed at it.
+    url = urllib.parse.urlsplit(str(reply.get("login_url", "")))
+    if not (url.scheme == "http" and url.hostname and url.hostname.endswith(".localhost")
+            and url.port == port and url.path == "/login"):
+        raise LaunchError("The console returned an unexpected sign-in address.")
+    return url.geturl()
 
 
 def _show_error(message: str) -> None:
