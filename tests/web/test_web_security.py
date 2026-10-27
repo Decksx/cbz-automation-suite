@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from comic_automation.web.security import BOOTSTRAP_TTL_SECONDS, MAX_BODY_BYTES, SESSION_COOKIE_PREFIX
-from web_support import ORIGIN, PORT, call, login, make_app, post_headers
+from web_support import HOST, LABEL, ORIGIN, PORT, call, login, make_app, post_headers
 
 
 @pytest.fixture
@@ -18,14 +18,37 @@ def app(tmp_path):
 
 
 # --------------------------------------------------------------- Host check
-@pytest.mark.parametrize("host", ["evil.example:8765", "127.0.0.1:9999", "192.168.42.117:8765", "", "127.0.0.1"])
-def test_a_foreign_host_gets_421_even_for_static_files(app, host):
+@pytest.mark.parametrize("host", ["evil.example:8765", "127.0.0.1:9999", "192.168.42.117:8765", "", "127.0.0.1",
+                                  f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"other.localhost:{PORT}",
+                                  f"{LABEL}.localhost:9999", f"{LABEL}.localhost"])
+def test_browser_pages_answer_only_on_this_runs_host(app, host):
+    """Browser pages live on <label>.localhost:<port>, an origin new each run, so
+    nothing an earlier program left in the browser can apply (codex-lead R3).
+    Plain 127.0.0.1/localhost are refused for them, as are foreign names."""
     assert call(app, "GET", "/", host=host).status == 421
     assert call(app, "GET", "/api/session", host=host).status == 421
 
 
-def test_localhost_spelling_is_accepted(app):
-    assert call(app, "GET", "/", host=f"localhost:{PORT}").status == 200
+def test_this_runs_browser_host_is_accepted_case_insensitively(app):
+    assert call(app, "GET", "/", host=HOST.upper()).status == 200
+
+
+@pytest.mark.parametrize("host", [f"127.0.0.1:{PORT}", f"localhost:{PORT}", HOST])
+def test_the_launcher_endpoints_also_answer_on_loopback(app, host):
+    secret = {"X-Launcher-Secret": app.secrets.launcher_secret}
+    assert call(app, "GET", "/api/launcher/hello", host=host, headers={"X-Launcher-Challenge": "c" * 40}).status == 200
+    assert call(app, "GET", "/api/health", host=host, headers=secret).status == 200
+    reply = call(app, "POST", "/api/bootstrap", host=host, headers=secret).json
+    assert reply["login_url"] == f"http://{HOST}/login?code={reply['code']}"
+
+
+def test_each_app_gets_its_own_random_browser_host(tmp_path):
+    from comic_automation.web.app import ConsoleApp
+
+    first = make_app(tmp_path)
+    labels = {ConsoleApp(config=first.config, secrets=first.secrets, port=PORT, started_at="", git_sha=None).origin_label
+              for _ in range(3)}
+    assert len(labels) == 3 and all(len(label) == 32 for label in labels)
 
 
 # ----------------------------------------------------------- authentication
@@ -117,7 +140,8 @@ def test_post_without_origin_is_403(app):
     assert call(app, "POST", "/api/nothing", headers=headers, body={}).json["error"] == "ORIGIN_REFUSED"
 
 
-@pytest.mark.parametrize("origin", ["http://evil.example", "http://127.0.0.1:9999", "null", "https://127.0.0.1:8765"])
+@pytest.mark.parametrize("origin", ["http://evil.example", "http://127.0.0.1:9999", "null", "https://127.0.0.1:8765",
+                                    f"http://127.0.0.1:{PORT}", f"https://{HOST}"])
 def test_post_with_a_foreign_origin_is_403(app, origin):
     auth, csrf = login(app)
     res = call(app, "POST", "/api/nothing", headers=post_headers(auth, csrf, Origin=origin), body={})
