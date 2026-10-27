@@ -24,7 +24,11 @@ from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG = REPO_ROOT / "config" / "web_console.example.toml"
-DEFAULT_PORT = 8765
+# 0: a free port chosen at every start. Browser state such as a service worker
+# belongs to an origin, which includes the port, so a fresh port means nothing
+# left on an earlier address by another program can intercept the console's
+# pages. The launcher reads the port from session.json, so nothing needs it fixed.
+DEFAULT_PORT = 0
 LOOPBACK_HOST = "127.0.0.1"
 
 # Path roles a tool parameter may point into (§4.3, §9 "Paths"). The console's
@@ -133,8 +137,8 @@ def load_console_config(config_path: Path, environ: Mapping[str, str] | None = N
     settings["server.host"] = Setting(LOOPBACK_HOST, "console.toml" if "host" in server else "default")
 
     port = server.get("port", DEFAULT_PORT)
-    if not 1024 <= port <= 65535:
-        raise ConfigError(f"{config_path}: server.port must be between 1024 and 65535")
+    if port != 0 and not 1024 <= port <= 65535:
+        raise ConfigError(f"{config_path}: server.port must be 0 (a new port each start) or between 1024 and 65535")
     settings["server.port"] = Setting(port, "console.toml" if "port" in server else "default")
 
     paths: dict[str, tuple[str, ...]] = {}
