@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ _NONCE = re.compile(r"[0-9a-f]{32}\Z")
 _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _POLICY = dal.ConnectionPolicy("console_jobs", False, 5.0,
     (("foreign_keys", "ON"), ("journal_mode", "WAL"), ("synchronous", "FULL"), ("busy_timeout", "5000")))
+log = logging.getLogger("comic_automation.web")
 
 
 class JobRefused(RuntimeError):
@@ -100,12 +102,16 @@ class RunnerClaim:
     nonce: str
     runner: ProcessIdentity
     _handle: object
+    _release: Callable | None = None
     _closed: bool = False
 
     def close(self) -> None:
         """Release only the OS lock; the durable claimed row still holds admission."""
         if not self._closed:
             self._closed = True
+            if self._release is not None:
+                self._release(self)
+                return
             try:
                 state_dir._unlock(self._handle)
             finally:
@@ -116,8 +122,14 @@ class RunnerClaim:
             raise JobRefused("CLAIM_CLOSED")
         return self
 
-    def __exit__(self, *args) -> None:
-        self.close()
+    def __exit__(self, kind, error, traceback) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup:
+            if error is None:
+                raise
+            log.warning("Runner lock cleanup failed for %s: %s", self.job_id, cleanup)
+            error.add_note(f"Runner lock cleanup also failed: {cleanup}")
 
 
 _SCHEMA = (
@@ -144,6 +156,16 @@ _SCHEMA = (
        BEGIN SELECT RAISE(ABORT, 'job_events are append-only'); END""",
     """CREATE TRIGGER IF NOT EXISTS job_events_no_delete BEFORE DELETE ON job_events
        BEGIN SELECT RAISE(ABORT, 'job_events are append-only'); END""",
+    "CREATE INDEX IF NOT EXISTS jobs_by_state ON jobs(state,admission_seq)",
+    "CREATE INDEX IF NOT EXISTS events_by_job ON job_events(job_id,event_seq)",
+    """CREATE TABLE IF NOT EXISTS job_archives (
+       job_id TEXT PRIMARY KEY REFERENCES jobs(job_id), batch_file TEXT NOT NULL,
+       batch_sha256 TEXT NOT NULL, archived_ms INTEGER NOT NULL, nonce TEXT NOT NULL,
+       command_digest TEXT NOT NULL, terminal_state TEXT NOT NULL)""",
+    """CREATE TRIGGER IF NOT EXISTS job_archives_no_update BEFORE UPDATE ON job_archives
+       BEGIN SELECT RAISE(ABORT, 'archive pointers are immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS job_archives_no_delete BEFORE DELETE ON job_archives
+       BEGIN SELECT RAISE(ABORT, 'archive pointers are immutable'); END""",
 )
 
 
@@ -187,7 +209,9 @@ class JobStore:
     def _lock(self, relative: Path, *, retry: bool = True):
         self._root()
         target = self.path / "locks" / relative
+        state_dir.check_private(self.path, [self.path / "locks", target.parent, target])
         target.parent.mkdir(exist_ok=True, parents=True)
+        state_dir.check_private(self.path, [self.path / "locks", target.parent, target])
         handle = open(target, "a+b")
         deadline = time.monotonic() + self.lock_timeout
         while not state_dir._try_lock(handle):
@@ -198,10 +222,12 @@ class JobStore:
         return handle
 
     @contextmanager
-    def _home(self, *, initialize: bool = False) -> Iterator[state_dir.StateDir]:
+    def _home(self, *, initialize: bool = False, job_id: str | None = None) -> Iterator[state_dir.StateDir]:
         handle = self._lock(Path("admission.lock"))
         try:
             view = state_dir.inspect_state_dir(self.path, expected_identity=self.identity)
+            if job_id is not None:
+                self._check_job(job_id)
             with dal.connection_scope(self.database, readonly=True) as db:
                 row = db.execute("SELECT value FROM console_meta WHERE key='schema_version'").fetchone()
             if (row is None and not initialize) or (row is not None and row[0] != SCHEMA_VERSION):
@@ -212,6 +238,46 @@ class JobStore:
                 state_dir._unlock(handle)
             finally:
                 handle.close()
+
+    def _check_job(self, job_id: str) -> None:
+        validate_job_id(job_id)
+        root = self.path / "jobs" / job_id
+        state_dir.check_private(self.path, [root, root / "command.json", root / "exit.json",
+            root / "stop.request", root / "log", root / "logs",
+            self.path / "locks" / "jobs", self.path / "locks" / "jobs" / f"{job_id}.runner.lock"])
+
+    def _close_runner_lock(self, job_id: str, handle) -> None:
+        """Called under admission exclusion; never unlink a different file."""
+        path = self.path / "locks" / "jobs" / f"{job_id}.runner.lock"
+        own = os.fstat(handle.fileno())
+        try:
+            state_dir.check_private(self.path, [path])
+            current = path.stat()
+            if (current.st_dev, current.st_ino) != (own.st_dev, own.st_ino):
+                raise JobRefused("RUNNER_LOCK_IDENTITY_CHANGED")
+        finally:
+            try:
+                state_dir._unlock(handle)
+            finally:
+                handle.close()
+        try:
+            current = path.stat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) != (own.st_dev, own.st_ino):
+            raise JobRefused("RUNNER_LOCK_IDENTITY_CHANGED")
+        path.unlink()
+
+    def _release_claim(self, claim: RunnerClaim) -> None:
+        try:
+            with self._home(job_id=claim.job_id):
+                self._close_runner_lock(claim.job_id, claim._handle)
+        finally:
+            if not claim._handle.closed:
+                try:
+                    state_dir._unlock(claim._handle)
+                finally:
+                    claim._handle.close()
 
     @contextmanager
     def _write(self):
@@ -304,8 +370,10 @@ class JobStore:
                 command.flush()
                 os.fsync(command.fileno())
             os.replace(temporary, home / "command.json")
+            self._check_job(job_id)
             if (home / "command.json").read_bytes() != payload:
                 raise JobRefused("COMMAND_READBACK_MISMATCH")
+            self._check_job(job_id)
             with self._write() as db:
                 self._compatible(self._active(db), request, watcher)
                 committed_at = self._time(db)
@@ -324,7 +392,7 @@ class JobStore:
     def get(self, job_id: str) -> dict:
         """Read an internal job record; HTTP redaction belongs to the service layer."""
         validate_job_id(job_id)
-        with self._home(), dal.connection_scope(self.database, readonly=True) as db:
+        with self._home(job_id=job_id), dal.connection_scope(self.database, readonly=True) as db:
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             if row is None:
                 raise JobRefused("JOB_NOT_FOUND")
@@ -335,7 +403,7 @@ class JobStore:
         validate_job_id(job_id)
         if type(after) is not int or not 0 <= after < 2**63 or type(limit) is not int or not 1 <= limit <= 1000:
             raise JobRefused("INVALID_EVENT_PAGE")
-        with self._home(), dal.connection_scope(self.database, readonly=True) as db:
+        with self._home(job_id=job_id), dal.connection_scope(self.database, readonly=True) as db:
             return [dict(row) for row in db.execute("SELECT * FROM job_events WHERE job_id=? AND event_seq>? "
                          "ORDER BY event_seq LIMIT ?", (job_id, after, limit))]
 
@@ -345,9 +413,11 @@ class JobStore:
         runner.validate()
         if not isinstance(nonce, str) or not _NONCE.fullmatch(nonce):
             raise JobRefused("INVALID_NONCE")
-        handle = self._lock(Path("jobs") / f"{job_id}.runner.lock", retry=False)
+        handle = None
         try:
-            with self._home(), self._write() as db:
+            with self._home(job_id=job_id), self._write() as db:
+                handle = self._lock(Path("jobs") / f"{job_id}.runner.lock", retry=False)
+                self._check_job(job_id)
                 now = self._time(db)
                 changed = db.execute("""UPDATE jobs SET state='claimed',state_version=state_version+1,
                     updated_ms=?,runner_pid=?,runner_created_at=?,runner_session_id=?
@@ -357,12 +427,15 @@ class JobStore:
                     raise JobRefused("CLAIM_FENCED")
                 row = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
                 self._event(db, row, "claimed", f"runner:{runner.pid}:{runner.created_at}", now)
-            return RunnerClaim(job_id, nonce, runner, handle)
+            return RunnerClaim(job_id, nonce, runner, handle, self._release_claim)
         except BaseException:
-            try:
-                state_dir._unlock(handle)
-            finally:
-                handle.close()
+            if handle is not None:
+                # Leave a closed failed-claim lock for retention; removing it
+                # here would race claimers after admission exclusion unwinds.
+                try:
+                    state_dir._unlock(handle)
+                finally:
+                    handle.close()
             raise
 
     def expire_admissions(self) -> list[str]:
@@ -373,6 +446,7 @@ class JobStore:
             rows = db.execute("SELECT * FROM jobs WHERE state='admitted' AND claim_deadline_ms<=? AND admitted_ms<=?",
                               (now, now)).fetchall()
             for old in rows:
+                self._check_job(old["job_id"])
                 changed = db.execute("UPDATE jobs SET state='admission_expired',state_version=state_version+1,updated_ms=? "
                     "WHERE job_id=? AND nonce=? AND state='admitted' AND state_version=?",
                     (now, old["job_id"], old["nonce"], old["state_version"]))
@@ -391,7 +465,7 @@ class JobStore:
                 or not isinstance(actor, str) or not 1 <= len(actor) <= 256
                 or not isinstance(reason, str) or len(reason) > 4096):
             raise JobRefused("INVALID_UNCERTAIN_REQUEST")
-        with self._home(), self._write() as db:
+        with self._home(job_id=job_id), self._write() as db:
             now = self._time(db)
             changed = db.execute("UPDATE jobs SET state='uncertain',state_version=state_version+1,updated_ms=? "
                 "WHERE job_id=? AND nonce=? AND state_version=? AND state IN ('admitted','claimed','running')",
