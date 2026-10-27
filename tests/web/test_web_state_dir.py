@@ -323,6 +323,58 @@ def test_a_share_whose_server_cannot_be_identified_is_refused(state):
     assert not (state / "console.sqlite3").exists()
 
 
+def test_a_timed_out_check_does_not_keep_a_refused_process_alive():
+    """codex-lead's R4 on #151: a ThreadPoolExecutor worker is joined at
+    interpreter exit, so a start-up refused on a timed-out lookup still hung
+    until the blocked call returned. The worker must not hold the process."""
+    import sys
+    import time as _time
+
+    code = (
+        "import time\n"
+        "from comic_automation.web import state_dir as sd\n"
+        "sd.REMOTE_CHECK_TIMEOUT_SECONDS = 0.5\n"
+        "try:\n"
+        "    sd._bounded(time.sleep, 60)\n"
+        "except TimeoutError:\n"
+        "    print('timed out')\n"
+    )
+    started = _time.monotonic()
+    out = subprocess.run([sys.executable, "-c", code], cwd=sd.REPO_ROOT, capture_output=True, text=True, timeout=60)
+    elapsed = _time.monotonic() - started
+    assert out.stdout.strip() == "timed out", out.stderr
+    assert elapsed < 20, f"the process took {elapsed:.1f} s to exit; the blocked call kept it alive"
+
+
+def test_a_stalled_own_address_lookup_is_bounded_too():
+    """codex-lead's R4 follow-up: the lookup of this machine's own addresses ran
+    unbounded before any other check. A stall must time out and let the
+    refused process exit."""
+    import sys
+    import time as _time
+
+    code = (
+        "import socket, time\n"
+        "from comic_automation.web import state_dir as sd\n"
+        "sd.REMOTE_CHECK_TIMEOUT_SECONDS = 0.5\n"
+        "socket.gethostbyname_ex = lambda name: time.sleep(60)\n"
+        "try:\n"
+        "    sd._local_addresses()\n"
+        "except TimeoutError:\n"
+        "    print('timed out')\n"
+    )
+    started = _time.monotonic()
+    out = subprocess.run([sys.executable, "-c", code], cwd=sd.REPO_ROOT, capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip() == "timed out", out.stderr
+    assert _time.monotonic() - started < 20
+
+
+def test_bounded_passes_results_and_errors_through():
+    assert sd._bounded(lambda a, b: a + b, 2, 3) == 5
+    with pytest.raises(FileNotFoundError):
+        sd._bounded(os.stat, "Z:\\definitely\\not\\here\\" if os.name == "nt" else "/definitely/not/here")
+
+
 def test_local_host_names_are_recognised_without_the_network():
     import socket
 
