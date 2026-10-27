@@ -43,8 +43,17 @@ rollout. Don't select a different backend.
 
 ## Ownership lifetime and shutdown
 
-The acquiring thread owns and releases the mutex. The handle is closed on
+The acquiring thread owns and releases the mutex. Handle close is attempted on
 every exit, including initialization failure and abandoned-owner recovery.
+Cleanup failure is distinct from startup refusal: main returns **exit code 4**
+and logs "Watcher shutdown failed" if release or handle close is the only
+failure. If acquisition or the session already raised, that original exception
+and its exit classification remain primary; cleanup is logged and attached as
+an exception note. Close is attempted even after a release exception. A root
+whose release or close was uncertain stays blocked to new embedded sessions
+for that process's lifetime. Closing a handle alone is not proof of release;
+there is no automatic in-process retry or forced ownership takeover.
+
 No child inherits it. Process/thread death gives Win32 its normal abandoned
 mutex semantics; no stale lock file or PID (process identifier) takeover is used.
 
