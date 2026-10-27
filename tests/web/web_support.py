@@ -17,7 +17,7 @@ from typing import Any
 
 from comic_automation.web.app import ConsoleApp
 from comic_automation.web.config import load_console_config
-from comic_automation.web.security import SESSION_COOKIE, SecretStore
+from comic_automation.web.security import SESSION_COOKIE_PREFIX, SecretStore
 
 PORT = 8765
 ORIGIN = f"http://127.0.0.1:{PORT}"
@@ -87,7 +87,9 @@ def login(app: ConsoleApp) -> tuple[dict[str, str], str]:
     jar.load(res.headers["set-cookie"])
     location = res.headers["location"]
     assert location.startswith("/#k=")
-    auth = {"Cookie": f"{SESSION_COOKIE}={jar[SESSION_COOKIE].value}", "X-Session-Key": location[len("/#k="):]}
+    (name, morsel), = jar.items()  # exactly one cookie, named for this session
+    assert name.startswith(SESSION_COOKIE_PREFIX)
+    auth = {"Cookie": f"{name}={morsel.value}", "X-Session-Key": location[len("/#k="):]}
     csrf = call(app, "GET", "/api/session", headers=auth).json["csrf_token"]
     return auth, csrf
 
