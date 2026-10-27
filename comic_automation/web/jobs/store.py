@@ -86,7 +86,7 @@ class ProcessIdentity:
     session_id: int
 
     def validate(self) -> None:
-        """Reject guessed, zero or rounded identities before persisting them."""
+        """Require nonzero, bounded integer fields before persisting identity."""
         if (type(self.pid) is not int or not 0 < self.pid < 2**32 or type(self.created_at) is not int
                 or not 0 < self.created_at < 2**64 or type(self.session_id) is not int
                 or not 0 <= self.session_id < 2**32):
