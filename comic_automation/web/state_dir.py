@@ -432,10 +432,9 @@ def _validate_home(path: Path) -> None:
         )
     if not path.is_dir():
         raise StateDirRefused(f"{path} is not a directory.")
-    # A local volume only. SQLite's locking is unreliable over SMB, and it is
-    # what makes the lexical-only comparison of network roots sound: a network
-    # root cannot contain a local directory. Without this, a state directory
-    # spelled \\tower\media\comics\... would slip past a root spelled Z:\comics.
+    # Local storage only: SQLite's locking is unreliable over SMB. This does
+    # not establish disjointness from network roots: a share may expose a
+    # local directory, so containment also compares physical identities.
     if _is_network(str(path)) or _is_network(os.path.realpath(path)):
         raise StateDirRefused(f"The state directory {path} is on a network location; it must be on a local drive.")
     # Checked before anything is written into it, including the lock file.
