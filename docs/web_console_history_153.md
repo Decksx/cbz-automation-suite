@@ -55,7 +55,7 @@ orphan-directory reuse, and root identity refusal before lock-file creation.
 Direct runner-inspection tests also cover root access, a network location and
 zero identity. The two files pass63/63 before archive integration.
 
-The independent archive codec passes13 focused cases, including corruption,
+The independent archive codec passes14 focused cases, including corruption,
 changed sources, fsync failure, resource bounds and a real Windows junction.
 Store/private-helper integration and ledger-first cleanup follow after the
 helper's exact-head review and merge. This checkpoint is not a claim that the
