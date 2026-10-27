@@ -38,7 +38,7 @@ from comic_automation.series_resolver import (
     unique_path,
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
-from comic_automation.library.watcher_instance import watcher_instance_lock, WatcherInstanceRefused
+from comic_automation.library.watcher_instance import watcher_instance_lock, WatcherInstanceRefused, WatcherInstanceCleanupError
 from comic_automation.archive import field_resolution as _media_fr
 from comic_automation.library.media_naming import media_fields, watcher_naming, with_comicinfo_year, KeepArrivalName, split_series_year
 from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
@@ -3600,6 +3600,9 @@ def main(argv: list[str] | None = None):
     except WatcherInstanceRefused as exc:
         log.error("Watcher start refused: %s", exc)
         return 3
+    except WatcherInstanceCleanupError as exc:
+        log.error("Watcher shutdown failed: %s", exc)
+        return 4
 
 
 if __name__ == "__main__":
