@@ -63,10 +63,10 @@ def test_browser_sign_in_csrf_cross_origin_and_code_reuse(console, browser):
     page.goto(url)
     assert page.url == f"http://127.0.0.1:{port}/"
     sync_api.expect(page.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
-    cookie = next(c for c in context.cookies() if c["name"] == "cbz_console_session")
+    cookie = next(c for c in context.cookies() if c["name"].startswith("cbz_console_"))
     assert cookie["httpOnly"] and cookie["sameSite"] == "Strict"
     # The cookie is invisible to page script; the browser key left the URL for sessionStorage.
-    assert "cbz_console_session" not in page.evaluate("document.cookie")
+    assert "cbz_console_" not in page.evaluate("document.cookie")
     assert "#" not in page.url and page.evaluate("sessionStorage.getItem('cbz-console-key')")
 
     # The cookie alone is not a session. A same-origin POST without the CSRF
@@ -101,4 +101,18 @@ def test_browser_sign_in_csrf_cross_origin_and_code_reuse(console, browser):
     # The same login link a second time is refused.
     response = page.goto(url)
     assert response.status == 401
+
+    # A second launch in the same browser (a new tab) must not lock out the
+    # first tab, before or after the first tab reloads.
+    first = context.new_page()
+    first.goto(_login_url(console))
+    sync_api.expect(first.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
+    second = context.new_page()
+    second.goto(_login_url(console))
+    sync_api.expect(second.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
+    session_status = """() => fetch('/api/session', {headers: {'X-Session-Key': sessionStorage.getItem('cbz-console-key')}})
+                              .then(r => r.status)"""
+    assert first.evaluate(session_status) == 200
+    first.reload()
+    sync_api.expect(first.locator("#who")).to_have_text(f"Signed in: {getpass.getuser()}")
     context.close()
