@@ -173,7 +173,10 @@ def write_batch(directory: Path, batch_id: str, jobs: Sequence[ArchiveJob], arch
 
 
 def _verify(path: Path, expected_digest: str, jobs: Mapping[str, ArchiveJob] | None,
-            check_sources: bool, requested: str | None) -> tuple[dict, bytes | None]:
+            check_sources: bool, requested: str | None,
+            allow_missing_sources: bool = False) -> tuple[dict, bytes | None]:
+    if allow_missing_sources and (not check_sources or jobs is None):
+        raise ArchiveRefused("Cleanup verification needs source and ledger evidence")
     if not _SHA.fullmatch(expected_digest):
         raise ArchiveRefused("Invalid archive digest")
     if not stat.S_ISREG(_plain(path).st_mode):
@@ -219,7 +222,8 @@ def _verify(path: Path, expected_digest: str, jobs: Mapping[str, ArchiveJob] | N
                         raise ArchiveRefused("Source evidence required")
                     root = jobs[job_id].root
                     current = {job_id + "/" + source.relative_to(root).as_posix() for source in _files(root)}
-                    if current != {member["path"] for member in members}:
+                    expected = {member["path"] for member in members}
+                    if (not allow_missing_sources and current != expected) or not current.issubset(expected):
                         raise ArchiveRefused("Hot source member set changed during archiving")
                 command_seen = False
                 for member in members:
@@ -250,6 +254,8 @@ def _verify(path: Path, expected_digest: str, jobs: Mapping[str, ArchiveJob] | N
                         if jobs is None:
                             raise ArchiveRefused("Source evidence required")
                         source = jobs[job_id].root.joinpath(*PurePosixPath(name).parts[1:])
+                        if allow_missing_sources and not os.path.lexists(source):
+                            continue
                         if not stat.S_ISREG(_plain(source).st_mode):
                             raise ArchiveRefused("Source changed during archiving")
                         with open(source, "rb") as hot:
@@ -263,10 +269,16 @@ def _verify(path: Path, expected_digest: str, jobs: Mapping[str, ArchiveJob] | N
 
 
 def verify_batch(path: Path, expected_digest: str, *, jobs: Mapping[str, ArchiveJob] | None = None,
-                 check_sources: bool = False) -> dict:
-    """Verify the whole sealed batch and optional current hot/ledger evidence."""
+                 check_sources: bool = False, allow_missing_sources: bool = False) -> dict:
+    """Verify a sealed batch and optional current hot/ledger evidence.
+
+    Missing-source mode is only for cleanup after a committed archive pointer:
+    it allows an interrupted deletion to resume, while every remaining hot file
+    must still be described and match. This function never authorizes deletion
+    or supplies the caller's durable-pointer proof.
+    """
     try:
-        return _verify(path, expected_digest, jobs, check_sources, None)[0]
+        return _verify(path, expected_digest, jobs, check_sources, None, allow_missing_sources)[0]
     except (KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
         raise ArchiveRefused(f"Invalid archive: {exc}") from None
 
