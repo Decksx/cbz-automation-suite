@@ -235,6 +235,30 @@ def test_a_state_directory_under_a_unc_root_is_still_caught_lexically():
     assert hit == ("paths.library", unc_root)
 
 
+@pytest.mark.parametrize("which", ["lexical", "resolved"])
+def test_a_state_directory_on_a_network_location_is_refused(state, monkeypatch, which):
+    """Found in codex-lead's review: with a library root spelled Z:\\comics (a
+    drive mapped to \\\\tower\\media), a state directory spelled
+    \\\\tower\\media\\comics\\web-console slipped past the lexical-only
+    comparison of network roots. A network state directory is refused outright;
+    'resolved' covers a local-looking path that a junction leads onto a share."""
+    real_realpath = sd.os.path.realpath
+    if which == "lexical":
+        monkeypatch.setattr(sd, "_is_network", lambda p: p == str(state))
+    else:
+        monkeypatch.setattr(sd.os.path, "realpath",
+                            lambda p, *a, **k: "\\\\tower\\media\\x" if str(p) == str(state) else real_realpath(p, *a, **k))
+    with pytest.raises(StateDirRefused, match="network location"):
+        open_state_dir(state, environ={})
+    assert not (state / "locks").exists()  # refused before writing anything
+
+
+def test_is_network_recognises_unc_paths():
+    assert sd._is_network("\\\\tower\\media\\comics")
+    assert sd._is_network("//tower/media")
+    assert not sd._is_network(r"C:\Users")
+
+
 def test_the_state_directory_may_not_sit_inside_the_repository(monkeypatch, tmp_path):
     monkeypatch.setattr(sd, "REPO_ROOT", tmp_path)
     inner = private_dir(tmp_path / "state")
