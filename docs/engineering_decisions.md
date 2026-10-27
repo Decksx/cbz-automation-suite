@@ -1675,3 +1675,28 @@ nonce/version to enter and has no automatic-clear method in this slice.
 Native creation/terminal proof, logs and reconciliation remain later M3 work.
 The single-task rules do not exclude arbitrary external CLI writers. No live
 watcher, library, intake, operational database or runtime is changed by M3a.
+
+### Web console: the privacy scan covers the fixed home, not job history (#153, 2026-10-27)
+
+M2 checked every entry under the state directory for loosened access, capped
+at 2,000 entries, and refused past the cap. M3a runs that check on every store
+call, and each job leaves three entries, so after about 664 jobs every call and
+every restart was refused (found by the claude-lead review of #152, measured on
+OfficePC: 30 ms per `get` at 1 job, 463 ms at 650).
+
+The scan now covers only the home's own entries and those of `locks/`: the
+config, the ledger and its journal files, `session.json`, `console.log`, the
+lock files, and the `jobs/` and `locks/jobs/` directories themselves. That set
+does not grow with history; it has its own ceiling of 200 entries, which only
+stray files can reach. Per-job paths are checked by `state_dir.check_private`
+when a job is used (the store's half of #153). A loosened artifact of a job
+that is never read again is therefore not refused at start-up; such an
+artifact is immutable and not trusted by anything that does not read it.
+
+The console never creates junctions or links in its home, so any reparse point
+below it is refused, checked with `lstat` before anything follows or lists it:
+`check_private` checks every component from the home down to the path, and
+the fixed scan refuses a junctioned `locks/` before listing it. Otherwise a
+junction at `jobs/<id>` made a file elsewhere pass as private (codex-lead's
+review of #154). The 200-entry ceiling is enforced while listing, so a flooded
+directory is never read in full.

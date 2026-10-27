@@ -39,7 +39,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Mapping
+from typing import IO, Iterable, Mapping
 
 from ..database import dal
 from . import acl
@@ -162,23 +162,66 @@ def _acquire_console_lock(state: Path) -> IO[bytes]:
     return handle
 
 
-MAX_CONTENT_ACL_CHECKS = 2000
+# The fixed part of the home: its own entries and those of locks/. Job
+# history (jobs/<id>/..., locks/jobs/<id>.runner.lock) lives one level further
+# down and is checked per job, by check_private, when a job is used. A scan of
+# the whole tree on every call grew with history and, past its 2,000-entry
+# cap, refused every call and every restart after ~664 jobs (#153).
+MAX_FIXED_ENTRIES = 200
+_FIXED_SUBDIRS = ("locks",)
 
 
-def _refuse_loosened_contents(state: Path) -> None:
-    """Refuse when anything inside the private directory grants access more widely.
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_reparse_point(path: str) -> bool:
+    """A junction, symlink or other reparse point (not followed)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT) or os.path.islink(path)
+
+
+def _refuse_reparse_below(home: str, full: str, shown: object) -> None:
+    """Refuse if any component from just below ``home`` down to ``full`` is a reparse point.
+
+    The console never creates junctions or links in its home, so one there was
+    put there by something else and could lead a "private" path to a file
+    elsewhere (codex-lead's review of #154). Checked with lstat, before
+    anything follows or enumerates it.
+    """
+    relative = os.path.relpath(full, home)
+    current = home
+    for part in relative.split(os.sep):
+        current = os.path.join(current, part)
+        if _is_reparse_point(current):
+            raise StateDirRefused(f"{shown}: {current} inside the state directory is a link or junction; refusing to follow it.")
+
+
+def check_private(state: Path, paths: Iterable[Path]) -> None:
+    """Refuse when any of ``paths`` inside the home grants access more widely.
 
     A private directory only sets the *default* for what is created in it: an
     explicit grant on a file inside (``icacls console.sqlite3 /grant Users:R``)
     still opens that file. Inheriting from the private directory is fine; an
-    extra allow entry or a foreign owner is not. Bounded so a huge tree cannot
-    stall start-up; past the bound, start-up refuses rather than skipping.
+    extra allow entry or a foreign owner is not. Missing paths are skipped:
+    callers check what exists. A path outside the home, by spelling or through
+    a junction or link, is refused rather than checked against the wrong owner.
     """
-    for count, entry in enumerate(state.rglob("*"), 1):
-        if count > MAX_CONTENT_ACL_CHECKS:
-            raise StateDirRefused(f"{state} holds more than {MAX_CONTENT_ACL_CHECKS} entries; cannot check them all.")
+    # No separate resolved-path check: with every component below the home
+    # refused if it is a reparse point, the lexical path is the physical one.
+    home = os.path.normcase(os.path.abspath(state))
+    for entry in paths:
+        full = os.path.normcase(os.path.abspath(entry))
+        if full != home:
+            if os.path.commonpath([home, full]) != home:
+                raise StateDirRefused(f"{entry} is not inside the state directory {state}.")
+            _refuse_reparse_below(home, full, entry)
+        if not os.path.lexists(entry):
+            continue
         try:
-            problems = [p for p in acl.privacy_problems(entry) if p != "inherits access from its parent folder"]
+            problems = [p for p in acl.privacy_problems(Path(entry)) if p != "inherits access from its parent folder"]
         except acl.AclError as exc:
             raise StateDirRefused(str(exc)) from None
         if problems:
@@ -186,6 +229,40 @@ def _refuse_loosened_contents(state: Path) -> None:
                 f"{entry} inside the state directory is not private to you ({'; '.join(problems)}). "
                 "Remove the extra access, or run `--init-state-dir` and remove it by hand."
             )
+
+
+def _fixed_entries(state: Path) -> list[Path]:
+    """The home's own entries and those of its fixed subdirectories, bounded.
+
+    The bound is enforced while iterating, so a directory flooded with entries
+    is never read or held in full. A fixed subdirectory that is a junction or
+    link is refused before it is enumerated.
+    """
+    entries: list[Path] = []
+    for directory in (state, *(state / name for name in _FIXED_SUBDIRS)):
+        if directory != state and _is_reparse_point(str(directory)):
+            raise StateDirRefused(f"{directory} inside the state directory is a link or junction; refusing to follow it.")
+        if not directory.is_dir():
+            continue
+        for entry in directory.iterdir():
+            entries.append(entry)
+            if len(entries) > MAX_FIXED_ENTRIES:
+                # Only stray files can reach this; job history is one level deeper.
+                raise StateDirRefused(f"{state} holds more than {MAX_FIXED_ENTRIES} top-level entries; "
+                                      "remove what does not belong there.")
+    return entries
+
+
+def _refuse_loosened_contents(state: Path) -> None:
+    """Refuse when any of the home's fixed entries grants access more widely.
+
+    Covers what start-up and every inspection trust: console.toml, the ledger
+    and its -wal/-shm/-journal files, session.json, console.log, locks/ and the
+    lock files in it, and the jobs/ and locks/jobs/ directories themselves.
+    Cost does not grow with job history; per-job paths go through
+    :func:`check_private` when used.
+    """
+    check_private(state, _fixed_entries(state))
 
 
 # ------------------------------------------------------------ path rule

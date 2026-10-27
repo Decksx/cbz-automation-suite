@@ -399,6 +399,127 @@ def test_a_file_inside_with_a_broader_grant_is_refused(state):
         open_state_dir(state, environ={})
 
 
+def _fake_job_history(state, jobs):
+    """Lay down the entries M3a leaves per job: jobs/<id>/command.json and
+    locks/jobs/<id>.runner.lock, inheriting the home's private access."""
+    (state / "locks" / "jobs").mkdir(parents=True, exist_ok=True)
+    for n in range(jobs):
+        job = state / "jobs" / f"01J{n:023d}"
+        job.mkdir(parents=True)
+        (job / "command.json").write_text("{}")
+        (state / "locks" / "jobs" / f"{job.name}.runner.lock").write_text("")
+
+
+def test_job_history_does_not_brick_or_slow_the_home(state):
+    """#153: the whole-tree scan refused every call and restart past ~664 jobs
+    and grew slower with history. 1,000 jobs (3,000 entries) is past the old
+    2,000-entry ceiling; opening must still work and cost about the same."""
+    import time as _time
+
+    open_state_dir(state, environ={}).close()
+    started = _time.perf_counter()
+    open_state_dir(state, environ={}).close()
+    empty = _time.perf_counter() - started
+
+    _fake_job_history(state, 1000)
+    started = _time.perf_counter()
+    open_state_dir(state, environ={}).close()
+    full = _time.perf_counter() - started
+    assert full < empty * 3 + 0.5, f"open took {full:.2f} s with history vs {empty:.2f} s without"
+
+
+@windows_only
+def test_a_loosened_lock_file_is_still_refused(state):
+    """The fixed scan still reaches inside locks/, which start-up trusts."""
+    open_state_dir(state, environ={}).close()
+    subprocess.run(["icacls", str(state / "locks" / "console.lock"), "/grant", "*S-1-5-11:R"],
+                   check=True, capture_output=True)
+    with pytest.raises(StateDirRefused, match="console.lock inside the state directory is not private"):
+        open_state_dir(state, environ={})
+
+
+@windows_only
+def test_check_private_refuses_a_loosened_job_file(state):
+    _fake_job_history(state, 1)
+    job_file = next((state / "jobs").iterdir()) / "command.json"
+    sd.check_private(state, [job_file])  # private by inheritance: fine
+    subprocess.run(["icacls", str(job_file), "/grant", "*S-1-5-11:R"], check=True, capture_output=True)
+    with pytest.raises(StateDirRefused, match="command.json inside the state directory is not private"):
+        sd.check_private(state, [job_file])
+    open_state_dir(state, environ={}).close()  # start-up does not rescan job history
+
+
+def test_check_private_refuses_paths_outside_the_home(state, tmp_path):
+    with pytest.raises(StateDirRefused, match="not inside the state directory"):
+        sd.check_private(state, [tmp_path / "elsewhere.json"])
+    sd.check_private(state, [state / "jobs" / "missing" / "command.json"])  # absent paths are skipped
+
+
+@windows_only
+def test_check_private_refuses_a_job_path_through_a_junction(state, tmp_path):
+    """codex-lead's review of #154: jobs/<id> as a junction to a folder outside
+    the home made check_private accept a file that is physically elsewhere."""
+    import _winapi
+
+    outside = tmp_path / "outside-job"
+    outside.mkdir()
+    (outside / "command.json").write_text("{}")
+    (state / "jobs").mkdir()
+    _winapi.CreateJunction(str(outside), str(state / "jobs" / "01JUNCTION"))
+    with pytest.raises(StateDirRefused, match="link or junction"):
+        sd.check_private(state, [state / "jobs" / "01JUNCTION" / "command.json"])
+
+
+@windows_only
+def test_a_junction_in_place_of_locks_is_refused_before_enumerating(state, tmp_path):
+    import _winapi
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _winapi.CreateJunction(str(elsewhere), str(state / "locks"))
+    listed = []
+    real_iterdir = sd.Path.iterdir
+
+    def recording(self):
+        listed.append(os.path.normcase(str(self)))
+        return real_iterdir(self)
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(sd.Path, "iterdir", recording):
+        with pytest.raises(StateDirRefused, match="link or junction"):
+            open_state_dir(state, environ={})
+    # Refused before following it: the junction's target was never listed.
+    assert os.path.normcase(str(state / "locks")) not in listed
+
+
+def test_the_entry_ceiling_stops_reading_at_the_first_entry_over(state, monkeypatch):
+    """codex-lead: the bound was checked after the whole listing was read. A
+    flood must be cut off while iterating, not held in memory first."""
+    consumed = []
+    real_iterdir = sd.Path.iterdir
+
+    def flood(self):
+        if self == state:
+            for n in range(100_000):
+                consumed.append(n)
+                yield self / f"stray-{n}"
+        else:
+            yield from real_iterdir(self)
+
+    monkeypatch.setattr(sd.Path, "iterdir", flood)
+    with pytest.raises(StateDirRefused, match="top-level entries"):
+        sd._fixed_entries(state)
+    assert len(consumed) == sd.MAX_FIXED_ENTRIES + 1
+
+
+def test_stray_top_level_clutter_has_its_own_ceiling(state):
+    for n in range(sd.MAX_FIXED_ENTRIES + 1):
+        (state / f"stray-{n}.txt").write_text("")
+    with pytest.raises(StateDirRefused, match="top-level entries"):
+        open_state_dir(state, environ={})
+
+
 def test_is_network_recognises_unc_paths():
     assert sd._is_network("\\\\tower\\media\\comics")
     assert sd._is_network("//tower/media")
