@@ -122,7 +122,7 @@ def write_batch(directory: Path, batch_id: str, jobs: Sequence[ArchiveJob], arch
         raise ArchiveRefused("Archive directory is unavailable")
     target = directory / f"jobs-{batch_id}.zip"
     temporary = directory / f"jobs-{batch_id}.zip.tmp"
-    if target.exists():
+    if os.path.lexists(target):
         raise ArchiveRefused("Archive batch name already exists")
     manifest = {"schema_version": 1, "batch_id": batch_id, "jobs": []}
     total_bytes = total_members = 0
@@ -214,6 +214,13 @@ def _verify(path: Path, expected_digest: str, jobs: Mapping[str, ArchiveJob] | N
                 members = record["members"]
                 if not isinstance(members, list) or not members:
                     raise ArchiveRefused("Empty archive job")
+                if check_sources:
+                    if jobs is None:
+                        raise ArchiveRefused("Source evidence required")
+                    root = jobs[job_id].root
+                    current = {job_id + "/" + source.relative_to(root).as_posix() for source in _files(root)}
+                    if current != {member["path"] for member in members}:
+                        raise ArchiveRefused("Hot source member set changed during archiving")
                 command_seen = False
                 for member in members:
                     name = member["path"]
