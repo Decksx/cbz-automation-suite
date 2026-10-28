@@ -1,6 +1,7 @@
 """Pinned-state adapters for M3b hot/cold logs; no HTTP or lifecycle authority."""
 from __future__ import annotations
 
+from collections import OrderedDict
 import os
 import hashlib
 from pathlib import Path
@@ -69,14 +70,20 @@ class JobLogs:
                         or pointer["terminal_state"] != row["state"]):
                     raise logs.LogRefused("ARCHIVED_LOG_POINTER_CHANGED")
                 batch = JobHistory(self.store)._batch_path(pointer["batch_file"])
-            cached = [None, None]
+            cached = OrderedDict()
             hot_sizes = {}
+            def remember(name, data):
+                cached[name] = data
+                cached.move_to_end(name)
+                if len(cached) > 2:
+                    cached.popitem(last=False)
             def read(name, offset, count):
                 if not _NAME.fullmatch(name):
                     raise logs.LogRefused("INVALID_LOG_MEMBER_NAME")
                 path = self.directory / name
-                if cached[0] == name:
-                    return cached[1][offset:offset + count]
+                if name in cached:
+                    cached.move_to_end(name)
+                    return cached[name][offset:offset + count]
                 state_dir.check_private(self.store.path, [self.directory, path])
                 cold = None
                 if batch is not None:
@@ -91,10 +98,10 @@ class JobLogs:
                     if cold is not None and (len(hot) != pin["size"] or hashlib.sha256(hot).hexdigest() != pin["sha256"]):
                         raise logs.LogRefused("HOT_COLD_LOG_DISAGREEMENT")
                     if cold is None:
-                        cached[:] = [name, hot]
+                        remember(name, hot)
                         return hot[offset:offset + count]
                 if cold is not None:
-                    cached[:] = [name, cold]  # at most one <=8MiB member per page
+                    remember(name, cold)  # two adjacent <=8MiB members per page
                     return cold[offset:offset + count]
                 raise logs.LogRefused("LOG_EVIDENCE_UNAVAILABLE")
             index = logs.load_index(read, self.job_id, row["nonce"])
