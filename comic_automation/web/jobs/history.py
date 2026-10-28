@@ -140,6 +140,10 @@ class JobHistory:
                             raise archives.ArchiveRefused("Terminal row changed before archive commit")
                         db.execute("INSERT INTO job_archives VALUES(?,?,?,?,?,?,?)", (old["job_id"], receipt.file_name,
                             receipt.sha256, committed_ms, old["nonce"], old["command_digest"], old["state"]))
+                        record = next(r for r in receipt.manifest["jobs"] if r["job_id"] == old["job_id"])
+                        for member in record["members"]:
+                            db.execute("INSERT INTO job_archive_members VALUES(?,?,?,?)", (old["job_id"],
+                                member["path"].split("/", 1)[1], member["size"], member["sha256"]))
                         self.store._event(db, current, "archived", "retention", committed_ms,
                                           {"batch_file": receipt.file_name, "batch_sha256": receipt.sha256})
                 # Pointer is durable. The same routine handles restart cleanup.
