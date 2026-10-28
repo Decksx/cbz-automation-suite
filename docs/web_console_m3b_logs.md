@@ -92,8 +92,8 @@ each member's size/SHA-256 in immutable `job_archive_members` rows, in the same
 transaction as its archive pointer and event. `read_pinned_member` authenticates
 one member against that independent ledger evidence. It bounds ZIP directory
 metadata before parsing and hashes at most one 8 MiB member rather than the
-whole 512 MiB batch. A page caches at most one member (8 MiB); repeated lines
-within it do not repeatedly hash it. This API intentionally trusts a pinned
+whole 512 MiB batch. A page caches at most two members (16 MiB), so bounded
+lookahead across rotation does not repeatedly re-hash adjacent segments. This API intentionally trusts a pinned
 member, not an unverified manifest or the contents of unrelated members.
 The existing command/cleanup APIs retain full-batch seal verification.
 
