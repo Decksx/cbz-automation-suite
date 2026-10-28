@@ -105,6 +105,10 @@ member rows refuse fast log paging; no evidence is backfilled or invented.
 Their original whole-batch command reader still works. No live archive was
 created or converted by this implementation.
 
+History packs batches by both raw bytes and member count. Many tiny retained
+segments can hit the codec's member cap before its byte cap; the oldest fitting
+prefix is sealed so subsequent maintenance calls can continue making progress.
+
 M3d still needs a byte/time budget for idle archiving, since full archive writes
 and cleanup verification hold admission. This paging change does not remove
 that requirement or enable production submissions, native launch, stop, routes,
