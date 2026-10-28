@@ -139,6 +139,19 @@ def test_batches_pack_by_bytes_instead_of_refusing_all_large_history(history, mo
     assert service.archive(keep=0) is None
 
 
+def test_batches_pack_member_count_instead_of_refusing_segmented_history(history, monkeypatch):
+    state, store, service, clock = history
+    rows = expired(store, clock, 3)
+    for row in rows:
+        (state.path / "jobs" / row["job_id"] / "fixture.log").write_bytes(b"small log")
+    monkeypatch.setattr(ar, "MAX_MEMBERS", 3)
+    service.initialize()
+    names = [service.archive(keep=0) for _ in rows]
+    assert len(set(names)) == 3 and all(names)
+    assert service.archive(keep=0) is None
+    assert all(service.read_command(row["job_id"]) for row in rows)
+
+
 def test_active_and_held_runner_jobs_are_never_archived(history):
     state, store, service, clock = history
     service.initialize()
