@@ -142,6 +142,21 @@ def test_uncertain_rows_block_every_class_and_cannot_expire(ledger):
         store.hold_uncertain(row["job_id"], row["nonce"], 1, actor="operator", reason="stale")
 
 
+def test_stale_uncertain_version_is_fenced_on_an_otherwise_eligible_row(ledger):
+    """M12: the source state must still permit the transition so only version
+    fencing can reject the request. An already-uncertain row masks this guard."""
+    _, store, _ = ledger
+    row = store.admit({})
+    with pytest.raises(JobRefused, match="UNCERTAIN_FENCED"):
+        store.hold_uncertain(row["job_id"], row["nonce"], row["state_version"] + 1,
+                             actor="operator", reason="stale preview")
+    current = store.get(row["job_id"])
+    assert (current["state"], current["state_version"]) == ("admitted", 1)
+    assert len(store.events(row["job_id"])) == 1
+    assert store.hold_uncertain(row["job_id"], row["nonce"], 1,
+                                actor="operator", reason="fresh")["state"] == "uncertain"
+
+
 def test_clock_rollback_cannot_expire_or_claim(ledger):
     _, store, clock = ledger
     row = store.admit({})
@@ -229,6 +244,39 @@ def test_failed_fsync_leaves_no_runnable_row_and_orphans_are_not_reused(ledger, 
     assert (orphan / "command.json.tmp").read_bytes() == prepared
     with dal.connection_scope(state.database, readonly=True) as db:
         assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_a_complete_orphan_command_directory_cannot_be_reused(ledger, monkeypatch):
+    """M11: no leftover .tmp is present to redundantly prevent overwriting a
+    complete orphan. Reuse must fail at the directory boundary itself."""
+    state, store, _ = ledger
+    monkeypatch.setattr("comic_automation.web.jobs.store.secrets.randbits", lambda size: 1)
+    read = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda p: b"mismatch" if p.name == "command.json" else read(p))
+    with pytest.raises(JobRefused, match="COMMAND_READBACK_MISMATCH"):
+        store.admit({})
+    monkeypatch.setattr(Path, "read_bytes", read)
+    directory = next((state.path / "jobs").iterdir())
+    command = directory / "command.json"
+    original = command.read_bytes()
+    assert not (directory / "command.json.tmp").exists()
+    with pytest.raises(FileExistsError):
+        store.admit({})
+    assert command.read_bytes() == original
+    with dal.connection_scope(state.database, readonly=True) as db:
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_root_identity_is_checked_before_a_lock_can_be_written(ledger):
+    """M14: later inspection is too late to prevent the initial lock write."""
+    state, store, _ = ledger
+    row = store.admit({})
+    lock = state.path / "locks" / "admission.lock"
+    lock.unlink()  # own unlocked fixture file
+    store.identity = (state.identity[0], state.identity[1] + 1)
+    with pytest.raises(sd.StateDirRefused, match="identity changed"):
+        store.get(row["job_id"])
+    assert not lock.exists()
 
 
 def test_clock_rollback_between_preparation_and_commit_refuses(ledger):
