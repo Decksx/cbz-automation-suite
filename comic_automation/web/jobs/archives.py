@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import struct
 from typing import Mapping, Sequence
 import zipfile
 
@@ -299,3 +300,67 @@ def read_command(path: Path, expected_digest: str, job_id: str, command_digest: 
         return data
     except (KeyError, TypeError, ValueError, zipfile.BadZipFile) as exc:
         raise ArchiveRefused(f"Invalid archive: {exc}") from None
+
+
+def read_pinned_member(path: Path, job_id: str, member: str, size: int, digest: str,
+                       offset: int, count: int) -> bytes:
+    """Verify one member against immutable ledger evidence, return a bounded slice.
+
+    Unlike read_command's original whole-seal contract this explicitly requires
+    a durable per-member digest/size recorded during verified publication. It
+    never trusts a manifest as its own authority. Hashing one <=8MiB segment
+    avoids hashing unrelated jobs/logs in a <=512MiB batch for each page.
+    """
+    validate_job_id(job_id)
+    name = job_id + "/" + member
+    _member_name(name, job_id)
+    if (type(size) is not int or not 0 <= size <= 8 * 1024 * 1024
+            or not _SHA.fullmatch(digest) or type(offset) is not int or not 0 <= offset <= size
+            or type(count) is not int or not 0 <= count <= 8 * 1024 * 1024):
+        raise ArchiveRefused("Invalid pinned member request")
+    value = _plain(path)
+    if not stat.S_ISREG(value.st_mode) or value.st_size > MAX_BATCH_BYTES + MAX_MANIFEST_BYTES + 4 * 1024 * 1024:
+        raise ArchiveRefused("Invalid pinned batch file")
+    try:
+        with open(path, "rb") as raw:
+            # Bound central-directory allocation before ZipFile parses it. Our
+            # format never needs ZIP64: <=4097 members and <=512MiB payload.
+            raw.seek(max(0, value.st_size - 65557))
+            tail = raw.read(65557)
+            position = tail.rfind(b"PK\x05\x06")
+            if position < 0 or len(tail) - position < 22:
+                raise ArchiveRefused("Missing bounded ZIP directory")
+            end = struct.unpack_from("<4s4H2LH", tail, position)
+            if (end[1] or end[2] or end[3] != end[4] or end[4] > MAX_MEMBERS + 1
+                    or end[5] > 2 * 1024 * 1024 or end[6] + end[5] > value.st_size
+                    or position + 22 + end[7] != len(tail)):
+                raise ArchiveRefused("Excessive ZIP directory")
+            raw.seek(0)
+            with zipfile.ZipFile(raw) as batch:
+                infos = batch.infolist()
+                if len(infos) > MAX_MEMBERS + 1 or sum(info.filename == name for info in infos) != 1:
+                    raise ArchiveRefused("Missing or duplicate pinned member")
+                info = batch.getinfo(name)
+                if (info.file_size != size or info.compress_size > size + 128 * 1024
+                        or info.compress_type != zipfile.ZIP_DEFLATED):
+                    raise ArchiveRefused("Pinned member size mismatch")
+                hashed, total, selected = hashlib.sha256(), 0, bytearray()
+                with batch.open(info) as stream:
+                    while True:
+                        block = stream.read(CHUNK_BYTES)
+                        if not block:
+                            break
+                        if total + len(block) > size:
+                            raise ArchiveRefused("Pinned member exceeds its bound")
+                        hashed.update(block)
+                        lower, upper = max(offset, total), min(offset + count, total + len(block))
+                        if lower < upper:
+                            selected.extend(block[lower - total:upper - total])
+                        total += len(block)
+                if total != size or hashed.hexdigest() != digest:
+                    raise ArchiveRefused("Pinned member digest mismatch")
+                return bytes(selected)
+    except (KeyError, TypeError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+        if isinstance(exc, ArchiveRefused):
+            raise
+        raise ArchiveRefused(f"Invalid pinned member: {exc}") from None
