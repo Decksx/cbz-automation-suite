@@ -29,10 +29,10 @@ def service(tmp_path):
     state.close()
 
 
-def written(service, body=b"first\nsecond\n", *, retain_hot=False, monkeypatch=None):
+def written(service, body=b"first\nsecond\n", *, retain_hot=False, monkeypatch=None, **options):
     state, store, row, logs = service
     with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
-        disk = logs.create_writer(claim)
+        disk = logs.create_writer(claim, **options)
         disk.append(0, body)
         disk.finish(len(body), complete=True)
     with dal.connection_scope(store.database) as db, dal.transaction(db):
@@ -88,6 +88,19 @@ def test_member_is_verified_once_per_page_instead_of_once_per_line(service, monk
     output = service[3].read_page()
     assert len(output["records"]) == 1000
     assert calls == ["log/index.json", "log/seg-0000000000000000.log"]
+
+
+def test_cold_page_lookahead_does_not_thrash_adjacent_segments(service, monkeypatch):
+    written(service, body=b"line\n" * 1000, segment_bytes=4096)
+    calls = []
+    original = ar.read_pinned_member
+    def counted(*args):
+        calls.append(args[2])
+        return original(*args)
+    monkeypatch.setattr(ar, "read_pinned_member", counted)
+    output = service[3].read_page()
+    assert len(output["records"]) == 1000 and output["eof"]
+    assert calls == ["log/index.json", "log/seg-0000000000000000.log", "log/seg-0000000000001000.log"]
 
 
 def rewrite_member(path, name, change):
