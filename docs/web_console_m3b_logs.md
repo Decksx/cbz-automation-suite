@@ -11,8 +11,16 @@ and [history review notes](https://github.com/Decksx/cbz-automation-suite/pull/1
 
 - `JobLogs(store, job_id).create_writer(claim)` checks the live matching claim
   and returns a `LogDisk`. The claim stays held until every log thread settles.
-  The writer revalidates the pinned/private home before file access, without
-  holding admission during disk writes. A closed claim refuses further writes.
+  Creation performs the full state-home inspection under admission: config,
+  containment, ledger identity pin and fixed privacy scan. Before each file
+  access the writer checks the home's physical identity against the pinned
+  identity, privacy of the home and selected path plus its parent, every
+  reparse component below the home, and the still-open claim. Streaming does
+  not reload configuration, inspect other job artifacts, scan fixed entries,
+  or check library/watch-root containment. No admission lock is held during
+  disk writes. A closed claim refuses further writes.
+  Watch-folder discovery caches the most recent source contents, so unchanged
+  watcher source is parsed once while edits invalidate the cached result.
 - `LogPump(source, disk).start()` creates daemon reader/writer threads. It owns
   neither the pipe nor the claim. `join(timeout)` returns `PumpResult` with
   settled/complete proof, read and durable offsets, and any observed error.
@@ -70,6 +78,17 @@ an exact lost suffix length or `eof: true`. Native writer/reader cancellation
 can be unsupported or race completion; thread exit must still be proved.
 The finite gap reasons remain dropped/retention/drain_timeout; a truncated
 unknown tail cannot be fabricated into a finite drain-timeout gap.
+
+A mid-job privacy, identity or reparse refusal raises StateDirRefused. This
+is a boundary failure, not a retryable OSError or a tool exit result. The writer
+thread records the error and stops without publishing finish/EOF. The reader
+continues draining/offering until stopped or EOF, with bounded queue drops.
+The index remains incomplete at its last durable offset; an exact unknown
+suffix length cannot be inferred. M3c must classify this as uncertain rather
+than tool failure and retain the claim until both threads have demonstrably
+settled. Paging reports live while the job row is still claimed/running, then
+unknown_tail after M3c records uncertainty; neither state supplies eof=true.
+M3c owns stopping/cancelling a still-running tool and reader after such a refusal.
 
 ## Reading, UTF-8 and archives
 
