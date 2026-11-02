@@ -98,3 +98,29 @@ def test_watch_folder_is_read_from_the_watcher_source_without_importing_it(tmp_p
     fake.write_text("WATCH_FOLDER = os.environ['X']\n")      # not a literal: reported as unknown
     assert watcher_watch_folder(fake) is None
     assert watcher_watch_folder(tmp_path / "missing.py") is None
+
+
+def test_watch_folder_parses_unchanged_contents_once_and_refreshes_edits(tmp_path, monkeypatch):
+    """Cache contents, not path/mtime: same-size edits still change containment."""
+    from comic_automation.web import config
+    config._watch_folder_literal.cache_clear()
+    source = tmp_path / "watcher.py"
+    source.write_bytes(b"WATCH_FOLDER = 'first'\n")
+    parse = config.ast.parse
+    calls = []
+    def counted(data, *args, **kwargs):
+        calls.append(data)
+        return parse(data, *args, **kwargs)
+    monkeypatch.setattr(config.ast, "parse", counted)
+    try:
+        assert all(watcher_watch_folder(source) == "first" for _ in range(5))
+        assert len(calls) == 1
+        old = source.stat()
+        source.write_bytes(b"WATCH_FOLDER = 'other'\n")
+        import os
+        os.utime(source, ns=(old.st_atime_ns, old.st_mtime_ns))
+        assert watcher_watch_folder(source) == "other"
+        assert watcher_watch_folder(source) == "other"
+        assert len(calls) == 2
+    finally:
+        config._watch_folder_literal.cache_clear()

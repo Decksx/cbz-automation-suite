@@ -106,7 +106,7 @@ class JobHistory:
                     f"WHERE {eligible} AND (j.updated_ms<=? OR j.admission_seq<=?) ORDER BY j.admission_seq LIMIT ?",
                     (now - age_ms, threshold[0] if threshold else -1, batch_size)).fetchall()
             try:
-                selected, sources, selected_bytes = [], {}, 0
+                selected, sources, selected_bytes, selected_members = [], {}, 0, 0
                 for row in rows:
                     self.store._check_job(row["job_id"])
                     try:
@@ -117,12 +117,15 @@ class JobHistory:
                     source = self._source(row)
                     if not source.root.is_dir():
                         raise archives.ArchiveRefused("Terminal hot evidence is missing before archival")
-                    size = sum(path.stat().st_size for path in archives._files(source.root))
+                    files = archives._files(source.root)
+                    size = sum(path.stat().st_size for path in files)
                     if size > archives.MAX_BATCH_BYTES:
                         raise archives.ArchiveRefused("One job exceeds the archive byte budget")
-                    if selected and selected_bytes + size > archives.MAX_BATCH_BYTES:
+                    if selected and (selected_bytes + size > archives.MAX_BATCH_BYTES
+                                     or selected_members + len(files) > archives.MAX_MEMBERS):
                         break  # publish the oldest fitting prefix; next call continues
                     selected_bytes += size
+                    selected_members += len(files)
                     selected.append(row)
                     sources[row["job_id"]] = source
                 if not selected:
@@ -140,6 +143,10 @@ class JobHistory:
                             raise archives.ArchiveRefused("Terminal row changed before archive commit")
                         db.execute("INSERT INTO job_archives VALUES(?,?,?,?,?,?,?)", (old["job_id"], receipt.file_name,
                             receipt.sha256, committed_ms, old["nonce"], old["command_digest"], old["state"]))
+                        record = next(r for r in receipt.manifest["jobs"] if r["job_id"] == old["job_id"])
+                        for member in record["members"]:
+                            db.execute("INSERT INTO job_archive_members VALUES(?,?,?,?)", (old["job_id"],
+                                member["path"].split("/", 1)[1], member["size"], member["sha256"]))
                         self.store._event(db, current, "archived", "retention", committed_ms,
                                           {"batch_file": receipt.file_name, "batch_sha256": receipt.sha256})
                 # Pointer is durable. The same routine handles restart cleanup.

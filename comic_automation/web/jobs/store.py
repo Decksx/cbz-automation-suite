@@ -166,6 +166,13 @@ _SCHEMA = (
        BEGIN SELECT RAISE(ABORT, 'archive pointers are immutable'); END""",
     """CREATE TRIGGER IF NOT EXISTS job_archives_no_delete BEFORE DELETE ON job_archives
        BEGIN SELECT RAISE(ABORT, 'archive pointers are immutable'); END""",
+    """CREATE TABLE IF NOT EXISTS job_archive_members (
+       job_id TEXT NOT NULL REFERENCES job_archives(job_id), member TEXT NOT NULL,
+       size INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(job_id,member))""",
+    """CREATE TRIGGER IF NOT EXISTS archive_members_no_update BEFORE UPDATE ON job_archive_members
+       BEGIN SELECT RAISE(ABORT, 'archive member evidence is immutable'); END""",
+    """CREATE TRIGGER IF NOT EXISTS archive_members_no_delete BEFORE DELETE ON job_archive_members
+       BEGIN SELECT RAISE(ABORT, 'archive member evidence is immutable'); END""",
 )
 
 
