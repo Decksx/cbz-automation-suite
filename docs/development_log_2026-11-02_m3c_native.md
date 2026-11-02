@@ -11,8 +11,8 @@ claim, ledger finalization, HTTP submission or rollout is enabled.
 
 Four one-file commits through **d257487836a442eb39e001612973650942ed50d8**
 add win32.py, disposable helper processes,31 native test cases and the API/
-measurement protocol. The final evidence-only follow-up leaves source/tests
-unchanged. Full-suite and exact-head CI receipts are recorded on the PR and
+measurement protocol. The evidence-only follow-up at9fdc159 leaves source/tests
+unchanged at that checkpoint. Full-suite and exact-head CI receipts are recorded on the PR and
 in maintained Swarm context rather than claimed complete at this checkpoint.
 
 OfficePC: Python3.11.3 AMD64, Windows10.0 build26200, session1;
@@ -74,6 +74,32 @@ Campaign script remains outside Git at Documents/Codex/control/
 m3c_native_mutants.py; the additional raw-handle recovery mutation was run
 with the same restore-in-finally pattern. The test source does not mutate
 production or real library roots.
+
+## Follow-up acceptance and qualified full run
+
+The full local -n4/--dist loadfile run begun at d257487 completed
+**4,737 passed /10 skipped /1 failed in495.81s**. All31 then-current native
+cases passed. The only failure is the previously recorded OfficePC
+test_alternating_overflow_compacts_map_and_physical_files: WinError5 at
+os.replace(index.tmp,index.json), candidate offset442. Log implementation and
+this test are unchanged from the M3b baseline; its underlying host cause
+remains undiagnosed. No clean local full pass or antivirus/ACL explanation is
+claimed. That earlier exception is not hidden by native/CI successes.
+
+Test-only follow-ups strengthen the sentinel check with physical samefile
+identity (handling path aliases), remove the remaining fixed process-count
+assumption, put fixture self-expiry beyond the bounded proof windows, assert
+the owner is actually alive before the deliberate crash, and count native
+create calls (zero on setup refusal, exactly one at/after native birth).
+An additional real missing-executable case proves no PATH fallback and no
+child. Current native file: **32 passed in7.53s**. Product source is unchanged
+since d257487; these are helper/test refinements plus this evidence update.
+
+After those refinements, HANDLE_LIST and KILL_ON_JOB_CLOSE mutations were
+replayed and again caused1 and2 named failures. Both were restored. The
+eleven unique selected mutations/twelve named failures above remain their
+measured campaign; repeats do not inflate that count. Final exact-head full
+Windows CI and readiness receipts follow on the PR and maintained context.
 
 ## Boundaries and next action
 
