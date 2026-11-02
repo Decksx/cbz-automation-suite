@@ -309,6 +309,9 @@ def launch(job_id: str, executable: Path, arguments: Sequence[str], *, cwd: Path
 
     This internal primitive is not a trusted registry or a public submission
     endpoint. The runner must check seals and policy before calling it.
+    Its dedicated host must not concurrently launch another process while
+    these temporary write/NUL handles are inheritable: HANDLE_LIST constrains
+    this creation only, not unrelated broad-inheritance calls in the host.
     Native setup never falls back to uncontained or suspended execution.
     A post-birth setup exception kills/closes the new job and reports
     child_created=True; it cannot be represented as a no-tool refusal.
@@ -394,7 +397,7 @@ def launch(job_id: str, executable: Path, arguments: Sequence[str], *, cwd: Path
         startup.startup.stdin, startup.startup.stdout, startup.startup.stderr = raw_nul, write.value, write.value
         startup.attributes = C.cast(buffer, C.c_void_p)
         env = C.create_unicode_buffer("\0".join(f"{k}={v}" for k, v in
-            sorted(environment.items(), key=lambda item: item[0].casefold())) + "\0\0")
+            sorted(environment.items(), key=lambda item: item[0].upper())) + "\0\0")
         _require(_kernel.CreateProcessW(str(executable), C.create_unicode_buffer(command), None, None,
                  True, 0x08000000 | 0x00080000 | 0x00000400, env, str(cwd),
                  C.byref(startup), C.byref(info)), "CreateProcessW")
