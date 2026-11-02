@@ -73,6 +73,9 @@ def config(tmp_path, rows):
     ("Series TPB 1.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
     ("Series Vol. 1 (Colored).cbz", "1", "issue", "Series v01 (2019) (TPB) (Colored).cbz"),
     ("Series Full 1.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
+    # A bare TPB label (no number after it) used to read as issue #001.
+    ("Series TPB.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
+    ("Series TPB v01.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
     ("Series Vol. 1.cbz", "1", "chapter", "Series v01 (2019).cbz"),
 ])
 def test_planner_and_real_watcher_rename_have_identical_media_names(library, tmp_path, monkeypatch, name, number, style, expected):
