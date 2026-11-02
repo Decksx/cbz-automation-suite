@@ -2,7 +2,12 @@
 
 No apply mode. --output exclusively creates a UTF-8 file outside the library;
 otherwise JSON goes to stdout. Exit 0: complete plan with no review holds;
-1: complete plan with review holds; 2: no trustworthy plan (stderr explains).
+1: plan with review holds or, in scoped mode, skipped series folders;
+2: no trustworthy plan (stderr explains).
+
+By default any change under the library root during planning refuses the
+whole plan. --scoped (or one or more --scope NAME) compares each series
+folder on its own and lists a changed folder under skipped_scopes instead.
 """
 
 from __future__ import annotations
@@ -42,6 +47,12 @@ def main(argv: list[str] | None = None) -> int:
                         default=DEFAULT_REGISTRY)
     parser.add_argument("--series-folder-root", action="store_true",
         help="Confirm that the scan root itself is the operator-chosen series folder.")
+    parser.add_argument("--scoped", action="store_true",
+        help="Opt in to scoped planning: a series folder that changes during planning is "
+             "skipped and reported instead of refusing the whole plan.")
+    parser.add_argument("--scope", action="append", metavar="NAME",
+        help="Plan only this series folder directly under the root (exact spelling); "
+             "repeatable; implies --scoped.")
     args = parser.parse_args(argv)
     try:
         if args.output is not None:
@@ -51,7 +62,8 @@ def main(argv: list[str] | None = None) -> int:
             accept_comicinfo_drop=args.accept_comicinfo_drop,
             temp_dir=args.temp_dir, max_held_bytes=args.max_held_bytes,
             max_copy_bytes=args.max_copy_bytes, number_style=args.number_style,
-            number_style_registry=args.number_style_registry, series_folder_root=args.series_folder_root)
+            number_style_registry=args.number_style_registry, series_folder_root=args.series_folder_root,
+            scoped=args.scoped, scopes=args.scope)
         payload = json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
         if args.output is not None:
             target = _output_target(args.output, args.library_root)
@@ -70,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(json.dumps({"output": str(target), "plan_digest": doc["plan_digest"],
                           "counts": doc["counts"], "diagnostics": doc["diagnostics"]}))
-    return 1 if doc["counts"]["review"] else 0
+    # A skipped folder was not planned at all, so the plan is not complete.
+    return 1 if doc["counts"]["review"] or doc.get("skipped_scopes") else 0
 
 
 if __name__ == "__main__":
