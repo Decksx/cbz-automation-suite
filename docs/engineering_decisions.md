@@ -16,6 +16,21 @@ Protocol, limits and ownership are in
 authorizes Claude's later read-only live plan after step 7 and the tag
 policy land; batch apply still needs the exact digest approval.
 
+## Scoped planning skips a changed series folder, never the root level (#158 B1)
+
+A whole-root inventory comparison voids a plan if anything under the root
+changes, which on the live X: library (17,000+ books, daily watcher
+arrivals) almost always happens. Scoped planning is opt-in (`--scoped`,
+`--scope NAME`); strict whole-root refusal stays the default until David
+opts in. In scoped mode each series folder directly under the root is
+compared on its own, and a changed one is dropped and listed in the sealed
+`skipped_scopes`. A change at the root level still refuses, because root
+books are planned under root-wide authority and a root arrival belongs to
+no one series. Collision checks are unaffected: destinations are siblings
+of their sources and quarantine paths are unique per family, so a dropped
+folder cannot have blocked or unblocked a kept one. Apply was not changed.
+Protocol in [canonical_naming_plan.md](canonical_naming_plan.md).
+
 ## Shared core is authoritative
 
 Normalization, series inference, title handling, translation helpers, number extraction, and ComicInfo update decisions belong in `cbz_core.py`.
