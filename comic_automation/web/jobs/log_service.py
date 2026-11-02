@@ -23,9 +23,15 @@ class JobLogs:
         self.directory = store.path / "jobs" / job_id / "log"
 
     def _validate(self, path):
-        state_dir.inspect_state_dir(self.store.path, expected_identity=self.store.identity)
-        self.store._check_job(self.job_id)
-        state_dir.check_private(self.store.path, [self.directory, path])
+        # Creation already checked config, containment and the ledger pin under
+        # admission. Streaming must not repeat those scans for every 64KiB.
+        current = self.store.path.stat()
+        identity = (current.st_dev, current.st_ino)
+        if not all(identity) or identity != self.store.identity:
+            raise state_dir.StateDirRefused("The log writer's state-directory identity changed.")
+        # check_private also refuses every reparse component below the home.
+        # Check the home itself too: inherited privacy can change mid-job.
+        state_dir.check_private(self.store.path, [self.store.path, path.parent, path])
 
     def create_writer(self, claim, **options) -> logs.LogDisk:
         """Create once under the matching live claim; never restart old evidence.
@@ -33,6 +39,8 @@ class JobLogs:
         M3c must retain the claim until all log threads settle. LogDisk only
         writes artifacts and cannot commit a lifecycle result. Private checks
         run before each file access, without taking admission during disk I/O.
+        The full home inspection runs only at creation; streaming checks the
+        pinned identity and selected path/parent privacy and reparse boundary.
         """
         with self.store._home(job_id=self.job_id), dal.connection_scope(self.store.database, readonly=True) as db:
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (self.job_id,)).fetchone()
