@@ -101,6 +101,14 @@ eleven unique selected mutations/twelve named failures above remain their
 measured campaign; repeats do not inflate that count. Final exact-head full
 Windows CI and readiness receipts follow on the PR and maintained context.
 
+Negative-mutation cleanup was then strengthened to reopen/terminate only the
+random fixture job after its own root/leaf identity handshakes, so removing
+kill-on-close cannot leave ancillary fixture processes alive. The two
+kill-on-close witnesses still fail under that mutation; sources are restored.
+The latest unmodified native run is **32 passed in2.58s**. Recent recorded
+fixture Python identities were checked gone. No production process was queried
+or terminated by this cleanup.
+
 ## Boundaries and next action
 
 This adapter is an internal trusted-caller primitive, not an unvalidated
