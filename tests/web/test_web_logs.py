@@ -7,6 +7,7 @@ import os
 import hashlib
 from pathlib import Path
 import threading
+import time
 
 import pytest
 
@@ -363,6 +364,64 @@ def test_progress_has_strict_finite_counts_and_never_changes_lifecycle(disk):
     assert lg.parse_progress({**result, "continued": True}) is None
 
 
+def finish_capture_fixture(pump, release_fixture, *, watchdog=180):
+    """Wait for a finite test workload before invoking cancellation-capable cleanup.
+
+    join() is a bounded final-drain operation, not a throughput benchmark. The
+    fixture watchdog bounds a broken test independently of that product limit.
+    On failure, release Python fixture waits as native I/O cancellation cannot
+    unblock a semaphore/event, and make bounded attempts to settle both threads.
+    """
+    deadline = time.monotonic() + watchdog
+    try:
+        for thread in (pump.reader, pump.writer):
+            thread.join(max(0, deadline - time.monotonic()))
+            assert not thread.is_alive(), (
+                thread.name, pump.queue.offset, pump.disk.snapshot["offset"], pump.error)
+        return pump.join(5)
+    finally:
+        if pump.reader.is_alive() or pump.writer.is_alive():
+            pump.abort.set()
+            pump.queue.finish(complete=False)
+            release_fixture()
+            pump.join(0)
+            pump.reader.join(5)
+            pump.writer.join(5)
+
+
+def test_capture_fixture_waits_for_workload_before_cleanup_deadline(disk, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    append = disk.append
+    def blocked(*args):
+        entered.set()
+        assert release.wait(5)
+        return append(*args)
+    monkeypatch.setattr(disk, "append", blocked)
+    pump = lg.LogPump(io.BytesIO(b"capture\n"), disk).start()
+    try:
+        assert entered.wait(5)
+        writer_join, cleanup_join = pump.writer.join, pump.join
+        calls = []
+        def workload_join(timeout):
+            # The writer stays blocked until the fixture explicitly waits for
+            # its completion. An early pump.join therefore fails deterministically.
+            release.set()
+            writer_join(timeout)
+        def cleanup_after_workload(timeout):
+            assert not pump.reader.is_alive() and not pump.writer.is_alive()
+            calls.append(timeout)
+            return cleanup_join(timeout)
+        monkeypatch.setattr(pump.writer, "join", workload_join)
+        monkeypatch.setattr(pump, "join", cleanup_after_workload)
+        result = finish_capture_fixture(pump, release.set, watchdog=5)
+        assert result.settled and result.complete and result.durable_offset == 8
+        assert calls == [5]
+    finally:
+        release.set()
+        pump.reader.join(5)
+        pump.writer.join(5)
+
+
 def test_fifty_mib_are_durable_and_pageable_without_a_server(disk):
     # No ConsoleApp, HTTP server or sessions exist. A deliberately paced fake
     # producer keeps eight chunks outstanding; overflow is tested separately.
@@ -374,7 +433,7 @@ def test_fifty_mib_are_durable_and_pageable_without_a_server(disk):
         def read(self, count):
             if self.offset == total:
                 return b""
-            assert credits.acquire(timeout=5)
+            assert credits.acquire(timeout=180)
             part = block[:min(count, total - self.offset)]
             self.offset += len(part)
             return part
@@ -383,7 +442,8 @@ def test_fifty_mib_are_durable_and_pageable_without_a_server(disk):
         append(*args)
         credits.release()
     disk.append = acknowledged
-    result = lg.LogPump(Producer(), disk).start().join(30)
+    pump = lg.LogPump(Producer(), disk).start()
+    result = finish_capture_fixture(pump, credits.release)
     assert result.settled and result.complete and result.durable_offset == total
     assert disk.snapshot["gaps"] == []
     actual = hashlib.sha256()
