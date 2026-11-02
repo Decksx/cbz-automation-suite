@@ -97,3 +97,19 @@ The writer-fails/child-writes-beyond-pipe-buffer witness remains specifically
 owed, as does drain/discard through final cleanup. Slice3 recovery evidence,
 M3d orchestration/routes and M4 production adapters remain separate. No rollout,
 production library/DB action, relay change or Codex-state change.
+
+
+## Full local result at the code checkpoint
+
+The run at exact **7c853b713aa4e42ecea9dcb475450c719ad155d1** completed:
+**4,832 passed /10 skipped in375.81s**, exit0. Command was the full
+`C:\Python311\python.exe -m pytest -n4 --dist loadfile -q` (with the separate
+`-n 4` spelling in the actual shell invocation). All 54 added cases are
+accounted for: 53 receipt/transition cases plus one native environment case.
+The previously recorded OfficePC alternating-overflow WinError5 did not
+reproduce in this run; its underlying cause is still not diagnosed.
+
+Only this dated record changes after the code/test/protocol checkpoint.
+Exact final candidate CI and independent review remain pending and must
+name that final head on #162. Product/test source is unchanged; no repeated
+full local run is needed for this evidence-only addition.
