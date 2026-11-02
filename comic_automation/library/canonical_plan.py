@@ -167,29 +167,41 @@ def _inventory(root: Path, scopes: frozenset[str] | None = None, *,
     and one such move must cost only its own series folder, not the plan.
     `_skipped_scopes` skips every scope holding a vanished row. Strict mode
     keeps raising, so its behaviour is unchanged.
+
+    Only an entry that can be attributed to one series folder is tolerated.
+    Anything below a series folder can. A root-level entry can only if the
+    listing itself saw a plain, plannable directory: `os.scandir` carries
+    each entry's type and attributes from the directory read, so that
+    evidence survives the entry vanishing. A vanished root-level file,
+    history or protected folder, reparse point, or an entry whose listed type
+    is unavailable is root-level evidence and refuses, as any root-level
+    change does (codex-lead's #159 re-review).
     """
     rows, books, excluded = [], [], []
     pending = [root]
     while pending:
         folder = pending.pop()
         try:
-            children = sorted(folder.iterdir(), key=lambda p: p.name)
+            with os.scandir(folder) as listing:
+                entries = sorted(listing, key=lambda e: e.name)
         except (FileNotFoundError, NotADirectoryError):
             if not tolerant or folder == root:
                 raise
+            # Only observed directories are queued, so this one is attributable.
             rows.append({"path": str(folder.relative_to(root)), "kind": "vanished"})
             continue
-        for child in children:
+        for entry in entries:
+            child = Path(entry.path)
             try:
                 info = child.lstat()
             except FileNotFoundError:
                 if not tolerant:
                     raise
-                # Gone between the listing and this lstat. Its type is unknown,
-                # so a root-level entry is attributed to a scope of its own
-                # name; a vanished loose file then reads as a skipped "folder",
-                # which plans nothing and is conservative.
-                if scopes is None or folder != root or child.name in scopes:
+                if folder == root and not _listed_series_folder(entry):
+                    raise PlanningRefused(
+                        "library root level changed during planning (an entry outside any "
+                        f"series folder vanished while being listed: {entry.name})") from None
+                if scopes is None or folder != root or entry.name in scopes:
                     rows.append({"path": str(child.relative_to(root)), "kind": "vanished"})
                 continue
             relative = str(child.relative_to(root))
@@ -217,6 +229,22 @@ def _inventory(root: Path, scopes: frozenset[str] | None = None, *,
     return sorted(rows, key=lambda r: r["path"]), sorted(books), sorted(
         excluded, key=lambda r: r["path"]
     )
+
+
+def _listed_series_folder(entry: os.DirEntry) -> bool:
+    """Whether a root entry was, by its listing alone, a plannable series folder.
+
+    Reads the type cached from the directory listing (no further system call
+    on Windows), so it is evidence about the entry even after it vanished.
+    Unavailable evidence is not a series folder.
+    """
+    try:
+        listed = entry.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(listed.st_mode) and not _reparse(listed)
+            and entry.name.casefold() not in _INTERNAL
+            and entry.name.casefold() != "ai-decensor-originals")
 
 
 def _scope_name(relative: str, *, directory: bool) -> str | None:
