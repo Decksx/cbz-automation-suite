@@ -997,3 +997,100 @@ def test_cli_scoped_plan_with_a_skipped_folder_is_not_a_clean_exit(env, capsys, 
     _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
     assert main([*args, "--scoped"]) == 1
     assert [s["scope"] for s in json.loads(capsys.readouterr().out)["skipped_scopes"]] == ["Beta"]
+
+
+def _vanish_during_walk(monkeypatch, root, walk, target, away, *, listing=False):
+    """Move ``target`` to ``away`` mid-listing, inside inventory walk ``walk``.
+
+    The hook runs only while `_inventory` call number ``walk`` is listing
+    ``target``'s parent: the real children are listed first, then the target
+    moves before they are returned, so the walk's own lstat finds it gone.
+    That is the watcher-moves-a-book race, made deterministic. With
+    ``listing`` the target folder instead moves after its lstat but just
+    before its own listing, so the walk's iterdir is what fails.
+    """
+    import pathlib
+    original_inventory, original_iterdir = cp._inventory, pathlib.Path.iterdir
+    calls, active = [], []
+
+    def inventory(*args, **kwargs):
+        calls.append(True)
+        active.append(len(calls) == walk)
+        try:
+            return original_inventory(*args, **kwargs)
+        finally:
+            active.pop()
+
+    def iterdir(self):
+        if listing and active and active[-1] and self == target and target.exists():
+            target.rename(away)  # gone before its own listing starts
+        children = list(original_iterdir(self))
+        if not listing and active and active[-1] and self == target.parent and target.exists():
+            target.rename(away)
+        return iter(children)
+
+    monkeypatch.setattr(cp, "_inventory", inventory)
+    monkeypatch.setattr(pathlib.Path, "iterdir", iterdir)
+
+
+@pytest.mark.parametrize("walk", [1, 2])
+@pytest.mark.parametrize("what", ["book", "folder", "listing"])
+def test_scoped_mode_skips_a_series_whose_entry_vanishes_mid_listing(env, monkeypatch, tmp_path, walk, what):
+    """Codex's #159 R1: a move between listing and lstat cost the whole plan.
+
+    Whether the book or the whole Beta folder moves, and whether it happens
+    during the first or the final walk, Alpha's rename survives and Beta is
+    skipped with a reason, instead of FileNotFoundError aborting every scope.
+    """
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    target = beta if what == "book" else root / "Beta"
+    _vanish_during_walk(monkeypatch, root, walk, target, tmp_path / f"moved-{what}",
+                        listing=what == "listing")
+    report = plan(scoped=True)
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert report["skipped_scopes"] == [{"scope": "Beta", "path": str(root / "Beta"),
+        "reason": "series folder changed while it was being listed"}]
+    assert parse_plan(report).digest == report["plan_digest"]
+
+
+def test_strict_mode_still_aborts_when_an_entry_vanishes_mid_listing(env, monkeypatch, tmp_path):
+    """Tolerance is scoped-only; strict mode keeps its all-or-nothing contract."""
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    _vanish_during_walk(monkeypatch, root, 2, beta, tmp_path / "moved")
+    with pytest.raises((FileNotFoundError, cp.PlanningRefused)):
+        plan()
+
+
+def test_a_skipped_scope_drops_its_family_and_quarantine(env, monkeypatch):
+    """Codex's #159 R2: the family filter had no direct witness.
+
+    Beta holds a two-version family that would quarantine its older member.
+    Once Beta changes mid-plan, neither the family nor its quarantine may
+    survive, while Alpha's ordinary rename still does.
+    """
+    root, db, book, plan = env
+    alpha = book(series="Alpha", folder="Alpha")
+    book("Beta ch. 1 v1.cbz", series="Beta", number="1", pages=(b"a",), folder="Beta")
+    book("Beta ch. 1 v2.cbz", series="Beta", number="1", pages=(b"a", b"b"), folder="Beta")
+    baseline = plan(scoped=True)
+    assert len(baseline["families"]) == 1 and baseline["counts"]["quarantines"] == 1
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    assert report["families"] == [] and report["counts"]["quarantines"] == 0
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert [s["scope"] for s in report["skipped_scopes"]] == ["Beta"]
+
+
+def test_a_skipped_scope_drops_its_unchanged_rows(env, monkeypatch):
+    """The unchanged-row filter had no direct witness either (#159 R2)."""
+    root, db, book, plan = env
+    alpha = book(series="Alpha", folder="Alpha")
+    book("Beta ch. 7.cbz", series="Beta", folder="Beta")
+    baseline = plan(scoped=True)
+    assert any(Path(u["path"]).parent.name == "Beta" for u in baseline["unchanged"])
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    assert not any(Path(u["path"]).parent.name == "Beta" for u in report["unchanged"])
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
