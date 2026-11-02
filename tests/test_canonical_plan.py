@@ -821,3 +821,314 @@ def test_saved_receipt_preserves_nonzero_diagnostics(env, tmp_path, capsys):
     receipt = json.loads(capsys.readouterr().out)
     document = json.loads(output.read_text(encoding="utf-8"))
     assert receipt["diagnostics"] == document["diagnostics"] == {"unverified_version_labels": 1}
+
+
+# --- scoped planning (#158 B1) -------------------------------------------------
+
+
+def _two_series(book):
+    """Two series folders, each with one book that plans as a rename."""
+    alpha = book(series="Alpha", folder="Alpha")
+    beta = book(series="Beta", folder="Beta")
+    return alpha, beta
+
+
+def _mutate_once(monkeypatch, mutate):
+    """Run ``mutate`` once, after the first archive has been derived.
+
+    Folders are planned in sorted order, so the first derivation is Alpha's
+    and the mutation lands mid-plan, between the two inventory walks.
+    """
+    original = cp.sv.derive_archive
+    done = []
+
+    def derive(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not done:
+            done.append(True)
+            mutate()
+        return result
+
+    monkeypatch.setattr(cp.sv, "derive_archive", derive)
+
+
+def test_scoped_mode_skips_only_the_series_folder_that_changed(env, monkeypatch):
+    """A book arriving in Beta drops Beta's rename and keeps Alpha's.
+
+    The arrival also changes Beta's own directory mtime, so this would
+    refuse outright if a series folder's row were treated as root level.
+    """
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.cbz").write_bytes(b"new"))
+    report = plan(scoped=True)
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert report["skipped_scopes"] == [{"scope": "Beta", "path": str(root / "Beta"),
+        "reason": "series folder inventory changed during planning"}]
+    assert report["planning_scope"] == {"mode": "series", "requested": None}
+    assert report["diagnostics"]["skipped_scopes"] == 1
+    assert report["counts"]["renames"] == 1 and not report["review"]
+    assert parse_plan(report).digest == report["plan_digest"]
+
+
+def test_scoped_mode_drops_holds_from_a_skipped_folder(env, monkeypatch):
+    """A skipped folder contributes nothing to the plan, not even its holds."""
+    root, db, book, plan = env
+    book(series="Alpha", folder="Alpha")
+    book(series="Beta", folder="Beta", catalog=False)
+    assert len(plan(scoped=True)["review"]) == 1
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    assert report["review"] == [] and len(report["renames"]) == 1
+    assert [s["scope"] for s in report["skipped_scopes"]] == ["Beta"]
+
+
+def test_scoped_mode_skips_a_change_deep_inside_a_series_folder(env, monkeypatch):
+    root, db, book, plan = env
+    alpha = book(series="Alpha", folder="Alpha")
+    book(series="Beta", folder="Beta/Volume 1")
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "Volume 1" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert [s["scope"] for s in report["skipped_scopes"]] == ["Beta"]
+
+
+def test_a_series_folder_appearing_during_scoped_planning_is_reported(env, monkeypatch):
+    root, db, book, plan = env
+    _two_series(book)
+    _mutate_once(monkeypatch, lambda: (root / "Gamma").mkdir())
+    report = plan(scoped=True)
+    assert len(report["renames"]) == 2
+    assert report["skipped_scopes"] == [{"scope": "Gamma", "path": str(root / "Gamma"),
+        "reason": "series folder appeared during planning"}]
+
+
+def test_strict_mode_still_refuses_a_change_inside_one_series_folder(env, monkeypatch):
+    root, db, book, plan = env
+    _two_series(book)
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.cbz").write_bytes(b"new"))
+    with pytest.raises(cp.PlanningRefused, match="library inventory changed"):
+        plan()
+
+
+def test_strict_mode_documents_carry_no_scoped_keys(env):
+    """Scoped planning is opt-in; a default plan's contract is unchanged."""
+    root, db, book, plan = env
+    _two_series(book)
+    report = plan()
+    assert "skipped_scopes" not in report and "planning_scope" not in report
+    assert report["diagnostics"] == {"unverified_version_labels": 0}
+
+
+@pytest.mark.parametrize("arrival", ["late.cbz", "notes.txt", ".stversions"])
+def test_scoped_mode_refuses_a_root_level_change_outside_every_series(env, monkeypatch, arrival):
+    """The root level is not a series and cannot be skipped.
+
+    Loose root books are planned under root-wide authority, and an arrival
+    there belongs to no single series, so scoped mode refuses like strict.
+    """
+    root, db, book, plan = env
+    _two_series(book)
+
+    def arrive():
+        target = root / arrival
+        if arrival.startswith("."):
+            target.mkdir()
+        else:
+            target.write_bytes(b"new")
+
+    _mutate_once(monkeypatch, arrive)
+    with pytest.raises(cp.PlanningRefused, match="root level changed"):
+        plan(scoped=True)
+
+
+def test_named_scopes_plan_only_those_folders_and_ignore_others(env, monkeypatch):
+    """With --scope, unnamed series folders are neither planned nor watched.
+
+    Loose root books are still observed (a root-level change refuses) but
+    are not planned, because the operator named only Alpha.
+    """
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    loose = book(series="Loose", folder=".")
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.cbz").write_bytes(b"new"))
+    report = plan(scopes=["Alpha"])
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert report["skipped_scopes"] == [] and report["review"] == []
+    assert report["planning_scope"] == {"mode": "series", "requested": ["Alpha"]}
+    assert not any(row["path"].startswith("Beta") for row in report["provenance"]["inventory"])
+    assert any(row["path"] == loose.name for row in report["provenance"]["inventory"])
+
+
+@pytest.mark.parametrize("name, message", [
+    ("Missing", "not a folder directly under the root"),
+    ("..", "one folder name"),
+    ("Alpha/x", "one folder name"),
+    (".stversions", "excluded"),
+    ("alpha", "not a folder directly under the root"),
+])
+def test_named_scopes_must_be_exact_plain_series_folders(env, name, message):
+    root, db, book, plan = env
+    _two_series(book)
+    (root / ".stversions").mkdir()
+    with pytest.raises(cp.PlanningRefused, match=message):
+        plan(scopes=[name])
+
+
+def test_the_digest_seals_the_skipped_scopes(env, monkeypatch):
+    """An approved digest cannot silently differ in what was left unplanned."""
+    from comic_automation.library.canonical_apply.plan import PlanError
+    root, db, book, plan = env
+    _two_series(book)
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    for forged in ([], [{**report["skipped_scopes"][0], "scope": "Gamma"}]):
+        with pytest.raises(PlanError, match="plan_digest"):
+            parse_plan({**report, "skipped_scopes": forged})
+
+
+def test_cli_scoped_plan_with_a_skipped_folder_is_not_a_clean_exit(env, capsys, monkeypatch):
+    root, db, book, plan = env
+    _two_series(book)
+    args = ["--library-root", str(root), "--database", str(db),
+            "--quarantine-date", "2026-10-24", "--number-style", "chapter"]
+    assert main([*args, "--scope", "Alpha", "--scope", "Beta"]) == 0
+    assert json.loads(capsys.readouterr().out)["skipped_scopes"] == []
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    assert main([*args, "--scoped"]) == 1
+    assert [s["scope"] for s in json.loads(capsys.readouterr().out)["skipped_scopes"]] == ["Beta"]
+
+
+def _vanish_during_walk(monkeypatch, root, walk, target, away, *, listing=False):
+    """Move ``target`` to ``away`` mid-listing, inside inventory walk ``walk``.
+
+    The hook runs only while `_inventory` call number ``walk`` is listing
+    ``target``'s parent: the real children are listed first, then the target
+    moves before they are returned, so the walk's own lstat finds it gone.
+    That is the watcher-moves-a-book race, made deterministic. With
+    ``listing`` the target folder instead moves after its lstat but just
+    before its own listing, so the walk's iterdir is what fails.
+    """
+    import contextlib
+    original_inventory, original_scandir = cp._inventory, cp.os.scandir
+    calls, active = [], []
+
+    def inventory(*args, **kwargs):
+        calls.append(True)
+        active.append(len(calls) == walk)
+        try:
+            return original_inventory(*args, **kwargs)
+        finally:
+            active.pop()
+
+    def scandir(folder):
+        here = Path(folder)
+        if not (active and active[-1]):
+            return original_scandir(folder)
+        if listing and here == target and target.exists():
+            target.rename(away)  # gone before its own listing starts
+        if not listing and here == target.parent and target.exists():
+            with original_scandir(folder) as it:
+                entries = list(it)  # listed (types cached) before the move
+            target.rename(away)
+            return contextlib.nullcontext(entries)
+        return original_scandir(folder)
+
+    monkeypatch.setattr(cp, "_inventory", inventory)
+    monkeypatch.setattr(cp.os, "scandir", scandir)
+
+
+@pytest.mark.parametrize("walk", [1, 2])
+@pytest.mark.parametrize("what", ["book", "folder", "listing"])
+def test_scoped_mode_skips_a_series_whose_entry_vanishes_mid_listing(env, monkeypatch, tmp_path, walk, what):
+    """Codex's #159 R1: a move between listing and lstat cost the whole plan.
+
+    Whether the book or the whole Beta folder moves, and whether it happens
+    during the first or the final walk, Alpha's rename survives and Beta is
+    skipped with a reason, instead of FileNotFoundError aborting every scope.
+    """
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    target = beta if what == "book" else root / "Beta"
+    _vanish_during_walk(monkeypatch, root, walk, target, tmp_path / f"moved-{what}",
+                        listing=what == "listing")
+    report = plan(scoped=True)
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert report["skipped_scopes"] == [{"scope": "Beta", "path": str(root / "Beta"),
+        "reason": "series folder changed while it was being listed"}]
+    assert parse_plan(report).digest == report["plan_digest"]
+
+
+def test_strict_mode_still_aborts_when_an_entry_vanishes_mid_listing(env, monkeypatch, tmp_path):
+    """Tolerance is scoped-only; strict mode keeps its all-or-nothing contract."""
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    _vanish_during_walk(monkeypatch, root, 2, beta, tmp_path / "moved")
+    with pytest.raises((FileNotFoundError, cp.PlanningRefused)):
+        plan()
+
+
+def test_a_skipped_scope_drops_its_family_and_quarantine(env, monkeypatch):
+    """Codex's #159 R2: the family filter had no direct witness.
+
+    Beta holds a two-version family that would quarantine its older member.
+    Once Beta changes mid-plan, neither the family nor its quarantine may
+    survive, while Alpha's ordinary rename still does.
+    """
+    root, db, book, plan = env
+    alpha = book(series="Alpha", folder="Alpha")
+    book("Beta ch. 1 v1.cbz", series="Beta", number="1", pages=(b"a",), folder="Beta")
+    book("Beta ch. 1 v2.cbz", series="Beta", number="1", pages=(b"a", b"b"), folder="Beta")
+    baseline = plan(scoped=True)
+    assert len(baseline["families"]) == 1 and baseline["counts"]["quarantines"] == 1
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    assert report["families"] == [] and report["counts"]["quarantines"] == 0
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert [s["scope"] for s in report["skipped_scopes"]] == ["Beta"]
+
+
+def test_a_skipped_scope_drops_its_unchanged_rows(env, monkeypatch):
+    """The unchanged-row filter had no direct witness either (#159 R2)."""
+    root, db, book, plan = env
+    alpha = book(series="Alpha", folder="Alpha")
+    book("Beta ch. 7.cbz", series="Beta", folder="Beta")
+    baseline = plan(scoped=True)
+    assert any(Path(u["path"]).parent.name == "Beta" for u in baseline["unchanged"])
+    _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
+    report = plan(scoped=True)
+    assert not any(Path(u["path"]).parent.name == "Beta" for u in report["unchanged"])
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+
+
+
+@pytest.mark.parametrize("walk", [1, 2])
+@pytest.mark.parametrize("scopes", [None, ["Alpha"]])
+@pytest.mark.parametrize("entry", ["loose.txt", ".cbz-canonical-naming", "ai-decensor-originals"])
+def test_a_root_entry_vanishing_mid_listing_refuses_scoped_planning(env, monkeypatch, tmp_path, walk, scopes, entry):
+    """Codex's #159 re-review: a vanished root entry is root-level evidence.
+
+    Its type was never observed as a plannable series folder (a loose file,
+    the planner's own history folder, protected decensor originals), so it
+    cannot be confined to a scope and must refuse, with or without --scope.
+    """
+    root, db, book, plan = env
+    _two_series(book)
+    target = root / entry
+    if entry.endswith(".txt"):
+        target.write_text("x")
+    else:
+        target.mkdir()
+    _vanish_during_walk(monkeypatch, root, walk, target, tmp_path / "moved-root-entry")
+    with pytest.raises(cp.PlanningRefused, match="root level changed"):
+        plan(scoped=True) if scopes is None else plan(scopes=scopes)
+
+
+def test_an_unrequested_series_folder_vanishing_is_not_this_plans_concern(env, monkeypatch, tmp_path):
+    """With --scope Alpha, Beta is never observed; its folder moving changes nothing."""
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    _vanish_during_walk(monkeypatch, root, 1, root / "Beta", tmp_path / "moved-beta")
+    report = plan(scopes=["Alpha"])
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert report["skipped_scopes"] == []

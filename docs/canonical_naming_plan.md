@@ -151,6 +151,53 @@ and at its existing guarded boundaries. This planner neither attests
 quiescence nor activates an executor. It does not measure SMB locking or
 rename semantics; those remain rollout prerequisites.
 
+### Scoped planning (opt-in, #158 B1)
+
+Strict mode above is the default. On a live library that the watcher writes
+to most days, a whole-root plan rarely completes, so `--scoped` (function
+`build_plan(..., scoped=True)`) compares the before/after inventory per
+series folder, meaning each folder directly under the root together with
+everything inside it, including its own directory row (an arrival changes
+the folder's mtime). A folder that changed, appeared or disappeared during
+planning is listed in `skipped_scopes` (`scope`, `path`, `reason`) and every
+rename, family, review hold and unchanged row inside it is dropped; the other
+folders' actions stand. `--scope NAME` (repeatable; `scopes=[...]`) plans
+only the named folders, exact spelling, and implies `--scoped`; unnamed
+series folders are then neither walked nor planned.
+
+A scoped walk also tolerates the live race where an entry is listed and then
+moves before it is examined: the watcher moving a book, or a whole series
+folder, mid-walk. Instead of aborting the run with `FileNotFoundError`, the
+entry is recorded as `vanished` under the series folder its name gives, and
+that folder is skipped with the reason "series folder changed while it was
+being listed", even if both walks happened to record the same vanished path.
+Only an entry attributable to one series folder is tolerated. Anything
+below a series folder is. A vanished root-level entry is attributed only if
+the directory listing itself (`os.scandir`, whose type and attributes come
+from the directory read and survive the entry vanishing) saw a plain,
+plannable directory. A vanished root-level file, history or protected
+folder, reparse point, or an entry whose listed type is unavailable is
+root-level evidence and refuses the run, with or without `--scope`, like any
+other root-level change. With `--scope`, an unnamed series folder vanishing
+is ignored, as its contents are never observed. The root itself vanishing
+still aborts, and strict mode still raises on any such race.
+
+The root level, meaning loose files, exclusions and reparse points directly
+under the root, is not a series and is never skipped: any change there
+refuses the run as strict mode does. Loose root books are planned under
+root-wide authority (`--series-folder-root` or the root's number-style
+registry entry), and an arrival there belongs to no single series, so
+there is no scope it could be confined to. With `--scope` the root level
+is still observed and still refuses, but its loose books are not planned.
+
+A scoped plan also carries `planning_scope` (`mode`, `requested`). Both keys
+are sealed by `plan_digest`, so an approved digest also approves exactly
+which folders were left unplanned. They are not part of `counts`, which
+stay the executor's five; `diagnostics.skipped_scopes` gives the number.
+The CLI exits 1 when any folder was skipped. A strict plan carries neither
+key and is byte-identical to one made before this option existed. Apply
+is unchanged: it already revalidates each action on its own.
+
 The SHA256 covers canonical UTF-8 JSON (sorted keys, compact separators,
 unescaped Unicode) of every field except `plan_digest`. Counts match the
 executor's five counts. Additional provenance, review and unchanged rows
