@@ -1,5 +1,6 @@
 """Real private homes, matching claims and ledger-pinned cold log pages."""
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -228,3 +229,107 @@ def test_codec_verification_compares_supplied_ledger_command_digest(tmp_path):
     other = ar.ArchiveJob(job_id, "failed", "f" * 64, root)
     with pytest.raises(ar.ArchiveRefused, match="ledger evidence"):
         ar.verify_batch(target / receipt.file_name, receipt.sha256, jobs={job_id: other})
+
+
+def test_create_writer_streams_eight_mib_with_one_full_inspection(service, monkeypatch):
+    """Production adapter, real ACLs/fsyncs: no fixed scan per 64KiB chunk."""
+    _, store, row, logs = service
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        original = sd.inspect_state_dir
+        inspections = []
+        def counted(*args, **kwargs):
+            inspections.append(args[0])
+            return original(*args, **kwargs)
+        monkeypatch.setattr(sd, "inspect_state_dir", counted)
+        disk = logs.create_writer(claim)
+        assert len(inspections) == 1  # the creation-time full check stays mandatory
+        chunk = b"x" * lg.CHUNK_BYTES
+        total = 8 * 1024 * 1024
+        for start in range(0, total, len(chunk)):
+            disk.append(start, chunk)
+        disk.finish(total, complete=True)
+        assert len(inspections) == 1
+        assert disk.snapshot["offset"] == total and disk.snapshot["complete"]
+        assert disk.snapshot["gaps"] == []
+        stored = (logs.directory / "seg-0000000000000000.log").read_bytes()
+        assert hashlib.sha256(stored).digest() == hashlib.sha256(chunk * 128).digest()
+
+
+def test_writer_refuses_changed_pinned_home_identity_after_creation(service):
+    _, store, row, logs = service
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        disk = logs.create_writer(claim)
+        original = store.identity
+        try:
+            store.identity = (original[0], original[1] + 1)
+            with pytest.raises(sd.StateDirRefused, match="identity changed"):
+                disk.append(0, b"refused")
+            assert disk.snapshot["offset"] == 0
+        finally:
+            store.identity = original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows permissions")
+@pytest.mark.parametrize("target", ["home", "parent", "index", "segment"])
+def test_streaming_writer_refuses_new_public_access(service, target):
+    state, store, row, logs = service
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        disk = logs.create_writer(claim)
+        disk.append(0, b"first")
+        path = {"home": state.path, "parent": logs.directory,
+                "index": disk.index_path,
+                "segment": logs.directory / "seg-0000000000000000.log"}[target]
+        acl._icacls(str(path), "/grant", "*S-1-5-11:R")
+        try:
+            with pytest.raises(sd.StateDirRefused, match="not private"):
+                disk.append(5, b"refused")
+            assert disk.snapshot["offset"] == 5
+        finally:
+            acl._icacls(str(path), "/remove:g", "*S-1-5-11")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native junction")
+def test_streaming_writer_refuses_log_parent_replaced_by_junction(service, tmp_path):
+    import _winapi
+    _, store, row, logs = service
+    outside = private_dir(tmp_path / "outside")
+    original_files = {p.name: p.read_bytes() for p in outside.iterdir()}
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        disk = logs.create_writer(claim)
+        parked = logs.directory.with_name("parked-log")
+        logs.directory.rename(parked)
+        _winapi.CreateJunction(str(outside), str(logs.directory))
+        try:
+            with pytest.raises(sd.StateDirRefused, match="link or junction"):
+                disk.append(0, b"refused")
+            assert {p.name: p.read_bytes() for p in outside.iterdir()} == original_files
+        finally:
+            logs.directory.rmdir()
+            parked.rename(logs.directory)
+
+
+def test_midjob_state_refusal_leaves_unknown_tail_at_last_durable_offset(service, monkeypatch):
+    """A privacy refusal is not retried or finalized as a tool failure."""
+    _, store, row, logs = service
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        disk = logs.create_writer(claim)
+        original = disk.validate
+        def refused(path):
+            original(path)
+            if disk.snapshot["offset"] >= 6:
+                raise sd.StateDirRefused("fixture mid-job boundary refusal")
+        monkeypatch.setattr(disk, "validate", refused)
+        class Source(io.BytesIO):
+            def read(self, count):
+                return super().read(6)
+        pump = lg.LogPump(Source(b"first\nnext\n"), disk).start()
+        result = pump.join(5)
+        assert result.settled and not result.complete
+        assert result.error == "StateDirRefused" and result.durable_offset == 6
+        # Paging still says live while M3c owns a live job; once it records
+        # uncertainty, the same incomplete index must expose unknown_tail.
+        with dal.connection_scope(store.database) as db, dal.transaction(db):
+            db.execute("UPDATE jobs SET state='uncertain' WHERE job_id=?", (row["job_id"],))
+        output = logs.read_page()
+        assert output["log_status"] == "unknown_tail" and not output["eof"]
+        assert output["proven_offset"] == "6"
