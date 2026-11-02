@@ -1,7 +1,6 @@
 """Native disposable trees and deterministic failure/ownership witnesses."""
 import ctypes as C
 from ctypes import wintypes as W
-import gc
 import json
 import os
 from pathlib import Path
@@ -120,7 +119,8 @@ def test_job_handle_noninheritance_private_dacl_and_collision_no_limit_change(jo
         with pytest.raises(w.JobCollision) as caught:
             spawn(job_id, tmp_path, "-c", "raise AssertionError('must not run')")
         assert not caught.value.child_created
-        assert child.active_processes() == 1
+        assert w.observe_process(child.identity).state == "alive"
+        assert child.active_processes() >= 1
         child.terminate()
         assert child.wait_root(5) is not None
         eventually(lambda: child.active_processes() == 0)
@@ -178,7 +178,12 @@ def test_wait_uses_signalled_process_before_exit_code(job_id, tmp_path, exit_cod
     "CreateFileW", "InitializeProcThreadAttributeList", "JOB_LIST", "HANDLE_LIST", "CreateProcessW",
     "after_create", "identity"])
 def test_each_failure_closes_every_owned_handle_and_never_relaunches(job_id, tmp_path, monkeypatch, stage):
-    owned, born_handles = [], []
+    owned, born_handles, creates = [], [], []
+    original_create = w._kernel.CreateProcessW
+    def record_create(*args):
+        creates.append(True)
+        return original_create(*args)
+    monkeypatch.setattr(w._kernel, "CreateProcessW", record_create)
     base = w._Handle
     class Tracked(base):
         def __init__(self, value):
@@ -222,11 +227,17 @@ def test_each_failure_closes_every_owned_handle_and_never_relaunches(job_id, tmp
         monkeypatch.setattr(w._kernel, "CreateProcessW", created)
     elif stage == "identity":
         monkeypatch.setattr(w, "_identity", lambda *args: (_ for _ in ()).throw(w.NativeLaunchError("identity", 5)))
+    elif stage == "CreateProcessW":
+        def refused(*args):
+            creates.append(True)
+            return fail()
+        monkeypatch.setattr(w._kernel, stage, refused)
     else:
         monkeypatch.setattr(w._kernel, stage, fail)
     with pytest.raises(w.NativeLaunchError) as caught:
         spawn(job_id, tmp_path, "-c", "import time;time.sleep(10)")
     assert caught.value.child_created == (stage in ("after_create", "identity"))
+    assert len(creates) == (1 if stage in ("CreateProcessW", "after_create", "identity") else 0)
     flags = W.DWORD()
     assert owned or stage == "security"
     for owner, value in owned:
@@ -255,6 +266,7 @@ def test_owner_death_kills_root_and_grandchild_without_retained_query_handle(job
         # Windows may include extra subprocesses; both witnessed identities
         # must be live and the eventual proof must cover the entire job.
         assert w.observe_job(job_id, session).active_processes >= 2
+        assert owner.poll() is None
         owner.kill()  # Only this fixture Popen; no production PID or job is targeted.
         owner.wait(timeout=5)
         eventually(lambda: all(w.observe_process(i).state == "gone" for i in identities))
@@ -296,4 +308,12 @@ def test_root_exit_does_not_imply_descendants_or_pipe_eof(job_id, tmp_path):
 def test_invalid_launch_inputs_create_no_job(job_id, tmp_path, arguments, environment):
     with pytest.raises(ValueError):
         w.launch(job_id, Path(sys.executable), arguments, cwd=tmp_path, environment=environment)
+    assert w.observe_job(job_id, w.current_identity().session_id).state == "absent"
+
+
+def test_real_missing_executable_refuses_without_search_or_child(job_id, tmp_path):
+    with pytest.raises(w.NativeLaunchError) as caught:
+        w.launch(job_id, tmp_path / "missing.exe", [], cwd=tmp_path, environment=dict(os.environ))
+    assert caught.value.stage == "CreateProcessW"
+    assert caught.value.code == 2 and not caught.value.child_created
     assert w.observe_job(job_id, w.current_identity().session_id).state == "absent"
