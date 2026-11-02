@@ -326,3 +326,18 @@ def test_real_missing_executable_refuses_without_search_or_child(job_id, tmp_pat
     assert caught.value.stage == "CreateProcessW"
     assert caught.value.code == 2 and not caught.value.child_created
     assert w.observe_job(job_id, w.current_identity().session_id).state == "absent"
+
+
+def test_environment_block_is_ordered_by_uppercase_names(job_id, tmp_path, monkeypatch):
+    """Casefold sorts underscore before lowercase letters, unlike uppercase order."""
+    original = w._kernel.CreateProcessW
+    observed = []
+    env = dict(os.environ, z_fixture="z", _fixture="underscore", a_fixture="a")
+    def create(*args):
+        block = args[6][:]
+        observed.extend(item.split("=", 1)[0] for item in block.split("\0") if item)
+        return original(*args)
+    monkeypatch.setattr(w._kernel, "CreateProcessW", create)
+    with spawn(job_id, tmp_path, "-c", "pass", environment=env) as child:
+        assert child.wait_root(5) == 0
+    assert observed == sorted(env, key=str.upper)
