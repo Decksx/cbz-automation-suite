@@ -152,20 +152,46 @@ def _safe_destination(path: str, root: Path) -> bool:
     return True
 
 
-def _inventory(root: Path, scopes: frozenset[str] | None = None) -> tuple[list[dict], list[Path], list[dict]]:
+def _inventory(root: Path, scopes: frozenset[str] | None = None, *,
+               tolerant: bool = False) -> tuple[list[dict], list[Path], list[dict]]:
     """Walk without following reparse points; unreadable directories abort.
 
     ``scopes`` limits the walk to the named series folders. Everything else
     directly under the root is still observed, except other series folders,
     which are neither recorded nor descended: their changes are not this
     plan's concern, but a root-level change still is (see `_skipped_scopes`).
+
+    ``tolerant`` (scoped planning only) records an entry that disappears
+    between being listed and being examined as a ``vanished`` row instead of
+    aborting. A live library has the watcher moving books while this walks,
+    and one such move must cost only its own series folder, not the plan.
+    `_skipped_scopes` skips every scope holding a vanished row. Strict mode
+    keeps raising, so its behaviour is unchanged.
     """
     rows, books, excluded = [], [], []
     pending = [root]
     while pending:
         folder = pending.pop()
-        for child in sorted(folder.iterdir(), key=lambda p: p.name):
-            info = child.lstat()
+        try:
+            children = sorted(folder.iterdir(), key=lambda p: p.name)
+        except (FileNotFoundError, NotADirectoryError):
+            if not tolerant or folder == root:
+                raise
+            rows.append({"path": str(folder.relative_to(root)), "kind": "vanished"})
+            continue
+        for child in children:
+            try:
+                info = child.lstat()
+            except FileNotFoundError:
+                if not tolerant:
+                    raise
+                # Gone between the listing and this lstat. Its type is unknown,
+                # so a root-level entry is attributed to a scope of its own
+                # name; a vanished loose file then reads as a skipped "folder",
+                # which plans nothing and is conservative.
+                if scopes is None or folder != root or child.name in scopes:
+                    rows.append({"path": str(child.relative_to(root)), "kind": "vanished"})
+                continue
             relative = str(child.relative_to(root))
             if child.name.casefold() == "ai-decensor-originals":
                 excluded.append({"path": relative, "reason": "protected decensor originals"})
@@ -211,7 +237,9 @@ def _by_scope(root: Path, rows: list[dict], books: list[Path],
     """Partition one `_inventory` observation by `_scope_name`."""
     grouped: dict[str | None, tuple[list, list, list]] = defaultdict(lambda: ([], [], []))
     for row in rows:
-        grouped[_scope_name(row["path"], directory=row["kind"] == "directory")][0].append(row)
+        # A vanished entry's type is unknown; attribute it to the series folder
+        # its name gives, never to the root level (see `_inventory`).
+        grouped[_scope_name(row["path"], directory=row["kind"] != "file")][0].append(row)
     for book in books:
         grouped[_scope_name(str(book.relative_to(root)), directory=False)][1].append(book)
     for row in excluded:
@@ -237,7 +265,11 @@ def _skipped_scopes(root: Path, before: tuple, after: tuple) -> list[dict]:
             "library root level changed during planning (outside any series folder)")
     skipped = []
     for name in sorted({*old, *new} - {None}):
-        if name not in old:
+        # Checked first: a scope observed mid-change is untrustworthy even
+        # when both walks happened to record the same vanished path.
+        if any(row["kind"] == "vanished" for side in (old, new) for row in side.get(name, ([],))[0]):
+            reason = "series folder changed while it was being listed"
+        elif name not in old:
             reason = "series folder appeared during planning"
         elif name not in new:
             reason = "series folder disappeared during planning"
@@ -550,7 +582,7 @@ def build_plan(
     def read(connection: sqlite3.Connection) -> dict:
         if file_identity(database) != target:
             raise PlanningRefused("database target changed before catalog read")
-        observed = _inventory(root, requested)
+        observed = _inventory(root, requested, tolerant=scoped)
         before, books, excluded = observed
         if requested is not None:
             # Root-level loose books are observed (a change there still
@@ -735,7 +767,7 @@ def build_plan(
             # siblings of their sources and quarantine paths are unique per
             # family, so no unit in a kept scope can collide with one dropped
             # here, and dropping cannot unblock anything.
-            skipped = _skipped_scopes(root, observed, _inventory(root, requested))
+            skipped = _skipped_scopes(root, observed, _inventory(root, requested, tolerant=True))
             _drop_scopes(doc, skipped, root)
             # Both keys are sealed by the digest like every other key, so an
             # approved digest also approves exactly what was left unplanned.
