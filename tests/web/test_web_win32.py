@@ -277,6 +277,15 @@ def test_owner_death_kills_root_and_grandchild_without_retained_query_handle(job
             owner.kill()
         owner.wait(timeout=5)
         if identities:
+            # A deliberately removed kill-on-close guard must not leave test
+            # conhosts/children alive. Only this random fixture job is opened,
+            # and only after its own child identity handshakes were observed.
+            cleanup = w._kernel.OpenJobObjectW(0x4 | 0x8, False, w.job_name(job_id))
+            if cleanup:
+                try:
+                    assert w._kernel.TerminateJobObject(cleanup, 1)
+                finally:
+                    assert w._kernel.CloseHandle(cleanup)
             eventually(lambda: all(w.observe_process(i).state == "gone" for i in identities), 8)
 
 
