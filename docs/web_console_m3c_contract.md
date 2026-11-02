@@ -117,6 +117,9 @@ richer outcome mappings explicitly.
 
 A StateDirRefused or writer failure retains the last durable index as an
 unknown tail and records uncertainty. A recovered writer cannot clear it.
+After writer failure, the reader must keep draining and discarding output
+through its bounded queue until final cleanup; do not call cancellation/join
+early and strand a still-running writing tool behind a full OS pipe.
 Continue bounded process supervision; stop requests must still obey the
 stored policy. In particular, a log failure is not a new permission to force
 terminate a writing tool with no accepted interruption gate. If such a tool
@@ -149,8 +152,12 @@ receipt or outcome from process absence.
 M3d's explicit recheck is the only transition out of durable uncertain. It
 requires the expected nonce/version and fresh proof that the exact old runner
 and recorded child are gone and the correct session's named job is absent.
-Even a valid late receipt cannot auto-clear uncertain. Merely opening an
-identically named Local object in another session is not evidence [3].
+Even a valid late receipt cannot auto-clear uncertain. A read-only job held
+uncertain solely for log/drain proof still blocks admission. M3d must expose
+this explicit operator acknowledgement/recheck path with fresh proof and an
+attributed event; no automatic timeout or recovered writer releases it.
+Merely opening an identically named Local object in another session is not
+evidence [3].
 Reconciliation never terminates a PID or adopts control of an existing job.
 
 No durable state update is possible when the state home/DB is unavailable.
@@ -170,7 +177,9 @@ missing tail and requires fresh native proof, not a presumed clean drain.
 2. Runner/store/receipt integration: conditional transitions, fake-tool
    success/failure, refused seals before birth, running-persist failure after
    birth, descendant grace independent of EOF, receipt durable/DB-commit crash,
-   blocked writer, reader cancellation and log-boundary refusal. Explicit
+   blocked writer, reader cancellation and log-boundary refusal. Include a
+   writer-fails witness whose writing child emits more than the OS pipe buffer
+   and still exits because the reader continues draining/discarding. Explicit
    handshakes at every crash point in M3 section5; no sleeps as race proof.
 3. Recovery evidence helpers: gone/alive/denied/reused PID, same/wrong session,
    absent/present/foreign named job, malformed/stale receipt, repeated import,
@@ -200,3 +209,9 @@ References checked2026-11-02:
 [2]: https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-createjobobjectw
 [3]: https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-openjobobjectw
 Also: [explicit inherited-handle attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
+Claude agreed all four decisions at original head3d9b5cc in hive #3454 and
+the PR #160 comment. This follow-up folds in the drain/discard invariant and
+explicit operator acknowledgement cost before implementation. Completion-port
+notifications remain an optional later optimization; initial polling stays
+250ms, with fresh query evidence rather than notification delivery as proof.
