@@ -16,6 +16,7 @@ a restart.
 from __future__ import annotations
 
 import ast
+import functools
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -178,12 +179,23 @@ def watcher_watch_folder(source: Path | None = None) -> str | None:
     configure logging as import side effects, so the literal is read with
     ``ast`` instead. Returns None when the assignment is missing or is not a
     plain string, so a refactor of the watcher weakens nothing silently: the
-    caller treats None as "unknown" and says so.
+    caller treats None as "unknown" and says so. Only the most recent source
+    contents are cached: repeated inspections parse once, but a source edit
+    (even one preserving size and timestamps) cannot leave a stale watch root.
     """
     path = source or REPO_ROOT / "scripts" / "cbz_watcher.py"
     try:
-        tree = ast.parse(path.read_bytes())
-    except (OSError, SyntaxError, ValueError):
+        return _watch_folder_literal(path.read_bytes())
+    except OSError:
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _watch_folder_literal(source: bytes) -> str | None:
+    """Parse one source snapshot without importing the watcher or its effects."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
         return None
     for node in tree.body:
         if (
