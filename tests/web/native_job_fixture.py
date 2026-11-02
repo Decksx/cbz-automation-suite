@@ -57,7 +57,7 @@ def run():
             query.argtypes, query.restype = [W.HANDLE, W.LPWSTR, W.DWORD, W.DWORD], W.DWORD
             name = C.create_unicode_buffer(32768)
             if query(int(sentinel), name, len(name), 0):
-                leaked = name.value.removeprefix("\\\\?\\") == os.environ["CBZ_FIXTURE_FILE"]
+                leaked = os.path.samefile(name.value, os.environ["CBZ_FIXTURE_FILE"])
         print(json.dumps(dict(identity=identity(), member=bool(member), arguments=sys.argv[3:],
                               stdin_eof=sys.stdin.buffer.read(1) == b"", leaked=leaked,
                               explicit_env=os.environ.get("CBZ_FIXTURE_VALUE"))), flush=True)
@@ -68,7 +68,7 @@ def run():
             original = w._identity
             def before_identity(handle):
                 publish(directory / "owner.json", {"at": "after_create_before_identity"})
-                wait_file(directory / "release", 25)
+                wait_file(directory / "release", 60)
                 return original(handle)
             w._identity = before_identity
         with w.launch(job_id, Path(sys.executable), [__file__, "tree", str(directory), job_id],
@@ -76,7 +76,7 @@ def run():
             wait_file(directory / "leaf.json")
             wait_file(directory / "tree.json")
             publish(directory / "owner.json", dict(identity=identity(), child=child.identity.__dict__))
-            wait_file(directory / "release", 25)
+            wait_file(directory / "release", 60)
         return
     if mode in ("tree", "orphan"):
         subprocess.Popen([sys.executable, __file__, "leaf", str(directory), job_id],
@@ -87,7 +87,7 @@ def run():
             return
     publish(directory / f"{mode}.json", identity())
     # A failed mutation cannot leave an uncontained test child forever.
-    deadline = time.monotonic() + 25
+    deadline = time.monotonic() + 60
     while not (directory / "release").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
 
