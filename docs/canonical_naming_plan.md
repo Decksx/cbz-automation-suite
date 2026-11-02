@@ -165,6 +165,17 @@ folders' actions stand. `--scope NAME` (repeatable; `scopes=[...]`) plans
 only the named folders, exact spelling, and implies `--scoped`; unnamed
 series folders are then neither walked nor planned.
 
+A scoped walk also tolerates the live race where an entry is listed and then
+moves before it is examined: the watcher moving a book, or a whole series
+folder, mid-walk. Instead of aborting the run with `FileNotFoundError`, the
+entry is recorded as `vanished` under the series folder its name gives, and
+that folder is skipped with the reason "series folder changed while it was
+being listed", even if both walks happened to record the same vanished path.
+The type of a vanished root-level entry is unknown, so it is attributed to a
+scope of its own name; a vanished loose file then reads as a skipped folder,
+which plans nothing. The root itself vanishing still aborts, and strict mode
+still raises on any such race.
+
 The root level, meaning loose files, exclusions and reparse points directly
 under the root, is not a series and is never skipped: any change there
 refuses the run as strict mode does. Loose root books are planned under
