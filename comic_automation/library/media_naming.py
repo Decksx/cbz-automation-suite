@@ -193,6 +193,16 @@ def media_fields(*, series: str, number: str | None, volume: str | None,
         if volume is not None and number is not None and fr.normalize_number(volume) != fr.normalize_number(number):
             raise CanonicalNameError("Full volume conflicts with resolved Number")
         volume, number, collection = volume or number or "1", None, "TPB"
+    elif tokens.collections == frozenset({"TPB"}) and not tokens.volume_tokens and not tokens.primary_numbers:
+        # A bare TPB label ("'68 Scars TPB") carries no number of its own, so
+        # the resolved Number or Volume is the collected volume. Unlike Full,
+        # there is no operator-approved default, so neither one is held.
+        if volume is not None and number is not None and fr.normalize_number(volume) != fr.normalize_number(number):
+            raise CanonicalNameError("TPB volume conflicts with resolved Number")
+        if volume is None and number is None:
+            raise CanonicalNameError("bare TPB label has no resolved volume")
+        volume, number = volume if volume is not None else number, None
+        collection = "TPB" if style == "issue" else None
     elif labelled_volume:
         if len(tokens.collections) > 1 or len(tokens.volume_tokens) != 1 or volume is None:
             raise CanonicalNameError("collected volume is unresolved or conflicting")
