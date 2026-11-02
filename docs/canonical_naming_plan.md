@@ -171,10 +171,16 @@ folder, mid-walk. Instead of aborting the run with `FileNotFoundError`, the
 entry is recorded as `vanished` under the series folder its name gives, and
 that folder is skipped with the reason "series folder changed while it was
 being listed", even if both walks happened to record the same vanished path.
-The type of a vanished root-level entry is unknown, so it is attributed to a
-scope of its own name; a vanished loose file then reads as a skipped folder,
-which plans nothing. The root itself vanishing still aborts, and strict mode
-still raises on any such race.
+Only an entry attributable to one series folder is tolerated. Anything
+below a series folder is. A vanished root-level entry is attributed only if
+the directory listing itself (`os.scandir`, whose type and attributes come
+from the directory read and survive the entry vanishing) saw a plain,
+plannable directory. A vanished root-level file, history or protected
+folder, reparse point, or an entry whose listed type is unavailable is
+root-level evidence and refuses the run, with or without `--scope`, like any
+other root-level change. With `--scope`, an unnamed series folder vanishing
+is ignored, as its contents are never observed. The root itself vanishing
+still aborts, and strict mode still raises on any such race.
 
 The root level, meaning loose files, exclusions and reparse points directly
 under the root, is not a series and is never skipped: any change there
