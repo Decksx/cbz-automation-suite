@@ -1,7 +1,7 @@
 """Durable console admission and runner claims, with no production run route.
 
 Only a trusted server-side verifier can supply a request. Native creation and
-terminal proof belong to subsequent M3 slices; this store never starts a tool.
+supervision belong to the runner; this store never starts a tool.
 All mutations own the admission byte lock and a DAL transaction. Runner claims
 add a per-job byte lock retained by their lease, including after DB commit.
 """
@@ -463,6 +463,124 @@ class JobStore:
                 self._event(db, row, "admission_expired", "reconciler", now)
                 expired.append(old["job_id"])
         return expired
+
+    def _claimed_row(self, db, claim: RunnerClaim, version: int, state: str):
+        """Authenticate the live lock and exact ledger generation under admission.
+
+        The lock must still name the same physical file, not merely an open
+        handle to an unlinked/replaced predecessor. Only claims from this store
+        are accepted; these objects are internal dependencies, never JSON proof.
+        """
+        if (not isinstance(claim, RunnerClaim) or claim._closed or claim._handle.closed
+                or claim._release != self._release_claim
+                or type(version) is not int or not 0 < version < 2**63):
+            raise JobRefused("LIVE_MATCHING_CLAIM_REQUIRED")
+        claim.runner.validate()
+        row = db.execute("SELECT * FROM jobs WHERE job_id=?", (claim.job_id,)).fetchone()
+        if (row is None or row["state"] != state or row["state_version"] != version
+                or row["nonce"] != claim.nonce or row["runner_pid"] != claim.runner.pid
+                or row["runner_created_at"] != str(claim.runner.created_at)
+                or row["runner_session_id"] != claim.runner.session_id):
+            raise JobRefused("CLAIM_TRANSITION_FENCED")
+        own = os.fstat(claim._handle.fileno())
+        current = (self.path / "locks" / "jobs" / f"{claim.job_id}.runner.lock").stat()
+        if not own.st_ino or (own.st_dev, own.st_ino) != (current.st_dev, current.st_ino):
+            raise JobRefused("RUNNER_LOCK_IDENTITY_CHANGED")
+        return row
+
+    def read_command(self, claim: RunnerClaim, version: int) -> dict:
+        """Read the bounded immutable command against its claimed ledger seal.
+
+        Registry reconstruction and fresh interpreter/source checks are still
+        required by the runner immediately before birth; this is not argv input.
+        """
+        with self._home(job_id=claim.job_id), dal.connection_scope(self.database, readonly=True) as db:
+            row = self._claimed_row(db, claim, version, "claimed")
+            path = self.path / "jobs" / claim.job_id / "command.json"
+            with open(path, "rb") as stream:
+                payload = stream.read(MAX_COMMAND_BYTES + 1)
+            self._check_job(claim.job_id)
+            return self._command_document(row, payload)
+
+    def _command_document(self, row, payload: bytes) -> dict:
+        """Bind a bounded command read to all immutable fields, also at finality."""
+        if len(payload) > MAX_COMMAND_BYTES or _digest(payload) != row["command_digest"]:
+            raise JobRefused("COMMAND_DIGEST_CHANGED")
+        try:
+            command = json.loads(payload)
+        except (ValueError, UnicodeError):
+            raise JobRefused("COMMAND_INVALID") from None
+        expected = dict(job_id=row["job_id"], nonce=row["nonce"], state_identity=list(self.identity),
+            seal=json.loads(row["seal_json"]), tool_id=row["tool_id"], kind=row["kind"],
+            readonly=bool(row["readonly"]), operator=row["operator"], dry_run=bool(row["dry_run"]),
+            effects=json.loads(row["effects_json"]))
+        if command != expected or _digest(_json(command["seal"]).encode()) != row["seal_digest"]:
+            raise JobRefused("COMMAND_LEDGER_MISMATCH")
+        return command
+
+    def mark_running(self, claim: RunnerClaim, version: int, child: ProcessIdentity) -> dict:
+        """Persist one contained child's identity; failure never permits relaunch.
+
+        The trusted caller already owns the newly created native job. A child
+        not yet committed here can still exist; it must never be called refused.
+        """
+        child.validate()
+        if child.session_id != claim.runner.session_id:
+            raise JobRefused("CHILD_SESSION_MISMATCH")
+        with self._home(job_id=claim.job_id), self._write() as db:
+            self._claimed_row(db, claim, version, "claimed")
+            now = self._time(db)
+            db.execute("UPDATE jobs SET state='running',state_version=state_version+1,updated_ms=?,"
+                "child_pid=?,child_created_at=?,job_object_name=? WHERE job_id=?",
+                (now, child.pid, str(child.created_at), f"Local\\cbz-console-{claim.job_id}", claim.job_id))
+            row = db.execute("SELECT * FROM jobs WHERE job_id=?", (claim.job_id,)).fetchone()
+            self._event(db, row, "running", f"runner:{claim.runner.pid}:{claim.runner.created_at}", now)
+            return dict(row)
+
+    def refuse_before_create(self, claim: RunnerClaim, version: int, *, reason: str) -> dict:
+        """Record a positively pre-birth refusal, never ambiguous native failure.
+
+        Only the trusted runner may call this and only before native birth was
+        attempted or after proven no-child setup failure. A name collision or
+        possible birth instead uses hold_uncertain, even with no child DB row.
+        """
+        if not isinstance(reason, str) or not 1 <= len(reason) <= 4096:
+            raise JobRefused("INVALID_REFUSAL_REASON")
+        with self._home(job_id=claim.job_id), self._write() as db:
+            self._claimed_row(db, claim, version, "claimed")
+            now = self._time(db)
+            db.execute("UPDATE jobs SET state='refused',state_version=state_version+1,updated_ms=?,outcome=? "
+                       "WHERE job_id=?", (now, reason, claim.job_id))
+            row = db.execute("SELECT * FROM jobs WHERE job_id=?", (claim.job_id,)).fetchone()
+            self._event(db, row, "refused", f"runner:{claim.runner.pid}:{claim.runner.created_at}", now,
+                        {"reason": reason})
+            return dict(row)
+
+    def finalize(self, claim: RunnerClaim, version: int, process, pump, *, outcome_mapper=None) -> dict:
+        """Commit a durable matching receipt after fresh owned native/log proof.
+
+        Admission and the per-runner lock cover proof-to-commit. Queries and
+        file reads occur before the short write transaction; no wait or fsync
+        occurs within it. Uncertain has no automatic transition through here.
+        Recovery import is a different, as-yet-unimplemented interface.
+        """
+        from .receipts import read_for_finalization
+        with self._home(job_id=claim.job_id):
+            with dal.connection_scope(self.database, readonly=True) as db:
+                old = dict(self._claimed_row(db, claim, version, "running"))
+            receipt, digest = read_for_finalization(self, old, claim, process, pump, outcome_mapper)
+            with self._write() as db:
+                self._claimed_row(db, claim, version, "running")
+                now = self._time(db)
+                if now < receipt["ended_ms"]:
+                    raise JobRefused("RECEIPT_FROM_FUTURE")
+                db.execute("UPDATE jobs SET state=?,state_version=state_version+1,updated_ms=?,"
+                    "exit_code=?,outcome=? WHERE job_id=?",
+                    (receipt["state"], now, receipt["exit_code"], receipt["state"], claim.job_id))
+                row = db.execute("SELECT * FROM jobs WHERE job_id=?", (claim.job_id,)).fetchone()
+                self._event(db, row, receipt["state"], f"runner:{claim.runner.pid}:{claim.runner.created_at}", now,
+                    {"receipt_sha256": digest, "durable_offset": receipt["logs"]["durable_offset"]})
+                return dict(row)
 
     def hold_uncertain(self, job_id: str, nonce: str, version: int, *, actor: str, reason: str) -> dict:
         """Retain admission after inconclusive evidence; no automatic release API."""
