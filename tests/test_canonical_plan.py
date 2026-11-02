@@ -1009,8 +1009,8 @@ def _vanish_during_walk(monkeypatch, root, walk, target, away, *, listing=False)
     ``listing`` the target folder instead moves after its lstat but just
     before its own listing, so the walk's iterdir is what fails.
     """
-    import pathlib
-    original_inventory, original_iterdir = cp._inventory, pathlib.Path.iterdir
+    import contextlib
+    original_inventory, original_scandir = cp._inventory, cp.os.scandir
     calls, active = [], []
 
     def inventory(*args, **kwargs):
@@ -1021,16 +1021,21 @@ def _vanish_during_walk(monkeypatch, root, walk, target, away, *, listing=False)
         finally:
             active.pop()
 
-    def iterdir(self):
-        if listing and active and active[-1] and self == target and target.exists():
+    def scandir(folder):
+        here = Path(folder)
+        if not (active and active[-1]):
+            return original_scandir(folder)
+        if listing and here == target and target.exists():
             target.rename(away)  # gone before its own listing starts
-        children = list(original_iterdir(self))
-        if not listing and active and active[-1] and self == target.parent and target.exists():
+        if not listing and here == target.parent and target.exists():
+            with original_scandir(folder) as it:
+                entries = list(it)  # listed (types cached) before the move
             target.rename(away)
-        return iter(children)
+            return contextlib.nullcontext(entries)
+        return original_scandir(folder)
 
     monkeypatch.setattr(cp, "_inventory", inventory)
-    monkeypatch.setattr(pathlib.Path, "iterdir", iterdir)
+    monkeypatch.setattr(cp.os, "scandir", scandir)
 
 
 @pytest.mark.parametrize("walk", [1, 2])
@@ -1094,3 +1099,36 @@ def test_a_skipped_scope_drops_its_unchanged_rows(env, monkeypatch):
     report = plan(scoped=True)
     assert not any(Path(u["path"]).parent.name == "Beta" for u in report["unchanged"])
     assert [r["source"] for r in report["renames"]] == [str(alpha)]
+
+
+
+@pytest.mark.parametrize("walk", [1, 2])
+@pytest.mark.parametrize("scopes", [None, ["Alpha"]])
+@pytest.mark.parametrize("entry", ["loose.txt", ".cbz-canonical-naming", "ai-decensor-originals"])
+def test_a_root_entry_vanishing_mid_listing_refuses_scoped_planning(env, monkeypatch, tmp_path, walk, scopes, entry):
+    """Codex's #159 re-review: a vanished root entry is root-level evidence.
+
+    Its type was never observed as a plannable series folder (a loose file,
+    the planner's own history folder, protected decensor originals), so it
+    cannot be confined to a scope and must refuse, with or without --scope.
+    """
+    root, db, book, plan = env
+    _two_series(book)
+    target = root / entry
+    if entry.endswith(".txt"):
+        target.write_text("x")
+    else:
+        target.mkdir()
+    _vanish_during_walk(monkeypatch, root, walk, target, tmp_path / "moved-root-entry")
+    with pytest.raises(cp.PlanningRefused, match="root level changed"):
+        plan(scoped=True) if scopes is None else plan(scopes=scopes)
+
+
+def test_an_unrequested_series_folder_vanishing_is_not_this_plans_concern(env, monkeypatch, tmp_path):
+    """With --scope Alpha, Beta is never observed; its folder moving changes nothing."""
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    _vanish_during_walk(monkeypatch, root, 1, root / "Beta", tmp_path / "moved-beta")
+    report = plan(scopes=["Alpha"])
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
+    assert report["skipped_scopes"] == []
