@@ -954,6 +954,11 @@ def _canonical_tokens(filename: str) -> NameTokens | None:
       valid name for the series "Series Special Edition"). That trailing run
       stays a candidate run like any other, ahead of the special slot, and
       `effective_markers` places it against the decided series.
+    * The formatter writes a collected edition only as ``vNN (TPB)``, so a
+      series ending in a bare TPB word (``'68 Scars TPB``) is a legacy
+      collected-edition label, not a title. It takes the legacy reading,
+      which records the marker; read here, the label vanished into the
+      series and an authoritative Number of 1 became issue #001.
     """
     try:
         fields = parse_canonical_name(filename)
@@ -961,7 +966,7 @@ def _canonical_tokens(filename: str) -> NameTokens | None:
         return None
     if any(_number_tokens(fields.series).values()) or _BRACKET_CHAR_RE.search(
         fields.series
-    ):
+    ) or re.search(r"(?<![A-Za-z])TPB(?![A-Za-z])", fields.series, re.I):
         return None
     canonical_series = fields.series + (f" ({fields.series_year})" if fields.series_year is not None else "")
     head = canonical_series + (f" {fields.special}" if fields.special else "")
@@ -1049,7 +1054,10 @@ def _legacy_tokens(filename: str) -> NameTokens:
     # Bracket groups are blanked before number tokens are read: numbers
     # inside them are not this book's numbering.
     body = _BRACKET_GROUP_RE.sub(" ", stem)
-    if re.search(r"(?<![A-Za-z])TPB\.?\s*" + _NUMBER_TEXT, body, re.I):
+    # TPB is an explicit collected-edition label with or without a number
+    # after it. Requiring the number missed "'68 Scars TPB" and "Saga TPB v01",
+    # so an authoritative ComicInfo Number of 1 was formatted as issue #001.
+    if re.search(r"(?<![A-Za-z])TPB(?![A-Za-z])", body, re.I):
         collections.add("TPB")
     if re.search(r"(?<![A-Za-z])Full(?:\.?\s*" + _NUMBER_TEXT + r")?\s*$", body, re.I):
         collections.add("Full")
