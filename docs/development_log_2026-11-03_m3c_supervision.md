@@ -1,5 +1,48 @@
 # M3c slice 2B supervision checkpoint — 2026-11-03
 
+## Follow-up: delayed persistence is not failed proof
+
+This section supersedes the age-only receipt-timeout behavior described in the
+initial checkpoint below. Exact250f135 push CI41674738395 failed **2 /4,879
+passed /3 skipped**: the normal runner fixture ended uncertain, and an untouched
+backup collision/dedup fixture failed. The assertion did not print the runner's
+reason, so its actual CI cause is unknown; no timing/WinError diagnosis is
+claimed from that output. Claude requested diagnostics and a decision on
+age-only persistence in PR comment6609818293.
+
+A deterministic slow-publish witness reproduced the policy concern separately:
+holding a successful publisher past the5-second observation threshold caused
+PERSISTENCE_TIMEOUT:publish and sticky uncertainty in the old implementation.
+The revised runner retains ownership and native supervision, reports waiting,
+and waits for the operation's actual result. Successful delayed publication can
+finalize only after fresh native/log/receipt proof. A second witness injects
+real native uncertainty while publication waits and proves that a late valid
+receipt still cannot clear it. Errors, log/drain failures and descendant
+deadlines retain their prior conservative rules. No production deadline widened.
+
+Ordinary runner fixtures now use production drain/cleanup budgets rather than
+the shortened deadline-test budgets. Only explicit deadline witnesses select
+SHORT. Success assertions include reason, phase, log error, budgets and events.
+The original CI uncertainty remains undiagnosed unless further output identifies
+it. Full/load/guard follow-up results will be appended after verification.
+
+The backup fixture's separate clock-boundary probe passes with fixed identical
+ZIP metadata and deliberately reproduces its assertion failure when the third
+archive's ZIP entry timestamps cross a2-second boundary. This was measured on
+unchanged base20ebcc2; its SHA256-based backup behavior is untouched. It
+establishes a fixture sensitivity, not the original CI byte-level cause.
+
+Follow-up verification before the new full run: focused runner **43 passed
+in37.32s**. Eight-worker concurrent load selection (runner plus50MiB log capture
+and8MiB inspection-count witness) **45 passed in35.32s**. Twenty selected guard
+mutants all killed, **23 failing executions with overlap**, including the new
+age-is-not-failure witness and a real-native-unknown-during-publication witness.
+The latter keeps a late valid receipt from clearing actual uncertainty. Source
+restored byte-equal after every mutant. Follow-up replay/output are outside Git:
+m3c_supervision_mutants_followup.py/.log and m3c_supervision_load.log in the
+same control directory. Backup fixture issue is tracked separately as
+[comic #164](https://github.com/Decksx/cbz-automation-suite/issues/164).
+
 Owner: Codex. Independent reviewer/next owner: Claude. Base master
 `36a1b82cb9dbdd3d890e55b95fec6d1159592de7` (merged slice 2A #162).
 Delivery #3636 acknowledged as confirmed hive #3639; plan confirmed #3641.
