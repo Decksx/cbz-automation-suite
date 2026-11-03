@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import math
+import os
+import re
 import threading
 import time
 
@@ -35,10 +37,11 @@ class Limits:
     drain: float = 5
     cleanup: float = 5
     persistence: float = 5
+    refresh: float = 1
 
     def __post_init__(self):
         for name, maximum in (("poll", .25), ("descendants", 10), ("termination", 30),
-                              ("drain", 5), ("cleanup", 5), ("persistence", 5)):
+                              ("drain", 5), ("cleanup", 5), ("persistence", 5), ("refresh", 2)):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= maximum:
                 raise ValueError("Invalid runner budget: " + name)
@@ -115,7 +118,14 @@ class Runner:
                 except Exception:
                     owner._uncertain("PREBIRTH_PERSIST_FAILED")
             else:
-                owner._uncertain("LAUNCH_OR_START_FAILED:" + type(exc).__name__)
+                if owner.process is not None and (owner.pump is None or
+                        owner.pump.reader.ident is None or owner.pump.writer.ident is None):
+                    owner._uncertain("LOG_PUMP_START_FAILED_AFTER_BIRTH:" + type(exc).__name__)
+                    # Birth still happened: retain the exact child identity for
+                    # later recovery even though no successful log start exists.
+                    owner._dispatch("running", lambda: store.mark_running(claim, 2, owner.process.identity))
+                else:
+                    owner._uncertain("LAUNCH_OR_START_FAILED:" + type(exc).__name__)
         return owner
 
     def _dispatch(self, kind, operation):
@@ -182,7 +192,7 @@ class Runner:
                     self._uncertain("STOP_OR_STATE_RECHECK_REQUIRED")
             if op.kind in ("running", "refresh") and self.reason is None:
                 self.phase = "running"
-            self.next_refresh = now + self.limits.poll
+            self.next_refresh = now + self.limits.refresh
 
     def _observe(self, now):
         if self.process is None:
@@ -282,6 +292,22 @@ class Runner:
         return self.row
 
 
+def admission_identity(environ=None) -> tuple[int, int]:
+    """Require the parent admission context's home identity, never a fresh stat.
+
+    M3d's trusted detached spawn supplies CBZ_CONSOLE_STATE_IDENTITY as canonical
+    decimal device:file ID. A missing context refuses before inspecting/opening
+    any ledger. This is transport for an already-pinned identity, not a new pin.
+    """
+    value = (os.environ if environ is None else environ).get("CBZ_CONSOLE_STATE_IDENTITY", "")
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,38}:[1-9][0-9]{0,38}", value):
+        raise JobRefused("ADMISSION_STATE_IDENTITY_REQUIRED")
+    identity = tuple(map(int, value.split(":")))
+    if any(part >= 2**128 for part in identity):
+        raise JobRefused("ADMISSION_STATE_IDENTITY_INVALID")
+    return identity
+
+
 def main(argv=None):
     """Accept only job ID/nonce; inspect the existing pinned home, never init it.
 
@@ -293,8 +319,7 @@ def main(argv=None):
     parser.add_argument("nonce")
     args = parser.parse_args(argv)
     path = state_dir.state_dir_from_env()
-    st = path.stat()
-    state = state_dir.inspect_state_dir(path, expected_identity=(st.st_dev, st.st_ino))
+    state = state_dir.inspect_state_dir(path, expected_identity=admission_identity())
     runner = Runner.start(JobStore(state), args.job_id, args.nonce)
     row = runner.run()
     return 0 if row and row["state"] == "succeeded" else 2

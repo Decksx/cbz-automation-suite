@@ -11,7 +11,7 @@ import threading
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from comic_automation.web import state_dir as sd
-from comic_automation.web.jobs import runner, win32
+from comic_automation.web.jobs import runner, win32, receipts
 from comic_automation.web.jobs.launch_spec import FileSeal, LaunchSpec
 from comic_automation.web.jobs.store import JobStore
 
@@ -43,6 +43,27 @@ def main():
             pause(child)
             return original(claim, version, child)
         store.mark_running = before_running
+    elif stage == "before_receipt":
+        original = receipts.publish
+        def before_publish(store, claim, version, process, pump, **kwargs):
+            pause(process.identity)
+            return original(store, claim, version, process, pump, **kwargs)
+        receipts.publish = before_publish
+    elif stage == "receipt_temp":
+        born = []
+        mark = store.mark_running
+        def record_child(claim, version, child):
+            born.append(child)
+            return mark(claim, version, child)
+        store.mark_running = record_child
+        original = receipts.os.replace
+        def before_replace(source, target, *args, **kwargs):
+            if Path(target).name == "exit.json":
+                # Publication already holds admission. Do not recursively take
+                # that byte lock just to report a fixture handshake.
+                pause(born[0])
+            return original(source, target, *args, **kwargs)
+        receipts.os.replace = before_replace
     elif stage == "receipt":
         original = store.finalize
         def before_final(claim, version, process, pump, **kwargs):

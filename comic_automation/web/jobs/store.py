@@ -563,7 +563,7 @@ class JobStore:
         Admission and the per-runner lock cover proof-to-commit. Queries and
         file reads occur before the short write transaction; no wait or fsync
         occurs within it. Uncertain has no automatic transition through here.
-        Recovery import is a different, as-yet-unimplemented interface.
+        Recovery import is a separate guarded interface in recovery.py.
         """
         from .receipts import read_for_finalization
         with self._home(job_id=claim.job_id):
@@ -584,7 +584,7 @@ class JobStore:
                 return dict(row)
 
     def hold_uncertain(self, job_id: str, nonce: str, version: int, *, actor: str, reason: str) -> dict:
-        """Retain admission after inconclusive evidence; no automatic release API."""
+        """Retain admission; only recovery.recheck can explicitly acknowledge uncertainty."""
         validate_job_id(job_id)
         if (not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
                 or type(version) is not int or not 0 < version < 2**63
