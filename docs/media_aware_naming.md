@@ -24,7 +24,9 @@ is recognised the same way as an unnumbered `Full`: a standalone word
 (Unicode-aware, so `\u00e9TPB` or `TPBX` are not it), nothing after it but
 bracket tags, and the text before it equal to a decided title. A file named
 just `TPB` (apart from bracket tags) inside its series folder is the label as
-well, unless the decided series itself is literally named "TPB". Its volume
+well, unless the decided series itself (the chosen folder, which wins over a
+ComicInfo alias, so the watcher and planner agree) is literally named "TPB" or
+"TPB (year)". Its volume
 comes from the resolved Volume or Number, so Number 1 gives `v01 (TPB)`, not
 issue `#001`. A Volume and Number that disagree are held, and so is a bare
 TPB with neither resolved: unlike Full, no operator decision approves a
