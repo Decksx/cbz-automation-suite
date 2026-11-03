@@ -312,6 +312,39 @@ def test_snapshot_cutoff_excludes_jobs_admitted_during_a_pass(service, ledger, m
     assert service.reconcile_once() and visited == [row["job_id"]]
 
 
+
+def test_real_server_close_retains_guard_while_storage_worker_is_unsettled(ledger, monkeypatch):
+    state, _, _ = ledger
+    http, app = server.build_server(state, 0)
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    original = app.jobs.store.expire_admissions
+    def blocked():
+        entered.set()
+        assert release.wait(15)
+        return original()
+    monkeypatch.setattr(app.jobs.store, "expire_admissions", blocked)
+    worker = threading.Thread(target=app.jobs.reconcile_once)
+    worker.start()
+    def close():
+        http.server_close()
+        closed.set()
+    closer = threading.Thread(target=close)
+    try:
+        assert entered.wait(5)
+        closer.start()
+        # server_close first uses its production2s bounded budget, then must
+        # retain its caller/guard until the real storage worker exits.
+        assert not closed.wait(2.3)
+        assert state._lock is not None
+        with pytest.raises(sd.StateDirRefused): sd.open_state_dir(state.path, environ={})
+    finally:
+        release.set()
+        worker.join(10)
+        if closer.ident is not None: closer.join(10)
+        http.server_close()
+    assert closed.is_set() and not worker.is_alive() and not closer.is_alive()
+
+
 def wait_for(predicate, proc=None, timeout=25):
     """Wait for an explicit native fixture handshake, with a failure watchdog."""
     end = time.monotonic() + timeout
