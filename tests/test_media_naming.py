@@ -55,7 +55,9 @@ def test_each_numbered_tpb_maps_its_own_volume_without_a_default(number):
 
 
 @pytest.mark.parametrize("filename,title", [("'68 Scars TPB.cbz", "'68 Scars"), ("Series TPB.cbz", "Series"),
-                                            ("Series tpb (2019).cbz", "Series")])
+                                            ("Series tpb (2019).cbz", "Series"), ("TPB.cbz", "Blessed Thistle"),
+                                            ("TPB (2019).cbz", "Series"), ("TPB [Scan].cbz", "Series"),
+                                            ("TPB.cbz", "Series (2019)")])
 def test_a_bare_tpb_after_the_decided_title_is_volume_not_issue(filename, title):
     # "'68 Scars TPB" with ComicInfo Number 1 used to be named issue #001.
     year = "2019" if "(2019)" in filename else None
@@ -67,7 +69,8 @@ def test_a_bare_tpb_after_the_decided_title_is_volume_not_issue(filename, title)
 @pytest.mark.parametrize("filename,title", [("TPB Tales.cbz", "TPB Tales"), ("Series TPB.cbz", "Series TPB"),
     ("TPB Tales #003.cbz", "TPB Tales"), ("\u00e9TPB Series.cbz", "\u00e9TPB Series"),
     ("Series TPB\u00e9.cbz", "Series TPB\u00e9"), ("Series TPBX.cbz", "Series"),
-    ("Caf\u00e9TPB.cbz", "Caf\u00e9"), ("Series TPB Extra.cbz", "Series")])
+    ("Caf\u00e9TPB.cbz", "Caf\u00e9"), ("Series TPB Extra.cbz", "Series"), ("TPB.cbz", "TPB"),
+    ("TPB #003.cbz", "TPB"), ("TPB [Scan].cbz", "TPB"), ("TPB.cbz", "TPB (2019)")])
 def test_tpb_inside_the_decided_title_or_a_longer_word_stays_an_issue(filename, title):
     """Codex's #157 R1: a title word is not a collection label.
 
@@ -77,6 +80,13 @@ def test_tpb_inside_the_decided_title_or_a_longer_word_stays_an_issue(filename, 
     fields = media_fields(series=title, number="3", volume=None, style="issue",
                           tokens=fr.parse_name_tokens(filename))
     assert (fields.issue, fields.volume, fields.collection) == ("3", None, None)
+
+
+def test_a_series_literally_named_tpb_keeps_a_year_tagged_issue():
+    """Codex's #169 R1: tags or an issue year never turn the title into a label."""
+    fields = media_fields(series="TPB", number="1", volume=None, style="issue",
+                          tokens=fr.parse_name_tokens("TPB (2019).cbz"), year="2019")
+    assert (fields.issue, fields.volume, fields.collection) == ("1", None, None)
 
 
 def test_a_bare_tpb_takes_its_volume_from_number_or_volume_and_holds_a_conflict():
