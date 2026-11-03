@@ -184,11 +184,18 @@ def _tpb_after_title(tokens: fr.NameTokens, *titles: str | None) -> str | None:
     stem = re.sub(r"\.(?:cbz|zip)$", "", tokens.filename, flags=re.I)
     for label in re.finditer(r"(?<!\w)TPB(?!\w)", stem, re.I):
         prefix = display_key(stem[:label.start()])
+        tail = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem[label.end():]).strip(" []()._-")
         for title in filter(None, titles):
-            # A title that itself ends in TPB never equals the text before it,
-            # so it keeps its word without a special case.
-            if prefix and prefix in {display_key(title), display_key(split_series_year(title)[0])}:
-                return re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem[label.end():]).strip(" []()._-")
+            if prefix:
+                # A title that itself ends in TPB never equals the text before
+                # it, so it keeps its word without a special case.
+                if prefix in {display_key(title), display_key(split_series_year(title)[0])}:
+                    return tail
+            elif not tail and display_key(stem) != display_key(title):
+                # The whole name is the label ("TPB.cbz" inside its series
+                # folder). Only then: "TPB Tales #003" stays an ordinary title,
+                # and a series literally named "TPB" keeps its word.
+                return tail
     return None
 
 
