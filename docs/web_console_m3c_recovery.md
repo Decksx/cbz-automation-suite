@@ -58,11 +58,16 @@ uncertain only to lost/unknown, never success. An inconclusive attempt retains
 uncertainty and records its evidence/note with a new version to fence replay.
 Log-only uncertainty has the same explicit acknowledgement requirement.
 
-Uncertain rows lacking a recorded child identity remain conservative: this
-recheck cannot invent the missing identity and retains uncertainty. This differs
-from a claimed pre-child crash, which the accepted crash table permits to become
-lost on containment/job absence proof. A future operator repair protocol must
-explicitly address ambiguous missing identity; no broad override is supplied.
+An uncertain row with no recorded child can be explicitly rechecked after the
+exact runner is gone and the deterministic named job is absent in that runner's
+Windows session. JOB_LIST at birth, no breakaway and kill-on-close mean there
+cannot be a surviving contained member, even if death preceded child-identity
+persistence. This is the same absence proof accepted for a claimed pre-child
+crash; it changes only the operator-attributed recheck-to-lost path. Automatic
+reconciliation still leaves uncertain untouched and receipt import still needs
+a recorded child. Both child fields must be absent: a partial identity, present
+job (even empty), wrong/unknown session, denied query or foreign stored name
+retains uncertainty. There is no desired-outcome or broad proof override.
 
 An existing exit.json.tmp produces ORPHAN_EXIT_RECEIPT_TEMP during publication
 or dead-owner recovery. The file is preserved, never promoted, overwritten,
