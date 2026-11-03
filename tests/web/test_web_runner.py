@@ -26,6 +26,7 @@ from web_support import private_dir
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows contained runner")
 SHORT = r.Limits(poll=.01, descendants=.3, termination=.5, drain=1, cleanup=.3)
+NORMAL = r.Limits(poll=.01)
 
 
 def until(owner, predicate, timeout=15):
@@ -42,7 +43,7 @@ def until(owner, predicate, timeout=15):
 def fixture(tmp_path):
     state = sd.open_state_dir(private_dir(tmp_path / "state"), environ={})
     owners = []
-    def prepare(body="import os;os.write(1,b'fixture\\n')", *, readonly=True, limits=SHORT, clock=time.monotonic):
+    def prepare(body="import os;os.write(1,b'fixture\\n')", *, readonly=True, limits=NORMAL, clock=time.monotonic):
         source = tmp_path / "tool.py"
         registry = tmp_path / "registry.json"
         source.write_text(body, encoding="utf-8")
@@ -85,7 +86,9 @@ def test_runner_commits_only_after_native_log_and_receipt_proof(fixture, code, s
     owner = start()
     until(owner, lambda: owner.done)
     final = store.get(row["job_id"])
-    assert final["state"] == state and final["exit_code"] == code
+    assert final["state"] == state and final["exit_code"] == code, dict(
+        reason=owner.reason, phase=owner.phase, log_error=owner.pump.error,
+        budgets=dataclasses.asdict(owner.limits), events=store.events(row["job_id"]))
     assert owner.claim._closed and not owner.pump.reader.is_alive() and not owner.pump.writer.is_alive()
     receipt = json.loads((store.path / "jobs" / row["job_id"] / "exit.json").read_bytes())
     assert receipt["logs"]["complete"] and receipt["logs"]["durable_offset"] == 6
@@ -198,7 +201,7 @@ def test_descendant_grace_starts_at_root_exit_independent_of_eof(fixture, monkey
     redirection = "" if holds_pipe else ",stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL"
     body = (f"import subprocess,sys,time,pathlib;subprocess.Popen([sys.executable,'-c',{child!r}]"
             f"{redirection})\nwhile not pathlib.Path({str(marker)!r}).exists(): time.sleep(.005)\n")
-    store, row, _, start = fixture(body)
+    store, row, _, start = fixture(body, limits=SHORT)
     owner = start()
     until(owner, lambda: owner.root_exit is not None)
     assert marker.exists() and owner.process.active_processes() > 0
@@ -214,7 +217,7 @@ def test_stalled_running_commit_cannot_block_descendant_supervision(fixture, mon
     child = f"import pathlib,time;pathlib.Path({str(ready)!r}).touch();time.sleep(60)"
     body = (f"import subprocess,sys,pathlib,time;subprocess.Popen([sys.executable,'-c',{child!r}])\n"
             f"while not pathlib.Path({str(ready)!r}).exists(): time.sleep(.005)\n")
-    store, row, _, start = fixture(body)
+    store, row, _, start = fixture(body, limits=SHORT)
     entered, release = threading.Event(), threading.Event()
     original = store.mark_running
     def blocked(*args):
@@ -233,7 +236,7 @@ def test_stalled_running_commit_cannot_block_descendant_supervision(fixture, mon
     assert store.get(row["job_id"])["state"] == "succeeded"
 
 
-def test_receipt_stall_is_sticky_uncertain_and_holds_claim_until_worker_settles(fixture, monkeypatch):
+def test_slow_receipt_publication_retains_owner_and_waits_for_actual_proof(fixture, monkeypatch):
     now = [0.]
     store, row, _, start = fixture(clock=lambda: now[0])
     entered, release = threading.Event(), threading.Event()
@@ -248,12 +251,13 @@ def test_receipt_stall_is_sticky_uncertain_and_holds_claim_until_worker_settles(
         until(owner, lambda: entered.is_set())
         now[0] = 6
         owner.tick()
-        assert owner.reason == "PERSISTENCE_TIMEOUT:publish" and not owner.claim._closed
+        assert owner.reason is None and owner.phase == "waiting_for_publish"
+        assert not owner.claim._closed
         assert not owner.done and owner.process._job.value
     finally:
         release.set()
     until(owner, lambda: owner.done)
-    assert store.get(row["job_id"])["state"] == "uncertain"
+    assert store.get(row["job_id"])["state"] == "succeeded"
     assert (store.path / "jobs" / row["job_id"] / "exit.json").exists()
 
 
@@ -307,7 +311,7 @@ def test_prebirth_log_boundary_failure_refuses_without_a_tool(fixture, monkeypat
 @pytest.mark.parametrize("worker", ["reader", "writer"])
 def test_cleanup_deadline_requests_cancellation_but_retains_unsettled_owner(fixture, monkeypatch, worker):
     now = [0.]
-    store, row, _, start = fixture(clock=lambda: now[0])
+    store, row, _, start = fixture(clock=lambda: now[0], limits=SHORT)
     entered, release = threading.Event(), threading.Event()
     original = LogPump._read if worker == "reader" else LogDisk.append
     def blocked(*args, **kwargs):
@@ -337,7 +341,7 @@ def test_cleanup_deadline_requests_cancellation_but_retains_unsettled_owner(fixt
 
 def test_denied_job_query_and_termination_request_never_prove_zero(fixture, monkeypatch):
     now = [0.]
-    store, row, _, start = fixture(clock=lambda: now[0])
+    store, row, _, start = fixture(clock=lambda: now[0], limits=SHORT)
     owner = start()
     query = owner.process.active_processes
     requests = []
@@ -360,7 +364,7 @@ def test_denied_job_query_and_termination_request_never_prove_zero(fixture, monk
 
 def test_termination_deadline_does_not_turn_a_request_into_zero(fixture, monkeypatch):
     now = [0.]
-    store, row, _, start = fixture(clock=lambda: now[0])
+    store, row, _, start = fixture(clock=lambda: now[0], limits=SHORT)
     owner = start()
     query = owner.process.active_processes
     requests = []
@@ -540,3 +544,33 @@ def test_inflight_terminal_commit_retains_owner_and_is_not_raced_by_polling(fixt
         release.set()
     until(owner, lambda: owner.done)
     assert store.get(row["job_id"])["state"] == "succeeded"
+
+
+def test_actual_native_uncertainty_during_slow_publication_stays_sticky(fixture, monkeypatch):
+    now = [0.]
+    store, row, _, start = fixture(clock=lambda: now[0])
+    entered, release = threading.Event(), threading.Event()
+    original = receipts.publish
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(15)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(receipts, "publish", blocked)
+    owner = start()
+    try:
+        until(owner, lambda: entered.is_set())
+        query = owner.process.active_processes
+        def denied():
+            raise PermissionError("injected unknown native observation")
+        monkeypatch.setattr(owner.process, "active_processes", denied)
+        owner.tick()
+        monkeypatch.setattr(owner.process, "active_processes", query)
+        assert owner.reason == "NATIVE_OBSERVATION_FAILED:PermissionError"
+        now[0] = 6
+        owner.tick()
+        assert owner.phase == "uncertain" and not owner.claim._closed
+    finally:
+        release.set()
+    until(owner, lambda: owner.done)
+    assert store.get(row["job_id"])["state"] == "uncertain"
+    assert (store.path / "jobs" / row["job_id"] / "exit.json").exists()
