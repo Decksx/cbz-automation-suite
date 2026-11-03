@@ -473,6 +473,15 @@ def test_a_literal_tpb_title_without_a_number_plans_as_an_issue(library, series)
     assert [Path(r["destination"]).name for r in report["renames"]] == [f"{series} #003.cbz"]
 
 
+def test_a_bare_tpb_filename_in_its_series_folder_is_a_collection(library):
+    """Plan v3b found Blessed Thistle/TPB.cbz with Number 1 planned as #001."""
+    root, db, book = library
+    book("TPB.cbz", series="Blessed Thistle", number="1", folder="Blessed Thistle")
+    report = cp.build_plan(root, database=db, quarantine_date="2026-11-03", number_style="issue")
+    assert not report["review"], report["review"]
+    assert [Path(r["destination"]).name for r in report["renames"]] == ["Blessed Thistle v01 (TPB).cbz"]
+
+
 @pytest.mark.parametrize("number", ["1", "3", "6"])
 def test_the_bare_tpb_label_maps_its_resolved_number(library, number):
     root, db, book = library
