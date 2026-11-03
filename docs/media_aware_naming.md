@@ -18,15 +18,17 @@ Its parser and formatter enforce the same fixpoint, length, reserved-name
 and ambiguity guards. `Full` without a number defaults to volume 1 under David's #2991 decision;
 its operator-policy evidence remains bound to the original archive facts.
 
-A bare `TPB` word with no number after it (`'68 Scars TPB`, `Series TPB v01`)
-is the same collected-edition label as `TPB 1` or `(TPB)`. Its volume comes
-from the resolved Volume or Number, so Number 1 gives `v01 (TPB)`, not issue
-`#001`. A Volume and Number that disagree are held. There is no default
-volume for a bare TPB: unlike Full, no operator decision approves one, so a
-bare TPB with neither field resolved is held for review. Because the formatter
-writes TPB only as `vNN (TPB)`, a name whose series would end in a bare TPB
-word is never read as canonical. Letters that merely contain "TPB" inside a
-longer word are not the label.
+A bare `TPB` word that ends the name right after the decided series title
+(`'68 Scars TPB`) is a collected-edition label, like `TPB 1` or `(TPB)`. It
+is recognised the same way as an unnumbered `Full`: a standalone word
+(Unicode-aware, so `\u00e9TPB` or `TPBX` are not it), nothing after it but
+bracket tags, and the text before it equal to a decided title. Its volume
+comes from the resolved Volume or Number, so Number 1 gives `v01 (TPB)`, not
+issue `#001`. A Volume and Number that disagree are held, and so is a bare
+TPB with neither resolved: unlike Full, no operator decision approves a
+default volume. A title that itself contains or ends in TPB ("TPB Tales",
+"Series TPB") keeps its word and stays an ordinary issue. The parser is
+unchanged; the decision is made where the decided title is known.
 
 ## Style registry
 
