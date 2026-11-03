@@ -524,6 +524,7 @@ class JobStore:
         The trusted caller already owns the newly created native job. A child
         not yet committed here can still exist; it must never be called refused.
         """
+        from .win32 import job_name
         child.validate()
         if child.session_id != claim.runner.session_id:
             raise JobRefused("CHILD_SESSION_MISMATCH")
@@ -532,7 +533,7 @@ class JobStore:
             now = self._time(db)
             db.execute("UPDATE jobs SET state='running',state_version=state_version+1,updated_ms=?,"
                 "child_pid=?,child_created_at=?,job_object_name=? WHERE job_id=?",
-                (now, child.pid, str(child.created_at), f"Local\\cbz-console-{claim.job_id}", claim.job_id))
+                (now, child.pid, str(child.created_at), job_name(claim.job_id), claim.job_id))
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (claim.job_id,)).fetchone()
             self._event(db, row, "running", f"runner:{claim.runner.pid}:{claim.runner.created_at}", now)
             return dict(row)
