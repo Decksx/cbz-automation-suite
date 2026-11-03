@@ -378,3 +378,136 @@ def test_wrong_session_native_absence_is_unknown(ledger):
     detail=json.loads(store.events(row["job_id"])[-1]["details_json"])
     assert detail["evidence"]["runner"]["state"] == "gone"
     assert detail["evidence"]["job"]["state"] == "unknown"
+
+
+def unrecorded(store, identity=RUNNER):
+    """Prepare durable uncertainty after a claim without inventing child fields."""
+    row=store.admit({})
+    store.claim(row["job_id"],row["nonce"],identity).close()
+    return store.hold_uncertain(row["job_id"],row["nonce"],2,actor="fixture runner",reason="pre-child persistence failed")
+
+
+def test_explicit_unrecorded_child_recheck_uses_containment_absence(ledger, dead):
+    _,store,_=ledger
+    row=unrecorded(store)
+    # Automatic reconciliation remains sticky even when no member survives.
+    assert rc.reconcile(store,row["job_id"],row["nonce"],3)==row
+    result=rc.recheck(store,row["job_id"],row["nonce"],3,actor="David",note="accept unknown outcome after owner death")
+    assert result["state"]=="lost" and result["outcome"]=="unknown" and result["exit_code"] is None
+    assert result["child_pid"] is None and result["child_created_at"] is None
+    event=store.events(row["job_id"])[-1]
+    detail=json.loads(event["details_json"])
+    assert event["actor"]=="David" and detail["note"]=="accept unknown outcome after owner death"
+    assert detail["evidence"]["child"]["state"]=="not_recorded"
+    assert detail["evidence"]["job"]["state"]=="absent"
+    assert detail["evidence"]["recorded"]["expected_job_name"]==w.job_name(row["job_id"])
+    assert store.admit({})["job_id"]!=row["job_id"]
+
+
+@pytest.mark.parametrize("runner,job",[("alive","absent"),("unknown","absent"),("gone","present"),("gone","unknown")])
+def test_unrecorded_recheck_stays_uncertain_without_complete_proof(ledger,dead,monkeypatch,runner,job):
+    _,store,_=ledger
+    row=unrecorded(store)
+    monkeypatch.setattr(w,"observe_process",lambda i:w.ProcessObservation(runner,i,error=5))
+    monkeypatch.setattr(w,"observe_job",lambda *a:w.JobObservation(job,0 if job=="present" else None,error=5))
+    result=rc.recheck(store,row["job_id"],row["nonce"],3,actor="operator",note="explicit recheck")
+    assert result["state"]=="uncertain" and result["state_version"]==4
+    detail=json.loads(store.events(row["job_id"])[-1]["details_json"])
+    assert detail["evidence"]["job"]["state"]==job
+    with pytest.raises(JobRefused):store.admit({})
+
+
+@pytest.mark.parametrize("pid,created",[(None,"2"),(456,None)])
+def test_partial_child_identity_is_not_unrecorded_proof(ledger,dead,pid,created):
+    _,store,_=ledger
+    row=unrecorded(store)
+    with dal.connection_scope(store.database) as db,dal.transaction(db):
+        db.execute("UPDATE jobs SET child_pid=?,child_created_at=?,job_object_name=? WHERE job_id=?",
+                   (pid,created,w.job_name(row["job_id"]),row["job_id"]))
+    result=rc.recheck(store,row["job_id"],row["nonce"],3,actor="operator",note="check partial identity")
+    assert result["state"]=="uncertain"
+    assert "PARTIAL_CHILD_IDENTITY" in store.events(row["job_id"])[-1]["details_json"]
+
+
+@pytest.mark.skipif(os.name!="nt",reason="Windows namespace proof")
+def test_unrecorded_recheck_cannot_use_another_sessions_absence(ledger):
+    _,store,_=ledger
+    current=w.current_identity()
+    row=unrecorded(store,ProcessIdentity(current.pid,1,current.session_id+1))
+    result=rc.recheck(store,row["job_id"],row["nonce"],3,actor="operator",note="check old session")
+    assert result["state"]=="uncertain"
+    detail=json.loads(store.events(row["job_id"])[-1]["details_json"])
+    assert detail["evidence"]["runner"]["state"]=="gone"
+    assert detail["evidence"]["job"]["state"]=="unknown"
+    with pytest.raises(JobRefused):store.admit({})
+
+
+@pytest.mark.skipif(os.name!="nt",reason="Windows named job proof")
+@pytest.mark.parametrize("live",[False,True])
+def test_unrecorded_recheck_retains_a_real_present_job_even_when_empty(ledger,tmp_path,live):
+    _,store,_=ledger
+    current=w.current_identity()
+    row=unrecorded(store,ProcessIdentity(current.pid,1,current.session_id))
+    release=tmp_path/"release-present"
+    body=f"import pathlib,time\nwhile not pathlib.Path({str(release)!r}).exists():time.sleep(.01)" if live else "pass"
+    child=w.launch(row["job_id"],Path(sys.executable),["-c",body],cwd=tmp_path,environment=dict(os.environ))
+    try:
+        if not live:
+            assert child.wait_root(5)==0
+            deadline=time.monotonic()+5
+            while child.active_processes():
+                assert time.monotonic()<deadline
+                time.sleep(.01)
+        result=rc.recheck(store,row["job_id"],row["nonce"],3,actor="operator",note="check actual object")
+        assert result["state"]=="uncertain"
+        detail=json.loads(store.events(row["job_id"])[-1]["details_json"])
+        assert detail["evidence"]["job"]["state"]=="present"
+        if live:
+            assert detail["evidence"]["job"]["active_processes"]>=1
+        else:
+            assert detail["evidence"]["job"]["active_processes"]==0
+    finally:
+        release.touch()
+        assert child.wait_root(5)==0
+        deadline=time.monotonic()+5
+        while child.active_processes():
+            assert time.monotonic()<deadline
+            time.sleep(.01)
+        child.close()
+    result=rc.recheck(store,row["job_id"],row["nonce"],4,actor="operator",note="acknowledge after object is gone")
+    assert result["state"]=="lost" and result["child_pid"] is None
+
+
+@pytest.mark.skipif(os.name!="nt",reason="Windows actual owner death")
+@pytest.mark.parametrize("stage",["claim","birth"])
+def test_unrecorded_uncertainty_after_real_owner_death_has_operator_escape(fixture,tmp_path,stage):
+    ready,tool_ready,release=(tmp_path/name for name in ("owner-ready","tool-ready","release"))
+    body=f"import pathlib,time\npathlib.Path({str(tool_ready)!r}).touch()\nwhile not pathlib.Path({str(release)!r}).exists():time.sleep(.01)"
+    store,row,_,_=fixture(body)
+    helper=Path(__file__).with_name("runner_job_fixture.py")
+    host=subprocess.Popen([sys.executable,str(helper),str(store.path),row["job_id"],row["nonce"],stage,str(ready)],
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        deadline=time.monotonic()+15
+        while not ready.exists() or stage=="birth" and not tool_ready.exists():
+            assert host.poll() is None,host.communicate(timeout=1)
+            assert time.monotonic()<deadline
+            time.sleep(.01)
+        report=json.loads(ready.read_text())
+        uncertain=store.hold_uncertain(row["job_id"],row["nonce"],2,actor="fixture",reason="failed before child identity commit")
+        assert uncertain["child_pid"] is None
+        host.kill() # This known disposable fixture owner only.
+        host.communicate(timeout=5)
+        deadline=time.monotonic()+8
+        while w.observe_job(row["job_id"],report["runner"]["session_id"]).state!="absent":
+            assert time.monotonic()<deadline
+            time.sleep(.01)
+        assert rc.reconcile(store,row["job_id"],row["nonce"],3)==uncertain
+        result=rc.recheck(store,row["job_id"],row["nonce"],3,actor="operator",note="accept unknown crash outcome")
+        assert result["state"]=="lost" and result["outcome"]=="unknown" and result["child_pid"] is None
+        if report["child"]:
+            assert w.observe_process(ProcessIdentity(**report["child"])).state=="gone"
+    finally:
+        release.touch()
+        if host.poll() is None:host.kill()
+        host.communicate(timeout=5)
