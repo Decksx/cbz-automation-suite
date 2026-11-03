@@ -36,8 +36,11 @@ def observe(row) -> dict:
                       created_at=row["child_created_at"], session_id=row["runner_session_id"]),
                       job_object_name=row["job_object_name"], expected_job_name=win32.job_name(row["job_id"])))
     try:
+        child_unrecorded = row["child_pid"] is None and row["child_created_at"] is None
+        if (row["child_pid"] is None) != (row["child_created_at"] is None):
+            raise JobRefused("PARTIAL_CHILD_IDENTITY")
         runner = _process(row["runner_pid"], row["runner_created_at"], row["runner_session_id"])
-        for key, identity in (("runner", runner), ("child", None if row["child_pid"] is None else
+        for key, identity in (("runner", runner), ("child", None if child_unrecorded else
                 _process(row["child_pid"], row["child_created_at"], runner.session_id))):
             if identity is None:
                 result[key] = dict(state="not_recorded")
@@ -48,7 +51,7 @@ def observe(row) -> dict:
             result[key] = item
         expected_name = win32.job_name(row["job_id"])
         if (row["job_object_name"] != expected_name and not
-                (row["state"] == "claimed" and row["child_pid"] is None and row["job_object_name"] is None)):
+                (row["state"] in ("claimed", "uncertain") and child_unrecorded and row["job_object_name"] is None)):
             result["job"] = dict(state="unknown", reason="FOREIGN_JOB_NAME")
         else:
             result["job"] = asdict(win32.observe_job(row["job_id"], runner.session_id))
@@ -163,6 +166,8 @@ def recheck(store, job_id: str, nonce: str, version: int, *, actor: str, note: s
     M3d must call only after authenticated operator intent, including log-only
     uncertainty. Every attempt uses fresh proof and records an event; a failed
     attempt retains uncertainty and increments the version to fence replay.
+    An entirely unrecorded child can qualify: verified same-session job absence
+    proves no surviving contained member. Partial identities remain unknown.
     No desired outcome or caller-supplied native evidence is accepted.
     """
     validate_job_id(job_id)
@@ -175,6 +180,9 @@ def recheck(store, job_id: str, nonce: str, version: int, *, actor: str, note: s
         if old["state"] != "uncertain":
             raise JobRefused("RECHECK_REQUIRES_UNCERTAIN")
         evidence = observe(old)
-        state = "lost" if _gone(evidence) else "uncertain"
+        # JOB_LIST at birth, no breakaway and kill-on-close make same-session
+        # absence sufficient even if death preceded the child identity commit.
+        # This exception is explicit/operator-attributed; reconcile stays sticky.
+        state = "lost" if _gone(evidence, before_child=True) else "uncertain"
         return _commit(store, old, state, "operator_recheck", actor,
             dict(note=note, evidence=evidence, acknowledged_unknown_outcome=state == "lost"))
