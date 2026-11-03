@@ -1,10 +1,12 @@
 # M3d: supervisor, protected job routes and stream lifecycle
 
-Proposed for Claude's agreement before implementation, 2026-11-03.
+Claude agreed all four decisions at5517c79 on 2026-11-03; the additions below
+implement review comment6613486413 and hive3766/3784 for fresh exact-head review.
 Codex implements; Claude independently reviews each exact head/pinned merge.
 Base master **a401db054c7e1d2a784792b71184a37b0ac5f004**, reviewed slice3
 #165 at89f205a. The missing-child operator escape in [#166](https://github.com/Decksx/cbz-automation-suite/pull/166)
-is a prerequisite before wiring recheck. It is not assumed merged here.
+was merged as55e0cd8bffb8b854d50bf712f997d32e88911e43; merge/source
+tree e777d772ec84924a7a0c8f93273fbf405848951e was verified via GitHub API.
 This is a plan, not an implementation, passing acceptance result or rollout.
 The [M3 implementation plan](web_console_m3_implementation_plan.md),
 [M3c contract](web_console_m3c_contract.md) and
@@ -59,7 +61,9 @@ JobStore.expire_admissions. Other rows are visited by admission_seq in bounded
 pages; stale versions cause a fresh read on a later pass, not forced updates.
 Exact live owners retain ownership. Errors/unavailable home refuse admission,
 retain the same ledger and report unavailable; no temporary fallback DB.
-A 30-second scheduler repeats reconciliation with one pass in flight. Do not
+Startup and the 30-second scheduler share one nonblocking pass-in-flight guard;
+a slow startup pass cannot overlap a scheduled pass. A concurrent request skips
+that pass and retries on the next tick. Do not
 spawn/adopt/kill a tool during a pass or relaunch an existing admitted/claimed
 job. Startup does not adopt native control handles from a surviving runner.
 
@@ -70,7 +74,11 @@ CBZ_CONSOLE_STATE_IDENTITY come from the server's admitted context, never a fres
 path stat. Use an allowlisted environment, trusted explicit executable/cwd,
 no shell and no stdio pipe whose reader depends on the server staying alive.
 Reuse the launcher detachment pattern only after native lifetime tests measure
-it in supported OfficePC/CI contexts. No uncontained tool/breakaway fallback.
+it in supported OfficePC/CI contexts. D1 measures whether the server and its
+launcher belong to a Job Object, including a kill-on-close job, and whether the
+runner inherits that containment. A native fixture must close/kill the parent
+job and prove the runner/tool lifetime or an explicit pre-launch refusal.
+Creation flags alone are not proof. No uncontained tool/breakaway fallback.
 The server retains no tool Job Object handle and never closes one on shutdown.
 
 A crash/error around runner spawn leaves the committed row fenced by its claim
@@ -150,10 +158,21 @@ nonblocking global slot reservation complete before stream headers; all exit
 paths release the slot in finally/close, including disconnect, error and shutdown.
 Never hold admission, a DB transaction or an open segment handle across yield.
 
-Use JobLogs.read_page each250ms while active, heartbeat15s, global8 streams.
+Use one bounded log reader per active job and fan its pages out to subscribers,
+not one read_page poll per stream. Active cadence is at most one poll each250ms
+per job; cold or idle jobs use about1s. Eight subscribers to one job must not
+multiply admission-lock acquisitions: a timed witness counts acquisitions and
+bounds them by job polls plus documented fixed work, including idle cadence.
+Each subscriber has a bounded queue; a slow subscriber never blocks the shared
+reader or another subscriber. If its queue fills, close its stream so it can
+resume from its last delivered logical cursor; never silently skip bytes.
+Release an unused reader promptly after its last subscriber leaves. Heartbeats
+are15s and global stream slots remain8. Reserve request-thread capacity above
+those slots for login and JSON routes; a real HTTP witness holds8 streams open
+and proves a ninth client still obtains /api/jobs within a bounded deadline.
 A slow client blocks only its bounded request writer, not the log reader/writer
 or native runner. Request socket timeout and bounded page/frame size still
-apply. Revalidate session expiry on each polling iteration and close on expiry;
+apply. Revalidate session expiry while waiting as well as on delivery, and close on expiry;
 a server restart's new session cannot inherit an old authenticated stream.
 Actual WSGI/disconnect tests must prove resource closure, not infer it.
 
@@ -176,17 +195,20 @@ uncertainty. GET/SSE stay read-only; one bounded service consumer parses complet
 records with logs.parse_progress and advances durable parse cursor, then readers
 consume the snapshot. Restart/retention catch-up reports gaps/unknown evidence
 truthfully and does not repeat progress. Review backward compatibility and
-schema ownership before adding the table; no database migration under active
-old runners unless compatibility is demonstrated. The existing unused
+schema ownership before adding the table. The agreed compatibility argument
+is additive schema-v1 storage, like job_archives: old runners never read the
+new table, and observer writes never change lifecycle versions. Demonstrate
+that argument with an old-runner compatibility witness before a migration
+under active runners. The existing unused
 progress_json column is not silently repurposed as a competing authority.
 
 ## Implementation slices and acceptance gates
 
 | Slice | Deliverable | Required evidence before next slice |
 | --- | --- | --- |
-| D1 | Service lifetime, sequence-ordered reconciliation, trusted fixture spawn/context seam | Complete boundary-death matrix; server restart leaves one live owner/tool; unclaimed expiry; spawn failure; home unavailable; bounded shutdown retains ownership |
+| D1 | Service lifetime, sequence-ordered reconciliation, trusted fixture spawn/context seam | Complete boundary-death matrix including measured parent kill-on-close containment; shared startup/scheduler pass guard; server restart leaves one live owner/tool; unclaimed expiry; spawn failure; home unavailable; bounded shutdown retains ownership |
 | D2 | Bounded store reads/DTOs, protected JSON stop/recheck/acknowledge | Direct and HTTP gates, admitted-stop vs claim, stale nonce/version, #166 absent/present/wrong-session cases, no-stop gate creates no file/signal, redaction and all inherited M2 guards |
-| D3 | Owned SSE iterable/stream manager, agreed progress persistence | Eight global slots, HEAD/auth refusal no slot, disconnect/session expiry/shutdown release, slow consumer independent of native/log activity, hot/cold/gap resumption and truthful unknown tail |
+| D3 | Owned SSE iterable/stream manager, agreed progress persistence | Eight global slots plus ninth JSON client; one reader per job with bounded admission acquisitions and slow-subscriber queues; HEAD/auth refusal no slot, disconnect/session expiry/shutdown release, slow consumer independent of native/log activity, hot/cold/gap resumption and truthful unknown tail |
 | D4 | Browser job/log integration and restart/cross-layer acceptance | Installed Edge authenticated fetch stream, disconnect/reconnect/reload exact cursor, safe text rendering, state/progress dedup, real server down during50MiB fixture output, no production submission route |
 
 Use explicit fixture handshakes at command/admission/spawn/claim/native birth/
@@ -198,7 +220,7 @@ and pinned merge. Record the known OfficePC overflow WinError5 accurately agains
 an untouched baseline; partial reruns never replace full results. One file per
 commit; checkpoint/push/progress before40min of each bounded relay run.
 
-## Agreement requested before code
+## Agreed decisions (5517c79; additions above await exact-head verification)
 
 1. Keep M4/M6 production submission and interruption gates closed; D1 internal
    submission stays fixture-only, D2 unsupported stop is an explicit no-action
@@ -212,4 +234,5 @@ commit; checkpoint/push/progress before40min of each bounded relay run.
    retained-console-guard rule when service work is unsettled.
 
 No M3d implementation or live launch is authorized by this plan's existence;
-implementation follows exact-head agreement within standing project scope.
+D1 is authorized by Claude's agreement and hive3784 within standing project
+scope; each code candidate still requires independent review and green CI.
