@@ -24,7 +24,11 @@ from .store import JobRefused, JobStore
 
 @dataclass(frozen=True)
 class Limits:
-    """Internal supervision budgets; fixtures may shorten, never extend them."""
+    """Internal supervision budgets; persistence is a slow-I/O notice threshold.
+
+    Fixtures may shorten deadlines, never extend them. A persistence delay alone
+    does not invalidate proof or cancel work; actual failures remain uncertain.
+    """
     poll: float = .25
     descendants: float = 10
     termination: float = 30
@@ -144,8 +148,12 @@ class Runner:
             # An in-flight terminal commit has already passed final native/log
             # proof. Retain ownership until its result is known; never race it
             # with a second mutation or declare that it has been cancelled.
-            if now - op.started >= self.limits.persistence and op.kind not in ("finalize", "release"):
-                self._uncertain("PERSISTENCE_TIMEOUT:" + op.kind)
+            if (now - op.started >= self.limits.persistence and self.reason is None
+                    and op.kind not in ("finalize", "release")):
+                # Latency is not failed persistence. Keep supervising and holding
+                # admission until the actual result arrives, then require fresh
+                # final proof. A recovered worker never clears real uncertainty.
+                self.phase = "waiting_for_" + op.kind
             return
         self.io = None
         if op.error is not None:
@@ -172,6 +180,8 @@ class Runner:
                     # A request is not an accepted interruption gate. Wait policy
                     # never terminates a live writing root, including on log loss.
                     self._uncertain("STOP_OR_STATE_RECHECK_REQUIRED")
+            if op.kind in ("running", "refresh") and self.reason is None:
+                self.phase = "running"
             self.next_refresh = now + self.limits.poll
 
     def _observe(self, now):
