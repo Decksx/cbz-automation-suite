@@ -505,3 +505,32 @@ def test_the_real_watcher_keeps_a_literal_tpb_title_as_an_issue(library, tmp_pat
     assert not refused
     (landed,) = values
     assert landed.name == "TPB Tales #003.cbz" and landed.read_bytes() == before
+
+
+
+@pytest.mark.parametrize("metadata,folder,expected", [
+    ("Original Title", "TPB", "TPB #001.cbz"), ("Original Title", "TPB (2019)", "TPB (2019) #001.cbz"),
+    ("TPB", "Other", "Other v01 (TPB).cbz"), ("TPB", "Other (2019)", "Other (2019) v01 (TPB).cbz")])
+def test_the_decided_folder_not_a_comicinfo_alias_judges_a_bare_tpb_name(library, tmp_path, monkeypatch,
+                                                                         metadata, folder, expected):
+    """Codex's #169 R2: planner and real watcher agree; the chosen folder decides.
+
+    A folder literally named TPB keeps TPB.cbz an issue even when ComicInfo
+    still says "Original Title"; an unrelated folder makes it a collection
+    even when ComicInfo says "TPB".
+    """
+    root, db, book = library
+    source = book("TPB.cbz", series=metadata, folder=folder)
+    before = source.read_bytes()
+    report = cp.build_plan(root, database=db, quarantine_date="2026-11-03", number_style="issue")
+    assert not report["review"], report["review"]
+    assert [Path(r["destination"]).name for r in report["renames"]] == [expected]
+    registry = config(tmp_path, [{"path": str(root), "style": "issue"}])
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(registry))
+    monkeypatch.setattr(watcher, "_number_style_requested", "auto")
+    monkeypatch.setattr(watcher, "process_comicinfo", lambda *a: None)
+    values = {source: parse_comic_name(source, rules=ALL_RULES - {"translate"}, display_tokens=True)}
+    refused, _ = watcher._apply_media_naming(values, {source: fr.archive_facts_from_file(source)}, folder, root)
+    assert not refused, refused
+    (landed,) = values
+    assert landed.name == expected and landed.read_bytes() == before
