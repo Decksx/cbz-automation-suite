@@ -73,6 +73,8 @@ def config(tmp_path, rows):
     ("Series TPB 1.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
     ("Series Vol. 1 (Colored).cbz", "1", "issue", "Series v01 (2019) (TPB) (Colored).cbz"),
     ("Series Full 1.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
+    # A bare TPB label after the title (no number of its own) used to read as issue #001.
+    ("Series TPB.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
     ("Series Vol. 1.cbz", "1", "chapter", "Series v01 (2019).cbz"),
 ])
 def test_planner_and_real_watcher_rename_have_identical_media_names(library, tmp_path, monkeypatch, name, number, style, expected):
@@ -447,3 +449,50 @@ def test_registered_flat_root_never_becomes_series_authority(library, tmp_path):
     path = config(tmp_path, [{"path": str(root), "style": "issue"}])
     doc = cp.build_plan(root, database=db, quarantine_date="2026-10-26", number_style_registry=path)
     assert doc["review"] and not doc["renames"]
+
+
+
+@pytest.mark.parametrize("series", ["TPB Tales", "Series TPB"])
+def test_a_literal_tpb_title_keeps_its_canonical_issue_in_the_planner(library, series):
+    """Codex's #157 R1: a decided title containing TPB is not a collection."""
+    root, db, book = library
+    source = book(f"{series} #003.cbz", series=series, number="3")
+    before = source.read_bytes()
+    report = cp.build_plan(root, database=db, quarantine_date="2026-11-03", number_style="issue")
+    assert not report["review"], report["review"]
+    assert not report["renames"] and not report["families"]
+    assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("series", ["TPB Tales", "Series TPB", "\u00e9TPB Series", "Series TPB\u00e9"])
+def test_a_literal_tpb_title_without_a_number_plans_as_an_issue(library, series):
+    root, db, book = library
+    book(f"{series}.cbz", series=series, number="3")
+    report = cp.build_plan(root, database=db, quarantine_date="2026-11-03", number_style="issue")
+    assert not report["review"], report["review"]
+    assert [Path(r["destination"]).name for r in report["renames"]] == [f"{series} #003.cbz"]
+
+
+@pytest.mark.parametrize("number", ["1", "3", "6"])
+def test_the_bare_tpb_label_maps_its_resolved_number(library, number):
+    root, db, book = library
+    book("'68 Scars TPB.cbz", series="'68 Scars", number=number)
+    report = cp.build_plan(root, database=db, quarantine_date="2026-11-03", number_style="issue")
+    assert not report["review"], report["review"]
+    assert Path(report["renames"][0]["destination"]).name == f"'68 Scars v{int(number):02} (TPB).cbz"
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_the_real_watcher_keeps_a_literal_tpb_title_as_an_issue(library, tmp_path, monkeypatch, canonical):
+    root, db, book = library
+    source = book("TPB Tales #003.cbz" if canonical else "TPB Tales.cbz", series="TPB Tales", number="3")
+    before = source.read_bytes()
+    registry = config(tmp_path, [{"path": str(root), "style": "issue"}])
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(registry))
+    monkeypatch.setattr(watcher, "_number_style_requested", "auto")
+    monkeypatch.setattr(watcher, "process_comicinfo", lambda *a: None)
+    values = {source: parse_comic_name(source, rules=ALL_RULES - {"translate"}, display_tokens=True)}
+    refused, _ = watcher._apply_media_naming(values, {source: fr.archive_facts_from_file(source)}, "TPB Tales", root)
+    assert not refused
+    (landed,) = values
+    assert landed.name == "TPB Tales #003.cbz" and landed.read_bytes() == before

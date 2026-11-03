@@ -54,6 +54,60 @@ def test_each_numbered_tpb_maps_its_own_volume_without_a_default(number):
     assert format_canonical_name(fields) == f"Series v{number:02} (TPB).cbz"
 
 
+@pytest.mark.parametrize("filename,title", [("'68 Scars TPB.cbz", "'68 Scars"), ("Series TPB.cbz", "Series"),
+                                            ("Series tpb (2019).cbz", "Series")])
+def test_a_bare_tpb_after_the_decided_title_is_volume_not_issue(filename, title):
+    # "'68 Scars TPB" with ComicInfo Number 1 used to be named issue #001.
+    year = "2019" if "(2019)" in filename else None
+    fields = media_fields(series=title, number="1", volume=None, style="issue",
+                          tokens=fr.parse_name_tokens(filename), year=year)
+    assert (fields.volume, fields.issue, fields.collection) == ("1", None, "TPB")
+
+
+@pytest.mark.parametrize("filename,title", [("TPB Tales.cbz", "TPB Tales"), ("Series TPB.cbz", "Series TPB"),
+    ("TPB Tales #003.cbz", "TPB Tales"), ("\u00e9TPB Series.cbz", "\u00e9TPB Series"),
+    ("Series TPB\u00e9.cbz", "Series TPB\u00e9"), ("Series TPBX.cbz", "Series"),
+    ("Caf\u00e9TPB.cbz", "Caf\u00e9"), ("Series TPB Extra.cbz", "Series")])
+def test_tpb_inside_the_decided_title_or_a_longer_word_stays_an_issue(filename, title):
+    """Codex's #157 R1: a title word is not a collection label.
+
+    "TPB Tales", a series literally ending in TPB, and letters such as
+    \u00e9TPB or TPBX keep their words, so Number 3 is still issue #003.
+    """
+    fields = media_fields(series=title, number="3", volume=None, style="issue",
+                          tokens=fr.parse_name_tokens(filename))
+    assert (fields.issue, fields.volume, fields.collection) == ("3", None, None)
+
+
+def test_a_bare_tpb_takes_its_volume_from_number_or_volume_and_holds_a_conflict():
+    tokens = fr.parse_name_tokens("Series TPB.cbz")
+    assert media_fields(series="Series", number="3", volume=None, style="issue", tokens=tokens).volume == "3"
+    assert media_fields(series="Series", number=None, volume="3", style="issue", tokens=tokens).volume == "3"
+    with pytest.raises(CanonicalNameError, match="conflicts"):
+        media_fields(series="Series", number="2", volume="3", style="issue", tokens=tokens)
+
+
+def test_a_bare_tpb_without_a_number_is_held_rather_than_defaulted():
+    # Full defaults to v01 by operator policy; nothing approves that for TPB.
+    with pytest.raises(CanonicalNameError, match="no resolved volume"):
+        media_fields(series="Series", number=None, volume=None, style="issue",
+                     tokens=fr.parse_name_tokens("Series TPB.cbz"))
+
+
+@pytest.mark.parametrize("filename", ["Series TPB #001.cbz", "Series TPB ch. 1.cbz"])
+def test_a_tpb_label_plus_an_issue_or_chapter_number_is_held(filename):
+    # Collection and primary number disagree about what the book is.
+    with pytest.raises(CanonicalNameError, match="also claims"):
+        media_fields(series="Series", number="1", volume=None, style="issue",
+                     tokens=fr.parse_name_tokens(filename))
+
+
+def test_a_bare_tpb_label_conflicts_with_chapter_style():
+    with pytest.raises(CanonicalNameError, match="chapter style"):
+        media_fields(series="Series", number="1", volume=None, style="chapter",
+                     tokens=fr.parse_name_tokens("Series TPB.cbz"))
+
+
 @pytest.mark.parametrize("resolved,folder", [("ICECREAMMAN", "Ice Cream Man"),
     ("68", "'68"), ("Series Name", "Series! Name"), ("Straße", "STRASSE")])
 def test_normalized_equal_folder_spelling_wins_without_deleting_legal_punctuation(resolved, folder):

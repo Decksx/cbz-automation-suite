@@ -160,6 +160,38 @@ def unnumbered_full(tokens: fr.NameTokens, *titles: str | None) -> bool:
     return False
 
 
+def unnumbered_tpb(tokens: fr.NameTokens, *titles: str | None) -> bool:
+    """Recognize a bare trailing TPB label against decided/original series names.
+
+    Mirrors `unnumbered_full`: the word must be standalone (Unicode-aware, so
+    ``\u00e9TPB`` is not it), end the name apart from bracket tags, and follow
+    exactly a decided title. A title that literally contains or ends in TPB
+    ("TPB Tales", "Series TPB") keeps its word and stays an ordinary issue.
+    Without this, "'68 Scars TPB" with ComicInfo Number 1 was named #001.
+    """
+    if tokens.volume_tokens or tokens.primary_numbers:
+        return False
+    tail = _tpb_after_title(tokens, *titles)
+    return tail is not None and not tail
+
+
+def _tpb_after_title(tokens: fr.NameTokens, *titles: str | None) -> str | None:
+    """Text after a standalone TPB that directly follows a decided title, else None.
+
+    None means TPB is absent or part of the title itself. Bracket tags are
+    ignored in the returned text, so "" means TPB ends the name.
+    """
+    stem = re.sub(r"\.(?:cbz|zip)$", "", tokens.filename, flags=re.I)
+    for label in re.finditer(r"(?<!\w)TPB(?!\w)", stem, re.I):
+        prefix = display_key(stem[:label.start()])
+        for title in filter(None, titles):
+            # A title that itself ends in TPB never equals the text before it,
+            # so it keeps its word without a special case.
+            if prefix and prefix in {display_key(title), display_key(split_series_year(title)[0])}:
+                return re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem[label.end():]).strip(" []()._-")
+    return None
+
+
 def media_fields(*, series: str, number: str | None, volume: str | None,
                  style: str, tokens: fr.NameTokens, year=None, edition=None,
                  special=None, version=None, folder: str | None = None,
@@ -193,6 +225,23 @@ def media_fields(*, series: str, number: str | None, volume: str | None,
         if volume is not None and number is not None and fr.normalize_number(volume) != fr.normalize_number(number):
             raise CanonicalNameError("Full volume conflicts with resolved Number")
         volume, number, collection = volume or number or "1", None, "TPB"
+    elif tokens.primary_numbers and _tpb_after_title(tokens, series, folder) is not None:
+        # "Series TPB #001" / "Series TPB ch. 1": the label says collection and
+        # the number says issue/chapter; never silently drop either claim.
+        raise CanonicalNameError("TPB label also claims an issue/chapter")
+    elif unnumbered_tpb(tokens, series, folder):
+        # A bare TPB label after the decided title ("'68 Scars TPB") carries no
+        # number of its own, so the resolved Number or Volume is the collected
+        # volume. Unlike Full, there is no operator-approved default, so
+        # neither being resolved is held, as is a disagreement between them.
+        if style != "issue":
+            raise CanonicalNameError("TPB collection conflicts with chapter style")
+        if volume is not None and number is not None and fr.normalize_number(volume) != fr.normalize_number(number):
+            raise CanonicalNameError("TPB volume conflicts with resolved Number")
+        if volume is None and number is None:
+            raise CanonicalNameError("bare TPB label has no resolved volume")
+        volume, number = volume if volume is not None else number, None
+        collection = "TPB" if style == "issue" else None
     elif labelled_volume:
         if len(tokens.collections) > 1 or len(tokens.volume_tokens) != 1 or volume is None:
             raise CanonicalNameError("collected volume is unresolved or conflicting")
