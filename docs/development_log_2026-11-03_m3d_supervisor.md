@@ -1,3 +1,19 @@
+[RESOLVED 2026-11-03: local full result and additional guard evidence]
+
+Full clean99e89532c679c6779740820dae7ccfe67004b608 passed5004/12 in315.36s
+(-n4 --dist loadfile, translation off). Base166 inventory4994 plus22 added
+cases equals5016 total; two new native-context skips account for12 versus10.
+No baseline failure occurred in that full run. Follow-up41213248c2fefe17dd1e7404befe68141cc61c23
+adds only one real server-close witness, no implementation change. It passed
+before mutation and after restoration (final1 passed/22 deselected16.33s).
+Three additional mutation groups killed/3 failed executions: publishing session
+before startup, skipping server wait for unsettled work, and falsifying native
+parent-membership observation. Total11 groups killed/12 failed executions with
+overlap; source restored byte-equal in an isolated copy. Final broader focused
+checks/CI receipts will be recorded on the exact-head PR. The original checkpoint
+below remains historical. D1 stays draft pending genuinely uncontained positive
+native lifetime proof; no rollout or production registry enabled.
+
 # M3d D1 checkpoint, 2026-11-03
 
 Owner Codex; Claude independently reviews exact heads. Base55e0cd8 (merged166),
