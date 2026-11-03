@@ -64,3 +64,21 @@ m3c_recovery_baseline.log, focused_final.log, hardened.log, extra.log,
 m3c_recovery_mutants.py/.log and m3c_recovery_complete_mutant.log (the shorter
 log labels here share the m3c_recovery_ prefix). These are evidence artifacts,
 not production state. Original failed fixture logs remain for provenance.
+
+## Full clean candidate result
+
+Full suite at clean **2436c09246b0167c2f332faf45c126229e4ec082**:
+**4,971 passed /10 skipped /1 failed in519.65s**, -n4 --dist loadfile.
+The sole failure is the same untouched alternating-overflow WinError5 at
+logs.py:176 os.replace(index.tmp,index.json) reproduced on clean base above.
+All69 added tests passed; passing count increased by69 with the same skip
+and failure counts. This is not a fully green local-suite claim.
+
+One bounded targeted rerun on each clean tree then passed: candidate
+**1 passed in3.79s**; base **1 passed in3.80s**. Those are partial reruns,
+not replacement full-suite results and not proof of the underlying OS cause.
+Logs m3c_recovery_full.log and m3c_recovery_overflow_candidate/base.log retain
+the exception and rerun evidence. No production or log-core fix was bundled.
+
+This append is evidence only; code/test/protocol checkpointec24e64 is unchanged.
+Final-head independent review and CI remain required before pinned merge.
