@@ -59,9 +59,14 @@ it never treats a cancellation receipt as completion. A stalled log thread
 keeps claim and handles alive even after the deadline. Native cancellation
 may be ignored by a driver, as Microsoft's documentation explicitly states.
 
-Receipt publication has a 5-second observation budget. A timeout marks local
-uncertainty, retains the worker/claim/handles, and prevents later automatic
-finalization even if publication eventually succeeds. After publication, the
+Persistence has a 5-second slow-I/O notice threshold, not a proof-invalidating
+deadline. Passing it changes the local phase to waiting_for_running/publish/
+refresh, while retaining the worker/claim/handles and native supervision.
+Latency alone neither cancels the operation nor records durable uncertainty.
+When it eventually succeeds, finalization still requires all fresh proof.
+Actual I/O errors, unknown native observations and failed log settlement remain
+sticky uncertainty; a late successful receipt cannot clear any of those.
+After publication, the
 terminal store operation repeats 2A's native/log/receipt proof. An in-flight
 terminal DB commit cannot be safely cancelled: the runner retains ownership and
 continues responding until its outcome is known, without racing it with another
