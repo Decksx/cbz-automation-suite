@@ -279,11 +279,17 @@ class LogPump:
     This class owns neither the pipe handle nor the runner claim. M3c owns
     native cancellation/closure and maps unsettled cleanup to uncertainty.
     No worker callback may finalize a job or clear that uncertainty.
+    sticky_failure keeps EOF incomplete after any error even if retries recover;
+    the claimed runner enables it, while standalone capture keeps its old default.
     """
-    def __init__(self, source, disk: LogDisk, *, capacity: int = QUEUE_CHUNKS, retry_seconds: float = 0.1):
+    def __init__(self, source, disk: LogDisk, *, capacity: int = QUEUE_CHUNKS, retry_seconds: float = 0.1,
+                 sticky_failure: bool = False):
         if not isinstance(retry_seconds, (int, float)) or not math.isfinite(retry_seconds) or not 0.001 <= retry_seconds <= 5:
             raise ValueError("Invalid writer retry delay")
         self.source, self.disk = source, disk
+        if type(sticky_failure) is not bool:
+            raise ValueError("Invalid sticky log-failure policy")
+        self.sticky_failure = sticky_failure
         self.queue = LogQueue(capacity)
         self.retry_seconds, self.error = retry_seconds, None
         self.abort = threading.Event()
@@ -331,7 +337,10 @@ class LogPump:
             while not self.abort.is_set():
                 item = self.queue.take()
                 if item is None:
-                    self._retry(lambda: self.disk.finish(self.queue.offset, complete=self.queue.complete))
+                    # A runner's first storage failure permanently disqualifies
+                    # EOF finality, even if this retry eventually becomes durable.
+                    self._retry(lambda: self.disk.finish(self.queue.offset,
+                        complete=self.queue.complete and not (self.sticky_failure and self.error is not None)))
                     return
                 if not self._retry(lambda: self.disk.append(*item)):
                     return
