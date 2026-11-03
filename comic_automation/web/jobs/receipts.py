@@ -16,7 +16,7 @@ from .. import state_dir
 from .log_io import shared_read
 from .logs import LogPump, MAX_INDEX_BYTES, validate_index
 from .store import JobRefused, MAX_COMMAND_BYTES, _digest, _json
-from .win32 import ContainedProcess
+from .win32 import ContainedProcess, job_name
 
 MAX_RECEIPT_BYTES = 64 * 1024
 
@@ -57,7 +57,7 @@ def _proof(store, row, claim, process, pump) -> tuple[int, dict]:
             or str(process.identity.created_at) != row["child_created_at"]
             or process.identity.session_id != claim.runner.session_id
             or process.name != row["job_object_name"]
-            or process.name != f"Local\\cbz-console-{claim.job_id}"):
+            or process.name != job_name(claim.job_id)):
         raise JobRefused("RECEIPT_OWNER_MISMATCH")
     code = process.wait_root(0)
     if code is None or process.active_processes() != 0:
