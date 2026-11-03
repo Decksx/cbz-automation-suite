@@ -191,10 +191,12 @@ def _tpb_after_title(tokens: fr.NameTokens, *titles: str | None) -> str | None:
                 # it, so it keeps its word without a special case.
                 if prefix in {display_key(title), display_key(split_series_year(title)[0])}:
                     return tail
-            elif not tail and display_key(stem) != display_key(title):
+            elif not tail and display_key(stem[label.start():label.end()]) not in {
+                    display_key(title), display_key(split_series_year(title)[0])}:
                 # The whole name is the label ("TPB.cbz" inside its series
                 # folder). Only then: "TPB Tales #003" stays an ordinary title,
-                # and a series literally named "TPB" keeps its word.
+                # and a series literally named "TPB" (or "TPB (2019)") keeps its
+                # word whatever bracket tags or year the file carries.
                 return tail
     return None
 
