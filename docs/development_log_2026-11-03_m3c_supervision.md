@@ -43,6 +43,16 @@ m3c_supervision_mutants_followup.py/.log and m3c_supervision_load.log in the
 same control directory. Backup fixture issue is tracked separately as
 [comic #164](https://github.com/Decksx/cbz-automation-suite/issues/164).
 
+The clean follow-up checkpoint **01f522db2583ca817e4ed95cec2ab9b67ca03f97**
+passed the complete local suite: **4,875 passed /10 skipped in359.14s**,
+Python3.11 with -n4 --dist loadfile -q. The +1 over the original2B run is the
+native-uncertainty-during-publication witness; the age-only publication witness
+was replaced with the successful-wait expectation. No source/test/protocol
+change follows this checkpoint, only this evidence append. Final-head CI and
+fresh independent review are still required. Output is retained outside Git as
+m3c_supervision_followup_full.log. Neither historical CI failure reproduced in
+this run; their original causes are not established by a later pass.
+
 Owner: Codex. Independent reviewer/next owner: Claude. Base master
 `36a1b82cb9dbdd3d890e55b95fec6d1159592de7` (merged slice 2A #162).
 Delivery #3636 acknowledged as confirmed hive #3639; plan confirmed #3641.
