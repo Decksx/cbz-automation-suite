@@ -1,6 +1,6 @@
 """Loopback-only threading WSGI server: startup checks, ``session.json``, shutdown.
 
-Design: ``docs/web_console_v1_design.md`` §3, §4.2 and §9. Run it as
+Design: ``docs/web_console_v1_design.md`` Ã‚Â§3, Ã‚Â§4.2 and Ã‚Â§9. Run it as
 ``python -m comic_automation.web.server``; the launcher
 (``apps/web_console.py``) does that detached. Startup either completes or
 refuses with one operator-readable line on stderr and exit code 2:
@@ -23,6 +23,7 @@ import getpass
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 from logging.handlers import RotatingFileHandler
@@ -34,11 +35,13 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 from . import acl, security
 from .app import ConsoleApp
 from .config import LOOPBACK_HOST, REPO_ROOT
+from .jobs.store import JobRefused
+from .jobs.supervisor import Supervisor
 from .security import SecretStore
 from .state_dir import StateDir, StateDirRefused, init_state_dir, open_state_dir, state_dir_from_env
 
 log = logging.getLogger("comic_automation.web")
-# Bounds what one stalled client can hold (§3: wsgiref is not hardened, so the
+# Bounds what one stalled client can hold (Ã‚Â§3: wsgiref is not hardened, so the
 # loopback bind, the body cap and this timeout do that job).
 REQUEST_TIMEOUT_SECONDS = 30
 EXIT_REFUSED = 2
@@ -52,6 +55,19 @@ class _Server(ThreadingMixIn, WSGIServer):
     # not set. A wildcard 0.0.0.0:<port> bind can coexist either way, but loopback
     # traffic still reaches the more specific 127.0.0.1 bind.
     allow_reuse_address = False
+    supervisor = None
+
+    def server_close(self):
+        """Stop console work before releasing its caller's state-home guard.
+
+        A bounded shutdown failure retains the process/guard until actual work
+        exits. It never cancels storage or closes a detached runner's handles.
+        """
+        if self.supervisor is not None:
+            if not self.supervisor.close():
+                log.warning("Console shutdown unsettled; retaining ownership until service work exits")
+                self.supervisor.wait_closed()
+        super().server_close()
 
 
 class _Handler(WSGIRequestHandler):
@@ -81,7 +97,7 @@ def _git_sha() -> str | None:
 
 
 def write_session_file(state: StateDir, port: int, launcher_secret: str) -> None:
-    """Write ``session.json`` (§4.2: it holds the launcher secret).
+    """Write ``session.json`` (Ã‚Â§4.2: it holds the launcher secret).
 
     The state directory is already private (checked at start-up), so the file
     inherits operator-only access from the moment it exists. The file's own
@@ -123,7 +139,16 @@ def build_server(state: StateDir, port: int | None = None) -> tuple[_Server, Con
         raise StateDirRefused(f"Cannot listen on {LOOPBACK_HOST}:{bind_port}: {exc}") from None
     server.set_app(app)
     app.port = server.server_address[1]
-    write_session_file(state, app.port, secrets.launcher_secret)
+    try:
+        server.supervisor = Supervisor(state)
+        app.jobs = server.supervisor
+        # A session file is a readiness capability. Never publish it before
+        # recovery, or allow startup failure to leave a bound listener behind.
+        server.supervisor.start()
+        write_session_file(state, app.port, secrets.launcher_secret)
+    except BaseException:
+        server.server_close()
+        raise
     return server, app
 
 
@@ -149,7 +174,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _configure_logging(state)
         server, app = build_server(state, args.port)
-    except (StateDirRefused, OSError) as exc:
+    except (StateDirRefused, JobRefused, OSError, sqlite3.Error) as exc:
         # OSError too (console.log locked, session.json held open, disk full):
         # the launcher shows stderr's last line, so it must be a reason, not a
         # traceback.
