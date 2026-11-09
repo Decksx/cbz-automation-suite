@@ -175,16 +175,21 @@ def _parsed(paths):
     return {p: cbz_core.ParsedComicName(p, p.name, "s", "s", None, None) for p in paths}
 
 
+def _held_copies(paths, series):
+    """Held copy -> kept copy, with nothing refused by naming."""
+    return watcher._second_copies(watcher._duplicate_chapter_copies(_parsed(paths), series), set())
+
+
 def test_copies_rank_by_group_size_then_file_size(tmp_path):
     big_group = [_make_cbz(tmp_path / f"Alpha Vol.1 Ch.{n}.cbz", 10) for n in (1, 2, 3)]
     small_group = [_make_cbz(tmp_path / f"Beta Vol.1 Ch.{n}.cbz", 999) for n in (1, 2)]
-    assert watcher._duplicate_chapter_copies(_parsed(big_group + small_group), "Usogui") == {
+    assert _held_copies(big_group + small_group, "Usogui") == {
         small_group[0]: big_group[0], small_group[1]: big_group[1]}
 
     # Equal group sizes: the larger file is kept.
     a = [_make_cbz(tmp_path / "eq" / f"Gamma Ch.{n}.cbz", 10) for n in (1, 2)]
     b = [_make_cbz(tmp_path / "eq" / f"Delta Ch.{n}.cbz", 20 if n == 1 else 5) for n in (1, 2)]
-    assert watcher._duplicate_chapter_copies(_parsed(a + b), "Usogui") == {a[0]: b[0], b[1]: a[1]}
+    assert _held_copies(a + b, "Usogui") == {a[0]: b[0], b[1]: a[1]}
 
 
 @pytest.mark.parametrize("series, names", [
@@ -200,7 +205,7 @@ def test_copies_rank_by_group_size_then_file_size(tmp_path):
 ])
 def test_only_true_second_translations_are_held(tmp_path, series, names):
     paths = [_make_cbz(tmp_path / name) for name in names]
-    assert watcher._duplicate_chapter_copies(_parsed(paths), series) == {}
+    assert _held_copies(paths, series) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +231,21 @@ def _held_arrival(watch_root: Path) -> Path:
     return arrival
 
 
+def _settle(arrival: Path) -> None:
+    """Run passes until the held archive's hold is remembered.
+
+    The first pass writes ComicInfo into the held placeholder after judging
+    it, so that hold is not remembered yet (it must be judged again on the
+    rewritten archive). The second pass leaves it unchanged and records it.
+    """
+    watcher.process_and_move_directory(arrival)
+    watcher.process_and_move_directory(arrival)
+
+
 def test_an_unchanged_held_directory_is_skipped_on_the_next_pass(watch, tmp_path, monkeypatch):
     watch_root, library = watch
     arrival = _held_arrival(watch_root)
-    watcher.process_and_move_directory(arrival)
+    _settle(arrival)
     state = _held_state(tmp_path)
     assert list(state) == [str(arrival)]
     assert state[str(arrival)]["held"] == ["volvox Chapter (Colored) (Uncensored).cbz"]
@@ -242,7 +258,7 @@ def test_an_unchanged_held_directory_is_skipped_on_the_next_pass(watch, tmp_path
 def test_any_change_to_a_held_directory_retries_it(watch, tmp_path, monkeypatch):
     watch_root, library = watch
     arrival = _held_arrival(watch_root)
-    watcher.process_and_move_directory(arrival)
+    _settle(arrival)
     calls = _count_processing(monkeypatch)
 
     _make_cbz(arrival / "Berserk Ch. 6.cbz", 600)
@@ -263,7 +279,7 @@ def test_any_change_to_a_held_directory_retries_it(watch, tmp_path, monkeypatch)
 def test_a_watcher_upgrade_retries_every_held_directory(watch, monkeypatch):
     watch_root, library = watch
     arrival = _held_arrival(watch_root)
-    watcher.process_and_move_directory(arrival)
+    _settle(arrival)
     calls = _count_processing(monkeypatch)
     monkeypatch.setattr(watcher, "WATCHER_SOURCE_VERSION", "sha256:new")
 
@@ -275,7 +291,7 @@ def test_a_watcher_upgrade_retries_every_held_directory(watch, monkeypatch):
 def test_deleting_the_entry_forces_a_retry(watch, tmp_path, monkeypatch):
     watch_root, library = watch
     arrival = _held_arrival(watch_root)
-    watcher.process_and_move_directory(arrival)
+    _settle(arrival)
     (tmp_path / "state" / "held.json").unlink()
     calls = _count_processing(monkeypatch)
 
@@ -301,7 +317,7 @@ def test_a_failed_move_is_not_remembered_as_held(watch, tmp_path, monkeypatch):
 def test_an_emptied_directory_is_forgotten(watch, tmp_path):
     watch_root, library = watch
     arrival = _held_arrival(watch_root)
-    watcher.process_and_move_directory(arrival)
+    _settle(arrival)
     assert _held_state(tmp_path)
 
     # The operator resolves the held file by hand; the next pass lands the
@@ -380,12 +396,13 @@ def test_year_and_season_variants_are_not_second_translations(watch, tag_a, tag_
     assert not list(arrival.glob("*.cbz"))
 
 
-def test_a_replacement_with_the_same_size_and_mtime_is_retried(watch, monkeypatch):
+def test_a_replacement_with_the_same_size_and_mtime_is_retried(watch, tmp_path, monkeypatch):
     """Different page bytes, same archive length and mtime, swapped in with
     os.replace: names, sizes and mtimes alone cannot see it."""
     watch_root, library = watch
     arrival = _held_arrival(watch_root)
-    watcher.process_and_move_directory(arrival)
+    _settle(arrival)
+    assert _held_state(tmp_path)[str(arrival)]["fingerprint"]
     held = next(arrival.glob("*.cbz"))
     before = held.stat()
     replacement = held.with_suffix(".new")
@@ -441,3 +458,44 @@ def test_held_second_copies_stay_held_when_a_new_chapter_arrives(media_watch):
     landed = library / "Usogui"
     assert _names(landed) == [f"Usogui ch. {n}.cbz" for n in (1, 2, 3, 4)]
     assert _payload_size(landed / "Usogui ch. 1.cbz") == 101
+
+
+def test_a_refused_kept_copy_promotes_the_next_copy(tmp_path):
+    """Unit view of _second_copies: the kept copy is the best one naming
+    did not refuse, and refused copies hold nothing back."""
+    alpha = [_make_cbz(tmp_path / f"Alpha Ch.{n}.cbz", 10) for n in (1, 2, 3)]
+    beta = [_make_cbz(tmp_path / f"Beta Ch.{n}.cbz", 10) for n in (1, 2)]
+    clusters = watcher._duplicate_chapter_copies(_parsed(alpha + beta), "Usogui")
+
+    assert watcher._second_copies(clusters, set()) == {beta[0]: alpha[0], beta[1]: alpha[1]}
+    assert watcher._second_copies(clusters, {alpha[0]}) == {beta[1]: alpha[1]}
+    assert watcher._second_copies(clusters, {alpha[0], beta[0]}) == {beta[1]: alpha[1]}
+
+
+def test_part_markers_are_not_second_translations(watch):
+    """Probe from the same review: Part A and Part B of chapter 1 are two
+    halves, not two translations."""
+    watch_root, library = watch
+    arrival = watch_root / "Usogui"
+    for group, part in (("Alpha", "A"), ("Beta", "B")):
+        for chapter in (1, 2):
+            _make_cbz(arrival / f"{group} Ch.{chapter} - Part {part}.cbz")
+
+    watcher.process_and_move_directory(arrival)
+
+    assert len(list(library.rglob("*.cbz"))) == 4
+
+
+def test_a_hold_judged_before_this_pass_rewrote_the_archive_is_re_judged(media_watch, monkeypatch):
+    """The pass rewrites ComicInfo after reading the facts it judged, so
+    the held archive changed under its own decision. The next pass must
+    judge the rewritten archive rather than skip it."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _with_number(_make_cbz(arrival / "Alpha Ch.1.cbz"), 99)
+    watcher.process_and_move_directory(arrival)
+    calls = _count_processing(monkeypatch)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert calls
