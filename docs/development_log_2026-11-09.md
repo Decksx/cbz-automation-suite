@@ -167,3 +167,34 @@ rewrite the archive in the same pass, so bypassing a transient guard failed
 nothing. New tests run the refusing pass twice (the second leaves the
 archive unchanged), so each transient guard is again load-bearing. A guard
 that a missing fingerprint never matches was unreachable and was removed.
+
+### Round 1 verification
+
+At `eb98c51` (code and tests unchanged since; this commit is documentation
+only), Windows / `C:\Python311` / Python 3.11, temporary fixtures only:
+
+- full suite: **5,055 passed / 10 skipped / 0 failed** (5,065 tests) =
+  master `c9bba0f`'s 5,031 + 34 (29 in `test_watcher_held_archives.py`, 5 in
+  `test_media_naming.py`);
+- Codex's probe file `test_review173_probes.py` (SHA256
+  `ba26ca90...8aed7`): **8/8 passed** at this head; **0/8** at `c2805816`;
+- `scripts/cbz_watcher.py` stored bare-LF count still 868.
+
+Every guard added or changed in this round fails named tests when bypassed:
+
+| Guard | Fails |
+| --- | --- |
+| tag-stripped arrivals not cached | 1 |
+| bracket tags in the duplicate key | 2 |
+| `Part` markers in the duplicate key | 1 |
+| content hash in the fingerprint | 1 |
+| a refused copy cannot be kept | 2 |
+| copies freed by a refusal are named | 1 |
+| earlier second copies stay held | 1 |
+| a carried copy must be unchanged | 1 |
+| rewritten archives are judged again | 1 |
+| empty registry never enters media naming | 1 |
+| kept copy's own group is not held | 1 |
+| OSError refusal is transient | 1 |
+| registry refusal is transient | 1 |
+| transient refusals left out of deliberate holds | 2 |
