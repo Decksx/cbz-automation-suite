@@ -545,10 +545,10 @@ def test_a_changed_second_copy_is_no_longer_carried(tmp_path, monkeypatch):
     folder = tmp_path / "Usogui"
     copy = _make_cbz(folder / "Beta Ch.1.cbz", 10)
     watcher._remember_held_directory(folder, {copy}, {copy: "Alpha Ch.1.cbz"})
-    assert watcher._carried_second_copies(folder, [copy]) == ({copy: "Alpha Ch.1.cbz"}, set())
+    assert watcher._carried_second_copies(folder, [copy]) == ({copy: "Alpha Ch.1.cbz"}, set(), True)
 
     _make_cbz(copy, 11)
-    assert watcher._carried_second_copies(folder, [copy]) == ({}, {copy})
+    assert watcher._carried_second_copies(folder, [copy]) == ({}, {copy}, True)
 
     (tmp_path / "held.json").write_text("{not json", encoding="utf-8")
     assert watcher._carried_second_copies(folder, [copy]) is None
@@ -788,3 +788,93 @@ def test_a_failed_move_of_a_protected_copy_is_not_remembered(media_watch, tmp_pa
 
     remembered = _held_state(tmp_path).get(str(arrival), {}).get("second_copies", {})
     assert not any(name.startswith("Usogui ch.") for name in remembered)
+
+
+# ---------------------------------------------------------------------------
+# PR #175 review round 2: protection fails closed. An OSError at any state or
+# move step in one pass, then clean passes: no copy is ever discarded.
+# ---------------------------------------------------------------------------
+
+def _all_payloads(root: Path) -> list[int]:
+    return sorted(_payload_size(p) for p in root.rglob("*.cbz"))
+
+
+def _inject(monkeypatch, step):
+    """Make *step* fail during the next pass only; returns a disarm function."""
+    armed = {"on": True, "calls": 0}
+
+    def wrap(name, failure):
+        real = getattr(watcher, name)
+
+        def fake(*args, **kwargs):
+            armed["calls"] += 1
+            if armed["on"] and failure(armed["calls"]):
+                if name == "_load_held_state":
+                    return None
+                if name == "_move_cbz_dir" and step == "move-returns-none":
+                    return None
+                raise PermissionError(f"injected failure in {name}")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(watcher, name, fake)
+
+    first = lambda calls: calls == 1
+    second = lambda calls: calls == 2
+    if step == "state-read-at-start":
+        wrap("_load_held_state", first)
+    elif step == "state-read-at-record":
+        wrap("_load_held_state", second)
+    elif step == "state-write":
+        wrap("_write_held_state", first)
+    elif step in ("move-returns-none", "move-raises"):
+        wrap("_move_cbz_dir", first)
+    elif step == "merge-file-move":
+        real_move = watcher.shutil.move
+
+        def flaky(src, dst):
+            if armed["on"]:
+                armed["on"] = False
+                raise PermissionError("injected failure moving one archive")
+            return real_move(src, dst)
+
+        monkeypatch.setattr(watcher.shutil, "move", flaky)
+    elif step == "loose-move":
+        wrap("_move_loose_files", first)
+    elif step == "hash":
+        wrap("_file_sha256", lambda calls: True)
+    elif step == "list-held-directory":
+        real_iterdir = Path.iterdir
+
+        def failing_iterdir(self):
+            if armed["on"] and self.name == "Usogui" and "incoming" in self.parts:
+                raise PermissionError("injected failure listing the directory")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", failing_iterdir)
+    return lambda: armed.update(on=False)
+
+
+@pytest.mark.parametrize("step", [
+    "state-read-at-start", "state-read-at-record", "state-write",
+    "move-returns-none", "move-raises", "merge-file-move", "loose-move",
+    "hash", "list-held-directory",
+])
+def test_a_failure_at_any_step_never_discards_a_copy(media_watch, monkeypatch, step):
+    watch_root, library = media_watch
+    existing = _make_cbz(library / "Usogui" / "Usogui ch. 1.cbz", 50)
+    before = existing.read_bytes()
+    arrival = watch_root / "Usogui"
+    _clustered_arrival(arrival, nested=step == "loose-move")
+    originals = _all_payloads(watch_root.parent)
+
+    disarm = _inject(monkeypatch, step)
+    watcher.process_and_move_directory(arrival)
+    disarm()
+    watcher.process_and_move_directory(arrival)
+    watcher.process_and_move_directory(arrival)
+
+    assert existing.read_bytes() == before
+    survivors = _all_payloads(watch_root.parent)
+    assert all(survivors.count(size) >= originals.count(size) for size in set(originals))
+    # Unaffected siblings still land once the failure clears.
+    assert {"Usogui ch. 2.cbz", "Usogui ch. 3.cbz"} <= {p.name for p in (library / "Usogui").glob("*.cbz")}
