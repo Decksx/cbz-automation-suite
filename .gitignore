@@ -10,6 +10,7 @@ Logs/*_root.log
 Logs/*_root.log.1
 Logs/cbz_gaps_*.csv
 Logs/series_exclusions.json
+Logs/cbz_watcher_held.json
 # Keep the folder anchor
 !Logs/.gitkeep
 
