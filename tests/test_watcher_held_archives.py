@@ -549,3 +549,121 @@ def test_a_changed_second_copy_is_no_longer_carried(tmp_path, monkeypatch):
 
     _make_cbz(copy, 11)
     assert watcher._carried_second_copies(folder, [copy]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Issue #174: no path may discard a held copy
+# ---------------------------------------------------------------------------
+
+def _hold_two_second_copies(arrival: Path) -> None:
+    """Alpha 1-3 and larger Beta 1-2: Beta 1 and 2 are held behind Alpha."""
+    for chapter in (1, 2, 3):
+        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
+    watcher.process_and_move_directory(arrival)
+    assert _names(arrival) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
+
+
+def _library_bytes(library: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in (library / "Usogui").glob("*.cbz")}
+
+
+@pytest.fixture
+def ai_rewrites(monkeypatch, tmp_path):
+    """AI decensoring on, with a deterministic in-place rewrite of every
+    archive it is given (one more byte on the page), keeping a backup."""
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", True)
+    monkeypatch.setattr(watcher, "destination_is_comix", lambda destination: True)
+    monkeypatch.setattr(watcher, "archive_completed_ai_backups", lambda *args: None)
+    rewritten: list[str] = []
+
+    def rewrite(path, destination):
+        backup = tmp_path / "ai-backups" / f"{len(rewritten)}-{path.name}"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(path.read_bytes())
+        page = _payload_size(path)
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("page1.jpg", b"\0" * (page + 1))
+        rewritten.append(path.name)
+        return backup
+
+    monkeypatch.setattr(watcher, "run_ai_decensor", rewrite)
+    return rewritten
+
+
+def test_ai_preprocessing_does_not_release_held_second_copies(media_watch, ai_rewrites):
+    """Issue #174. The pass AI-rewrites the held copies before checking
+    whether they are the copies it remembered, so their bytes no longer
+    matched, a new arrival released them, and keep-the-larger discarded
+    them onto the library's names. The carry is now judged on the bytes the
+    pass found, before any preprocessing."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _hold_two_second_copies(arrival)
+    before = _library_bytes(library)
+
+    _make_cbz(arrival / "Alpha Ch.4.cbz", 104)
+    ai_rewrites.clear()
+    watcher.process_and_move_directory(arrival)
+
+    assert {"Beta Ch.1.cbz", "Beta Ch.2.cbz"} <= set(ai_rewrites)
+    assert _names(arrival) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
+    after = _library_bytes(library)
+    assert {name: after[name] for name in before} == before
+
+
+def test_a_changed_held_copy_is_held_on_collision_not_discarded(media_watch):
+    """The operator replaces a held copy, so it is judged again. Its kept
+    copy has landed, so it now names onto the kept copy's library name. It
+    must be held there, not settled by keep-the-larger (which here would
+    replace the library copy with it)."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _hold_two_second_copies(arrival)
+    before = _library_bytes(library)
+
+    _make_cbz(arrival / "Beta Ch.1.cbz", 5000)
+    watcher.process_and_move_directory(arrival)
+
+    assert _library_bytes(library) == before
+    held = list(arrival.glob("*.cbz"))
+    assert sorted(_payload_size(p) for p in held) == [902, 5000]
+
+
+def test_an_unreadable_state_file_releases_nothing_into_a_discard(media_watch, tmp_path):
+    """With the held-state file unreadable the remembered copies are
+    unknown, so every collision in that pass is held rather than settled by
+    keep-the-larger."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _hold_two_second_copies(arrival)
+    before = _library_bytes(library)
+    (tmp_path / "state" / "held.json").write_text("{not json", encoding="utf-8")
+
+    _make_cbz(arrival / "Alpha Ch.4.cbz", 104)
+    watcher.process_and_move_directory(arrival)
+
+    after = _library_bytes(library)
+    assert {name: after[name] for name in before} == before
+    assert "Usogui ch. 4.cbz" in after
+    assert sorted(_payload_size(p) for p in arrival.glob("*.cbz")) == [901, 902]
+
+
+def test_a_second_copy_never_replaces_a_different_library_book(media_watch):
+    """A copy from a duplicate cluster that lands onto a name the library
+    already holds with different bytes is held for review, not settled by
+    keep-the-larger: which translation wins is the operator's call."""
+    watch_root, library = media_watch
+    existing = _make_cbz(library / "Usogui" / "Usogui ch. 1.cbz", 50)
+    existing_bytes = existing.read_bytes()
+    arrival = watch_root / "Usogui"
+    for chapter in (1, 2, 3):
+        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert existing.read_bytes() == existing_bytes
+    assert 101 in [_payload_size(p) for p in arrival.glob("*.cbz")]
