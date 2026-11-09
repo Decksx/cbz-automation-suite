@@ -198,3 +198,57 @@ Every guard added or changed in this round fails named tests when bypassed:
 | OSError refusal is transient | 1 |
 | registry refusal is transient | 1 |
 | transient refusals left out of deliberate holds | 2 |
+
+## Issue #174: held copies discarded after AI preprocessing
+
+PR #173 merged as `0d9eea8`. Codex then withdrew its approval: with AI
+decensoring reprocessing held archives, a remembered second copy was
+rewritten by the pass *before* `_carried_second_copies` hashed it. The hash
+no longer matched, so a new arrival released both held Beta copies; they
+were named onto the library's chapter names and discarded by
+keep-the-larger. Codex's repro `test_review173_r2_preprocessing.py`
+(SHA256 `de49c3d1...8bced`) fails its `rewrite` case at `0d9eea8`. The live
+watcher was rolled back to `5755290` and is untouched by this work.
+
+Branch `fix/watcher-held-preprocessing` from `0d9eea8`. Tests first
+(`99c1324`, four failing at `0d9eea8`), then the fix:
+
+1. **Check order.** The carry is judged on the bytes the pass finds, before
+   ComicInfo or AI rewrites them (`memory` in
+   `_process_and_move_directory_inner`). The recorded hash is of the bytes a
+   pass leaves behind, which is exactly what the next pass finds unless
+   someone else changed the file.
+2. **No path settles a held or second copy by keep-the-larger.** A
+   protected arrival that meets a different existing file is held
+   (`_hold_protected_collision`, in both `_merge_directories` and
+   `_move_loose_files`); an exact duplicate is still removed. Protected:
+   every copy in a duplicate cluster that is not already held (the fourth
+   test showed keep-the-larger *discarding* an incoming kept copy whose gain
+   was below the replacement threshold), a remembered copy whose bytes
+   changed, and, when the state file is unreadable
+   (`_load_held_state` returns None, distinct from "no file"), every
+   archive in the pass.
+3. **Docs.** Force a retry by touching a file, not by deleting the state
+   entry: deleting it makes the watcher forget the held copies, after which
+   a forgotten copy outside any duplicate cluster is an ordinary arrival.
+   That operator action is the one remaining way to give up the protection,
+   and it is documented as such.
+
+Guards proven by bypass (held-archive tests, failing per guard): carry
+judged before preprocessing 1; merge holds a protected collision 4; loose
+move holds a protected collision 1; exact duplicate is not held 2; changed
+remembered copy protected 1; unreadable state protects everything 1;
+cluster copies protected 1; unreadable state is not empty state 2.
+
+Verification at `98f0719` (code and tests; later commits are docs only),
+Windows / `C:\Python311` / Python 3.11, temporary fixtures only:
+
+- full suite: **5,060 passed / 10 skipped / 1 failed** (5,071 tests) =
+  master `0d9eea8`'s 5,065 + 6. The failure is
+  `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`,
+  the same Windows file-lock flake that failed on master `c9bba0f` in this
+  log's first baseline; the branch changes nothing under `web`, and it
+  passes alone;
+- Codex's files at this head: `test_review173_r2_preprocessing.py` 2/2,
+  `test_review173_probes.py` 8/8, `test_review173_r2_guards.py` 4/4;
+- `scripts/cbz_watcher.py` stored bare-LF count still 868.
