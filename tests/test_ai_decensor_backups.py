@@ -17,9 +17,10 @@ from scripts import cbz_watcher as watcher
 
 def _book(path: Path, series: str, page: bytes = b"original") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # ZipInfo's fixed default date keeps duplicate archive bytes independent of the clock.
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("ComicInfo.xml", f"<ComicInfo><Series>{series}</Series></ComicInfo>")
-        archive.writestr("001.jpg", page)
+        archive.writestr(zipfile.ZipInfo("ComicInfo.xml"), f"<ComicInfo><Series>{series}</Series></ComicInfo>")
+        archive.writestr(zipfile.ZipInfo("001.jpg"), page)
     return path
 
 
