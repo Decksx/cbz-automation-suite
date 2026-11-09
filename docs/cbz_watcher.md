@@ -34,6 +34,43 @@ The immediate comic directory is the batch:
 11. Move the directory.
 12. Merge file-by-file if the destination exists.
 
+## Held archives
+
+Some archives in a batch are held in the import folder for review instead of
+moving. Since 2026-11-09 only those archives stay behind; their siblings move
+as normal (before then one held archive deferred the whole directory, so a
+710-archive series waited on 54 refusals and was re-processed on every pass).
+
+An archive is held when:
+
+- media or fallback naming refuses it (a `REVIEW:` line gives the reason). A
+  refused placeholder keeps its generic name, and merging it into the series
+  folder is where the next chapter sharing that name would collide;
+- it is a second copy of a chapter from another scanlation group
+  (`_duplicate_chapter_copies`). The copy whose group has the most archives
+  in the directory lands, then the larger file. Copies need the same single
+  chapter/issue number, volume, specials, editions and version markers;
+  both groups need two or more archives in the directory; a prefix that is
+  the series name plus more words (`Batman Annual` in `Batman`) is another
+  title, not a group. Nothing is deleted: choose a copy and remove the other
+  by hand;
+- it meets a different library book only because a tag was stripped from
+  its name (`HELD FOR REVIEW`, issue #131).
+
+Each pass logs `Holding N of M archive(s)` and one `HELD (...)` line per
+archive. When every archive is held, nothing moves and no series folder is
+created.
+
+A directory left holding only held archives is recorded in
+`Logs\cbz_watcher_held.json` with a fingerprint of its files (names, sizes,
+modification times), the watcher's source hash and the number-style registry
+hash. Later passes and restarts skip it with one `Skipping ...` line while
+the fingerprint matches. Adding, removing, replacing or touching a file, or
+upgrading the watcher or the registry, retries it. To force a retry, delete
+the directory's entry or the whole file. A directory that still holds
+archives that were not deliberately held (a move that failed, for example)
+is never recorded, so a transient failure is retried as before.
+
 ## Canonical series resolver
 
 The GUI enables **Resolve series names and import directly to Z:** by default.
@@ -244,4 +281,5 @@ Use the watcher for incoming day-to-day processing. Use unified workflows for re
 Logs\cbz_watcher.log
 ```
 
-The rotating log is 5 MB with three backups.
+The rotating log is 5 MB with three backups. Held directories are recorded
+beside it in `Logs\cbz_watcher_held.json` (see Held archives).
