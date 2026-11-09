@@ -1617,6 +1617,32 @@ def _hold_stripped_collision(src: Path, dest: Path, display_name: str) -> bool:
     return True
 
 
+def _hold_protected_collision(src: Path, dest: Path) -> bool:
+    """Hold a protected arrival instead of letting keep-the-larger settle it.
+
+    A protected arrival is another copy of a chapter the operator has to
+    choose between (see the caller in ``_process_and_move_directory_inner``).
+    Keep-the-larger would replace the library copy or discard the arrival,
+    deciding that choice silently, and either way a translation is lost.
+    Returns ``False`` only for the same bytes, an exact duplicate the
+    caller's own handling may remove without losing anything; a failed
+    comparison holds, as in ``_hold_stripped_collision``.
+    """
+    try:
+        same = src.stat().st_size == dest.stat().st_size and digest(src) == digest(dest)
+    except OSError as e:
+        log.error(f"    Could not compare '{src.name}' with '{dest}' "
+                  f"({type(e).__name__}: {e}); holding it.")
+        same = False
+    if same:
+        return False
+    log.warning(
+        f"    HELD FOR REVIEW: '{src.name}' is another copy of a chapter the "
+        f"library already holds as the different '{dest}'. Existing left "
+        f"untouched; incoming kept in the import folder as '{src}' (issue #174).")
+    return True
+
+
 def _land_deferred_names(
     src_dir: Path, dest_dir: Path, stripped_arrivals: dict[Path, str] | None
 ) -> None:
@@ -1658,6 +1684,7 @@ def _merge_directories(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
+    protected: frozenset[Path] = frozenset(),
 ) -> None:
     """Recursively merge *src_dir* into *dest_dir*.
 
@@ -1676,6 +1703,10 @@ def _merge_directories(
     review (a refused name, or a second copy of a chapter). They are never
     moved, replaced or deleted here, so ``_remove_merged_source`` finds them
     still in *src_dir* and leaves it in place.
+
+    A *protected* archive that meets a different existing file is held the
+    same way (``_hold_protected_collision``) instead of being settled by
+    either keep-the-larger branch.
     """
     stripped_arrivals = stripped_arrivals or {}
     for src_item in iter_paths_excluding_directories(src_dir):
@@ -1706,6 +1737,8 @@ def _merge_directories(
             if display_name is not None and _hold_stripped_collision(
                 src_item, dest_item, display_name
             ):
+                continue
+            if src_item in protected and _hold_protected_collision(src_item, dest_item):
                 continue
             if conflict_quarantine_root is not None:
                 outcome = settle_file_conflict(
@@ -2348,6 +2381,7 @@ def _move_cbz_dir(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
+    protected: frozenset[Path] = frozenset(),
 ) -> Path | None:
     """Move a processed comic directory to dest_folder, merging if it already exists.
 
@@ -2373,6 +2407,8 @@ def _move_cbz_dir(
     With any held, the directory is never moved wholesale -- that would carry
     them into the library -- so the destination is created if needed and the
     rest are merged into it, leaving *dir_path* behind with the held files.
+    *protected* is passed to ``_merge_directories``. A move into a folder
+    that does not exist yet meets nothing, so protects nothing it needs to.
     """
     if not dir_path.exists():
         log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
@@ -2418,6 +2454,7 @@ def _move_cbz_dir(
                 conflict_quarantine_root=conflict_quarantine_root,
                 stripped_arrivals=stripped_arrivals,
                 held=held,
+                protected=protected,
             )
             _remove_merged_source(dir_path)
             log.info(f"  Merge complete.")
@@ -2440,6 +2477,7 @@ def _move_cbz_dir(
                         conflict_quarantine_root=conflict_quarantine_root,
                         stripped_arrivals=stripped_arrivals,
                         held=held,
+                        protected=protected,
                     )
                     _remove_merged_source(dir_path)
                     log.info(f"  Merge complete.")
@@ -2462,12 +2500,14 @@ def _move_loose_files(
     series_name: str,
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
+    protected: frozenset[Path] = frozenset(),
 ) -> Path | None:
     """Move individual .cbz files — not their parent directory — into
     ``dest_folder/series_name``, applying the same keep-the-larger-on-conflict
     policy as ``_merge_directories`` on a per-file basis, including its hold
     for a stripped arrival that meets a different book (*stripped_arrivals*,
-    issue #131). A held file stays where it is and is not counted as moved.
+    issue #131) and for a *protected* arrival (issue #174). A held file stays
+    where it is and is not counted as moved.
 
     Used for .cbz files that sit directly in a directory which also contains
     other subdirectories that are themselves comic directories (each with
@@ -2497,6 +2537,8 @@ def _move_loose_files(
             if display_name is not None and _hold_stripped_collision(
                 src, dest_item, display_name
             ):
+                continue
+            if src in protected and _hold_protected_collision(src, dest_item):
                 continue
             if conflict_quarantine_root is not None:
                 outcome = settle_file_conflict(
@@ -2708,16 +2750,23 @@ def _held_fingerprint(comic_dir: Path) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _read_held_state() -> dict:
+def _load_held_state() -> dict | None:
+    """The held-state document: {} when there is none, None when unreadable."""
     try:
         state = json.loads(HELD_STATE_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
-        # An unreadable file only costs a re-processing pass; never fatal.
         log.warning(f"  Held-directory state unreadable ({exc}); re-checking every directory.")
-        return {}
-    return state if isinstance(state, dict) else {}
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _read_held_state() -> dict:
+    # For the skip and for rewriting the record, unreadable is the same as
+    # empty: it only costs a re-processing pass. Remembered second copies
+    # need to know the difference (_carried_second_copies).
+    return _load_held_state() or {}
 
 
 def _write_held_state(state: dict) -> None:
@@ -2746,29 +2795,48 @@ def _held_directory_unchanged(comic_dir: Path) -> dict | None:
     return entry if entry.get("fingerprint") == current else None
 
 
-def _carried_second_copies(comic_dir: Path, paths) -> dict[Path, str]:
-    """Archives held as second copies on an earlier pass, still unchanged.
+def _carried_second_copies(
+    comic_dir: Path, paths
+) -> tuple[dict[Path, str], set[Path]] | None:
+    """Archives held as second copies on an earlier pass: (carried, changed).
 
     Once the kept copy has landed, the import folder alone no longer shows
     the held copy as a second translation. Released, it would be named onto
     the kept copy's library name and settled by keep-the-larger, discarding
     one translation. So a held copy stays held while its name and bytes are
-    unchanged, whatever else arrives beside it. Maps path -> kept copy's name.
+    unchanged, whatever else arrives beside it: *carried* maps such a path
+    to the kept copy's name. A remembered name whose bytes changed (the
+    operator replaced it) is in *changed*: it is judged again, and protected
+    from keep-the-larger where it lands.
+
+    Call this on the arrival paths before the pass preprocesses them. The
+    recorded hash is of the bytes a pass left behind, which is what the next
+    pass finds, unless someone else changed them; ComicInfo and AI rewrites
+    made by this pass come after and must not count (issue #174).
+
+    None when the state file cannot be read: what was held is then unknown.
     """
     with _held_state_lock:
-        entry = _read_held_state().get(str(comic_dir))
+        state = _load_held_state()
+    if state is None:
+        return None
+    entry = state.get(str(comic_dir))
     recorded = entry.get("second_copies", {}) if isinstance(entry, dict) else {}
     carried: dict[Path, str] = {}
+    changed: set[Path] = set()
     for path in paths:
         hold = recorded.get(path.name)
         if not isinstance(hold, dict):
             continue
         try:
-            if _file_sha256(path) == hold.get("sha256"):
-                carried[path] = str(hold.get("kept", ""))
+            same = _file_sha256(path) == hold.get("sha256")
         except OSError:
-            continue
-    return carried
+            same = False
+        if same:
+            carried[path] = str(hold.get("kept", ""))
+        else:
+            changed.add(path)
+    return carried, changed
 
 
 def _remember_held_directory(
@@ -2984,6 +3052,10 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         # Each arrival's (size, mtime) before this pass rewrites any of them;
         # see the _remember_held_directory call below.
         arrival_stats = {cbz: _size_and_mtime(cbz) for cbz in cbz_files}
+        # Second copies held on an earlier pass, judged on the bytes this pass
+        # found: ComicInfo and AI decensoring below rewrite them, and the
+        # watcher's own rewrite must not read as the operator's (issue #174).
+        memory = _carried_second_copies(comic_dir, cbz_files)
         parsed_by_path: dict[Path, ParsedComicName] = {}
         media_originals = {}
         ai_decensor_backups: list[tuple[Path, Path]] = []
@@ -3128,7 +3200,9 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 # Second copies held on an earlier pass stay held while
                 # unchanged: their kept copies have landed, so this pass alone
                 # would no longer see them as second copies.
-                carried = _carried_second_copies(comic_dir, list(parsed_by_path))
+                carried_origins, changed_origins = memory if memory is not None else ({}, set())
+                carried = {path: carried_origins[origin] for path, origin in origins.items()
+                           if origin in carried_origins}
                 carried_entries = {path: parsed_by_path.pop(path) for path in carried}
                 # Second copies of a chapter are set aside before naming, so
                 # media naming cannot give one copy the other's name. A kept
@@ -3155,6 +3229,22 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 second_copies = {path: kept.name for path, kept in duplicates.items()}
                 second_copies.update(carried)
                 held = refused | set(second_copies)
+                # Every other copy of a duplicated chapter, and a remembered
+                # copy whose bytes changed, may still meet a different library
+                # book under its new name. Which one stays is the operator's
+                # call, so keep-the-larger must not settle it: it is held
+                # (_hold_protected_collision). With the state file unreadable
+                # nobody knows what was held, so every archive is protected.
+                second_copy_origins = {
+                    origins.get(path, path) for cluster in clusters for path, _ in cluster
+                } | changed_origins
+                protected = {
+                    path for path, parsed in parsed_by_path.items()
+                    if path not in held and (
+                        memory is None
+                        or getattr(parsed, "original_path", path) in second_copy_origins)
+                }
+                protected_option = {"protected": frozenset(protected)} if protected else {}
                 ai_backups = _rekey_ai_backups(
                     ai_decensor_backups, origins, parsed_by_path)
                 # Read after the fallback renames, which change paths. Passed
@@ -3196,7 +3286,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     )
                     landed = _move_loose_files(
                         archives, dest_folder, series_name,
-                        **loose_options, **stripped_option,
+                        **loose_options, **stripped_option, **protected_option,
                     ) if archives else None
                     _note_move(series_name, dest_folder, landed)
                 elif held and all(path in held for path in parsed_by_path):
@@ -3231,6 +3321,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         **move_options,
                         **stripped_option,
                         **held_option,
+                        **protected_option,
                     )
                     _note_move(series_name, dest_folder, landed)
                 if (
