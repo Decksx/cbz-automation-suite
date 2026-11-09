@@ -2564,9 +2564,9 @@ def _duplicate_chapter_copies(
     folder for review (`_second_copies`). Nothing is deleted.
 
     Two archives are copies only when their names give the same single
-    chapter/issue number, the same volume (or none), the same years and
-    bracketed tags (``(2019)``, ``(s2)``: a season or year apart is another
-    book, not another translation), the same ``Part`` markers, and the same
+    chapter/issue number, the same volume (or none), the same bracketed tags
+    (a year ``(2019)`` or season ``(s2)`` apart is another book, not another
+    translation), the same ``Part`` markers, and the same
     specials, editions, collection markers and version markers, and their
     pre-number prefixes (the "group") differ. Both groups must also have at
     least two archives
@@ -2599,7 +2599,7 @@ def _duplicate_chapter_copies(
         parts = frozenset(_PART_RE.findall(path.stem.casefold()))
         key = (numbers[0], volumes[0] if volumes else None,
                tokens.specials, tokens.editions, tokens.collections,
-               frozenset(tokens.version_markers), frozenset(tokens.years), brackets, parts)
+               frozenset(tokens.version_markers), brackets, parts)
         facts[path] = (key, group)
 
     group_sizes: dict[str, int] = {}
@@ -2653,8 +2653,10 @@ def _name_batch(
     runs only for the archives media naming accepted: a refused archive stays
     in the import folder under its arrival name.
     """
-    refused, selection = _apply_media_naming(
-        batch, media_originals, series_name, dest_folder, transient=transient)
+    refused, selection = set(), None
+    if _media_naming_enabled():  # an empty registry keeps the legacy path untouched
+        refused, selection = _apply_media_naming(
+            batch, media_originals, series_name, dest_folder, transient=transient)
     options = {"number_style": selection.style} if selection is not None else {}
     named = {p: v for p, v in batch.items() if p not in refused}
     kept_back = {p: v for p, v in batch.items() if p in refused}
