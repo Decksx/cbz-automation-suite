@@ -1685,6 +1685,7 @@ def _merge_directories(
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
     protected: frozenset[Path] = frozenset(),
+    protected_holds: dict[Path, str] | None = None,
 ) -> None:
     """Recursively merge *src_dir* into *dest_dir*.
 
@@ -1706,7 +1707,10 @@ def _merge_directories(
 
     A *protected* archive that meets a different existing file is held the
     same way (``_hold_protected_collision``) instead of being settled by
-    either keep-the-larger branch.
+    either keep-the-larger branch. Each such hold that happens is reported
+    in *protected_holds* (source path -> existing file's name) so the caller
+    can remember it: on the next pass nothing else marks the archive as
+    protected.
     """
     stripped_arrivals = stripped_arrivals or {}
     for src_item in iter_paths_excluding_directories(src_dir):
@@ -1739,6 +1743,8 @@ def _merge_directories(
             ):
                 continue
             if src_item in protected and _hold_protected_collision(src_item, dest_item):
+                if protected_holds is not None:
+                    protected_holds[src_item] = dest_item.name
                 continue
             if conflict_quarantine_root is not None:
                 outcome = settle_file_conflict(
@@ -2382,6 +2388,7 @@ def _move_cbz_dir(
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
     protected: frozenset[Path] = frozenset(),
+    protected_holds: dict[Path, str] | None = None,
 ) -> Path | None:
     """Move a processed comic directory to dest_folder, merging if it already exists.
 
@@ -2407,8 +2414,9 @@ def _move_cbz_dir(
     With any held, the directory is never moved wholesale -- that would carry
     them into the library -- so the destination is created if needed and the
     rest are merged into it, leaving *dir_path* behind with the held files.
-    *protected* is passed to ``_merge_directories``. A move into a folder
-    that does not exist yet meets nothing, so protects nothing it needs to.
+    *protected* and *protected_holds* are passed to ``_merge_directories``.
+    A move into a folder that does not exist yet meets nothing, so protects
+    nothing it needs to.
     """
     if not dir_path.exists():
         log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
@@ -2455,6 +2463,7 @@ def _move_cbz_dir(
                 stripped_arrivals=stripped_arrivals,
                 held=held,
                 protected=protected,
+                protected_holds=protected_holds,
             )
             _remove_merged_source(dir_path)
             log.info(f"  Merge complete.")
@@ -2478,6 +2487,7 @@ def _move_cbz_dir(
                         stripped_arrivals=stripped_arrivals,
                         held=held,
                         protected=protected,
+                        protected_holds=protected_holds,
                     )
                     _remove_merged_source(dir_path)
                     log.info(f"  Merge complete.")
@@ -2501,13 +2511,15 @@ def _move_loose_files(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     protected: frozenset[Path] = frozenset(),
+    protected_holds: dict[Path, str] | None = None,
 ) -> Path | None:
     """Move individual .cbz files — not their parent directory — into
     ``dest_folder/series_name``, applying the same keep-the-larger-on-conflict
     policy as ``_merge_directories`` on a per-file basis, including its hold
     for a stripped arrival that meets a different book (*stripped_arrivals*,
-    issue #131) and for a *protected* arrival (issue #174). A held file stays
-    where it is and is not counted as moved.
+    issue #131) and for a *protected* arrival (issue #174), reported in
+    *protected_holds* as in ``_merge_directories``. A held file stays where
+    it is and is not counted as moved.
 
     Used for .cbz files that sit directly in a directory which also contains
     other subdirectories that are themselves comic directories (each with
@@ -2539,6 +2551,8 @@ def _move_loose_files(
             ):
                 continue
             if src in protected and _hold_protected_collision(src, dest_item):
+                if protected_holds is not None:
+                    protected_holds[src] = dest_item.name
                 continue
             if conflict_quarantine_root is not None:
                 outcome = settle_file_conflict(
@@ -3244,7 +3258,14 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         memory is None
                         or getattr(parsed, "original_path", path) in second_copy_origins)
                 }
-                protected_option = {"protected": frozenset(protected)} if protected else {}
+                # The holds that actually happen are reported back, so they can
+                # be remembered like second copies: on the next pass the held
+                # archive, renamed and alone, would be protected by nothing.
+                collision_holds: dict[Path, str] = {}
+                protected_option = (
+                    {"protected": frozenset(protected), "protected_holds": collision_holds}
+                    if protected else {}
+                )
                 ai_backups = _rekey_ai_backups(
                     ai_decensor_backups, origins, parsed_by_path)
                 # Read after the fallback renames, which change paths. Passed
@@ -3360,6 +3381,11 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 path for path in held
                 if _size_and_mtime(path) != arrival_stats.get(origins.get(path, path))
             }
+            # A protected arrival held on a library collision is remembered as
+            # a second copy, by the name and bytes it was held with, so later
+            # passes keep holding it. Only holds that happened are reported:
+            # a failed move stays an ordinary arrival and is retried.
+            second_copies.update(collision_holds)
             _remember_held_directory(comic_dir, held - transient - rewritten, second_copies)
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
