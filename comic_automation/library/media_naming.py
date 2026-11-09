@@ -21,6 +21,17 @@ class KeepArrivalName(CanonicalNameError):
     """
 
 
+def distinct_numbers(values) -> tuple:
+    """The distinct values of a number-token tuple, in first-seen order.
+
+    A name may state the same number twice in different spellings, e.g.
+    ``Vol.44 Ch.483.5 - Volume 44 Side Story``. Both tokens are already in
+    `normalize_number` form, so equal values are one claim, not a conflict;
+    only genuinely different values (``Vol.12 ... v2``) stay ambiguous.
+    """
+    return tuple(dict.fromkeys(values))
+
+
 def display_key(text: str) -> str:
     """Fold only case, spacing and punctuation, retaining every letter/mark.
 
@@ -257,9 +268,10 @@ def media_fields(*, series: str, number: str | None, volume: str | None,
         volume, number = volume if volume is not None else number, None
         collection = "TPB" if style == "issue" else None
     elif labelled_volume:
-        if len(tokens.collections) > 1 or len(tokens.volume_tokens) != 1 or volume is None:
+        volume_claims = distinct_numbers(tokens.volume_tokens)
+        if len(tokens.collections) > 1 or len(volume_claims) != 1 or volume is None:
             raise CanonicalNameError("collected volume is unresolved or conflicting")
-        if fr.normalize_number(volume) != tokens.volume_tokens[0]:
+        if fr.normalize_number(volume) != volume_claims[0]:
             raise CanonicalNameError("collection label conflicts with resolved volume")
         if tokens.collections and tokens.primary_numbers:
             raise CanonicalNameError("collected edition also claims an issue/chapter")
@@ -308,7 +320,11 @@ def watcher_naming(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
         raise CanonicalNameError("inconsistent arrival ComicInfo")
     tokens = fr.parse_name_tokens(fact.filename)
     display = display_tokens_for(series, fact.filename)
-    if len(tokens.primary_numbers) > 1 or len(tokens.volume_tokens) > 1:
+    # Repeats of one value ("Vol.44 ... Volume 44") are a single claim; every
+    # repeated spelling is still consumed below, so none survives as an
+    # unconsumed number.
+    if (len(distinct_numbers(tokens.primary_numbers)) > 1
+            or len(distinct_numbers(tokens.volume_tokens)) > 1):
         raise CanonicalNameError("conflicting arrival number tokens")
     resolved_series = ci.fields["Series"] if ci.authoritative("Series") else series
     series_display(resolved_series, series)  # Keeping a name cannot bypass title conflict.
