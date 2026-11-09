@@ -333,3 +333,111 @@ def test_a_registry_refusal_is_retried_not_remembered(media_watch, tmp_path, mon
 
     assert _names(arrival) == ["Team Duwang Vol.1 Ch.1 - Gambler.cbz"]
     assert _held_state(tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# PR #173 review (2026-11-09): five cases reproduced by Codex, plus the
+# connector's P1. Each failed at c2805816.
+# ---------------------------------------------------------------------------
+
+def _with_number(path: Path, number) -> Path:
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("ComicInfo.xml",
+                         f"<ComicInfo><Series>Usogui</Series><Number>{number}</Number></ComicInfo>")
+    return path
+
+
+def test_a_failed_move_of_a_deferred_tagged_arrival_is_retried(watch, tmp_path, monkeypatch):
+    """A deferred tag-stripping rename is a plan, not a hold. If the move
+    fails, the arrival was never held on purpose and must be retried."""
+    watch_root, library = watch
+    arrival = watch_root / "Solo Leveling"
+    _make_cbz(arrival / "Solo Leveling ch. 4 (s2).cbz")
+    real_move = watcher._move_cbz_dir
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+    watcher.process_and_move_directory(arrival)
+    assert _held_state(tmp_path) == {}
+
+    monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
+    watcher.process_and_move_directory(arrival)
+    assert (library / "Solo Leveling" / "Solo Leveling ch. 4.cbz").is_file()
+
+
+@pytest.mark.parametrize("tag_a, tag_b", [
+    pytest.param("(2019)", "(2020)", id="years"),
+    pytest.param("(s1)", "(s2)", id="seasons"),
+])
+def test_year_and_season_variants_are_not_second_translations(watch, tag_a, tag_b):
+    watch_root, library = watch
+    arrival = watch_root / "Usogui"
+    for group, tag in (("Alpha", tag_a), ("Beta", tag_b)):
+        for chapter in (1, 2):
+            _make_cbz(arrival / f"{group} Ch.{chapter} {tag}.cbz")
+
+    watcher.process_and_move_directory(arrival)
+
+    assert len(list(library.rglob("*.cbz"))) == 4
+    assert not list(arrival.glob("*.cbz"))
+
+
+def test_a_replacement_with_the_same_size_and_mtime_is_retried(watch, monkeypatch):
+    """Different page bytes, same archive length and mtime, swapped in with
+    os.replace: names, sizes and mtimes alone cannot see it."""
+    watch_root, library = watch
+    arrival = _held_arrival(watch_root)
+    watcher.process_and_move_directory(arrival)
+    held = next(arrival.glob("*.cbz"))
+    before = held.stat()
+    replacement = held.with_suffix(".new")
+    with zipfile.ZipFile(held) as source, zipfile.ZipFile(replacement, "w") as target:
+        for info in source.infolist():
+            data = source.read(info)
+            target.writestr(info, b"\1" * len(data) if info.filename == "page1.jpg" else data)
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.replace(replacement, held)
+    assert held.stat().st_size == before.st_size and held.stat().st_mtime_ns == before.st_mtime_ns
+
+    calls = _count_processing(monkeypatch)
+    watcher.process_and_move_directory(arrival)
+    assert calls
+
+
+def test_a_refused_preferred_copy_does_not_hold_back_the_valid_one(media_watch):
+    """Beta has more archives, so its Ch.1 is preferred, but its ComicInfo
+    Number (99) conflicts and naming refuses it. Alpha's valid Ch.1 must
+    then land instead of waiting behind a copy that cannot."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    for group, chapters in (("Alpha", (1, 10)), ("Beta", (1, 2, 3))):
+        for chapter in chapters:
+            number = 99 if (group, chapter) == ("Beta", 1) else chapter
+            _with_number(_make_cbz(arrival / f"{group} Ch.{chapter}.cbz"), number)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert (library / "Usogui" / "Usogui ch. 1.cbz").is_file()
+    assert _names(arrival) == ["Beta Ch.1.cbz"]
+
+
+def test_held_second_copies_stay_held_when_a_new_chapter_arrives(media_watch):
+    """The connector's P1. After the first pass the kept copies are in the
+    library, so the intake alone no longer shows the held copies as second
+    translations. A new arrival must not release them into a merge that
+    renames them onto the library's names and discards one."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    for chapter in (1, 2, 3):
+        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
+    watcher.process_and_move_directory(arrival)
+    assert _names(arrival) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
+
+    _make_cbz(arrival / "Alpha Ch.4.cbz", 104)
+    watcher.process_and_move_directory(arrival)
+
+    assert _names(arrival) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
+    assert _payload_size(arrival / "Beta Ch.1.cbz") == 901
+    landed = library / "Usogui"
+    assert _names(landed) == [f"Usogui ch. {n}.cbz" for n in (1, 2, 3, 4)]
+    assert _payload_size(landed / "Usogui ch. 1.cbz") == 101
