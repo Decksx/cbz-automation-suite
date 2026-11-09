@@ -55,8 +55,10 @@ An archive is held when:
   version markers; both groups need two or more archives in the directory;
   a prefix that is the series name plus more words (`Batman Annual` in
   `Batman`) is another title, not a group. A held copy stays held by name
-  and content on later passes, even after new chapters arrive. Nothing is
-  deleted: choose a copy, and remove or swap the other by hand;
+  and content on later passes, even after new chapters arrive; its content
+  is checked on the bytes the pass finds, before ComicInfo or AI decensoring
+  rewrite it (issue #174). Nothing is deleted: choose a copy, and remove or
+  swap the other by hand;
 - it meets a different library book only because a tag was stripped from
   its name (`HELD FOR REVIEW`, issue #131).
 
@@ -70,9 +72,19 @@ modification times and SHA-256 of their contents), the watcher's source hash
 and the number-style registry hash. Later passes and restarts skip it with
 one `Skipping ...` line while the fingerprint matches. Adding, removing,
 replacing, rewriting or touching a file, or upgrading the watcher or the
-registry, retries it. To force a retry, delete the directory's entry or the
-whole file. Second copies are recorded in the same entry (`second_copies`,
-by name and SHA-256); deleting the entry also releases them.
+registry, retries it. To force a retry, touch any file in the directory.
+Second copies are recorded in the same entry (`second_copies`, by name and
+SHA-256). Do not delete the entry or the file to force a retry: the watcher
+would then forget which copies it was holding.
+
+No held or second copy is ever settled by keep-the-larger. Every other copy
+of a duplicated chapter, and a remembered copy whose bytes changed (it is
+judged again), is protected where it lands: meeting a different library
+book under the same name, it is held in the import folder (`HELD FOR
+REVIEW ... (issue #174)`) and the library copy is left untouched. An exact
+duplicate is still removed, since nothing is lost. If the state file cannot
+be read, what was held is unknown, so every archive in that pass is
+protected the same way.
 
 Some holds are never recorded, so their directories are retried every pass,
 as before this change:
