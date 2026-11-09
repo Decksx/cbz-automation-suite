@@ -345,6 +345,10 @@ def test_a_registry_refusal_is_retried_not_remembered(media_watch, tmp_path, mon
         raise NumberStyleRefused("auto number style needs exactly one registered root")
 
     monkeypatch.setattr(type(watcher._number_style_registry), "select", refuse)
+    # Two passes: the first writes ComicInfo (so is never remembered); the
+    # second leaves the archive unchanged, so only the refusal being
+    # transient keeps it from being remembered.
+    watcher.process_and_move_directory(arrival)
     watcher.process_and_move_directory(arrival)
 
     assert _names(arrival) == ["Team Duwang Vol.1 Ch.1 - Gambler.cbz"]
@@ -499,3 +503,49 @@ def test_a_hold_judged_before_this_pass_rewrote_the_archive_is_re_judged(media_w
     watcher.process_and_move_directory(arrival)
 
     assert calls
+
+
+def test_a_failed_rename_is_retried_not_remembered(media_watch, tmp_path, monkeypatch):
+    """An OSError during naming (a locked archive) refuses without anything
+    being wrong with the archive. Even once a pass leaves it unchanged, it
+    is retried, and lands when the lock clears."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _make_cbz(arrival / "Team Duwang Vol.1 Ch.1 - Gambler.cbz")
+
+    def locked(*_args, **_kwargs):
+        raise PermissionError("locked by another process")
+
+    real_rename = watcher.rename_arrival
+    monkeypatch.setattr(watcher, "rename_arrival", locked)
+    watcher.process_and_move_directory(arrival)
+    watcher.process_and_move_directory(arrival)
+    assert _held_state(tmp_path) == {}
+
+    monkeypatch.setattr(watcher, "rename_arrival", real_rename)
+    watcher.process_and_move_directory(arrival)
+    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz"]
+
+
+def test_a_groups_own_second_copy_is_not_held_behind_it(tmp_path):
+    """Two same-numbered archives from the kept copy's own group are parts
+    or re-uploads, not a second translation; only the other group's copy
+    is held."""
+    alpha = [_make_cbz(tmp_path / name, 10) for name in (
+        "Alpha Ch.1 - Bet.cbz", "Alpha Ch.1 - Wager.cbz", "Alpha Ch.2.cbz")]
+    beta = [_make_cbz(tmp_path / name, 10) for name in ("Beta Ch.1.cbz", "Beta Ch.2.cbz")]
+    held = _held_copies(alpha + beta, "Usogui")
+    assert set(held) == {beta[0], beta[1]}
+
+
+def test_a_changed_second_copy_is_no_longer_carried(tmp_path, monkeypatch):
+    """A remembered second copy stays held only while its bytes match: once
+    the operator replaces it, it is judged again like any arrival."""
+    monkeypatch.setattr(watcher, "HELD_STATE_FILE", tmp_path / "held.json")
+    folder = tmp_path / "Usogui"
+    copy = _make_cbz(folder / "Beta Ch.1.cbz", 10)
+    watcher._remember_held_directory(folder, {copy}, {copy: "Alpha Ch.1.cbz"})
+    assert watcher._carried_second_copies(folder, [copy]) == {copy: "Alpha Ch.1.cbz"}
+
+    _make_cbz(copy, 11)
+    assert watcher._carried_second_copies(folder, [copy]) == {}
