@@ -143,3 +143,40 @@ def test_issue_and_collection_cannot_become_one_version_family():
     family = fr.resolve_folder(fr.FolderFacts(None, facts)).families[0]
     assert not family.established
     assert any("collected-edition" in reason for reason in family.reasons)
+
+
+def _watcher_name(tmp_path, filename, series="Usogui"):
+    """Name an arrival the way the watcher does: real archive, real parser."""
+    import zipfile
+    from comic_automation.library.media_naming import watcher_fields
+    from scripts.cbz_core import ALL_RULES, parse_comic_name
+
+    path = tmp_path / series / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("001.png", b"page")
+    parsed = parse_comic_name(path, rules=ALL_RULES - {"translate"}, display_tokens=True)
+    fields = watcher_fields(parsed, fr.archive_facts_from_file(path), series=series, style="chapter")
+    return format_canonical_name(fields)
+
+
+@pytest.mark.parametrize("filename, expected", [
+    # Taken from the 2026-11-09 Usogui arrival, where all 54 such side
+    # stories were refused and held the whole 710-file directory back.
+    ("Inglorious Vol.44 Ch.483.5 - Volume 44 Side Story.cbz", "Usogui v44 ch. 483.5.cbz"),
+    ("Team Duwang Vol.5 Ch.53.5 - Volume 5 Side Story.cbz", "Usogui v05 ch. 53.5.cbz"),
+])
+def test_a_volume_stated_twice_with_one_value_is_one_claim(tmp_path, filename, expected):
+    assert _watcher_name(tmp_path, filename) == expected
+
+
+@pytest.mark.parametrize("filename", [
+    # A trailing v2 may be a revision, not volume 2: two different values.
+    "Team Duwang Vol.12 Ch.127 - Superhuman v2.cbz",
+    "Series Vol.3 Ch.10 - Volume 4 Side Story.cbz",
+    # Two different chapter numbers stay ambiguous too.
+    "Team Duwang Vol.30 Ch.323 - Chapter 1, Fin.cbz",
+])
+def test_different_repeated_number_values_are_still_refused(tmp_path, filename):
+    with pytest.raises(CanonicalNameError, match="conflicting arrival number tokens"):
+        _watcher_name(tmp_path, filename)
