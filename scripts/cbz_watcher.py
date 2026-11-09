@@ -2809,10 +2809,17 @@ def _held_directory_unchanged(comic_dir: Path) -> dict | None:
     return entry if entry.get("fingerprint") == current else None
 
 
+# Second copies a pass could not write to the state file (a failed write, or
+# a file it could not read and so must not overwrite), by directory. Merged
+# into every later read and cleared once a write for that directory succeeds,
+# so a failed write never releases a hold within this watcher process.
+_unsaved_second_copies: dict[str, dict] = {}
+
+
 def _carried_second_copies(
     comic_dir: Path, paths
-) -> tuple[dict[Path, str], set[Path]] | None:
-    """Archives held as second copies on an earlier pass: (carried, changed).
+) -> tuple[dict[Path, str], set[Path], bool] | None:
+    """Archives held as second copies on an earlier pass: (carried, changed, under_review).
 
     Once the kept copy has landed, the import folder alone no longer shows
     the held copy as a second translation. Released, it would be named onto
@@ -2820,22 +2827,29 @@ def _carried_second_copies(
     one translation. So a held copy stays held while its name and bytes are
     unchanged, whatever else arrives beside it: *carried* maps such a path
     to the kept copy's name. A remembered name whose bytes changed (the
-    operator replaced it) is in *changed*: it is judged again, and protected
-    from keep-the-larger where it lands.
+    operator replaced it) is in *changed*: it is judged again. While any
+    second copy is remembered for the directory, *under_review* is true and
+    every archive in it is protected from keep-the-larger: an earlier pass
+    may have renamed a copy and then failed to move it, and only the pass
+    that lands or holds a copy may release it.
 
     Call this on the arrival paths before the pass preprocesses them. The
     recorded hash is of the bytes a pass left behind, which is what the next
     pass finds, unless someone else changed them; ComicInfo and AI rewrites
-    made by this pass come after and must not count (issue #174).
+    made by this pass come after and must not count (issue #174). Copies a
+    pass could not save (``_unsaved_second_copies``) count as recorded.
 
     None when the state file cannot be read: what was held is then unknown.
     """
+    key = str(comic_dir)
     with _held_state_lock:
         state = _load_held_state()
+        unsaved = dict(_unsaved_second_copies.get(key, {}))
     if state is None:
         return None
-    entry = state.get(str(comic_dir))
-    recorded = entry.get("second_copies", {}) if isinstance(entry, dict) else {}
+    entry = state.get(key)
+    recorded = dict(entry.get("second_copies", {})) if isinstance(entry, dict) else {}
+    recorded.update(unsaved)
     carried: dict[Path, str] = {}
     changed: set[Path] = set()
     for path in paths:
@@ -2843,6 +2857,8 @@ def _carried_second_copies(
         if not isinstance(hold, dict):
             continue
         try:
+            # A hold recorded with no hash (it could not be read) never
+            # matches, so that copy is judged again and stays protected.
             same = _file_sha256(path) == hold.get("sha256")
         except OSError:
             same = False
@@ -2850,13 +2866,13 @@ def _carried_second_copies(
             carried[path] = str(hold.get("kept", ""))
         else:
             changed.add(path)
-    return carried, changed
+    return carried, changed, bool(recorded)
 
 
 def _remember_held_directory(
     comic_dir: Path, held: set[Path], second_copies: dict[Path, str]
 ) -> None:
-    """Record what this pass held in *comic_dir*.
+    """Record what this pass held in *comic_dir*. Fails closed.
 
     *second_copies* (held copy -> kept copy's name) are remembered by name
     and content so a later pass keeps holding them (`_carried_second_copies`).
@@ -2868,24 +2884,44 @@ def _remember_held_directory(
     library book (that hold depends on the library, which the fingerprint
     cannot see), a refusal that may clear by itself -- is retried every
     pass, as before. A directory that emptied is forgotten.
+
+    Every failure keeps protection rather than dropping it: a directory that
+    cannot be listed keeps all its second copies; a copy that cannot be
+    hashed is recorded with no hash, so the next pass treats it as changed
+    (still protected); an unreadable state file is never overwritten; and a
+    failed write keeps the copies in ``_unsaved_second_copies``.
     """
+    key = str(comic_dir)
     try:
         remaining = (
             {p for p in comic_dir.iterdir() if p.is_file() and p.suffix.casefold() == ".cbz"}
             if comic_dir.exists() else set()
         )
-        record = bool(remaining) and remaining <= held
+    except OSError as exc:
+        log.warning(f"  Could not list held directory '{comic_dir}': {exc}")
+        remaining = set(second_copies)
+    copies = {}
+    for path, kept in second_copies.items():
+        if path not in remaining:
+            continue
+        try:
+            sha = _file_sha256(path)
+        except OSError:
+            sha = None
+        copies[path.name] = {"sha256": sha, "kept": kept}
+    record = bool(remaining) and remaining <= held
+    try:
         fingerprint = _held_fingerprint(comic_dir) if record else None
-        copies = {
-            path.name: {"sha256": _file_sha256(path), "kept": kept}
-            for path, kept in second_copies.items() if path in remaining
-        }
     except OSError as exc:
         log.warning(f"  Could not fingerprint held directory '{comic_dir}': {exc}")
-        return
+        record, fingerprint = False, None
     with _held_state_lock:
-        state = _read_held_state()
-        key = str(comic_dir)
+        state = _load_held_state()
+        if state is None:
+            _keep_unsaved(key, copies)
+            log.warning(f"  Held-directory state not written for '{comic_dir}': the file "
+                        f"is unreadable and is never overwritten; holds kept in memory.")
+            return
         if record or copies:
             state[key] = {
                 "fingerprint": fingerprint,
@@ -2893,14 +2929,30 @@ def _remember_held_directory(
                 "second_copies": copies,
                 "recorded": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-        elif key not in state:
-            return
-        else:
+        elif key in state:
             del state[key]
+        else:
+            _unsaved_second_copies.pop(key, None)
+            return
         try:
             _write_held_state(state)
         except OSError as exc:
-            log.warning(f"  Could not record held directory '{comic_dir}': {exc}")
+            _keep_unsaved(key, copies)
+            log.warning(f"  Could not record held directory '{comic_dir}': {exc}; "
+                        f"holds kept in memory until a write succeeds.")
+            return
+        _unsaved_second_copies.pop(key, None)
+
+
+def _keep_unsaved(key: str, copies: dict) -> None:
+    """Keep *copies* for a later write. Caller holds ``_held_state_lock``.
+
+    With no copies nothing changes: whatever the file or an earlier unsaved
+    record still holds keeps the directory under review until a write for
+    it succeeds.
+    """
+    if copies:
+        _unsaved_second_copies[key] = copies
 
 
 def process_and_move_directory(dir_path: Path) -> bool:
@@ -3214,7 +3266,8 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 # Second copies held on an earlier pass stay held while
                 # unchanged: their kept copies have landed, so this pass alone
                 # would no longer see them as second copies.
-                carried_origins, changed_origins = memory if memory is not None else ({}, set())
+                carried_origins, changed_origins, under_review = (
+                    memory if memory is not None else ({}, set(), True))
                 carried = {path: carried_origins[origin] for path, origin in origins.items()
                            if origin in carried_origins}
                 carried_entries = {path: parsed_by_path.pop(path) for path in carried}
@@ -3247,15 +3300,18 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 # copy whose bytes changed, may still meet a different library
                 # book under its new name. Which one stays is the operator's
                 # call, so keep-the-larger must not settle it: it is held
-                # (_hold_protected_collision). With the state file unreadable
-                # nobody knows what was held, so every archive is protected.
+                # (_hold_protected_collision). Protection fails closed: while
+                # the directory has any remembered second copy (on disk or
+                # unsaved), or the state file is unreadable, every archive in
+                # it is protected. An earlier pass may have renamed a copy and
+                # failed to move it; nothing else would still mark it.
                 second_copy_origins = {
                     origins.get(path, path) for cluster in clusters for path, _ in cluster
                 } | changed_origins
                 protected = {
                     path for path, parsed in parsed_by_path.items()
                     if path not in held and (
-                        memory is None
+                        under_review
                         or getattr(parsed, "original_path", path) in second_copy_origins)
                 }
                 # The holds that actually happen are reported back, so they can
@@ -3305,10 +3361,16 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         if conflict_quarantine_root is not None
                         else {}
                     )
-                    landed = _move_loose_files(
-                        archives, dest_folder, series_name,
-                        **loose_options, **stripped_option, **protected_option,
-                    ) if archives else None
+                    try:
+                        landed = _move_loose_files(
+                            archives, dest_folder, series_name,
+                            **loose_options, **stripped_option, **protected_option,
+                        ) if archives else None
+                    except Exception as e:  # noqa: BLE001 — as _move_cbz_dir does
+                        # A failed move is retried, and the holds made before
+                        # it failed must still be remembered below.
+                        log.error(f"  Failed to move loose files of '{comic_dir.name}': {e}")
+                        landed = None
                     _note_move(series_name, dest_folder, landed)
                 elif held and all(path in held for path in parsed_by_path):
                     # Nothing to move: creating the series folder for no
@@ -3334,16 +3396,22 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         else {}
                     )
                     held_option = {"held": frozenset(held)} if held else {}
-                    landed = _move_cbz_dir(
-                        comic_dir,
-                        dest_folder,
-                        target_name=series_name,
-                        chapter_number=dir_number,
-                        **move_options,
-                        **stripped_option,
-                        **held_option,
-                        **protected_option,
-                    )
+                    try:
+                        landed = _move_cbz_dir(
+                            comic_dir,
+                            dest_folder,
+                            target_name=series_name,
+                            chapter_number=dir_number,
+                            **move_options,
+                            **stripped_option,
+                            **held_option,
+                            **protected_option,
+                        )
+                    except Exception as e:  # noqa: BLE001 — its own failures return None
+                        # Anything it raises is a failed move too: retried,
+                        # with the holds made before it still remembered.
+                        log.error(f"  Failed to move '{comic_dir.name}': {e}")
+                        landed = None
                     _note_move(series_name, dest_folder, landed)
                 if (
                     landed is not None
