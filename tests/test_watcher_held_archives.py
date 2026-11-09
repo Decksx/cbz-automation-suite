@@ -545,10 +545,13 @@ def test_a_changed_second_copy_is_no_longer_carried(tmp_path, monkeypatch):
     folder = tmp_path / "Usogui"
     copy = _make_cbz(folder / "Beta Ch.1.cbz", 10)
     watcher._remember_held_directory(folder, {copy}, {copy: "Alpha Ch.1.cbz"})
-    assert watcher._carried_second_copies(folder, [copy]) == {copy: "Alpha Ch.1.cbz"}
+    assert watcher._carried_second_copies(folder, [copy]) == ({copy: "Alpha Ch.1.cbz"}, set())
 
     _make_cbz(copy, 11)
-    assert watcher._carried_second_copies(folder, [copy]) == {}
+    assert watcher._carried_second_copies(folder, [copy]) == ({}, {copy})
+
+    (tmp_path / "held.json").write_text("{not json", encoding="utf-8")
+    assert watcher._carried_second_copies(folder, [copy]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -667,3 +670,27 @@ def test_a_second_copy_never_replaces_a_different_library_book(media_watch):
 
     assert existing.read_bytes() == existing_bytes
     assert 101 in [_payload_size(p) for p in arrival.glob("*.cbz")]
+
+
+@pytest.mark.parametrize("mover", ["merge", "loose"])
+def test_a_protected_arrival_is_held_on_a_different_book_and_merged_on_the_same(tmp_path, mover):
+    """Both landing paths: a protected arrival meeting different bytes is
+    held with the existing file untouched; meeting the same bytes it is an
+    exact duplicate and the normal handling removes it (nothing is lost)."""
+    src, library = tmp_path / "intake" / "Usogui", tmp_path / "library"
+    different = _make_cbz(src / "Usogui ch. 1.cbz", 900)
+    same = _make_cbz(src / "Usogui ch. 2.cbz", 102)
+    existing_1 = _make_cbz(library / "Usogui" / "Usogui ch. 1.cbz", 101)
+    existing_2 = library / "Usogui" / "Usogui ch. 2.cbz"
+    existing_2.write_bytes(same.read_bytes())
+    before = existing_1.read_bytes()
+    protected = frozenset({different, same})
+
+    if mover == "merge":
+        watcher._merge_directories(src, library / "Usogui", protected=protected)
+    else:
+        watcher._move_loose_files([different, same], str(library), "Usogui", protected=protected)
+
+    assert different.is_file() and _payload_size(different) == 900
+    assert existing_1.read_bytes() == before
+    assert not same.exists() and existing_2.is_file()
