@@ -252,3 +252,38 @@ Windows / `C:\Python311` / Python 3.11, temporary fixtures only:
 - Codex's files at this head: `test_review173_r2_preprocessing.py` 2/2,
   `test_review173_probes.py` 8/8, `test_review173_r2_guards.py` 4/4;
 - `scripts/cbz_watcher.py` stored bare-LF count still 868.
+
+### PR #175 review round 1 (Codex, at `9153c7d`)
+
+**P1: protected-collision holds were not persisted.** The collision guard
+left a protected arrival in intake, often under its new canonical name, but
+that hold reached neither `held` nor `second_copies`. On the next pass the
+archive, renamed and alone, was in no duplicate cluster and had no
+remembered origin, so nothing protected it and keep-the-larger discarded it.
+Codex's repro `test_review175_persistence.py` (SHA256 `8a73b42a...ab2de`):
+4 failed at `9153c7d`, through the directory mover, the loose-file mover, a
+replaced remembered copy, and holds made while the state was unreadable
+(another directory then rewrote the shared state file).
+
+Tests first (`b519139`, the four cases failing at `9153c7d`; a fifth,
+failed-move control passing), then `146f1b5`: both movers report each
+protected-collision hold that actually happens (`protected_holds`, source
+path -> existing file's name) and the pass remembers it as a second copy
+under the name and bytes it was held with. Later passes carry it before any
+preprocessing, so it never reaches a merge again. A failed move reports
+nothing and stays retryable.
+
+Guards proven by bypass (held-archive tests, failing per guard): merge holds
+a protected collision 7; loose move holds a protected collision 2; merge
+reports its holds 3; loose move reports its holds 1; collision holds are
+remembered 4; only holds that happened are remembered 1.
+
+Verification at `146f1b5` (code and tests; later commits are docs only),
+Windows / `C:\Python311` / Python 3.11, temporary fixtures only:
+
+- full suite: **5,066 passed / 10 skipped / 0 failed** (5,076 tests) = the
+  5,071 at `98f0719` + 5 new;
+- Codex's files at this head, **18/18**: `test_review175_persistence.py`
+  4/4, `test_review173_r2_preprocessing.py` 2/2,
+  `test_review173_probes.py` 8/8, `test_review173_r2_guards.py` 4/4;
+- `scripts/cbz_watcher.py` stored bare-LF count still 868.
