@@ -84,7 +84,10 @@ book under the same name, it is held in the import folder (`HELD FOR
 REVIEW ... (issue #174)`) and the library copy is left untouched. An exact
 duplicate is still removed, since nothing is lost. If the state file cannot
 be read, what was held is unknown, so every archive in that pass is
-protected the same way.
+protected the same way. A hold made this way is remembered as a second copy
+under the name and bytes it was held with (often its new canonical name),
+so later passes keep holding it; a protected archive whose move failed was
+never held, and is retried as an ordinary arrival.
 
 Some holds are never recorded, so their directories are retried every pass,
 as before this change:
