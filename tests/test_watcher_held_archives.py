@@ -694,3 +694,97 @@ def test_a_protected_arrival_is_held_on_a_different_book_and_merged_on_the_same(
     assert different.is_file() and _payload_size(different) == 900
     assert existing_1.read_bytes() == before
     assert not same.exists() and existing_2.is_file()
+
+
+# ---------------------------------------------------------------------------
+# PR #175 review: a collision hold that happened must outlive its pass
+# ---------------------------------------------------------------------------
+
+def _clustered_arrival(arrival: Path, nested: bool = False) -> None:
+    for chapter in (1, 2, 3):
+        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
+    if nested:
+        # A comic subfolder makes this a mixed drop point (loose-file mover).
+        _make_cbz(arrival / "Nested" / "volvox_Chapter (Colored) (Uncensored).cbz", 500)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["directory", "loose"])
+def test_a_collision_hold_is_still_held_on_the_next_pass(media_watch, nested):
+    """The first pass holds the kept Alpha Ch.1, renamed to the canonical
+    name, because the library already has a different `Usogui ch. 1`. That
+    hold must be remembered: the next pass sees no duplicate cluster for it
+    and would otherwise settle it by keep-the-larger."""
+    watch_root, library = media_watch
+    existing = _make_cbz(library / "Usogui" / "Usogui ch. 1.cbz", 50)
+    before = existing.read_bytes()
+    arrival = watch_root / "Usogui"
+    _clustered_arrival(arrival, nested)
+    watcher.process_and_move_directory(arrival)
+    held = arrival / "Usogui ch. 1.cbz"
+    assert held.is_file()
+    held_bytes = held.read_bytes()
+
+    watcher.process_and_move_directory(arrival)
+    watcher.process_and_move_directory(arrival)
+
+    assert held.is_file() and held.read_bytes() == held_bytes
+    assert existing.read_bytes() == before
+
+
+def test_a_replaced_copy_held_on_collision_stays_held(media_watch):
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _clustered_arrival(arrival)
+    watcher.process_and_move_directory(arrival)
+    existing = library / "Usogui" / "Usogui ch. 1.cbz"
+    before = existing.read_bytes()
+    _make_cbz(arrival / "Beta Ch.1.cbz", 5000)
+    watcher.process_and_move_directory(arrival)
+    held = arrival / "Usogui ch. 1.cbz"
+    assert held.is_file()
+
+    watcher.process_and_move_directory(arrival)
+
+    assert held.is_file() and _payload_size(held) == 5000
+    assert existing.read_bytes() == before
+
+
+def test_holds_made_while_the_state_was_unreadable_survive_a_rewrite(media_watch):
+    """With the state unreadable every collision is held. Those holds are
+    written to the fresh record, so another directory rewriting the shared
+    state file afterwards cannot release them."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _clustered_arrival(arrival)
+    watcher.process_and_move_directory(arrival)
+    existing = library / "Usogui" / "Usogui ch. 1.cbz"
+    before = existing.read_bytes()
+    watcher.HELD_STATE_FILE.write_text("{not json", encoding="utf-8")
+    _make_cbz(arrival / "Alpha Ch.4.cbz", 104)
+    watcher.process_and_move_directory(arrival)
+    held = arrival / "Usogui ch. 1.cbz"
+    assert held.is_file()
+
+    other = watch_root / "Other"
+    _make_cbz(other / "volvox_Chapter (Colored) (Uncensored).cbz", 100)
+    watcher.process_and_move_directory(other)
+    watcher.process_and_move_directory(other)
+    watcher.process_and_move_directory(arrival)
+
+    assert held.is_file()
+    assert existing.read_bytes() == before
+
+
+def test_a_failed_move_of_a_protected_copy_is_not_remembered(media_watch, tmp_path, monkeypatch):
+    """Only holds that happened are remembered: a protected copy whose move
+    failed was never held, and must be retried as an ordinary arrival."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _clustered_arrival(arrival)
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+    watcher.process_and_move_directory(arrival)
+
+    remembered = _held_state(tmp_path).get(str(arrival), {}).get("second_copies", {})
+    assert not any(name.startswith("Usogui ch.") for name in remembered)
