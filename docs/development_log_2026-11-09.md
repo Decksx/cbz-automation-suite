@@ -115,3 +115,55 @@ canonical-convergence and series-year test files (failing tests per guard):
 A first draft also skipped duplicate groups with a single group before
 ranking. Bypassing it failed nothing (the per-copy group check already
 covers it), so it was removed as unreachable.
+
+## Review round 1 (Codex, at `c2805816`)
+
+Codex reproduced four findings as five failing probe cases; the connector
+left a P1. Each became a test first (`8225eb7`, all six failing at
+`c2805816`), then a fix:
+
+1. **A failed deferred-name move was cached as a hold.** Every
+   tag-stripped arrival was passed as deliberately held, so a failed move
+   was skipped for good. Tag-stripped arrivals are no longer passed at all:
+   a deferred rename is a plan, and a collision hold depends on the library
+   copy, which the directory fingerprint cannot see. Those directories are
+   retried every pass, as before this PR.
+2. **Year and season variants were held as second translations.** The
+   duplicate key now compares bracketed tags (`(2019)`, `(s2)`) and `Part`
+   markers. A separate key on parsed years was tried and removed: the
+   parser reads only parenthesised years, which the bracket tags already
+   cover, and bypassing it failed nothing.
+3. **A same-size, same-mtime replacement inherited the skip.** The
+   fingerprint now includes each file's SHA-256 (it is computed only for
+   directories holding nothing but held archives).
+4. **A refused preferred copy held back the valid one.** `_second_copies`
+   keeps the best copy naming did not refuse; a copy freed that way is
+   named in a further batch (`_name_batch`) until every cluster settles.
+5. **P1: held second copies were released by a new arrival.** Once the
+   kept copy has landed, the intake alone no longer shows the held copy as
+   a second translation, so it was named onto the kept copy's library name
+   and settled by keep-the-larger. Second copies are now remembered by name
+   and SHA-256 (`second_copies` in the state entry) and stay held while
+   unchanged, whatever else arrives.
+
+Two more cases in Codex's probe file were not reported as findings but
+failed at `c2805816` and pass on base, so they are fixed too:
+
+- `Part A` / `Part B` of one chapter from two prefixes (item 2);
+- a held archive whose ComicInfo the pass itself rewrote after judging it.
+  Its hold was remembered from facts that no longer hold, so the next pass
+  never judged the rewritten archive. An archive the pass rewrote
+  (size or mtime changed since the pass began) is no longer remembered; the
+  next pass judges it again and, if it is then left unchanged, remembers it.
+  This costs one extra pass for such an archive.
+
+Found while verifying: `_name_batch` called `_apply_media_naming` without
+the `_media_naming_enabled()` guard the inline code had, which
+`test_empty_registry_runs_real_legacy_watcher_import_without_stalling`
+caught. The guard is restored.
+
+The rewrite rule masked the transient-refusal guards: their existing tests
+rewrite the archive in the same pass, so bypassing a transient guard failed
+nothing. New tests run the refusing pass twice (the second leaves the
+archive unchanged), so each transient guard is again load-bearing. A guard
+that a missing fingerprint never matches was unreachable and was removed.
