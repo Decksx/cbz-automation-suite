@@ -48,12 +48,15 @@ An archive is held when:
   folder is where the next chapter sharing that name would collide;
 - it is a second copy of a chapter from another scanlation group
   (`_duplicate_chapter_copies`). The copy whose group has the most archives
-  in the directory lands, then the larger file. Copies need the same single
-  chapter/issue number, volume, specials, editions and version markers;
-  both groups need two or more archives in the directory; a prefix that is
-  the series name plus more words (`Batman Annual` in `Batman`) is another
-  title, not a group. Nothing is deleted: choose a copy and remove the other
-  by hand;
+  in the directory lands, then the larger file. If naming refuses that copy,
+  the next one is named instead, so a copy that cannot land never holds a
+  valid one back. Copies need the same single chapter/issue number, volume,
+  years, bracketed tags (`(s2)`), `Part` markers, specials, editions and
+  version markers; both groups need two or more archives in the directory;
+  a prefix that is the series name plus more words (`Batman Annual` in
+  `Batman`) is another title, not a group. A held copy stays held by name
+  and content on later passes, even after new chapters arrive. Nothing is
+  deleted: choose a copy, and remove or swap the other by hand;
 - it meets a different library book only because a tag was stripped from
   its name (`HELD FOR REVIEW`, issue #131).
 
@@ -63,13 +66,25 @@ created.
 
 A directory left holding only held archives is recorded in
 `Logs\cbz_watcher_held.json` with a fingerprint of its files (names, sizes,
-modification times), the watcher's source hash and the number-style registry
-hash. Later passes and restarts skip it with one `Skipping ...` line while
-the fingerprint matches. Adding, removing, replacing or touching a file, or
-upgrading the watcher or the registry, retries it. To force a retry, delete
-the directory's entry or the whole file. A directory that still holds
-archives that were not deliberately held (a move that failed, for example)
-is never recorded, so a transient failure is retried as before.
+modification times and SHA-256 of their contents), the watcher's source hash
+and the number-style registry hash. Later passes and restarts skip it with
+one `Skipping ...` line while the fingerprint matches. Adding, removing,
+replacing, rewriting or touching a file, or upgrading the watcher or the
+registry, retries it. To force a retry, delete the directory's entry or the
+whole file. Second copies are recorded in the same entry (`second_copies`,
+by name and SHA-256); deleting the entry also releases them.
+
+Some holds are never recorded, so their directories are retried every pass,
+as before this change:
+
+- a move that failed, or any archive not held on purpose;
+- a refusal that can clear without a file changing (an OSError such as a
+  locked archive, or a number-style registry refusal);
+- a tag-stripped collision hold: it depends on the library copy, which the
+  fingerprint cannot see;
+- an archive this pass rewrote (ComicInfo, AI decensor). It was judged on its
+  facts before the rewrite, so the next pass judges it again, and a hold is
+  remembered once a pass leaves it unchanged.
 
 ## Canonical series resolver
 
