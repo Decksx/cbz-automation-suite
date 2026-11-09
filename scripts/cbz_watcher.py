@@ -41,6 +41,7 @@ from comic_automation.library.readiness_hold import ReadinessHolds
 from comic_automation.library.watcher_instance import watcher_instance_lock, WatcherInstanceRefused, WatcherInstanceCleanupError
 from comic_automation.archive import field_resolution as _media_fr
 from comic_automation.library.media_naming import media_fields, watcher_naming, with_comicinfo_year, KeepArrivalName, split_series_year
+from comic_automation.library.media_naming import display_key, distinct_numbers
 from comic_automation.library.arrival_rename import rename_arrival, CaseRenameRecoveryError
 from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from comic_automation.library.exclusions import (
@@ -115,6 +116,11 @@ except ModuleNotFoundError:
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"
 REPO_ROOT     = Path(__file__).resolve().parents[1]
 LOG_FILE      = REPO_ROOT / "Logs" / "cbz_watcher.log"
+# Series directories left in the import folder with archives held for review,
+# and a fingerprint of what was held (_remember_held_directory). A directory
+# whose fingerprint is unchanged is skipped instead of re-processed on every
+# settle pass and restart. Delete an entry, or the file, to force a retry.
+HELD_STATE_FILE = REPO_ROOT / "Logs" / "cbz_watcher_held.json"
 # Main initializes the shared policy; direct legacy helper callers retain their API.
 _number_style_registry = None
 _number_style_requested = "auto"
@@ -1258,12 +1264,18 @@ def _media_naming_enabled():
     return _number_style_registry is not None and bool(_number_style_registry.roots)
 
 
-def _apply_media_naming(parsed_by_path, originals, series_name, destination):
+def _apply_media_naming(parsed_by_path, originals, series_name, destination, transient=None):
     """Name arrivals under the final resolved destination's media policy.
 
     Pre-rewrite metadata stays bound to each parsed original_path. A policy
     refusal keeps the archive in intake for review. Existing tag-sensitive
     landing and no-overwrite rules still own the actual rename.
+
+    *transient*, when given, collects the refusals that can clear without
+    any file changing: an OSError (a locked archive, a failed rename) or a
+    style the registry could not select (a root can be briefly
+    inaccessible). The caller retries those on the next pass instead of
+    remembering the directory as held (``_remember_held_directory``).
     """
     if not _media_naming_enabled():
         return set(), None
@@ -1271,6 +1283,8 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
         selection = _number_style_registry.select(destination, _number_style_requested)
     except (OSError, NumberStyleRefused) as exc:
         log.warning("  REVIEW: media naming refused: %s", exc)
+        if transient is not None:
+            transient.update(parsed_by_path)
         return set(parsed_by_path), None
     log.info("  Media naming: %s (%s), registry SHA256 %s",
              selection.style, selection.source, selection.registry_sha256)
@@ -1308,10 +1322,14 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination):
             del parsed_by_path[path]
             parsed_by_path[retained] = _dataclasses_replace(parsed, filename=retained.name)
             refused.add(retained)
+            if transient is not None:
+                transient.add(retained)
             log.warning("    REVIEW: %s", exc)
         except (OSError, ValueError, KeyError) as exc:
             log.warning("    REVIEW: media naming refused for %s: %s", path.name, exc)
             refused.add(path)
+            if transient is not None and isinstance(exc, OSError):
+                transient.add(path)
     return refused, selection
 
 
@@ -1639,6 +1657,7 @@ def _merge_directories(
     dest_dir: Path,
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
+    held: frozenset[Path] = frozenset(),
 ) -> None:
     """Recursively merge *src_dir* into *dest_dir*.
 
@@ -1652,6 +1671,11 @@ def _merge_directories(
     (``_hold_stripped_collision``), so neither keep-the-larger branch can
     replace, quarantine or delete a different book. Every other conflict is
     settled exactly as before.
+
+    *held* names archives the caller is keeping in the import folder for
+    review (a refused name, or a second copy of a chapter). They are never
+    moved, replaced or deleted here, so ``_remove_merged_source`` finds them
+    still in *src_dir* and leaves it in place.
     """
     stripped_arrivals = stripped_arrivals or {}
     for src_item in iter_paths_excluding_directories(src_dir):
@@ -1660,6 +1684,8 @@ def _merge_directories(
 
         if src_item.is_dir():
             dest_item.mkdir(parents=True, exist_ok=True)
+            continue
+        if src_item in held:
             continue
 
         # A deferred rename (_stripped_arrivals) is applied here, as the
@@ -2321,6 +2347,7 @@ def _move_cbz_dir(
     chapter_number: str | None = None,
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
+    held: frozenset[Path] = frozenset(),
 ) -> Path | None:
     """Move a processed comic directory to dest_folder, merging if it already exists.
 
@@ -2341,6 +2368,11 @@ def _move_cbz_dir(
     then leaves in place. A move into a folder that does not exist yet has
     no conflict to hold; its archives whose rename was deferred get their
     display names once the folder has landed (``_land_deferred_names``).
+
+    *held* archives stay in *dir_path* for review (``_merge_directories``).
+    With any held, the directory is never moved wholesale -- that would carry
+    them into the library -- so the destination is created if needed and the
+    rest are merged into it, leaving *dir_path* behind with the held files.
     """
     if not dir_path.exists():
         log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
@@ -2373,6 +2405,9 @@ def _move_cbz_dir(
 
     try:
         os.makedirs(dest_folder, exist_ok=True)
+        if held and not dest_dir.exists():
+            dest_dir.mkdir()
+            log.info(f"  Created '{dest_dir.name}'; merging all but the {len(held)} held archive(s).")
 
         if dest_dir.exists():
             if chapter_number:
@@ -2382,6 +2417,7 @@ def _move_cbz_dir(
                 dir_path, dest_dir,
                 conflict_quarantine_root=conflict_quarantine_root,
                 stripped_arrivals=stripped_arrivals,
+                held=held,
             )
             _remove_merged_source(dir_path)
             log.info(f"  Merge complete.")
@@ -2403,6 +2439,7 @@ def _move_cbz_dir(
                         dir_path, dest_dir,
                         conflict_quarantine_root=conflict_quarantine_root,
                         stripped_arrivals=stripped_arrivals,
+                        held=held,
                     )
                     _remove_merged_source(dir_path)
                     log.info(f"  Merge complete.")
@@ -2508,6 +2545,282 @@ def _move_loose_files(
     return dest_dir if moved else None
 
 
+# ─────────────────────────────────────────────
+# HELD ARCHIVES: same-chapter copies and unchanged held directories
+# ─────────────────────────────────────────────
+_BRACKET_TAG_RE = re.compile(r"[\[(]([^\[\]()]*)[\])]")
+_PART_RE = re.compile(r"(?<![a-z])part\.?\s*([0-9a-z]+)\b")
+
+
+def _duplicate_chapter_copies(
+    parsed_by_path: dict[Path, ParsedComicName], series_name: str
+) -> list[list[tuple[Path, str]]]:
+    """Clusters of same-chapter copies from different groups, best copy first.
+
+    A series folder sometimes arrives holding two scanlations of the same
+    chapter (``Easy Going & Endless Abyss Vol.3 Ch.26 - I bet!.cbz`` beside
+    ``Team Duwang Vol.3 Ch.26 - Bet.cbz``). Which translation to keep is the
+    operator's call, so one copy lands and the others are held in the import
+    folder for review (`_second_copies`). Nothing is deleted.
+
+    Two archives are copies only when their names give the same single
+    chapter/issue number, the same volume (or none), the same bracketed tags
+    (a year ``(2019)`` or season ``(s2)`` apart is another book, not another
+    translation), the same ``Part`` markers, and the same
+    specials, editions, collection markers and version markers, and their
+    pre-number prefixes (the "group") differ. Both groups must also have at
+    least two archives
+    in the directory. That excludes a folder of unrelated one-shots that each
+    happen to be ``#1``, where the prefix is a title, not a group. A prefix
+    that is *series_name* plus more words (``Batman Annual`` in the
+    ``Batman`` folder) is a different title, so it is never a group either.
+    Names whose numbering is ambiguous are left alone for media naming to
+    judge.
+
+    Each cluster is ranked deterministically: the copy whose group has the
+    most archives in the directory (keeping one translation consistent across
+    the run), then the larger file, then the name. Each entry is
+    ``(path, group)``; every cluster spans at least two groups.
+    """
+    series = display_key(split_series_year(series_name)[0])
+    facts: dict[Path, tuple[tuple, str]] = {}
+    for path in parsed_by_path:
+        if not path.exists():
+            continue
+        tokens = _media_fr.parse_name_tokens(path.name)
+        group = display_key(tokens.series or "")
+        if series and group != series and group.startswith(series):
+            continue  # "Batman Annual" beside "Batman": another title
+        numbers = distinct_numbers(value for _kind, value in tokens.primary_numbers)
+        volumes = distinct_numbers(tokens.volume_tokens)
+        if len(numbers) != 1 or len(volumes) > 1:
+            continue
+        brackets = frozenset(display_key(tag) for tag in _BRACKET_TAG_RE.findall(path.stem))
+        parts = frozenset(_PART_RE.findall(path.stem.casefold()))
+        key = (numbers[0], volumes[0] if volumes else None,
+               tokens.specials, tokens.editions, tokens.collections,
+               frozenset(tokens.version_markers), brackets, parts)
+        facts[path] = (key, group)
+
+    group_sizes: dict[str, int] = {}
+    for _key, group in facts.values():
+        group_sizes[group] = group_sizes.get(group, 0) + 1
+    by_key: dict[tuple, list[Path]] = {}
+    for path, (key, group) in facts.items():
+        if group_sizes[group] >= 2:
+            by_key.setdefault(key, []).append(path)
+
+    clusters = []
+    for copies in by_key.values():
+        if len({facts[path][1] for path in copies}) < 2:
+            continue
+        ranked = sorted(copies, key=lambda p: (
+            -group_sizes[facts[p][1]], -p.stat().st_size, p.name.casefold()))
+        clusters.append([(path, facts[path][1]) for path in ranked])
+    return clusters
+
+
+def _second_copies(
+    clusters: list[list[tuple[Path, str]]], refused: set[Path]
+) -> dict[Path, Path]:
+    """Held copy -> the copy kept in its place, given what naming refused.
+
+    The kept copy is the best-ranked one naming has not refused: a copy that
+    cannot land must not hold a valid translation back. Copies from the kept
+    copy's own group are not second translations (two same-numbered archives
+    from one group are parts or re-uploads), and refused copies are already
+    held for their own reason.
+    """
+    held: dict[Path, Path] = {}
+    for cluster in clusters:
+        live = [(path, group) for path, group in cluster if path not in refused]
+        if not live:
+            continue
+        kept, kept_group = live[0]
+        for path, group in live[1:]:
+            if group != kept_group:
+                held[path] = kept
+    return held
+
+
+def _name_batch(
+    batch: dict[Path, ParsedComicName], media_originals: dict, series_name: str,
+    dest_folder: str, dir_number: str | None, transient: set[Path],
+) -> set[Path]:
+    """Media naming, then fallback naming, for *batch*; returns the refused paths.
+
+    *batch* is updated in place to the archives' new paths. Fallback naming
+    runs only for the archives media naming accepted: a refused archive stays
+    in the import folder under its arrival name.
+    """
+    refused, selection = set(), None
+    if _media_naming_enabled():  # an empty registry keeps the legacy path untouched
+        refused, selection = _apply_media_naming(
+            batch, media_originals, series_name, dest_folder, transient=transient)
+    options = {"number_style": selection.style} if selection is not None else {}
+    named = {p: v for p, v in batch.items() if p not in refused}
+    kept_back = {p: v for p, v in batch.items() if p in refused}
+    refused = set(refused)
+    refused.update(_apply_fallback_naming(named, series_name, dir_number, **options) or ())
+    batch.clear()
+    batch.update(kept_back)
+    batch.update(named)
+    return refused
+
+
+_held_state_lock = threading.Lock()
+
+
+def _size_and_mtime(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _held_fingerprint(comic_dir: Path) -> str:
+    """Digest of the files directly in *comic_dir*: names, sizes, mtimes, contents.
+
+    Contents are hashed as well as sizes and mtimes: a replacement can keep
+    both (a rebuilt archive of the same length, its mtime restored), and it
+    must not inherit the old archive's hold. Only directories holding
+    nothing but held archives are fingerprinted, so this reads few files.
+    The watcher's source version and number-style registry hash are mixed
+    in, so a watcher upgrade or registry change re-evaluates every held
+    directory once instead of trusting a decision made under the old rules.
+    """
+    rows = sorted(
+        (entry.name, entry.stat().st_size, entry.stat().st_mtime_ns, _file_sha256(entry))
+        for entry in comic_dir.iterdir()
+        if entry.is_file()
+    )
+    registry = getattr(_number_style_registry, "sha256", None)
+    payload = json.dumps([WATCHER_SOURCE_VERSION, registry, rows], ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _read_held_state() -> dict:
+    try:
+        state = json.loads(HELD_STATE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        # An unreadable file only costs a re-processing pass; never fatal.
+        log.warning(f"  Held-directory state unreadable ({exc}); re-checking every directory.")
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _write_held_state(state: dict) -> None:
+    HELD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = HELD_STATE_FILE.with_name(HELD_STATE_FILE.name + ".tmp")
+    temporary.write_text(json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, HELD_STATE_FILE)
+
+
+def _held_directory_unchanged(comic_dir: Path) -> dict | None:
+    """The recorded entry when *comic_dir* still holds exactly what was held.
+
+    Re-processing a held directory re-reads and rewrites every archive in it
+    (minutes for a large series) only to hold the same files again. Any
+    change -- a file added, removed, replaced or rewritten -- gives a new
+    fingerprint and the directory is processed as normal.
+    """
+    with _held_state_lock:
+        entry = _read_held_state().get(str(comic_dir))
+    if not isinstance(entry, dict):
+        return None
+    try:
+        current = _held_fingerprint(comic_dir)
+    except OSError:
+        return None
+    return entry if entry.get("fingerprint") == current else None
+
+
+def _carried_second_copies(comic_dir: Path, paths) -> dict[Path, str]:
+    """Archives held as second copies on an earlier pass, still unchanged.
+
+    Once the kept copy has landed, the import folder alone no longer shows
+    the held copy as a second translation. Released, it would be named onto
+    the kept copy's library name and settled by keep-the-larger, discarding
+    one translation. So a held copy stays held while its name and bytes are
+    unchanged, whatever else arrives beside it. Maps path -> kept copy's name.
+    """
+    with _held_state_lock:
+        entry = _read_held_state().get(str(comic_dir))
+    recorded = entry.get("second_copies", {}) if isinstance(entry, dict) else {}
+    carried: dict[Path, str] = {}
+    for path in paths:
+        hold = recorded.get(path.name)
+        if not isinstance(hold, dict):
+            continue
+        try:
+            if _file_sha256(path) == hold.get("sha256"):
+                carried[path] = str(hold.get("kept", ""))
+        except OSError:
+            continue
+    return carried
+
+
+def _remember_held_directory(
+    comic_dir: Path, held: set[Path], second_copies: dict[Path, str]
+) -> None:
+    """Record what this pass held in *comic_dir*.
+
+    *second_copies* (held copy -> kept copy's name) are remembered by name
+    and content so a later pass keeps holding them (`_carried_second_copies`).
+
+    The directory itself is fingerprinted for skipping only when every
+    archive left in it is in *held*: an archive held on purpose this pass
+    (a refused name or a second copy). A directory that still holds any
+    other archive -- a move that failed, a tag-stripped arrival that met a
+    library book (that hold depends on the library, which the fingerprint
+    cannot see), a refusal that may clear by itself -- is retried every
+    pass, as before. A directory that emptied is forgotten.
+    """
+    try:
+        remaining = (
+            {p for p in comic_dir.iterdir() if p.is_file() and p.suffix.casefold() == ".cbz"}
+            if comic_dir.exists() else set()
+        )
+        record = bool(remaining) and remaining <= held
+        fingerprint = _held_fingerprint(comic_dir) if record else None
+        copies = {
+            path.name: {"sha256": _file_sha256(path), "kept": kept}
+            for path, kept in second_copies.items() if path in remaining
+        }
+    except OSError as exc:
+        log.warning(f"  Could not fingerprint held directory '{comic_dir}': {exc}")
+        return
+    with _held_state_lock:
+        state = _read_held_state()
+        key = str(comic_dir)
+        if record or copies:
+            state[key] = {
+                "fingerprint": fingerprint,
+                "held": sorted(p.name for p in remaining) if record else [],
+                "second_copies": copies,
+                "recorded": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        elif key not in state:
+            return
+        else:
+            del state[key]
+        try:
+            _write_held_state(state)
+        except OSError as exc:
+            log.warning(f"  Could not record held directory '{comic_dir}': {exc}")
+
+
 def process_and_move_directory(dir_path: Path) -> bool:
     """Claim the directory and run its recursive import pass.
 
@@ -2587,6 +2900,15 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
     shadow_handoffs: list = []
 
     for comic_dir, cbz_files in sorted(cbz_dirs.items()):
+        unchanged = _held_directory_unchanged(comic_dir)
+        if unchanged is not None:
+            log.info(
+                f"  Skipping '{comic_dir.name}': its {len(unchanged.get('held', []))} "
+                f"held archive(s) are unchanged since {unchanged.get('recorded')}. "
+                f"Change a file, or remove its entry from {HELD_STATE_FILE}, to retry."
+            )
+            progress.step(len(cbz_files))
+            continue
         route_category, legacy_dest = _resolve_route(comic_dir)
         incoming_series_alias = comic_dir.name
         clean_dir_name = clean_directory_name(comic_dir.name)
@@ -2659,6 +2981,9 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 fallback_names[cbz] = f"{comic_dir.name} {i}.cbz"
 
         log.info(f"  Processing directory: {comic_dir.name} ({len(cbz_files)} file(s)) -> {dest_folder}")
+        # Each arrival's (size, mtime) before this pass rewrites any of them;
+        # see the _remember_held_directory call below.
+        arrival_stats = {cbz: _size_and_mtime(cbz) for cbz in cbz_files}
         parsed_by_path: dict[Path, ParsedComicName] = {}
         media_originals = {}
         ai_decensor_backups: list[tuple[Path, Path]] = []
@@ -2800,19 +3125,36 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     path: getattr(parsed, "original_path", path)
                     for path, parsed in parsed_by_path.items()
                 }
-                refused = set()
-                media_selection = None
-                refusal_kind = "fallback name refused for {} placeholder archive(s)"
-                if _media_naming_enabled():
-                    refused, media_selection = _apply_media_naming(
-                        parsed_by_path, media_originals, series_name, dest_folder)
-                    if refused:
-                        refusal_kind = "media naming refused for {} archive(s)"
-                media_options = ({"number_style": media_selection.style}
-                                 if media_selection is not None else {})
-                if not refused:
-                    refused.update(_apply_fallback_naming(
-                        parsed_by_path, series_name, dir_number, **media_options) or ())
+                # Second copies held on an earlier pass stay held while
+                # unchanged: their kept copies have landed, so this pass alone
+                # would no longer see them as second copies.
+                carried = _carried_second_copies(comic_dir, list(parsed_by_path))
+                carried_entries = {path: parsed_by_path.pop(path) for path in carried}
+                # Second copies of a chapter are set aside before naming, so
+                # media naming cannot give one copy the other's name. A kept
+                # copy that naming then refuses cannot stand in for the rest:
+                # _second_copies picks the next copy, which is released and
+                # named in turn, until every cluster has a kept copy or none.
+                clusters = _duplicate_chapter_copies(parsed_by_path, series_name)
+                transient = set()
+                duplicates = _second_copies(clusters, set())
+                set_aside = {path: parsed_by_path.pop(path) for path in duplicates}
+                refused = _name_batch(parsed_by_path, media_originals, series_name,
+                                      dest_folder, dir_number, transient)
+                while True:
+                    duplicates = _second_copies(clusters, refused)
+                    released = {path: set_aside.pop(path)
+                                for path in list(set_aside) if path not in duplicates}
+                    if not released:
+                        break
+                    refused |= _name_batch(released, media_originals, series_name,
+                                           dest_folder, dir_number, transient)
+                    parsed_by_path.update(released)
+                parsed_by_path.update(set_aside)
+                parsed_by_path.update(carried_entries)
+                second_copies = {path: kept.name for path, kept in duplicates.items()}
+                second_copies.update(carried)
+                held = refused | set(second_copies)
                 ai_backups = _rekey_ai_backups(
                     ai_decensor_backups, origins, parsed_by_path)
                 # Read after the fallback renames, which change paths. Passed
@@ -2823,30 +3165,27 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 stripped_option = (
                     {"stripped_arrivals": stripped} if stripped else {}
                 )
-
-                if refused and not has_nested_comic_dirs:
-                    # A refused placeholder kept its generic name. Moving the
-                    # directory would merge that name into the series folder,
-                    # where the next chapter sharing it collides -- the loss
-                    # the fallback exists to prevent. So the whole directory
-                    # stays in the import folder for review; nothing in it is
-                    # moved, and the next settle pass or restart retries it.
+                if held:
                     log.warning(
-                        f"  Deferred '{comic_dir.name}' for review: "
-                        f"{refusal_kind.format(len(refused))}; "
-                        f"left in the import folder.")
-                    landed = None
-                elif has_nested_comic_dirs:
+                        f"  Holding {len(held)} of {len(parsed_by_path)} archive(s) of "
+                        f"'{comic_dir.name}' in the import folder for review; "
+                        f"the rest move as normal.")
+                    for path in sorted(refused):
+                        log.warning(f"    HELD (name refused, see REVIEW above): {path.name}")
+                    for path, kept in sorted(second_copies.items()):
+                        log.warning(f"    HELD (second copy of '{kept}'): {path.name}")
+
+                if has_nested_comic_dirs:
                     log.warning(
                         f"  '{comic_dir.name}' has loose .cbz file(s) alongside subdirectories that "
                         f"have their own .cbz files — moving only the loose files, not the whole "
                         f"directory, so unrelated series aren't swept along with it."
                     )
-                    # Refused placeholders stay behind in the import folder;
-                    # the other loose files move as before. With none left there
+                    # Held archives stay behind in the import folder; the
+                    # other loose files move as before. With none left there
                     # is nothing to move, and _move_loose_files would still create
                     # an empty series folder, so it is not called.
-                    archives = [a for a in parsed_by_path if a not in refused]
+                    archives = [a for a in parsed_by_path if a not in held]
                     _shadow_route(comic_dir, legacy_dest, series_name, archives,
                                   shadow_results, shadow_handoffs,
                                   mixed_parent=True)
@@ -2860,15 +3199,30 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         **loose_options, **stripped_option,
                     ) if archives else None
                     _note_move(series_name, dest_folder, landed)
+                elif held and all(path in held for path in parsed_by_path):
+                    # Nothing to move: creating the series folder for no
+                    # archive would only leave an empty directory behind.
+                    log.warning(
+                        f"  Deferred '{comic_dir.name}' for review: all "
+                        f"{len(held)} archive(s) held; left in the import folder.")
+                    landed = None
                 else:
+                    # A refused placeholder kept its generic name. Merging it
+                    # into the series folder is where the next chapter sharing
+                    # that name collides -- the loss the fallback exists to
+                    # prevent -- so held archives never leave the import
+                    # folder (_move_cbz_dir's *held*). Their siblings are
+                    # unaffected by that risk and move now, instead of the
+                    # whole series waiting on one archive.
                     _shadow_route(comic_dir, legacy_dest, series_name,
-                                  list(parsed_by_path.keys()), shadow_results,
-                                  shadow_handoffs)
+                                  [p for p in parsed_by_path if p not in held],
+                                  shadow_results, shadow_handoffs)
                     move_options = (
                         {"conflict_quarantine_root": conflict_quarantine_root}
                         if conflict_quarantine_root is not None
                         else {}
                     )
+                    held_option = {"held": frozenset(held)} if held else {}
                     landed = _move_cbz_dir(
                         comic_dir,
                         dest_folder,
@@ -2876,6 +3230,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         chapter_number=dir_number,
                         **move_options,
                         **stripped_option,
+                        **held_option,
                     )
                     _note_move(series_name, dest_folder, landed)
                 if (
@@ -2900,6 +3255,21 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                             f"{type(e).__name__}: {e}"
                         )
             archive_completed_ai_backups(_routed_ai_backups(ai_backups, landed), landed)
+            # Remembered only after the pass completed: a deferral for an
+            # unstable identity (below) is transient and must be retried.
+            # So is a refusal that can clear by itself (a locked file), which
+            # is left out of the deliberate holds so the directory is retried.
+            # Tag-stripped arrivals are not passed: a deferred rename is only
+            # a plan, and a collision hold depends on the library, which the
+            # directory fingerprint cannot see. Nor is an archive this pass
+            # rewrote (ComicInfo, AI decensor): it was judged on its facts
+            # before the rewrite, and the next pass must judge the new ones.
+            # Once a pass leaves it unchanged, its hold is remembered.
+            rewritten = {
+                path for path in held
+                if _size_and_mtime(path) != arrival_stats.get(origins.get(path, path))
+            }
+            _remember_held_directory(comic_dir, held - transient - rewritten, second_copies)
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
             # nothing was mutated, the arrival is still in the watch folder,

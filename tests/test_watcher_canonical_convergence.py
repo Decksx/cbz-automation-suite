@@ -936,7 +936,10 @@ def test_the_probe_layout_offloads_only_the_routed_original(ai_watch):
     assert backup_of["volvox Chapter (2019).cbz"].is_file()
 
 
-def test_a_refused_directory_offloads_nothing(ai_watch):
+def test_a_refused_archive_keeps_its_original_while_its_sibling_routes(ai_watch):
+    """Since 2026-11-09 a refusal holds only the refused archive, not the
+    whole directory (test_watcher_held_archives). The sibling routes and its
+    original is offloaded; the refused archive and its original stay."""
     watch_root, library, backup_of, offloaded, calls = ai_watch
     arrival = watch_root / "Berserk Ch. 4"
     _make_cbz(arrival / "volvox_Chapter (Colored) (Uncensored).cbz", 400)
@@ -944,10 +947,13 @@ def test_a_refused_directory_offloads_nothing(ai_watch):
 
     watcher.process_and_move_directory(arrival)
 
-    assert offloaded == []
-    assert all(landed is None for _pairs, landed in calls)
-    assert all(backup.is_file() for backup in backup_of.values())
-    assert len(list(arrival.glob("*.cbz"))) == 2
+    refused = "volvox Chapter (Colored) (Uncensored).cbz"
+    assert [p.name for p in arrival.glob("*.cbz")] == [refused]
+    assert not list(library.rglob("*volvox*"))
+    offloaded_backups = [backup for backup, _series in offloaded]
+    assert backup_of[refused] not in offloaded_backups
+    assert backup_of[refused].is_file()
+    assert len(offloaded_backups) == 1
 
 
 def test_an_all_refused_loose_pass_offloads_nothing_of_its_own(ai_watch):

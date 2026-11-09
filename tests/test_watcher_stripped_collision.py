@@ -66,6 +66,11 @@ def env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
     monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
     monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
+    # These tests drive the retry itself: the next pass must re-read the
+    # held arrival and hold it again. The watcher normally skips an
+    # unchanged held directory (tested in test_watcher_held_archives), which
+    # would leave nothing here to exercise.
+    monkeypatch.setattr(watcher, "_held_directory_unchanged", lambda comic_dir: None)
     return incoming, library, quarantine, request.param
 
 
