@@ -9,7 +9,9 @@ import os
 import hashlib
 from contextlib import contextmanager
 import argparse
+import glob
 import re
+import uuid
 import gc
 import json
 import subprocess
@@ -1553,26 +1555,59 @@ def _reserve(path: Path, *, numbered: bool = True) -> Path | None:
             index += 1
 
 
-def _land(src: Path, dest: Path) -> bool:
-    """Move *src* to the free name *dest*, owning it first (``_reserve``).
+# Marker of a library landing in flight: a hidden sidecar
+# ``.<name>.cbzreserve-<token>`` beside the destination, created before the
+# destination is reserved and removed only once the archive is complete
+# there. It never ends in .cbz, so nothing reads it as a book.
+RESERVE_MARK = ".cbzreserve-"
 
-    False, with *src* left in place, when another placement took *dest*
+
+def _landing_in_flight(dest: Path) -> bool:
+    """Whether some placement (any thread or watcher) is landing on *dest* now.
+
+    While a landing is in flight, *dest* is an empty reservation or a
+    partial copy, not a library book: settling against it would quarantine
+    or replace it, and its owner would then overwrite, or clean up, the
+    archive that took its place. Every collision path defers instead.
+    """
+    return any(dest.parent.glob(f".{glob.escape(dest.name)}{RESERVE_MARK}*"))
+
+
+def _land(src: Path, dest: Path) -> bool:
+    """Move *src* to the free name *dest*, owning it for the whole landing.
+
+    The placement first creates its marker (``RESERVE_MARK``, exclusive,
+    unique token), then the destination itself exclusively (``_reserve``).
+    The marker exists for as long as *dest* is not yet a complete archive,
+    so no other placement settles against it (``_landing_in_flight``), and
+    nothing else can replace *dest* meanwhile; this placement's own cleanup
+    can therefore only ever remove its own reservation or partial copy.
+
+    False, with *src* left in place, when another placement owns *dest*
     first: it must not be overwritten, and the next pass settles the two as
     a collision. A failed move removes only this placement's reservation
     (or its own partial copy) and re-raises, as the plain move did.
     """
-    if _reserve(dest, numbered=False) is None:
-        log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
-                    f"'{src}' stays for the next pass.")
+    marker = dest.with_name(f".{dest.name}{RESERVE_MARK}{uuid.uuid4().hex}")
+    try:
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError as e:
+        log.warning(f"    Could not mark '{dest.name}' for landing ({e}); '{src}' stays.")
         return False
     try:
-        shutil.move(str(src), str(dest))
-    except (OSError, shutil.Error):
-        if src.exists():
-            dest.unlink(missing_ok=True)
-        raise
-    return True
-
+        if _reserve(dest, numbered=False) is None:
+            log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
+                        f"'{src}' stays for the next pass.")
+            return False
+        try:
+            shutil.move(str(src), str(dest))
+        except (OSError, shutil.Error):
+            if src.exists():
+                dest.unlink(missing_ok=True)
+            raise
+        return True
+    finally:
+        marker.unlink(missing_ok=True)
 
 def _settle_by_size(src: Path, dest: Path, label: str, series_dir: str) -> bool:
     """Settle a name collision by size without deleting a different book.
@@ -1817,6 +1852,10 @@ def _merge_directories(
                 dest_item = match
 
         if dest_item.exists():
+            if _landing_in_flight(dest_item):
+                log.warning(f"    '{dest_item.name}' is still being landed by another arrival; "
+                            f"'{relative}' waits for the next pass.")
+                continue
             if display_name is not None and _hold_stripped_collision(
                 src_item, dest_item, display_name
             ):
@@ -2597,6 +2636,10 @@ def _move_loose_files(
                 dest_item = match
 
         if dest_item.exists():
+            if _landing_in_flight(dest_item):
+                log.warning(f"    '{dest_item.name}' is still being landed by another arrival; "
+                            f"'{src.name}' waits for the next pass.")
+                continue
             if display_name is not None and _hold_stripped_collision(
                 src, dest_item, display_name
             ):
