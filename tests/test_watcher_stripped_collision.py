@@ -190,20 +190,21 @@ def test_season_tag_arrival_is_held_when_the_series_appears_mid_move(
     arrival = incoming / "Solo Leveling"
     _make_cbz(arrival / "Solo Leveling ch. 4 (s2).cbz", BIG, b"\1")
     existing = library / "Solo Leveling" / "Solo Leveling ch. 4.cbz"
-    original_move = watcher.shutil.move
+    original_rename = watcher.os.rename
 
+    # A whole folder moves only by os.rename (never shutil.move: PR #176).
     def series_appears_then_move_fails(src, dest, *args, **kwargs):
         if Path(src) == arrival and Path(dest) == library / "Solo Leveling":
             _make_cbz(existing, SMALL)
             raise OSError("simulated: destination appeared concurrently")
-        return original_move(src, dest, *args, **kwargs)
+        return original_rename(src, dest, *args, **kwargs)
 
-    monkeypatch.setattr(watcher.shutil, "move", series_appears_then_move_fails)
+    monkeypatch.setattr(watcher.os, "rename", series_appears_then_move_fails)
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
     held = arrival / "Solo Leveling ch. 4 (s2).cbz"
-    assert "Race on move" in caplog.text
+    assert "merging file by file" in caplog.text
     assert _payload(existing) == b"\0" * SMALL
     _assert_held(env, caplog, existing, existing.read_bytes(), held, b"\1" * BIG)
 
