@@ -103,6 +103,14 @@ quarantine**; it never deletes a copy that differs from the one it keeps.
   fails, both copies stay where they were and the arrival is retried on the
   next pass. If the arrival then cannot take the library copy's place, the
   quarantined library copy is moved back.
+- Every placement owns its target first: the quarantine name, and a new
+  library name, are created exclusively (`O_CREAT | O_EXCL`) before the
+  move, so two imports running at once can never pick the same name and
+  overwrite one another. A failed placement removes only the name it
+  created. A library name taken by another arrival in the meantime is
+  left alone; the arrival stays and is settled as a collision next pass.
+- Only a settled collision or a completed landing counts as landed; a
+  failed one is not reported as a landing.
 
 The quarantine is `C:\Temp\cbz_held\quarantine` by default; set it with
 `--quarantine-root` or `CBZ_QUARANTINE_ROOT`. Resolver mode keeps its own
