@@ -313,3 +313,22 @@ def test_a_failed_loose_settlement_is_not_reported_as_landed(tmp_path, monkeypat
 
     assert landed is None
     assert src.is_file() and existing.read_bytes() == before
+
+
+def test_a_loose_file_whose_name_was_taken_meanwhile_is_not_reported_as_landed(tmp_path, monkeypatch):
+    """The name was free when checked and taken before the landing (another
+    arrival won the race): nothing lands, nothing is overwritten, and the
+    batch is not reported as a landing."""
+    library = tmp_path / "library" / "Berserk"
+    winner = _make_cbz(library / "Berserk ch. 9.cbz", 300)
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 9.cbz", 100)
+    real_exists = Path.exists
+    monkeypatch.setattr(Path, "exists",
+                        lambda self: False if self == winner else real_exists(self))
+    monkeypatch.setattr(watcher, "_find_archive_collision", lambda *a, **k: None)
+
+    landed = watcher._move_loose_files([src], str(library.parent), library.name)
+    monkeypatch.setattr(Path, "exists", real_exists)
+
+    assert landed is None
+    assert src.is_file() and _payload_size(winner) == 300
