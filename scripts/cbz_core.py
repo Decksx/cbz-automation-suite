@@ -1314,20 +1314,43 @@ def infer_series_name(path: Path, library_root: Path | None = None) -> str:
     return candidates[-1] if candidates else parent.name
 
 
+# Words that say where a chapter sits in a work, not who translated it. A
+# prefix holding one of them is never taken for a scanlation group.
+_STRUCTURAL_PREFIX_WORDS = frozenset({
+    "part", "parts", "pt", "arc", "book", "story", "side", "extra", "extras",
+    "special", "specials", "bonus", "omake", "oneshot", "prologue", "epilogue",
+    "afterword", "interlude", "act", "season", "volume", "vol", "chapter", "ch",
+    "episode", "ep",
+})
+
+
+def _is_group_prefix(prefix: str) -> bool:
+    """Whether a downloader prefix names a scanlation group (conservative).
+
+    Not a group when it holds a digit (``Part 2``, ``S2``, ``Vol. 3``,
+    ``Book 1``) or a structural word (``Part A``, ``Side Story``, ``Extra``):
+    those are identity, and dropping them would give two different chapters
+    one name. When in doubt it is not a group, and the arrival keeps the
+    name it had before (PR #178 review).
+    """
+    if any(char.isdigit() for char in prefix):
+        return False
+    words = re.findall(r"[^\W\d_]+", prefix.casefold())
+    return not _STRUCTURAL_PREFIX_WORDS.intersection(words)
+
+
 def _without_group_prefix(name: str) -> str:
     """*name* without a downloader's scanlation-group prefix (``_GROUP_CHAPTER_RE``).
 
     ``Alpha_Episode 42_2a8cb9.cbz`` becomes ``Chapter 42_2a8cb9.cbz``, which
     the stem pipeline names after the series folder (``<Series> Ch. 42``),
     exactly as a group-free ``Chapter 42_2a8cb9.cbz``. Episode and Ep. are
-    chapter tokens here. A prefix that carries a volume or season (``Vol. 3_
-    Chapter 12_...``) is information, not a group, and the name is kept.
+    chapter tokens here. A prefix that is identity rather than a group
+    (``Vol. 3_``, ``Season 2_``, ``Part A_``, ``Side Story_``;
+    ``_is_group_prefix``) is kept, with the whole name.
     """
     match = _GROUP_CHAPTER_RE.match(name)
-    if match is None:
-        return name
-    group = match.group("group")
-    if _VOLUME_NUMBER_RE.search(group) or _SEASON_NUMBER_RE.search(group):
+    if match is None or not _is_group_prefix(match.group("group")):
         return name
     return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
 
