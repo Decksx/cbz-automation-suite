@@ -311,3 +311,50 @@ three isolated reruns afterwards: 1 passed,1 passed,1 passed. Codex also reprodu
 WinError 5 on unmodified base. Codex's four PR #176 repro files pass 16/16
 at this head. Watcher bare-LF 871 (869 + two new import lines in the LF
 import block).
+
+### PR #176 review round 3 (Codex, at `d47b7d8`)
+
+**P1:** the landing marker was observed, not owned. A writer could see a
+complete library book, pause, and then settle against another arrival's
+reservation that replaced it meanwhile. Codex's
+`test_review176_marker_window.py` (SHA256 `bc9ca1e5...102a`) fails 16/16 at
+`d47b7d8`. Scope, narrowed by Codex (PR comment 6757585360): the
+demonstrated concurrency is two admitted timer threads in one watcher
+process, so an in-process lock per physical destination suffices; other
+processes writing the library are documented as outside the guarantee.
+
+Fix (`df2c4b5`): `_settle_or_land` is the one path both movers take for
+every file. It takes `_destination_lock(dest)` (a `threading.Lock` per
+normalized physical path, from a registry that keeps a lock only while it
+is used) **before** deciding anything and holds it through quarantine,
+landing, rollback and cleanup; a thread that cannot take it defers its
+arrival, untouched, to its next pass. The landing marker and its check
+(`RESERVE_MARK`, `_landing_in_flight`) are removed: one mechanism, and no
+marker files for a crash to leave behind. The exclusive reservation of the
+name in `_land` stays.
+
+Two of Codex's earlier probes no longer apply as written, and this is
+expected rather than a regression:
+
+- `test_review176_marker_window.py` patches `_landing_in_flight`, which no
+  longer exists (AttributeError). Its interleaving also cannot occur now:
+  while the paused writer owns the name, the second writer defers instead
+  of reserving it, so its wait for that reservation would time out. My
+  `test_a_writer_that_saw_a_clear_target_keeps_it_until_it_is_done` covers
+  the same scenario (pause after ownership and a clear observation; the
+  other writer must defer; every original survives), both movers, legacy
+  and resolver.
+- `test_review176_quarantine_race.py::test_concurrent_losing_arrivals_keep_both_quarantine_copies`
+  settles one library name from two threads at once, which ownership now
+  forbids: the second defers and never reaches the probe's barrier
+  (BrokenBarrierError after 10 s). My version of that race uses two library
+  roots, where two quarantines of one name can still meet.
+
+The other probes pass: active reservation 8/8, directory receipt 2/2,
+failed landing 2/2, and the two failure-cleanup cases of the quarantine
+race.
+
+Guards proven by bypass (failing tests): a settlement owns its destination
+18; one physical file, one lock 1; ownership ends with the settlement even
+on error 1 (it failed nothing until the test held a registry reference, as
+another thread would); the registry keeps no lock nobody uses 17.
