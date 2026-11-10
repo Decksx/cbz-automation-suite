@@ -51,6 +51,7 @@ except ImportError:
 try:
     from scripts.cbz_canonical_name import (
         EDITION_WORDS,
+        SPECIAL_WORDS,
         CanonicalNameError,
         format_canonical_name,
         parse_canonical_name,
@@ -58,6 +59,7 @@ try:
 except ModuleNotFoundError:  # run from inside scripts/ without the package
     from cbz_canonical_name import (  # type: ignore[no-redef]
         EDITION_WORDS,
+        SPECIAL_WORDS,
         CanonicalNameError,
         format_canonical_name,
         parse_canonical_name,
@@ -152,6 +154,17 @@ NUMBER_PREFIX_RE = re.compile(
 )
 TRAILING_JUNK_RE = re.compile(r"[\s\-_–—]+$")
 _SCANLATION_HASH_RE = re.compile(r"(?:[\s_-][0-9a-f]{6})+$", re.IGNORECASE)
+# A downloader's chapter name: "<Group>_<Chapter|Ch.|Episode|Ep.> N[ - title]
+# _<hash6>.cbz" ("Asura_Chapter 42_d1a897.cbz"). The text before the first
+# underscore is the scanlation group, not the series; it is only recognised
+# with the trailing hash and an underscore right before the chapter token,
+# the downloader's own layout. Cleaning turns the underscores into spaces, so
+# this is matched on the arrival's name, before cleaning.
+_GROUP_CHAPTER_RE = re.compile(
+    r"^(?P<group>[^_]+)_(?:chapter|ch\.?|episode|ep\.?)\s*"
+    r"(?P<rest>\d[^_]*?)(?P<hash>(?:_[0-9a-f]{6})+)(?P<ext>\.[^.]+)$",
+    re.IGNORECASE,
+)
 GIBBERISH_RE = re.compile(
     r"^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}"
     r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -1303,6 +1316,74 @@ def infer_series_name(path: Path, library_root: Path | None = None) -> str:
     return candidates[-1] if candidates else parent.name
 
 
+# A part marker ("Part A", "PartB", "part 2"), read on casefolded text. The
+# watcher's same-chapter copy check uses this same grammar (its _PART_RE), so
+# what counts as a part cannot drift between the two.
+PART_MARKER_RE = re.compile(r"(?<![a-z])part\.?\s*([0-9a-z]+)\b")
+
+
+def _word_pattern(words) -> re.Pattern:
+    """Whole-word *words* on casefolded text, each written with or without
+    spaces, hyphens or underscores between its parts ("one-shot",
+    "One shot", "Oneshot"; "side story", "SideStory")."""
+    alternatives = sorted(
+        (r"[\s_\-]*".join(map(re.escape, re.split(r"[\s\-]+", word.casefold())))
+         for word in words),
+        key=len, reverse=True)
+    return re.compile(r"(?<![a-z])(?:" + "|".join(alternatives) + r")(?![a-z])")
+
+
+# The canonical special words (Special, Extra, Bonus, Omake, One-shot, ...).
+_SPECIAL_WORD_RE = _word_pattern(SPECIAL_WORDS)
+# Words that say where a chapter sits in a work, not who translated it. This
+# is in addition to the grammars above, never instead of them: each word here
+# was a guard before they were used, and none may quietly stop being one
+# (PR #178 review round 3). "Part-A" and "Side A" are read through "part" and
+# "side"; "side story" also catches the run-together "SideStory".
+STRUCTURAL_PREFIX_WORDS: tuple[str, ...] = (
+    "part", "parts", "pt", "arc", "book", "story", "side", "side story",
+    "extra", "extras", "special", "specials", "bonus", "omake", "oneshot",
+    "prologue", "epilogue", "afterword", "interlude", "act", "season",
+    "volume", "vol", "chapter", "ch", "episode", "ep",
+)
+_STRUCTURAL_WORD_RE = _word_pattern(STRUCTURAL_PREFIX_WORDS)
+
+
+def _is_group_prefix(prefix: str) -> bool:
+    """Whether a downloader prefix names a scanlation group (conservative).
+
+    Not a group when it holds a digit (``Part 2``, ``S2``, ``Vol. 3``,
+    ``Extra2``), a part marker (``Part A``, ``PartB``; ``PART_MARKER_RE``), a
+    canonical special word (``One-shot``, ``Extra``; ``SPECIAL_WORDS``) or a
+    structural word (``Part-A``, ``Side B``, ``Specials``, ``SideStory``,
+    ``Act II``; ``STRUCTURAL_PREFIX_WORDS``), any one of them:
+    those are identity, and dropping them would give two different chapters
+    one name. When in doubt it is not a group, and the arrival keeps the
+    name it had before (PR #178 review).
+    """
+    if any(char.isdigit() for char in prefix):
+        return False
+    text = prefix.casefold()
+    return not (PART_MARKER_RE.search(text) or _SPECIAL_WORD_RE.search(text)
+                or _STRUCTURAL_WORD_RE.search(text))
+
+
+def _without_group_prefix(name: str) -> str:
+    """*name* without a downloader's scanlation-group prefix (``_GROUP_CHAPTER_RE``).
+
+    ``Alpha_Episode 42_2a8cb9.cbz`` becomes ``Chapter 42_2a8cb9.cbz``, which
+    the stem pipeline names after the series folder (``<Series> Ch. 42``),
+    exactly as a group-free ``Chapter 42_2a8cb9.cbz``. Episode and Ep. are
+    chapter tokens here. A prefix that is identity rather than a group
+    (``Vol. 3_``, ``Season 2_``, ``Part A_``, ``Side Story_``;
+    ``_is_group_prefix``) is kept, with the whole name.
+    """
+    match = _GROUP_CHAPTER_RE.match(name)
+    if match is None or not _is_group_prefix(match.group("group")):
+        return name
+    return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
+
+
 def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
     """The stem normalisation that follows cleaning in :func:`parse_comic_name`."""
     if "leading_nums" in rules:
@@ -1410,12 +1491,15 @@ def parse_comic_name(
     raw_series = infer_series_name(path, library_root=library_root)
     series = clean_directory_name(raw_series, rules)
 
+    # A downloader's scanlation-group prefix names the group, not the series:
+    # without it the folder's series names the chapter.
+    name = _without_group_prefix(path.name)
     # Capture the raw title (filename stem before cleaning) so we can detect a
     # CJK-only name and translate it. clean_filename() strips most non-Latin
     # text, so this must happen on the raw stem.
-    raw_stem, _raw_ext = _split_name(path.name)
+    raw_stem, _raw_ext = _split_name(name)
 
-    stem, ext = _split_name(clean_filename(path.name, rules))
+    stem, ext = _split_name(clean_filename(name, rules))
     stem = _stem_pipeline(stem, series, rules)
     translated_stem: str | None = None
 
@@ -1426,9 +1510,18 @@ def parse_comic_name(
     # are looked for in the cleaned stem and, failing that, the raw stem (the
     # cleaning pipeline may drop a token like "Ep. 1"). Chapter still owns the
     # native ComicInfo <Number>; these are recorded separately in <Notes>.
-    season = extract_season_number(stem) or extract_season_number(raw_stem)
-    episode = extract_episode_number(stem) or extract_episode_number(raw_stem)
-    part = extract_part_number(stem) or extract_part_number(raw_stem)
+    # A dropped group prefix also turned "Episode 42" into "Chapter 42"; the
+    # arrival's own words are read too, so it is still episode 42.
+    arrival_stems = [raw_stem]
+    if name != path.name:
+        arrival_stems += [_split_name(clean_filename(path.name, rules))[0],
+                          _split_name(path.name)[0]]
+    season = extract_season_number(stem) or next(
+        filter(None, map(extract_season_number, arrival_stems)), None)
+    episode = extract_episode_number(stem) or next(
+        filter(None, map(extract_episode_number, arrival_stems)), None)
+    part = extract_part_number(stem) or next(
+        filter(None, map(extract_part_number, arrival_stems)), None)
 
     # Fallback: pull chapter/volume from CJK markers (第N話/N話 -> chapter,
     # 第N巻/N巻 -> volume) when Latin-token extraction found nothing.

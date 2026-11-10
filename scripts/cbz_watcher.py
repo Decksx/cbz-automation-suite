@@ -63,6 +63,7 @@ from scripts.cbz_lock_order import (
 
 try:
     from scripts.cbz_core import (
+        PART_MARKER_RE,
         ParsedComicName,
         clean_directory_name,
         clean_filename,
@@ -80,6 +81,7 @@ try:
     )
 except ModuleNotFoundError:
     from cbz_core import (  # type: ignore[no-redef]
+        PART_MARKER_RE,
         ParsedComicName,
         clean_directory_name,
         clean_filename,
@@ -2831,7 +2833,8 @@ def _move_loose_files(
 # HELD ARCHIVES: same-chapter copies and unchanged held directories
 # ─────────────────────────────────────────────
 _BRACKET_TAG_RE = re.compile(r"[\[(]([^\[\]()]*)[\])]")
-_PART_RE = re.compile(r"(?<![a-z])part\.?\s*([0-9a-z]+)\b")
+# One grammar for parts, shared with cbz_core's group-prefix check.
+_PART_RE = PART_MARKER_RE
 
 
 def _duplicate_chapter_copies(
@@ -3647,7 +3650,25 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                 unknown_ai = {
                     p for p, parsed in parsed_by_path.items()
                     if getattr(parsed, "original_path", p) in unknown_origins}
-                review = (refused - transient) | unknown_ai
+                # Two archives of this arrival named alike, such as two
+                # groups' translations of one chapter once their group
+                # prefixes are dropped: the second kept its arrival name only
+                # because the first took the name. Landed, it would be a raw
+                # duplicate beside the first; which to keep is the operator's
+                # call, as for any collision with a different book. A name
+                # kept because it carries a distinguishing tag (``(s2)``,
+                # dropped_round_tags) is not one: that tag tells them apart.
+                taken = {path.name.casefold() for path in parsed_by_path}
+                same_name = set()
+                for path, parsed in parsed_by_path.items():
+                    display = getattr(parsed, "filename", None)
+                    if (display is None or path in second_copies
+                            or dropped_round_tags(path.stem)):
+                        continue
+                    display = normalize_apostrophes(display).casefold()
+                    if display != path.name.casefold() and display in taken:
+                        same_name.add(path)
+                review = (refused - transient) | unknown_ai | same_name
                 held = retry | review | set(second_copies)
                 # Every other copy of a duplicated chapter is protected where it
                 # lands, and on a resumed claim every archive is: a collision
@@ -3674,7 +3695,9 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                     {"stripped_arrivals": stripped} if stripped else {}
                 )
                 planned = {path: ("review", "name refused, see REVIEW above")
-                           for path in review - unknown_ai}
+                           for path in review - unknown_ai - same_name}
+                planned.update({path: ("review", "another archive of this arrival has its name")
+                                for path in same_name - unknown_ai})
                 planned.update({path: ("review", "AI rewrite of unknown state")
                                 for path in unknown_ai})
                 planned.update({path: ("quarantine", f"second copy of '{kept}'")
