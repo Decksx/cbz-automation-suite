@@ -1805,8 +1805,8 @@ def _merge_directories(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
-) -> None:
-    """Recursively merge *src_dir* into *dest_dir*.
+) -> int:
+    """Recursively merge *src_dir* into *dest_dir*; return how many files completed.
 
     Legacy imports retain the measured replacement threshold. Resolver imports
     compare exact duplicates and quarantine the smaller non-identical file
@@ -1825,8 +1825,14 @@ def _merge_directories(
     review (a refused name, or a second copy of a chapter). They are never
     moved, replaced or deleted here, so ``_remove_merged_source`` finds them
     still in *src_dir* and leaves it in place.
+
+    A file completes when it lands, when its collision is settled, or when
+    it is removed as an exact duplicate. A held, deferred or failed file
+    does not; ``_move_cbz_dir`` gives no landing receipt for a merge in which
+    nothing completed.
     """
     stripped_arrivals = stripped_arrivals or {}
+    completed = 0
     for src_item in iter_paths_excluding_directories(src_dir):
         relative  = src_item.relative_to(src_dir)
         dest_item = dest_dir / relative
@@ -1874,11 +1880,13 @@ def _merge_directories(
                         f"    Conflict '{relative}': {action}; smaller file quarantined at "
                         f"'{outcome['quarantined']}'."
                     )
+                completed += 1
                 continue
-            _settle_by_size(src_item, dest_item, str(relative), dest_dir.name)
+            completed += _settle_by_size(src_item, dest_item, str(relative), dest_dir.name)
         else:
             dest_item.parent.mkdir(parents=True, exist_ok=True)
-            _land(src_item, dest_item)
+            completed += _land(src_item, dest_item)
+    return completed
 
 
 # ─────────────────────────────────────────────
@@ -2555,13 +2563,16 @@ def _move_cbz_dir(
             if chapter_number:
                 _backfill_chapter_one(dest_dir, folder_name)
             log.info(f"  Destination exists - merging, keeping larger files on conflict.")
-            _merge_directories(
+            completed = _merge_directories(
                 dir_path, dest_dir,
                 conflict_quarantine_root=conflict_quarantine_root,
                 stripped_arrivals=stripped_arrivals,
                 held=held,
             )
             _remove_merged_source(dir_path)
+            if not completed:
+                log.warning(f"  Nothing from '{dir_path.name}' completed; it stays for the next pass.")
+                return None
             log.info(f"  Merge complete.")
             return dest_dir
         else:
@@ -2577,13 +2588,17 @@ def _move_cbz_dir(
                     if chapter_number:
                         _backfill_chapter_one(dest_dir, folder_name)
                     log.info(f"  Race on move — destination appeared, falling back to merge.")
-                    _merge_directories(
+                    completed = _merge_directories(
                         dir_path, dest_dir,
                         conflict_quarantine_root=conflict_quarantine_root,
                         stripped_arrivals=stripped_arrivals,
                         held=held,
                     )
                     _remove_merged_source(dir_path)
+                    if not completed:
+                        log.warning(f"  Nothing from '{dir_path.name}' completed; it stays "
+                                    f"for the next pass.")
+                        return None
                     log.info(f"  Merge complete.")
                     return dest_dir
                 else:
