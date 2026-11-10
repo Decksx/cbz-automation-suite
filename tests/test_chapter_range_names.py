@@ -426,10 +426,138 @@ def test_a_placeholder_in_a_volume_range_folder_is_reviewed(tmp_path):
 
 @pytest.mark.parametrize("arrival, expected", [
     ("\u6f2b\u753b Vol. 1-3.cbz", "Story Vol. 1-3.cbz"),
-    ("\u6f2b\u753b \u7b2c1-3\u5dfb.cbz", "Story Vol. 1-3.cbz"),
-    ("\u6f2b\u753b \u7b2c1-30\u8a71.cbz", "Story Ch. 1-30.cbz"),
+    # Round 4: the span is kept as written, not rebuilt as "Vol."/"Ch.".
+    ("\u6f2b\u753b \u7b2c1-3\u5dfb.cbz", "Story \u7b2c1-3\u5dfb.cbz"),
+    ("\u6f2b\u753b \u7b2c1-30\u8a71.cbz", "Story \u7b2c1-30\u8a71.cbz"),
     ("\u6f2b\u753b 1-30.cbz", "Story 1-30.cbz"),
 ])
 def test_a_translated_rebuild_keeps_the_ranges_kind(monkeypatch, arrival, expected):
     monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
     assert parse_comic_name(Path("C:/intake/Series") / arrival).filename == expected
+
+
+# PR #180 review round 4: a translated title keeps the arrival's numbering.
+# One chapter or volume number is written as master writes it (David's
+# style: "漫画 第3話" -> "Story Ch. 3"); a range, or more than one number, is
+# kept verbatim, never rebuilt from parsed fields (which hold one number at
+# most). A property over generated spans: every mix of markers, scalars and
+# ranges, every separator.
+_SCALARS = ["3", "30", "1.5"]
+_RANGES = [f"{a}{s}{b}" for s in _SEPARATORS for a, b in (("1", "30"), ("31", "60"))]
+# (spelling, kind): kinds "ch" and "vol" are the parsed fields; "ep" is not.
+_TOKENS = [("Vol. {n}", "vol"), ("v{n}", "vol"), ("{n}\u5dfb", "vol"),
+           ("Ch. {n}", "ch"), ("Chapter {n}", "ch"), ("#{n}", "ch"),
+           ("\u7b2c{n}\u8a71", "ch"), ("Ep. {n}", "ep")]
+
+
+def _norm(value: str) -> str:
+    return _re.sub(r"\s*[-\u2013~\u301c\uff5e]\s*", "-", value)
+
+
+def _spans():
+    """(span, meaning, expected name) for every generated numbering span."""
+    out = []
+    for spelling, kind in _TOKENS:
+        for n in _SCALARS:
+            span = spelling.format(n=n)
+            if kind == "ch":
+                expected = f"Story Ch. {n}.cbz"
+            elif kind == "vol":
+                expected = f"Story Vol. {n}.cbz"
+            else:
+                expected = f"Story {span}.cbz"  # an episode is no field: verbatim
+            out.append((span, ((kind, n),), expected))
+        for n in _RANGES:
+            span = spelling.format(n=n)
+            out.append((span, ((kind, _norm(n)),), f"Story {span}.cbz"))
+    for vol, _ in _TOKENS[:2]:
+        for ch, _ in _TOKENS[3:6]:
+            for a in ("3", "1-3"):
+                for b in ("30", "1-30", "31-60", "1 ~ 30"):
+                    span = f"{vol.format(n=a)} {ch.format(n=b)}"
+                    out.append((span, (("vol", a), ("ch", _norm(b))), f"Story {span}.cbz"))
+    return sorted(set(out))
+
+
+_GENERATED = _spans()
+
+
+@pytest.mark.parametrize("span, meaning, expected", _GENERATED,
+                         ids=[span for span, _, _ in _GENERATED])
+def test_a_translated_title_keeps_its_numbering(monkeypatch, span, meaning, expected):
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    parsed = parse_comic_name(Path("C:/intake/Series") / f"\u6f2b\u753b {span}.cbz")
+    assert parsed.filename == expected
+
+
+@pytest.mark.parametrize("display", [False, True], ids=["plain", "display"])
+def test_numbering_that_means_different_books_never_shares_a_translated_name(monkeypatch,
+                                                                            display):
+    """The same number spelled two ways ('Ch. 30', '#30', '第30話') is one
+    chapter, and may share a name; numbering that means different books
+    never does. With display tokens a name the canonical grammar already
+    reads (such as '漫画 Vol. 3') is kept verbatim, as before."""
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    seen: dict[str, tuple] = {}
+    for span, meaning, _expected in _GENERATED:
+        name = parse_comic_name(Path("C:/intake/Series") / f"\u6f2b\u753b {span}.cbz",
+                                display_tokens=display).filename
+        assert seen.setdefault(name, meaning) == meaning, (name, seen[name], meaning)
+
+
+@pytest.mark.parametrize("number, expected", [
+    ("\u7b2c3\u8a71", "Story Ch. 3.cbz"), ("3\u8a71", "Story Ch. 3.cbz"),
+    ("\u7b2c\uff11\uff12\u8a71", "Story Ch. 12.cbz"), ("\u7b2c3\u5dfb", "Story Vol. 3.cbz"),
+    ("3\u5dfb", "Story Vol. 3.cbz"), ("Ch. 30", "Story Ch. 30.cbz"),
+    ("Chapter 30", "Story Ch. 30.cbz"), ("#5", "Story Ch. 5.cbz"),
+    ("Vol. 3", "Story Vol. 3.cbz"), ("v01", "Story Vol. 1.cbz"), ("Ch. 1.5", "Story Ch. 1.5.cbz"),
+])
+def test_a_single_translated_number_is_written_as_on_master(monkeypatch, number, expected):
+    """Unchanged from eb32d3e (each expected name is master's output)."""
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    assert parse_comic_name(Path("C:/intake/Series") / f"\u6f2b\u753b {number}.cbz").filename \
+        == expected
+
+
+@pytest.mark.parametrize("arrival", [
+    "\u6f2b\u753b 30.cbz",        # a bare number the markers do not cover
+    "\u7b2c1-30\u8a71.cbz",       # no title before the numbering
+])
+def test_a_title_that_cannot_be_split_from_its_numbering_keeps_the_arrival_name(monkeypatch,
+                                                                               arrival):
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    assert parse_comic_name(Path("C:/intake/Series") / arrival).filename == arrival
+
+
+def test_a_translated_title_without_numbering_is_the_translation(monkeypatch):
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    assert parse_comic_name(Path("C:/intake/Series") / "\u6f2b\u753b.cbz").filename == "Story.cbz"
+
+
+def test_compound_translated_compilations_land_as_two_books(tmp_path, monkeypatch):
+    """Codex's round-4 probe, adapted: 'Vol. 1-3 Ch. 1-30' and 'Vol. 1-3
+    Ch. 31-60' keep both spans and land as two books; neither is reviewed."""
+    incoming, library = tmp_path / "incoming", tmp_path / "Manga"
+    incoming.mkdir()
+    library.mkdir()
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(incoming))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(library))
+    monkeypatch.setattr(watcher, "_series_resolvers", {})
+    monkeypatch.setattr(watcher, "_router", None)
+    monkeypatch.setattr(watcher, "_number_style_registry", None)
+    monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    arrival = incoming / "Series"
+    arrival.mkdir()
+    for span in ("1-30", "31-60"):
+        with zipfile.ZipFile(arrival / f"\u6f2b\u753b Vol. 1-3 Ch. {span}.cbz", "w") as zf:
+            zf.writestr("page.jpg", span.encode())
+
+    watcher.process_and_move_directory(arrival)
+
+    names = sorted(p.name for p in library.rglob("*.cbz"))
+    assert names == ["Story Vol. 1-3 Ch. 1-30.cbz", "Story Vol. 1-3 Ch. 31-60.cbz"]
+    assert not list((tmp_path / "_review").rglob("*.cbz"))
