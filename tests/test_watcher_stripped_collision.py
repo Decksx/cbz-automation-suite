@@ -66,11 +66,6 @@ def env(request, tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
     monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
     monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
-    # These tests drive the retry itself: the next pass must re-read the
-    # held arrival and hold it again. The watcher normally skips an
-    # unchanged held directory (tested in test_watcher_held_archives), which
-    # would leave nothing here to exercise.
-    monkeypatch.setattr(watcher, "_held_directory_unchanged", lambda comic_dir: None)
     return incoming, library, quarantine, request.param
 
 
@@ -82,18 +77,32 @@ def _files(root: Path) -> list[str]:
     )
 
 
+def _find(env, name: str) -> Path:
+    """Where an arrival archive is now: the import folder, a claim in
+    processing (work pending), or review (held). Claim-first moves it."""
+    incoming = env[0]
+    for root in (incoming, incoming.parent / "_processing", incoming.parent / "_review"):
+        found = sorted(root.rglob(name)) if root.exists() else []
+        if found:
+            return found[0]
+    return incoming / "_not_found" / name
+
+
 def _assert_held(env, caplog, existing: Path, existing_bytes: bytes,
-                 held: Path, held_payload: bytes) -> None:
+                 held: Path, held_payload: bytes, logged: bool = True) -> None:
     """The guarded outcome: nothing in the library or quarantine changed,
-    and the arrival is back under the name it came with, in the import folder."""
-    _incoming, library, quarantine, _mode = env
+    and the arrival, under the name it came with, is in review (claim-first:
+    a hold leaves the import folder as soon as it is decided)."""
+    incoming, library, quarantine, _mode = env
     assert existing.read_bytes() == existing_bytes
     assert _files(library) == [str(existing.relative_to(library))]
     assert _files(quarantine) == []
-    assert held.is_file()
-    assert _payload(held) == held_payload
-    assert "HELD FOR REVIEW" in caplog.text
-    assert held.name in caplog.text
+    placed = list((incoming.parent / "_review").rglob(held.name))
+    assert len(placed) == 1, placed
+    assert _payload(placed[0]) == held_payload
+    if logged:  # a pass that already moved it to review has nothing to hold again
+        assert "HELD FOR REVIEW" in caplog.text
+        assert held.name in caplog.text
 
 
 # --- the guarded case ------------------------------------------------------
@@ -115,7 +124,7 @@ def test_season_tag_arrival_is_held_and_the_existing_book_is_untouched(
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / "Solo Leveling ch. 4 (s2).cbz"
+    held = _find(env, "Solo Leveling ch. 4 (s2).cbz")
     _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * incoming_size)
     assert not (arrival / "Solo Leveling ch. 4.cbz").exists()
     # The hold is a clean skip, not a merge that failed part-way.
@@ -137,7 +146,9 @@ def test_a_hold_does_not_stop_the_rest_of_the_arrival_from_landing(env, caplog):
 
     assert existing.read_bytes() == existing_bytes
     assert _payload(library / "Solo Leveling" / "Solo Leveling ch. 5.cbz") == b"\3" * 80
-    assert sorted(p.name for p in arrival.iterdir()) == ["Solo Leveling ch. 4 (s2).cbz"]
+    held = _find(env, "Solo Leveling ch. 4 (s2).cbz")
+    assert "_review" in held.parts and _payload(held) == b"" * BIG
+    assert not arrival.exists()  # claimed whole; only the hold went to review
     assert "Merge complete" in caplog.text
     assert "Failed to move directory" not in caplog.text
 
@@ -156,8 +167,8 @@ def test_a_held_arrival_is_held_again_on_the_next_pass(env, caplog):
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / "Solo Leveling ch. 4 (s2).cbz"
-    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
+    held = _find(env, "Solo Leveling ch. 4 (s2).cbz")
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG, logged=False)
 
 
 def test_copy_suffix_arrival_with_different_bytes_is_held(env, monkeypatch, caplog):
@@ -176,7 +187,7 @@ def test_copy_suffix_arrival_with_different_bytes_is_held(env, monkeypatch, capl
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / "Solo Leveling ch. 4 (1).cbz"
+    held = _find(env, "Solo Leveling ch. 4 (1).cbz")
     _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * SMALL)
 
 
@@ -194,7 +205,8 @@ def test_season_tag_arrival_is_held_when_the_series_appears_mid_move(
 
     # A whole folder moves only by os.rename (never shutil.move: PR #176).
     def series_appears_then_move_fails(src, dest, *args, **kwargs):
-        if Path(src) == arrival and Path(dest) == library / "Solo Leveling":
+        # The source is the claim in processing, not the import folder.
+        if Path(src).name == arrival.name and Path(dest) == library / "Solo Leveling":
             _make_cbz(existing, SMALL)
             raise OSError("simulated: destination appeared concurrently")
         return original_rename(src, dest, *args, **kwargs)
@@ -203,7 +215,7 @@ def test_season_tag_arrival_is_held_when_the_series_appears_mid_move(
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / "Solo Leveling ch. 4 (s2).cbz"
+    held = _find(env, "Solo Leveling ch. 4 (s2).cbz")
     assert "merging file by file" in caplog.text
     assert _payload(existing) == b"\0" * SMALL
     _assert_held(env, caplog, existing, existing.read_bytes(), held, b"\1" * BIG)
@@ -221,7 +233,7 @@ def test_parody_tag_arrival_is_held(env, caplog):
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / "Kagome Diary (Inuyasha).cbz"
+    held = _find(env, "Kagome Diary (Inuyasha).cbz")
     _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
 
 
@@ -240,7 +252,7 @@ def test_loose_file_in_a_mixed_drop_point_is_held(env, caplog):
         watcher.process_and_move_directory(drop)
 
     assert existing.read_bytes() == existing_bytes
-    held = drop / "Drop ch. 4 (s2).cbz"
+    held = _find(env, "Drop ch. 4 (s2).cbz")
     assert _payload(held) == b"\1" * BIG
     assert "HELD FOR REVIEW" in caplog.text
     # The sibling series is unaffected by the hold.
@@ -266,7 +278,7 @@ def test_distinguishing_or_unclassified_tag_arrival_is_held(env, caplog, tag):
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / f"Solo Leveling ch. 4{tag}.cbz"
+    held = _find(env, f"Solo Leveling ch. 4{tag}.cbz")
     _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
 
 
@@ -548,7 +560,7 @@ def test_a_failed_rename_back_cannot_release_the_hold(env, monkeypatch, caplog, 
     renames = _break_tag_restoring_renames(monkeypatch, arrival)
 
     watcher.process_and_move_directory(arrival)
-    held = arrival / S2_ARRIVAL
+    held = _find(env, S2_ARRIVAL)
     assert existing.read_bytes() == existing_bytes
     assert _payload(held) == b"\1" * BIG
 
@@ -559,7 +571,7 @@ def test_a_failed_rename_back_cannot_release_the_hold(env, monkeypatch, caplog, 
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG, logged=False)
     assert [r for r in renames if "(s2)" in r[0] and "(s2)" not in r[1]] == []
 
 
@@ -580,7 +592,7 @@ def test_a_crash_after_processing_leaves_the_tag_for_the_restart(
     monkeypatch.setattr(watcher, crash_in, crash)
     with pytest.raises(_Crash):
         watcher.process_and_move_directory(arrival)
-    held = arrival / S2_ARRIVAL
+    held = _find(env, S2_ARRIVAL)
     assert held.is_file()
     assert existing.read_bytes() == existing_bytes
 
@@ -613,7 +625,7 @@ def test_a_failed_comparison_holds_and_the_next_pass_holds_again(
     monkeypatch.setattr(watcher, "digest", failing_digest)
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
-    held = arrival / "Solo Leveling ch. 4 (1).cbz"
+    held = _find(env, "Solo Leveling ch. 4 (1).cbz")
     _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * SMALL)
     assert "Could not compare" in caplog.text
     assert "Failed to move directory" not in caplog.text
@@ -622,7 +634,7 @@ def test_a_failed_comparison_holds_and_the_next_pass_holds_again(
     caplog.clear()
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
-    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * SMALL)
+    _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * SMALL, logged=False)
 
 
 def test_a_failed_sibling_move_keeps_the_held_tag_for_the_retry(env, monkeypatch, caplog):
@@ -646,7 +658,7 @@ def test_a_failed_sibling_move_keeps_the_held_tag_for_the_retry(env, monkeypatch
     assert failures
     assert "Failed to move directory" in caplog.text
     assert existing.read_bytes() == existing_bytes
-    assert (arrival / S2_ARRIVAL).is_file()
+    assert _find(env, S2_ARRIVAL).is_file()
 
     caplog.clear()
     with caplog.at_level("INFO"):
@@ -654,8 +666,8 @@ def test_a_failed_sibling_move_keeps_the_held_tag_for_the_retry(env, monkeypatch
     landed = existing.parent / "Solo Leveling ch. 5.cbz"
     assert _payload(landed) == b"\3" * 80
     assert existing.read_bytes() == existing_bytes
-    assert _payload(arrival / S2_ARRIVAL) == b"\1" * BIG
-    assert "HELD FOR REVIEW" in caplog.text
+    assert _payload(_find(env, S2_ARRIVAL)) == b"\1" * BIG
+    assert "_review" in _find(env, S2_ARRIVAL).parts  # held on the first pass
 
 
 def test_a_placeholder_fallback_name_that_strips_a_tag_is_deferred_too(env, caplog):
@@ -671,7 +683,7 @@ def test_a_placeholder_fallback_name_that_strips_a_tag_is_deferred_too(env, capl
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    held = arrival / "volvox_Chapter (s2).cbz"
+    held = _find(env, "volvox_Chapter (s2).cbz")
     _assert_held(env, caplog, existing, existing_bytes, held, b"\1" * BIG)
     assert "Rename deferred to landing (placeholder fallback)" in caplog.text
 
@@ -749,7 +761,7 @@ def test_a_held_archive_keeps_its_ai_original_while_a_routed_sibling_offloads(
     held_original, = [b for b in backups if _payload(b) == b"\1" * BIG]
     routed_original, = [b for b in backups if _payload(b) == b"\3" * 80]
     assert existing.read_bytes() == existing_bytes
-    assert _payload(arrival / S2_ARRIVAL) == b"\1" * BIG
+    assert _payload(_find(env, S2_ARRIVAL)) == b"\1" * BIG
     assert _payload(existing.parent / "Solo Leveling ch. 5.cbz") == b"\3" * 80
     assert offloaded == [routed_original]
     assert held_original.is_file()
