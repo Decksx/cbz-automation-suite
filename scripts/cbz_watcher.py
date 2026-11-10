@@ -5,6 +5,7 @@ Processes ALL .cbz files in a directory first, then moves the
 immediate comic directory to the configured destination.
 """
 
+import contextlib
 import os
 import hashlib
 from contextlib import contextmanager
@@ -39,6 +40,7 @@ from comic_automation.series_resolver import (
     unique_path,
 )
 from comic_automation.library.readiness_hold import ReadinessHolds
+from comic_automation.library import claims as _claims
 from comic_automation.library.watcher_instance import watcher_instance_lock, WatcherInstanceRefused, WatcherInstanceCleanupError
 from comic_automation.archive import field_resolution as _media_fr
 from comic_automation.library.media_naming import media_fields, watcher_naming, with_comicinfo_year, KeepArrivalName, split_series_year
@@ -117,11 +119,6 @@ except ModuleNotFoundError:
 WATCH_FOLDER  = r"C:\Temp\Mega\Mega Uploads\book2"
 REPO_ROOT     = Path(__file__).resolve().parents[1]
 LOG_FILE      = REPO_ROOT / "Logs" / "cbz_watcher.log"
-# Series directories left in the import folder with archives held for review,
-# and a fingerprint of what was held (_remember_held_directory). A directory
-# whose fingerprint is unchanged is skipped instead of re-processed on every
-# settle pass and restart. Delete an entry, or the file, to force a retry.
-HELD_STATE_FILE = REPO_ROOT / "Logs" / "cbz_watcher_held.json"
 # Main initializes the shared policy; direct legacy helper callers retain their API.
 _number_style_registry = None
 _number_style_requested = "auto"
@@ -138,6 +135,14 @@ AI_DECENSOR_REPROCESS = False
 # from the kept copy is ever deleted. Placements go in a dated subfolder
 # (YYYY-MM-DD) so a retention purge can work by age.
 QUARANTINE_ROOT = Path(os.environ.get("CBZ_QUARANTINE_ROOT", r"C:\Temp\cbz_held\quarantine"))
+# Claim-first processing (comic_automation.library.claims). Every arrival is
+# moved here, out of the MEGA-synced watch folder, by one same-volume rename
+# before anything changes it; work in progress lives here and is resumed on
+# start. None processes in place (direct callers only; the CLI always claims).
+PROCESSING_ROOT: Path | None = Path(os.environ.get("CBZ_PROCESSING_ROOT", r"C:\Temp\cbz_processing"))
+# Archives held for a decision (a refused name, a collision with a different
+# library book, an interrupted AI rewrite). Kept until someone acts on them.
+REVIEW_ROOT = Path(os.environ.get("CBZ_REVIEW_ROOT", r"C:\Temp\cbz_held\review"))
 CAMELIA_ROOT = Path(os.environ.get("CBZ_CAMELIA_ROOT", r"C:\git\camelia"))
 CAMELIA_PYTHON = Path(os.environ.get(
     "CBZ_CAMELIA_PYTHON",
@@ -1280,8 +1285,8 @@ def _apply_media_naming(parsed_by_path, originals, series_name, destination, tra
     *transient*, when given, collects the refusals that can clear without
     any file changing: an OSError (a locked archive, a failed rename) or a
     style the registry could not select (a root can be briefly
-    inaccessible). The caller retries those on the next pass instead of
-    remembering the directory as held (``_remember_held_directory``).
+    inaccessible). The caller leaves those where they are to be retried,
+    instead of sending them to review as a decision (``_dispose``).
     """
     if not _media_naming_enabled():
         return set(), None
@@ -1606,6 +1611,18 @@ def _destinations_guard_lookup(key: str):
                 del _destination_locks[key]
 
 
+# Suffix of a file being copied into the library from another volume. It
+# never ends in .cbz, so nothing reads it as a book.
+LANDING_SUFFIX = ".cbz-landing"
+
+
+def _same_volume(src: Path, dest_dir: Path) -> bool:
+    try:
+        return os.stat(src).st_dev == os.stat(dest_dir).st_dev
+    except OSError:
+        return False
+
+
 def _land(src: Path, dest: Path) -> bool:
     """Move *src* to the free name *dest*. The caller owns *dest* (``_destination_lock``).
 
@@ -1620,18 +1637,67 @@ def _land(src: Path, dest: Path) -> bool:
         log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
                     f"'{src}' stays for the next pass.")
         return False
+    partial = dest.with_name(f".{dest.name}{LANDING_SUFFIX}")
     try:
-        shutil.move(str(src), str(dest))
+        if _same_volume(src, dest.parent):
+            shutil.move(str(src), str(dest))
+        else:
+            # Across volumes (the library on Tower) the copy goes to a hidden
+            # partial name, is flushed, and replaces the reservation in one
+            # rename; only then is *src* removed. The name therefore only
+            # ever holds the empty reservation or the complete archive, and
+            # *src* survives until it is complete.
+            partial.unlink(missing_ok=True)
+            shutil.copy2(src, partial)
+            with open(partial, "rb+") as stream:
+                os.fsync(stream.fileno())
+            os.replace(partial, dest)
+            src.unlink()
     except (OSError, shutil.Error):
         if src.exists():
             dest.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
         raise
     return True
 
 
+def _clear_stale_landings(dest_folder: Path) -> None:
+    """Remove what a crashed landing left in *dest_folder*'s series folders.
+
+    A crash mid-landing leaves at most an empty reservation under the final
+    name, or (across volumes) a hidden ``.<name>.cbz-landing`` partial copy;
+    the arrival itself is still in its claim. Neither is ever a book, so both
+    are removed, each under that name's destination lock: a landing still in
+    progress on another thread owns its name and is skipped.
+    """
+    try:
+        series_dirs = [d for d in dest_folder.iterdir() if d.is_dir()]
+    except OSError:
+        return
+    for series_dir in series_dirs:
+        stale = [p for p in series_dir.glob("*.cbz") if p.is_file() and p.stat().st_size == 0]
+        stale += [p.with_name(p.name[1:-len(LANDING_SUFFIX)])
+                  for p in series_dir.glob(f".*{LANDING_SUFFIX}")]
+        for dest in stale:
+            with _destination_lock(dest) as owned:
+                if not owned:
+                    continue
+                partial = dest.with_name(f".{dest.name}{LANDING_SUFFIX}")
+                try:
+                    if dest.is_file() and dest.stat().st_size == 0:
+                        dest.unlink()
+                        log.warning(f"  Removed an empty reservation left by a crash: {dest}")
+                    if partial.exists():
+                        partial.unlink()
+                        log.warning(f"  Removed a partial copy left by a crash: {partial}")
+                except OSError as e:
+                    log.error(f"  Could not clear a crashed landing at {dest}: {e}")
+
+
 def _settle_or_land(src: Path, dest: Path, *, label: str, series_dir: str,
                     display_name: str | None, conflict_quarantine_root: Path | None,
-                    quarantine_name) -> bool:
+                    quarantine_name, protected: bool = False,
+                    holds: set | None = None) -> bool:
     """Land *src* on *dest*, or settle their collision, owning *dest* throughout.
 
     The one path every mover takes for every file (both movers, legacy and
@@ -1648,7 +1714,12 @@ def _settle_or_land(src: Path, dest: Path, *, label: str, series_dir: str,
             return False
         if not dest.exists():
             return _land(src, dest)
-        if display_name is not None and _hold_stripped_collision(src, dest, display_name):
+        if ((display_name is not None and _hold_stripped_collision(src, dest, display_name))
+                or (protected and _hold_protected_collision(src, dest))):
+            # A decision, not a failure: reported so the caller can send it
+            # to review rather than retry it.
+            if holds is not None:
+                holds.add(src)
             return False
         if conflict_quarantine_root is not None:
             outcome = settle_file_conflict(
@@ -1818,6 +1889,30 @@ def _hold_stripped_collision(src: Path, dest: Path, display_name: str) -> bool:
     return True
 
 
+def _hold_protected_collision(src: Path, dest: Path) -> bool:
+    """Leave a protected arrival where it is instead of settling it by size.
+
+    A protected arrival is another copy of a chapter, or any archive of a
+    resumed claim (whose earlier decisions may not have been recorded). Which
+    of two different copies belongs in the library is then the operator's
+    decision; the caller sends the arrival to review, the library copy left
+    untouched. Returns ``False`` only for the same bytes, an exact duplicate
+    the caller's own handling removes without losing anything; a failed
+    comparison holds, as in ``_hold_stripped_collision``.
+    """
+    try:
+        same = src.stat().st_size == dest.stat().st_size and digest(src) == digest(dest)
+    except OSError as e:
+        log.error(f"    Could not compare '{src.name}' with '{dest}' "
+                  f"({type(e).__name__}: {e}); holding it.")
+        same = False
+    if same:
+        return False
+    log.warning(f"    HELD FOR REVIEW: '{src.name}' meets the different '{dest}'; "
+                f"library copy left untouched (issue #174).")
+    return True
+
+
 def _land_deferred_names(
     src_dir: Path, dest_dir: Path, stripped_arrivals: dict[Path, str] | None
 ) -> None:
@@ -1859,6 +1954,8 @@ def _merge_directories(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
+    protected: frozenset[Path] = frozenset(),
+    holds: set | None = None,
 ) -> int:
     """Recursively merge *src_dir* into *dest_dir*; return how many files completed.
 
@@ -1884,6 +1981,11 @@ def _merge_directories(
     it is removed as an exact duplicate. A held, deferred or failed file
     does not; ``_move_cbz_dir`` gives no landing receipt for a merge in which
     nothing completed.
+
+    A *protected* archive (another copy of a chapter, or any archive of a
+    resumed claim) that meets a different existing file is left in *src_dir*
+    too (``_hold_protected_collision``): which copy belongs in the library is
+    the operator's decision, so the caller sends it to review.
     """
     stripped_arrivals = stripped_arrivals or {}
     completed = 0
@@ -1914,7 +2016,7 @@ def _merge_directories(
         completed += _settle_or_land(
             src_item, dest_item, label=str(relative), series_dir=dest_dir.name,
             display_name=display_name, conflict_quarantine_root=conflict_quarantine_root,
-            quarantine_name=relative)
+            quarantine_name=relative, protected=src_item in protected, holds=holds)
     return completed
 
 
@@ -2004,12 +2106,31 @@ def _load_routing_v2() -> None:
 
 
 def _source_folder_name(comic_dir: Path) -> str:
-    """The immediate child of WATCH_FOLDER that *comic_dir* arrived under."""
+    """The immediate child of WATCH_FOLDER that *comic_dir* arrived under.
+
+    A claimed payload is no longer under WATCH_FOLDER: its source was
+    recorded when it was claimed (``_claim_sources``) and is used instead.
+    """
+    key = os.path.normcase(str(comic_dir))
+    with _claim_sources_lock:
+        for claim_key, (source, _arrival) in _claim_sources.items():
+            if key == claim_key or key.startswith(claim_key + os.sep):
+                return source
     watch = Path(WATCH_FOLDER)
     for candidate in [comic_dir] + list(comic_dir.parents):
         if candidate.parent == watch:
             return candidate.name
     return comic_dir.name
+
+
+def _arrival_path(comic_dir: Path) -> Path:
+    """Where *comic_dir* arrived in the watch folder (itself if never claimed)."""
+    key = os.path.normcase(str(comic_dir))
+    with _claim_sources_lock:
+        for claim_key, (_source, arrival) in _claim_sources.items():
+            if key == claim_key or key.startswith(claim_key + os.sep):
+                return arrival
+    return comic_dir
 
 
 def _shadow_route(comic_dir: Path, legacy_dest: str, series_name: str,
@@ -2056,7 +2177,8 @@ def _shadow_handoff(comic_dir: Path, series_name: str, archives: list[Path],
         observation = observe(
             comic_dir, series_name, _source_folder_name(comic_dir),
             comparison.decision if comparison is not None else None,
-            mixed_parent=mixed_parent, archives=archives, error=error)
+            mixed_parent=mixed_parent, archives=archives, error=error,
+            arrival=_arrival_path(comic_dir))
         handoffs.append(observation)
         log.info(f"  {observation.describe()}")
     except Exception as e:                       # noqa: BLE001 — never fatal
@@ -2527,6 +2649,8 @@ def _move_cbz_dir(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
+    protected: frozenset[Path] = frozenset(),
+    holds: set | None = None,
 ) -> Path | None:
     """Move a processed comic directory to dest_folder, merging if it already exists.
 
@@ -2552,6 +2676,7 @@ def _move_cbz_dir(
     With any held, the directory is never moved wholesale -- that would carry
     them into the library -- so the destination is created if needed and the
     rest are merged into it, leaving *dir_path* behind with the held files.
+    *protected* is passed to ``_merge_directories``.
     """
     if not dir_path.exists():
         log.warning(f"  Skipping move: '{dir_path.name}' no longer exists (already moved by another thread).")
@@ -2597,6 +2722,8 @@ def _move_cbz_dir(
                 conflict_quarantine_root=conflict_quarantine_root,
                 stripped_arrivals=stripped_arrivals,
                 held=held,
+                protected=protected,
+                holds=holds,
             )
             _remove_merged_source(dir_path)
             if not completed:
@@ -2629,6 +2756,8 @@ def _move_cbz_dir(
                     conflict_quarantine_root=conflict_quarantine_root,
                     stripped_arrivals=stripped_arrivals,
                     held=held,
+                    protected=protected,
+                    holds=holds,
                 )
                 _remove_merged_source(dir_path)
                 if not completed:
@@ -2653,12 +2782,15 @@ def _move_loose_files(
     series_name: str,
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
+    protected: frozenset[Path] = frozenset(),
+    holds: set | None = None,
 ) -> Path | None:
     """Move individual .cbz files — not their parent directory — into
     ``dest_folder/series_name``, applying the same keep-the-larger-on-conflict
     policy as ``_merge_directories`` on a per-file basis, including its hold
     for a stripped arrival that meets a different book (*stripped_arrivals*,
-    issue #131). A held file stays where it is and is not counted as moved.
+    issue #131) and for a *protected* arrival (``_hold_protected_collision``).
+    A held file stays where it is and is not counted as moved.
 
     Used for .cbz files that sit directly in a directory which also contains
     other subdirectories that are themselves comic directories (each with
@@ -2687,7 +2819,7 @@ def _move_loose_files(
         if not _settle_or_land(
                 src, dest_item, label=src.name, series_dir=dest_dir.name,
                 display_name=display_name, conflict_quarantine_root=conflict_quarantine_root,
-                quarantine_name=src.name):
+                quarantine_name=src.name, protected=src in protected, holds=holds):
             continue  # deferred, held or failed: the arrival stays and is not a landing
         moved += 1
 
@@ -2818,160 +2950,6 @@ def _name_batch(
     return refused
 
 
-_held_state_lock = threading.Lock()
-
-
-def _size_and_mtime(path: Path) -> tuple[int, int] | None:
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return stat.st_size, stat.st_mtime_ns
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for block in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _held_fingerprint(comic_dir: Path) -> str:
-    """Digest of the files directly in *comic_dir*: names, sizes, mtimes, contents.
-
-    Contents are hashed as well as sizes and mtimes: a replacement can keep
-    both (a rebuilt archive of the same length, its mtime restored), and it
-    must not inherit the old archive's hold. Only directories holding
-    nothing but held archives are fingerprinted, so this reads few files.
-    The watcher's source version and number-style registry hash are mixed
-    in, so a watcher upgrade or registry change re-evaluates every held
-    directory once instead of trusting a decision made under the old rules.
-    """
-    rows = sorted(
-        (entry.name, entry.stat().st_size, entry.stat().st_mtime_ns, _file_sha256(entry))
-        for entry in comic_dir.iterdir()
-        if entry.is_file()
-    )
-    registry = getattr(_number_style_registry, "sha256", None)
-    payload = json.dumps([WATCHER_SOURCE_VERSION, registry, rows], ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _read_held_state() -> dict:
-    try:
-        state = json.loads(HELD_STATE_FILE.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError) as exc:
-        # An unreadable file only costs a re-processing pass; never fatal.
-        log.warning(f"  Held-directory state unreadable ({exc}); re-checking every directory.")
-        return {}
-    return state if isinstance(state, dict) else {}
-
-
-def _write_held_state(state: dict) -> None:
-    HELD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = HELD_STATE_FILE.with_name(HELD_STATE_FILE.name + ".tmp")
-    temporary.write_text(json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, HELD_STATE_FILE)
-
-
-def _held_directory_unchanged(comic_dir: Path) -> dict | None:
-    """The recorded entry when *comic_dir* still holds exactly what was held.
-
-    Re-processing a held directory re-reads and rewrites every archive in it
-    (minutes for a large series) only to hold the same files again. Any
-    change -- a file added, removed, replaced or rewritten -- gives a new
-    fingerprint and the directory is processed as normal.
-    """
-    with _held_state_lock:
-        entry = _read_held_state().get(str(comic_dir))
-    if not isinstance(entry, dict):
-        return None
-    try:
-        current = _held_fingerprint(comic_dir)
-    except OSError:
-        return None
-    return entry if entry.get("fingerprint") == current else None
-
-
-def _carried_second_copies(comic_dir: Path, paths) -> dict[Path, str]:
-    """Archives held as second copies on an earlier pass, still unchanged.
-
-    Once the kept copy has landed, the import folder alone no longer shows
-    the held copy as a second translation. Released, it would be named onto
-    the kept copy's library name and settled by keep-the-larger, which
-    quarantines one translation the operator never chose between. So a held
-    copy stays held while its name and bytes are
-    unchanged, whatever else arrives beside it. Maps path -> kept copy's name.
-    """
-    with _held_state_lock:
-        entry = _read_held_state().get(str(comic_dir))
-    recorded = entry.get("second_copies", {}) if isinstance(entry, dict) else {}
-    carried: dict[Path, str] = {}
-    for path in paths:
-        hold = recorded.get(path.name)
-        if not isinstance(hold, dict):
-            continue
-        try:
-            if _file_sha256(path) == hold.get("sha256"):
-                carried[path] = str(hold.get("kept", ""))
-        except OSError:
-            continue
-    return carried
-
-
-def _remember_held_directory(
-    comic_dir: Path, held: set[Path], second_copies: dict[Path, str]
-) -> None:
-    """Record what this pass held in *comic_dir*.
-
-    *second_copies* (held copy -> kept copy's name) are remembered by name
-    and content so a later pass keeps holding them (`_carried_second_copies`).
-
-    The directory itself is fingerprinted for skipping only when every
-    archive left in it is in *held*: an archive held on purpose this pass
-    (a refused name or a second copy). A directory that still holds any
-    other archive -- a move that failed, a tag-stripped arrival that met a
-    library book (that hold depends on the library, which the fingerprint
-    cannot see), a refusal that may clear by itself -- is retried every
-    pass, as before. A directory that emptied is forgotten.
-    """
-    try:
-        remaining = (
-            {p for p in comic_dir.iterdir() if p.is_file() and p.suffix.casefold() == ".cbz"}
-            if comic_dir.exists() else set()
-        )
-        record = bool(remaining) and remaining <= held
-        fingerprint = _held_fingerprint(comic_dir) if record else None
-        copies = {
-            path.name: {"sha256": _file_sha256(path), "kept": kept}
-            for path, kept in second_copies.items() if path in remaining
-        }
-    except OSError as exc:
-        log.warning(f"  Could not fingerprint held directory '{comic_dir}': {exc}")
-        return
-    with _held_state_lock:
-        state = _read_held_state()
-        key = str(comic_dir)
-        if record or copies:
-            state[key] = {
-                "fingerprint": fingerprint,
-                "held": sorted(p.name for p in remaining) if record else [],
-                "second_copies": copies,
-                "recorded": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        elif key not in state:
-            return
-        else:
-            del state[key]
-        try:
-            _write_held_state(state)
-        except OSError as exc:
-            log.warning(f"  Could not record held directory '{comic_dir}': {exc}")
-
-
 def process_and_move_directory(dir_path: Path) -> bool:
     """Claim the directory and run its recursive import pass.
 
@@ -2994,33 +2972,280 @@ def process_and_move_directory(dir_path: Path) -> bool:
     return True
 
 
-def _process_and_move_directory_inner(dir_path: Path) -> None:
-    # Clean the top-level watched directory name first.
-    clean_top    = clean_directory_name(dir_path.name)
-    if _media_naming_enabled():
-        base, reboot_year = split_series_year(dir_path.name)
-        if reboot_year is not None:
-            clean_top = f"{clean_directory_name(base) or base} ({reboot_year})"
-    old_dir_path = dir_path  # keep original for lock update
-    if clean_top and clean_top != dir_path.name:
-        new_top = dir_path.parent / clean_top
-        if new_top.exists():
-            log.warning(
-                f"  Could not rename top-level dir '{dir_path.name}': "
-                f"target '{clean_top}' already exists — continuing with original name."
-            )
+# ─────────────────────────────────────────────
+# CLAIM-FIRST PROCESSING (comic_automation.library.claims)
+# ─────────────────────────────────────────────
+# Claim folders being processed, mapped to the source folder each arrival
+# came from (the immediate child of WATCH_FOLDER) and its arrival path. A
+# claimed payload is no longer under WATCH_FOLDER, so _source_folder_name
+# and _arrival_path read what was recorded instead of re-deriving it from
+# the processing path.
+_claim_sources: dict[str, tuple[str, Path]] = {}
+_claim_sources_lock = threading.Lock()
+
+
+def _claim_context(comic_dir: Path) -> dict:
+    """What a claim records about where its arrival came from, before it moves."""
+    route_category, legacy_dest = _resolve_route(comic_dir)
+    watch = Path(WATCH_FOLDER)
+    try:
+        relative = str(comic_dir.relative_to(watch))
+    except ValueError:
+        relative = comic_dir.name
+    return {"watch_root": str(watch), "source": _source_folder_name(comic_dir),
+            "relative": relative, "route": [route_category, legacy_dest]}
+
+
+def _claimed_items(cbz_dirs: dict[Path, list[Path]], progress):
+    """Work items for ``_process_work``: each comic directory, claimed first.
+
+    A directory is claimed whole; a mixed drop point's loose archives are
+    claimed one by one (its subfolders are other series, claimed as their
+    own entries). A claim that cannot be made leaves the arrival untouched
+    and is retried on the next pass. With ``PROCESSING_ROOT`` None the
+    directory is processed in place.
+    """
+    for comic_dir, cbz_files in sorted(cbz_dirs.items()):
+        mixed = any(other != comic_dir and _is_subpath(other, comic_dir) for other in cbz_dirs)
+        if PROCESSING_ROOT is None:
+            yield comic_dir, cbz_files, None, False, mixed, _resolve_route(comic_dir)
+            continue
+        context = _claim_context(comic_dir)
+        if mixed:
+            claim = _claims.claim_files(comic_dir, cbz_files, PROCESSING_ROOT, context)
+        elif any(p.is_dir() for p in comic_dir.iterdir()):
+            # Its subfolders (a sync tool's history, say) are not the
+            # arrival's to take: claim its files and leave the folder.
+            files = sorted(p for p in comic_dir.iterdir() if p.is_file())
+            claim = _claims.claim_files(comic_dir, files, PROCESSING_ROOT, context, kind="files")
+            if claim is not None:
+                _remove_merged_source(comic_dir)  # empty dirs go, excluded history stays
         else:
+            claim = _claims.claim_directory(comic_dir, PROCESSING_ROOT, context)
+        if claim is None:
+            log.warning(f"  Could not claim '{comic_dir.name}' (record or rename failed); "
+                        f"left untouched, retried on the next pass.")
+            progress.step(len(cbz_files))
+            continue
+        log.info(f"  Claimed '{comic_dir.name}' -> {claim.dir}")
+        yield from _claim_item(claim, resumed=False)
+
+
+def _claim_item(claim: "_claims.Claim", *, resumed: bool):
+    """Yield one claim's payload for processing while owning the claim.
+
+    Before anything is processed the claim is marked started (a later run
+    then treats it as resumed: every archive protected), the payload is
+    re-inventoried and readiness-probed in processing (a late writer shows
+    here), and dispositions an earlier run recorded are carried out first.
+    Any of those failing leaves the claim as it is for a later attempt.
+    The claim is retired once nothing of the arrival is left in it.
+    """
+    lock = _claims.OwnerLock(claim.dir)
+    if not lock.acquire():
+        log.info(f"  Claim {claim.id} is owned by another watcher; skipped.")
+        return
+    try:
+        payload = claim.payload
+        if payload is None:
+            return
+        resumed = resumed or bool(claim.record.get("started"))
+        claim.record["started"] = True
+        try:
+            claim.save()
+        except OSError as e:
+            log.error(f"  Claim {claim.id}: record not writable ({e}); nothing processed.")
+            return
+        cbz_files = sorted(p for p in payload.iterdir()
+                           if p.is_file() and p.suffix.casefold() == ".cbz")
+        if not cbz_files:
+            return
+        readiness = probe_cbz_directory_readiness(cbz_files)
+        if readiness.status != ZipReadiness.READY:
+            log.info(f"  Claim {claim.id}: {readiness.ready_count}/{readiness.archive_count} "
+                     f"archive(s) ready; waiting in processing.")
+            return
+        if not _dispose_recorded(claim):
+            return
+        if resumed:
+            for folder in claim.record.get("dest_folders", []):
+                _clear_stale_landings(Path(folder))
+        cbz_files = [p for p in cbz_files if p.exists()]
+        key = os.path.normcase(str(claim.dir))
+        with _claim_sources_lock:
+            _claim_sources[key] = (
+                claim.record.get("source") or payload.name,
+                Path(claim.record.get("watch_root") or WATCH_FOLDER)
+                / (claim.record.get("relative") or payload.name))
+        try:
+            yield (claim.payload, cbz_files, claim, resumed,
+                   claim.record.get("kind") == "loose", tuple(claim.record.get("route") or ("", "")))
+        finally:
+            with _claim_sources_lock:
+                _claim_sources.pop(key, None)
+    finally:
+        lock.release()
+    _retire_claim(claim)
+
+
+def _retire_claim(claim: "_claims.Claim") -> None:
+    """Remove a claim once none of its arrival is left; otherwise report it."""
+    if not claim.dir.exists():
+        return
+    if _claims.has_arrival_files(claim.dir):
+        log.warning(f"  Claim {claim.id} unfinished: archive(s) remain in {claim.dir}; "
+                    f"resumed on the next pass.")
+        return
+    shutil.rmtree(claim.dir, ignore_errors=True)
+    log.info(f"  Claim {claim.id} complete.")
+
+
+def _resume_claims() -> None:
+    """Finish this watcher's unfinished claims, before any new arrival.
+
+    A claim folder whose record is missing or unreadable but which holds
+    files is preserved whole under review (``_unrecovered_claims``): what it
+    is cannot be trusted, and guessing could lose it. A claim folder with no
+    arrival left (its rename never happened, or its work is done) is
+    removed. A claim recorded for another watch root is left to its watcher.
+    """
+    if PROCESSING_ROOT is None:
+        return
+    items = _resumed_items()
+    with contextlib.closing(items):
+        _process_work(items, progress=ProgressReporter(0, "files"),
+                      shadow_results=[], shadow_handoffs=[])
+
+
+def _resumed_items():
+    watch_key = os.path.normcase(str(Path(WATCH_FOLDER)))
+    for claim_dir in _claims.claim_dirs(PROCESSING_ROOT):
+        record = _claims.read_record(claim_dir)
+        if record is None:
+            lock = _claims.OwnerLock(claim_dir)
+            if not lock.acquire():
+                continue
+            lock.release()  # the folder cannot be renamed while its lock file is open
+            if not _claims.has_arrival_files(claim_dir):
+                shutil.rmtree(claim_dir, ignore_errors=True)
+                continue
             try:
-                dir_path.rename(new_top)
-                log.info(f"  Directory renamed: '{dir_path.name}' -> '{clean_top}'")
-                dir_path = new_top
+                target = _claims.preserve_unrecoverable(claim_dir, REVIEW_ROOT)
+                log.critical(f"Claim {claim_dir.name} has no readable record; preserved "
+                             f"whole for review at {target}.")
             except OSError as e:
-                log.warning(f"  Could not rename top-level dir '{dir_path.name}': {e}")
-    # Update the processing-lock entry to use the new path so watchdog events
-    # fired by the rename (which reference the new path) are still suppressed.
-    with _processing_dirs_lock:
-        _processing_dirs.discard(old_dir_path)
-        _processing_dirs.add(dir_path)
+                log.critical(f"Claim {claim_dir.name} has no readable record and could not be "
+                             f"moved to review ({e}); left in processing.")
+            continue
+        if os.path.normcase(str(record.get("watch_root", ""))) != watch_key:
+            continue
+        claim = _claims.Claim(claim_dir, record)
+        if not _claims.has_arrival_files(claim_dir):
+            _retire_claim(claim)
+            continue
+        log.info(f"Resuming claim {claim.id} ({record.get('relative')}).")
+        yield from _claim_item(claim, resumed=True)
+
+
+def _ai_custody(claim: "_claims.Claim | None", name: str) -> dict | None:
+    """What the claim recorded about *name*'s AI rewrite, if anything."""
+    if claim is None:
+        return None
+    return (claim.record.get("ai") or {}).get(name)
+
+
+def _note_ai(claim: "_claims.Claim | None", name: str | None, entry: dict | None) -> bool:
+    """Record AI custody for *name* (None clears all). False if it could not be saved.
+
+    Written before the rewrite starts and again with the backup once it is
+    done, so a resumed claim never repeats the rewrite and always knows
+    where the original went. In place there is nothing to record.
+    """
+    if claim is None:
+        return True
+    custody = claim.record.setdefault("ai", {})
+    if name is None:
+        custody.clear()
+    else:
+        custody[name] = entry
+    try:
+        claim.save()
+    except OSError as e:
+        log.error(f"    Claim {claim.id}: AI custody not recorded ({e}).")
+        return False
+    return True
+
+
+def _dispose(claim: "_claims.Claim | None", planned: dict, series: str,
+             disposed: set) -> bool:
+    """Move each planned archive to review or quarantine; False if any could not.
+
+    With a claim, the decisions are written to its record first, so a crash
+    between deciding and moving is finished by the next run
+    (``_dispose_recorded``) before anything else of the claim is touched.
+    A failed move leaves that archive where it is, still held.
+    """
+    if claim is not None:
+        record = claim.record.setdefault("dispositions", {})
+        for path, (to, reason) in planned.items():
+            record[path.name] = {"to": to, "reason": reason, "series": series}
+        try:
+            claim.save()
+        except OSError as e:
+            log.error(f"    Claim {claim.id}: decisions not recorded ({e}); nothing moved.")
+            return False
+    ok = True
+    for path, (to, reason) in planned.items():
+        root = QUARANTINE_ROOT if to == "quarantine" else REVIEW_ROOT
+        try:
+            target = _claims.place(path, root, series)
+        except OSError as e:
+            log.error(f"    Could not move '{path.name}' to {to} ({e}); it stays held.")
+            ok = False
+            continue
+        disposed.add(path)
+        log.warning(f"    {to.upper()}: '{path.name}' ({reason}) -> {target}")
+        if claim is not None:
+            claim.record["dispositions"].pop(path.name, None)
+    if claim is not None:
+        try:
+            claim.save()
+        except OSError:
+            pass  # the next run finds the moved archives gone and drops them
+    return ok
+
+
+def _dispose_recorded(claim: "_claims.Claim") -> bool:
+    """Carry out dispositions an earlier run recorded but did not finish."""
+    planned = claim.record.get("dispositions") or {}
+    payload = claim.payload
+    pending = {}
+    for name, plan in list(planned.items()):
+        path = payload / name if payload is not None else None
+        if path is None or not path.exists():
+            planned.pop(name, None)
+            continue
+        pending[path] = (plan.get("to", "review"), plan.get("reason", "recorded decision"))
+        series = plan.get("series") or payload.name
+    if not pending:
+        return True
+    return _dispose(claim, pending, series, set())
+
+
+def _process_and_move_directory_inner(dir_path: Path) -> None:
+    """Claim each comic directory under *dir_path* and process it outside the watch folder.
+
+    Unfinished claims are resumed first: their arrivals were accepted before
+    this one. Each comic directory is then claimed (``_claimed_items``):
+    moved out of the MEGA-synced watch folder by one same-volume rename
+    before anything changes it. A mixed drop point's loose archives are
+    claimed one by one; its subfolders are other series, claimed on their
+    own. Nothing in the watch folder is renamed or rewritten.
+
+    With ``PROCESSING_ROOT`` None (direct callers only) each directory is
+    processed in place, with the same dispositions.
+    """
+    _resume_claims()
 
     log.info("=" * 60)
     log.info(f"Scanning: {dir_path.name}")
@@ -3049,18 +3274,44 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
     # long-running watcher never accumulates a record per directory.
     shadow_results: list = []
     shadow_handoffs: list = []
+    items = _claimed_items(cbz_dirs, progress)
+    with contextlib.closing(items):
+        total_processed, total_renamed, total_skipped = _process_work(
+            items, progress=progress, shadow_results=shadow_results,
+            shadow_handoffs=shadow_handoffs)
 
-    for comic_dir, cbz_files in sorted(cbz_dirs.items()):
-        unchanged = _held_directory_unchanged(comic_dir)
-        if unchanged is not None:
-            log.info(
-                f"  Skipping '{comic_dir.name}': its {len(unchanged.get('held', []))} "
-                f"held archive(s) are unchanged since {unchanged.get('recorded')}. "
-                f"Change a file, or remove its entry from {HELD_STATE_FILE}, to retry."
-            )
-            progress.step(len(cbz_files))
-            continue
-        route_category, legacy_dest = _resolve_route(comic_dir)
+
+    log.info(
+        f"  Batch complete — {total_processed} processed, "
+        f"{total_renamed} renamed, {total_skipped} skipped."
+    )
+    # Reported whenever shadow is running, not only when something was
+    # classified. If every classification fails, the errors are logged but the
+    # pass summary would otherwise vanish -- and a missing summary reads as
+    # "shadow was off", which is exactly the wrong conclusion.
+    if _router is not None and _router.enabled:
+        from scripts.cbz_watcher_router import summarise
+        log.info(summarise(shadow_results))
+        from scripts.cbz_shadow_handoff import summarise as summarise_handoffs
+        log.info(summarise_handoffs(shadow_handoffs))
+
+
+def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[int, int, int]:
+    """Process comic directories: name, decide, dispose of holds, land the rest.
+
+    Each item is ``(comic_dir, cbz_files, claim, resumed, mixed_parent,
+    route)``: a claim's payload (``claim`` set) or a directory in place.
+    Archives that need a decision go to review and unneeded second
+    translations to quarantine (``_dispose``) **before** anything lands, so a
+    held copy can never enter a merge. With a claim, each decision is written
+    to its record first, so a crash between deciding and moving cannot lose
+    it. *resumed* (a claim an earlier run started) protects every archive: a
+    decision that run made but never recorded must not be settled by
+    keep-the-larger. Returns (processed, renamed, skipped).
+    """
+    total_processed = total_skipped = total_renamed = 0
+    for comic_dir, cbz_files, claim, resumed, mixed_parent, route in items:
+        route_category, legacy_dest = route
         incoming_series_alias = comic_dir.name
         clean_dir_name = clean_directory_name(comic_dir.name)
         if _media_naming_enabled():
@@ -3076,49 +3327,19 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
         )
 
         # A directory that has .cbz files sitting directly inside it *and* also
-        # contains subdirectories that themselves hold .cbz files (each already
-        # its own entry in cbz_dirs) is a mixed drop point, not a single series
-        # folder — e.g. a source folder like "HentaiNexus" with a few loose
-        # files alongside dozens of per-title subfolders. Moving such a
-        # directory wholesale would sweep every unrelated subdirectory along
-        # with it, and the later loop iterations for those subdirectories would
-        # then find nothing left to move (they'd all report "already moved").
-        has_nested_comic_dirs = any(
-            other != comic_dir and _is_subpath(other, comic_dir)
-            for other in cbz_dirs
-        )
-
-        if has_nested_comic_dirs:
-            # Do not rename/merge the mixed drop-point directory itself here —
-            # it still holds subdirectories that belong to other cbz_dirs
-            # entries, and renaming it out from under them would invalidate
-            # those entries' paths. Only its loose files are handled below.
-            pass
-        elif not clean_dir_name:
-            log.warning(f"  Skipping rename: cleaning '{comic_dir.name}' produced an empty name.")
-        elif clean_dir_name != comic_dir.name:
-            new_dir_path = comic_dir.parent / clean_dir_name
-            if new_dir_path.exists():
-                log.warning(
-                    f"  Rename skipped: target already exists '{clean_dir_name}' "
-                    f"— merging '{comic_dir.name}' into it."
-                )
-                _merge_directories(
-                    comic_dir,
-                    new_dir_path,
-                    conflict_quarantine_root=conflict_quarantine_root,
-                )
-                try:
-                    comic_dir.rmdir()
-                except OSError:
-                    pass
-                cbz_files = sorted(new_dir_path.glob("*.cbz"))
-                comic_dir = new_dir_path
-            else:
-                comic_dir.rename(new_dir_path)
+        has_nested_comic_dirs = mixed_parent
+        if (claim is not None and not mixed_parent and clean_dir_name
+                and clean_dir_name != comic_dir.name):
+            # Inside the claim nothing else shares the folder, so its name is
+            # cleaned by a plain rename. The watch folder is never renamed.
+            cleaned = comic_dir.parent / clean_dir_name
+            try:
+                comic_dir.rename(cleaned)
                 log.info(f"  Directory renamed: '{comic_dir.name}' -> '{clean_dir_name}'")
-                cbz_files = [new_dir_path / f.name for f in cbz_files]
-                comic_dir = new_dir_path
+                cbz_files = [cleaned / f.name for f in cbz_files]
+                comic_dir = cleaned
+            except OSError as e:
+                log.warning(f"  Could not clean the name '{comic_dir.name}': {e}")
 
         empty_stem_files = [
             cbz for cbz in cbz_files
@@ -3132,9 +3353,6 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 fallback_names[cbz] = f"{comic_dir.name} {i}.cbz"
 
         log.info(f"  Processing directory: {comic_dir.name} ({len(cbz_files)} file(s)) -> {dest_folder}")
-        # Each arrival's (size, mtime) before this pass rewrites any of them;
-        # see the _remember_held_directory call below.
-        arrival_stats = {cbz: _size_and_mtime(cbz) for cbz in cbz_files}
         parsed_by_path: dict[Path, ParsedComicName] = {}
         media_originals = {}
         ai_decensor_backups: list[tuple[Path, Path]] = []
@@ -3146,6 +3364,10 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 f"    AI decensor skipped: destination is not under a Comix "
                 f"directory ({dest_folder})"
             )
+        # Archives whose AI rewrite an earlier run started but never recorded
+        # as finished: their state is unknown, so they go to review.
+        ai_unknown: set[Path] = set()
+        abandon = False
         for cbz in cbz_files:
             try:
                 if not cbz.exists():
@@ -3164,24 +3386,48 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         media_originals[cbz] = _media_fr.archive_facts_from_file(cbz)
                     except (OSError, ValueError, zipfile.BadZipFile) as exc:
                         log.warning("    REVIEW: cannot bind original media facts for %s: %s", cbz, exc)
-                        return
+                        abandon = True
+                        break
                 result_path, parsed = process_cbz_file(cbz, override_name=override)
                 total_processed += 1
                 if result_path.name != original_name:
                     total_renamed += 1
                 if parsed is not None:
                     if ai_decensor_this_directory:
-                        backup_path = run_ai_decensor(result_path, dest_folder)
-                        if backup_path is not None:
-                            ai_decensor_backups.append((result_path, backup_path))
+                        recorded = _ai_custody(claim, result_path.name)
+                        if recorded is not None and recorded.get("done"):
+                            # An earlier run of this claim decensored it: never
+                            # repeat destructive processing on a resume.
+                            if recorded.get("backup"):
+                                ai_decensor_backups.append(
+                                    (result_path, Path(recorded["backup"])))
+                        elif recorded is not None:
+                            ai_unknown.add(result_path)
+                        elif not _note_ai(claim, result_path.name, {"started": True}):
+                            # Custody before the rewrite: if it cannot be
+                            # recorded, nothing is rewritten.
+                            abandon = True
+                            break
+                        else:
+                            backup_path = run_ai_decensor(result_path, dest_folder)
+                            _note_ai(claim, result_path.name, {
+                                "started": True, "done": True,
+                                "backup": str(backup_path) if backup_path else None})
+                            if backup_path is not None:
+                                ai_decensor_backups.append((result_path, backup_path))
                     parsed_by_path[result_path] = parsed
             except AiDecensorError as exc:
                 log.error(f"    AI decensor failed for {cbz.name}: {exc}")
                 log.error("    Directory import stopped; completed AI replacements are being restored.")
                 restore_ai_decensor_backups(ai_decensor_backups)
-                return
+                _note_ai(claim, None, None)  # the originals are back in place
+                abandon = True
+                break
             finally:
                 progress.step()
+
+        if abandon:
+            continue
 
         # Route per-chapter folders ("Berserk Ch. 4") into a single series folder
         # ("Berserk") instead of creating one destination directory per chapter.
@@ -3276,11 +3522,6 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     path: getattr(parsed, "original_path", path)
                     for path, parsed in parsed_by_path.items()
                 }
-                # Second copies held on an earlier pass stay held while
-                # unchanged: their kept copies have landed, so this pass alone
-                # would no longer see them as second copies.
-                carried = _carried_second_copies(comic_dir, list(parsed_by_path))
-                carried_entries = {path: parsed_by_path.pop(path) for path in carried}
                 # Second copies of a chapter are set aside before naming, so
                 # media naming cannot give one copy the other's name. A kept
                 # copy that naming then refuses cannot stand in for the rest:
@@ -3302,10 +3543,33 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                                            dest_folder, dir_number, transient)
                     parsed_by_path.update(released)
                 parsed_by_path.update(set_aside)
-                parsed_by_path.update(carried_entries)
                 second_copies = {path: kept.name for path, kept in duplicates.items()}
-                second_copies.update(carried)
-                held = refused | set(second_copies)
+                # Decisions, made before anything lands: a refusal that can
+                # clear by itself (a locked file) stays to be retried; every
+                # other refusal, and an archive of unknown AI state, needs the
+                # operator (review); an unneeded second translation goes to
+                # quarantine.
+                unknown_origins = {origins.get(p, p) for p in ai_unknown}
+                retry = refused & transient
+                unknown_ai = {
+                    p for p, parsed in parsed_by_path.items()
+                    if getattr(parsed, "original_path", p) in unknown_origins}
+                review = (refused - transient) | unknown_ai
+                held = retry | review | set(second_copies)
+                # Every other copy of a duplicated chapter is protected where it
+                # lands, and on a resumed claim every archive is: a collision
+                # with a different library book is then held for review,
+                # never settled by keep-the-larger.
+                cluster_origins = {
+                    origins.get(path, path) for cluster in clusters for path, _ in cluster}
+                protected = frozenset(
+                    path for path, parsed in parsed_by_path.items()
+                    if path not in held and (
+                        resumed or getattr(parsed, "original_path", path) in cluster_origins))
+                # The movers report each archive they hold on a collision with
+                # a different book; those are decisions, sent to review below.
+                collision_holds: set[Path] = set()
+                protected_option = {"protected": protected, "holds": collision_holds}
                 ai_backups = _rekey_ai_backups(
                     ai_decensor_backups, origins, parsed_by_path)
                 # Read after the fallback renames, which change paths. Passed
@@ -3316,17 +3580,33 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                 stripped_option = (
                     {"stripped_arrivals": stripped} if stripped else {}
                 )
-                if held:
-                    log.warning(
-                        f"  Holding {len(held)} of {len(parsed_by_path)} archive(s) of "
-                        f"'{comic_dir.name}' in the import folder for review; "
-                        f"the rest move as normal.")
-                    for path in sorted(refused):
-                        log.warning(f"    HELD (name refused, see REVIEW above): {path.name}")
-                    for path, kept in sorted(second_copies.items()):
-                        log.warning(f"    HELD (second copy of '{kept}'): {path.name}")
+                planned = {path: ("review", "name refused, see REVIEW above")
+                           for path in review - unknown_ai}
+                planned.update({path: ("review", "AI rewrite of unknown state")
+                                for path in unknown_ai})
+                planned.update({path: ("quarantine", f"second copy of '{kept}'")
+                                for path, kept in second_copies.items()})
+                if claim is not None and str(dest_folder) not in claim.record.get("dest_folders", []):
+                    # Lets a resumed claim find and clear its own crashed
+                    # landings there (_clear_stale_landings).
+                    claim.record.setdefault("dest_folders", []).append(str(dest_folder))
+                    try:
+                        claim.save()
+                    except OSError:
+                        pass  # only that automatic clean-up depends on it
+                disposed: set[Path] = set()
+                blocked = bool(planned) and not _dispose(claim, planned, series_name, disposed)
+                if retry:
+                    log.warning(f"  {len(retry)} archive(s) of '{comic_dir.name}' refused for "
+                                f"a reason that may clear by itself; retried later.")
 
-                if has_nested_comic_dirs:
+                if blocked:
+                    # A decision could not be recorded or carried out. Nothing
+                    # lands this pass: every archive stays where it is.
+                    log.error(f"  Nothing from '{comic_dir.name}' lands this pass: a hold "
+                              f"could not be moved aside; retried later.")
+                    landed = None
+                elif has_nested_comic_dirs:
                     log.warning(
                         f"  '{comic_dir.name}' has loose .cbz file(s) alongside subdirectories that "
                         f"have their own .cbz files — moving only the loose files, not the whole "
@@ -3347,15 +3627,15 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                     )
                     landed = _move_loose_files(
                         archives, dest_folder, series_name,
-                        **loose_options, **stripped_option,
+                        **loose_options, **stripped_option, **protected_option,
                     ) if archives else None
                     _note_move(series_name, dest_folder, landed)
                 elif held and all(path in held for path in parsed_by_path):
-                    # Nothing to move: creating the series folder for no
+                    # Nothing to land: creating the series folder for no
                     # archive would only leave an empty directory behind.
                     log.warning(
-                        f"  Deferred '{comic_dir.name}' for review: all "
-                        f"{len(held)} archive(s) held; left in the import folder.")
+                        f"  Nothing from '{comic_dir.name}' lands: all "
+                        f"{len(held)} archive(s) held.")
                     landed = None
                 else:
                     # A refused placeholder kept its generic name. Merging it
@@ -3382,6 +3662,7 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                         **move_options,
                         **stripped_option,
                         **held_option,
+                        **protected_option,
                     )
                     _note_move(series_name, dest_folder, landed)
                 if (
@@ -3405,43 +3686,30 @@ def _process_and_move_directory_inner(dir_path: Path) -> None:
                             f"  Series registry update failed for '{landed.name}': "
                             f"{type(e).__name__}: {e}"
                         )
+                if collision_holds and not blocked:
+                    # Held on a collision with a different book (protected, or a
+                    # stripped tag, issue #131), whether or not anything else
+                    # landed. The library copy is untouched; which to keep is
+                    # the operator's call. Anything else still here (a deferral
+                    # or a failed move) stays in processing and is retried.
+                    collided = {
+                        path: ("review", "collides with a different library book")
+                        for path in sorted(collision_holds) if path.exists()}
+                    if collided:
+                        _dispose(claim, collided, series_name, disposed)
+            # A disposed archive's AI original stays on C: (it did not land).
+            for archive, backup in ai_backups:
+                if archive in disposed:
+                    log.warning(f"    AI original kept on C: for '{archive.name}': {backup}")
+            ai_backups = [(a, b) for a, b in ai_backups if a not in disposed]
             archive_completed_ai_backups(_routed_ai_backups(ai_backups, landed), landed)
-            # Remembered only after the pass completed: a deferral for an
-            # unstable identity (below) is transient and must be retried.
-            # So is a refusal that can clear by itself (a locked file), which
-            # is left out of the deliberate holds so the directory is retried.
-            # Tag-stripped arrivals are not passed: a deferred rename is only
-            # a plan, and a collision hold depends on the library, which the
-            # directory fingerprint cannot see. Nor is an archive this pass
-            # rewrote (ComicInfo, AI decensor): it was judged on its facts
-            # before the rewrite, and the next pass must judge the new ones.
-            # Once a pass leaves it unchanged, its hold is remembered.
-            rewritten = {
-                path for path in held
-                if _size_and_mtime(path) != arrival_stats.get(origins.get(path, path))
-            }
-            _remember_held_directory(comic_dir, held - transient - rewritten, second_copies)
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
             # nothing was mutated, the arrival is still in the watch folder,
             # and the next settle pass retries against a quieter library.
             log.error(f"  Deferred '{comic_dir.name}': {e}")
             continue
-
-    log.info(
-        f"  Batch complete — {total_processed} processed, "
-        f"{total_renamed} renamed, {total_skipped} skipped."
-    )
-    # Reported whenever shadow is running, not only when something was
-    # classified. If every classification fails, the errors are logged but the
-    # pass summary would otherwise vanish -- and a missing summary reads as
-    # "shadow was off", which is exactly the wrong conclusion.
-    if _router is not None and _router.enabled:
-        from scripts.cbz_watcher_router import summarise
-        log.info(summarise(shadow_results))
-        from scripts.cbz_shadow_handoff import summarise as summarise_handoffs
-        log.info(summarise_handoffs(shadow_handoffs))
-
+    return total_processed, total_renamed, total_skipped
 
 # ─────────────────────────────────────────────
 # PATH HELPERS
@@ -4025,6 +4293,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--quarantine-root", type=Path, default=QUARANTINE_ROOT,
         help="Where a file-name collision's losing copy is moved (never deleted).",
     )
+    parser.add_argument(
+        "--processing-root", type=Path, default=PROCESSING_ROOT,
+        help="Where arrivals are claimed and processed, outside the watch folder "
+             "and on its volume.",
+    )
+    parser.add_argument(
+        "--review-root", type=Path, default=REVIEW_ROOT,
+        help="Where archives needing a decision are moved; never purged.",
+    )
     parser.add_argument("--camelia-root", type=Path, default=CAMELIA_ROOT)
     parser.add_argument("--camelia-python", type=Path, default=CAMELIA_PYTHON)
     parser.add_argument(
@@ -4095,7 +4372,7 @@ def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
     """Apply session globals only after exclusive root ownership is held."""
     global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
-    global QUARANTINE_ROOT
+    global QUARANTINE_ROOT, PROCESSING_ROOT, REVIEW_ROOT
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
     global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
@@ -4113,6 +4390,8 @@ def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
     CAMELIA_ROOT = args.camelia_root
     CAMELIA_PYTHON = args.camelia_python
     QUARANTINE_ROOT = args.quarantine_root
+    PROCESSING_ROOT = args.processing_root
+    REVIEW_ROOT = args.review_root
     AI_DECENSOR_BACKUP_DIR = args.ai_decensor_backup_dir
     AI_DECENSOR_ARCHIVE_DIR = args.ai_decensor_archive_dir
     SERIES_RESOLVER_ENABLED = args.series_resolver
@@ -4192,7 +4471,29 @@ def _watch_session(args: argparse.Namespace, watch_path: Path, tracker: Director
 
     if tracker.stop_requested():
         return
-    _clean_up_stale_rewrite_files(watch_path)
+    if PROCESSING_ROOT is not None:
+        library_roots = [*_routing_destinations.values(), _routing_default,
+                         *SERIES_RESOLVER_ROOTS.values()]
+        try:
+            _claims.validate_roots(watch_path, PROCESSING_ROOT, REVIEW_ROOT,
+                                   QUARANTINE_ROOT, library_roots)
+        except _claims.ClaimConfigError as exc:
+            # Claiming would not be a same-volume rename outside the synced
+            # folder; working around it would change watched content first.
+            log.critical(f"Refusing to start: {exc}")
+            raise WatcherInstanceRefused(f"unsafe claim roots: {exc}") from exc
+        log.info(f"  Processing: {PROCESSING_ROOT}")
+        log.info(f"  Review    : {REVIEW_ROOT}")
+        log.info(f"  Quarantine: {QUARANTINE_ROOT} (purged after "
+                 f"{_claims.QUARANTINE_RETENTION_DAYS} days)")
+        for purged in _claims.purge_quarantine(QUARANTINE_ROOT):
+            log.info(f"  Quarantine purged: {purged}")
+        # Rewrites happen in claims now; the synced folder is never touched.
+        PROCESSING_ROOT.mkdir(parents=True, exist_ok=True)
+        _clean_up_stale_rewrite_files(PROCESSING_ROOT)
+        _resume_claims()
+    else:
+        _clean_up_stale_rewrite_files(watch_path)
 
     _discover_startup_directories(watch_path, tracker)
 
