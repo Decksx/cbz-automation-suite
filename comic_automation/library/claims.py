@@ -32,7 +32,11 @@ Contracts (PR replacing #175; Codex review, 2026-11-09):
    whole under ``review/_unrecovered_claims`` rather than guessed at. A
    recreated source path is a new arrival; it never affects an old claim.
 3. Each claim has one owner at a time (``OwnerLock``), also across watcher
-   roots sharing a processing root.
+   roots sharing a processing root, for its whole life: the creator takes
+   it before the record exists and keeps it through the rename (handing it
+   to the processing that follows), and a claim is retired only by its
+   owner, which re-checks under ownership that no arrival file is left. A
+   claim that looks empty is not proof its creator crashed (PR #177 review).
 4. Retention purges quarantine only, by placement date; processing and
    review are never purged.
 """
@@ -138,6 +142,7 @@ class Claim:
 
     dir: Path
     record: dict
+    owner: "OwnerLock | None" = None  # held from creation until handed on
 
     @property
     def id(self) -> str:
@@ -157,19 +162,35 @@ class Claim:
     def save(self) -> None:
         write_record(self.dir, self.record)
 
+    def release(self) -> None:
+        """Let go of the ownership taken at creation, if still held."""
+        if self.owner is not None:
+            self.owner.release()
+            self.owner = None
+
 
 def _new_claim(processing_root: Path, context: dict) -> Claim:
+    """Create a claim folder, owned before its record exists. Raises OSError.
+
+    The owner lock is the folder's first file, so no other party can retire
+    the claim while it is being published and filled. A folder that another
+    party retired between ``mkdir`` and the lock fails here (the lock file
+    cannot be created in a removed folder) and nothing has moved.
+    """
     claim_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:10]
     claim_dir = processing_root / claim_id
     claim_dir.mkdir(parents=True)
+    owner = OwnerLock(claim_dir)
+    if not owner.acquire():
+        raise OSError(f"claim folder {claim_dir} could not be owned")
     record = {"version": RECORD_VERSION, "id": claim_id, "state": "claiming",
               "created": time.strftime("%Y-%m-%d %H:%M:%S"), **context}
     try:
         write_record(claim_dir, record)
     except OSError:
-        shutil.rmtree(claim_dir, ignore_errors=True)
+        retire(claim_dir, owner)
         raise
-    return Claim(claim_dir, record)
+    return Claim(claim_dir, record, owner)
 
 
 def has_arrival_files(claim_dir: Path) -> bool:
@@ -178,10 +199,48 @@ def has_arrival_files(claim_dir: Path) -> bool:
                for p in claim_dir.rglob("*"))
 
 
+def retire(claim_dir: Path, owner: "OwnerLock | None" = None) -> bool:
+    """Remove a claim folder that holds no arrival file; True if removed.
+
+    Only an owner retires a claim: *owner* (already held, and released here
+    whatever happens) or, without one, the lock taken now; a claim owned
+    elsewhere is left. Emptiness is checked while owning it, and everything
+    but the lock goes while it is still held. After the release only the
+    lock file and the folder are removed, each without recursion, so a
+    creator or resumer that takes the lock in between keeps its folder: its
+    open lock file cannot be deleted, and the folder is then not empty.
+    """
+    if owner is None:
+        owner = OwnerLock(claim_dir)
+        if not owner.acquire():
+            return False
+    try:
+        if has_arrival_files(claim_dir):
+            return False
+        for entry in claim_dir.iterdir():
+            if entry.name == LOCK_NAME:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+    except OSError:
+        return False
+    finally:
+        owner.release()
+    try:
+        (claim_dir / LOCK_NAME).unlink(missing_ok=True)
+        claim_dir.rmdir()
+    except OSError:
+        return False
+    return True
+
+
 def abandon(claim: Claim) -> None:
-    """Remove a claim that holds no arrival file (its rename never happened)."""
-    if not has_arrival_files(claim.dir):
-        shutil.rmtree(claim.dir, ignore_errors=True)
+    """Remove a claim whose rename never happened, releasing its creator's
+    ownership. A claim holding any arrival file is kept."""
+    owner, claim.owner = claim.owner, None
+    retire(claim.dir, owner)
 
 
 def claim_directory(series_dir: Path, processing_root: Path, context: dict) -> Claim | None:
@@ -189,6 +248,8 @@ def claim_directory(series_dir: Path, processing_root: Path, context: dict) -> C
 
     Returns None, with the arrival untouched, if the record cannot be
     written or the rename fails (an open file, say); the caller retries.
+    The claim returned is still owned (``Claim.owner``): the caller
+    processes it under that ownership or calls ``release``.
     """
     try:
         claim = _new_claim(processing_root, {**context, "kind": "directory",
@@ -217,15 +278,20 @@ def claim_files(parent: Path, files: list[Path], processing_root: Path,
     holds subfolders (a sync tool's history, say) which are not the
     arrival's to take. A rename that fails stops the claim there; files
     already moved are claimed and the rest are left untouched for a later
-    claim. None when nothing was claimed.
+    claim. None when nothing was claimed. The claim returned is still owned,
+    as for ``claim_directory``.
     """
     try:
         claim = _new_claim(processing_root, {**context, "kind": kind,
                                              "payload_name": parent.name,
                                              "files": [f.name for f in files]})
-        payload = claim.dir / parent.name
+    except OSError:
+        return None
+    payload = claim.dir / parent.name
+    try:
         payload.mkdir()
     except OSError:
+        abandon(claim)
         return None
     for path in files:
         try:
