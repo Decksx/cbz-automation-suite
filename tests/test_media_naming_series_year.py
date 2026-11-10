@@ -152,9 +152,16 @@ def import_issue(tmp_path, monkeypatch):
             archive(arrival / name, ci)
         watcher.process_and_move_directory(arrival)
         landed = {str(p.relative_to(dest)).replace("\\", "/"): p for p in dest.rglob("*.cbz")}
-        left = sorted(p.name for p in intake.rglob("*.cbz"))
+        left = sorted(p.name for p in _unlanded(intake))
         return landed, left
     return run
+
+
+def _unlanded(intake: Path) -> list[Path]:
+    """Archives not in the library: the import folder, a claim still in
+    processing (retried), or review (held). Claim-first moves them out."""
+    roots = (intake, Path(watcher.PROCESSING_ROOT), Path(watcher.REVIEW_ROOT))
+    return sorted(p for root in roots if root.exists() for p in root.rglob("*.cbz"))
 
 
 @pytest.mark.parametrize("folder,name,expected", [
@@ -194,9 +201,10 @@ def test_comicinfo_confirmed_series_year_names_the_reboot_in_a_plain_folder(impo
     ("Batman (2016)", "Batman #003.cbz", {"Series": "Batman", "Number": "3", "Volume": "2011"}),
     ("Batman", "Batman (2016) #003.cbz", {"Series": "Batman (2011)", "Number": "3"}),
 ])
-def test_conflicting_series_years_stay_in_intake(import_issue, folder, name, ci):
+def test_conflicting_series_years_go_to_review(import_issue, folder, name, ci):
     landed, left = import_issue(folder, [(name, ci)])
     assert not landed and left == [name]
+    assert [p.name for p in Path(watcher.REVIEW_ROOT).rglob("*.cbz")] == [name]
 
 
 @pytest.mark.parametrize("name,ci", [
@@ -261,15 +269,18 @@ def test_a_failed_year_write_keeps_the_year_bearing_name_then_a_retry_lands(
         import_issue, failing_year_writes, tmp_path, name):
     landed, left = import_issue("Batman (2016)", [(name, None)])
     assert failing_year_writes["attempts"] == 5
-    # Nothing landed; the intake archive still names 2019 (the XML lacks it).
+    # Nothing landed; the claimed archive still names 2019 (the XML lacks it)
+    # and waits in processing, not review: a failed write is transient.
     assert not landed and len(left) == 1 and "(2019)" in left[0]
-    retained = next((tmp_path / "intake").rglob("*.cbz"))
+    retained, = _unlanded(tmp_path / "intake")
+    assert Path(watcher.PROCESSING_ROOT) in retained.parents
     assert "Year" not in comicinfo(retained)
-    # The lock clears; a retry (the watcher's next pass or a restart) lands it.
+    # The lock clears; a retry (the watcher's next pass or a restart) resumes
+    # the claim and lands it.
     failing_year_writes["on"] = False
-    watcher.process_and_move_directory(retained.parent)
+    watcher.process_and_move_directory(tmp_path / "intake" / "Batman (2016)")
     final = tmp_path / "Comix" / "Batman (2016)" / "Batman (2016) #003.cbz"
-    assert final.is_file() and not list((tmp_path / "intake").rglob("*.cbz"))
+    assert final.is_file() and not _unlanded(tmp_path / "intake")
     assert comicinfo(final)["Year"] == "2019"
     assert [p.name for p in (tmp_path / "Comix").rglob("*.cbz")] == [final.name]
 
