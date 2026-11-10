@@ -190,6 +190,65 @@ _RANGE_HEAD_RE = re.compile(r"(\d+(?:\.\d+)?)\s*" + _RANGE_SEP + r"\s*$")
 _RANGE_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*" + _RANGE_SEP + r"\s*(\d+(?:\.\d+)?)")
 
 
+# A range with its marker, as a name spells it: "Ch. 1-30", "#1-30",
+# "Vol. 1-3", "v01-03", "第1-30話", "1-3巻".
+_MARKED_RANGE_RE = re.compile(
+    r"(?:(?P<vol>vol(?:ume)?s?\.?|v)|(?P<ch>ch(?:ap(?:ter)?)?s?\.?|#|issues?)|第)?\s*"
+    r"(?P<range>\d+(?:\.\d+)?\s*" + _RANGE_SEP + r"\s*\d+(?:\.\d+)?)"
+    r"(?P<cjk>\s*[話话章回巻卷])?",
+    re.IGNORECASE,
+)
+
+
+def _marked_range(text: str) -> tuple[str, str] | None:
+    """The first ascending range in *text* with its kind, or None.
+
+    The kind is ``"vol"`` (``Vol. 1-3``, ``v01-03``, ``1-3巻``), ``"ch"``
+    (``Ch. 1-30``, ``#1-30``, ``第1-30話``) or ``""`` for a bare range.
+    """
+    for match in _MARKED_RANGE_RE.finditer(text):
+        span = _ascending_range(match.group("range"), anchored=True)
+        if span is None or span.end() != len(match.group("range")):
+            continue
+        cjk = (match.group("cjk") or "").strip()
+        if match.group("vol") or cjk in ("\u5dfb", "\u5377"):
+            return "vol", match.group("range")
+        return ("ch" if match.group("ch") or cjk else ""), match.group("range")
+    return None
+
+
+def _range_suffix(text: str) -> str:
+    """The first ascending range in *text* as a name suffix, or ``""``.
+
+    ``"... Ch. 1-30"`` gives ``"Ch. 1-30"``, a volume range ``"Vol. 1-3"``,
+    a bare range itself. A name rebuilt from parsed fields (the translated
+    title) carries it, since a range is never a chapter or volume field
+    (PR #180 review).
+    """
+    found = _marked_range(text)
+    if found is None:
+        return ""
+    kind, span = found
+    return {"vol": f"Vol. {span}", "ch": f"Ch. {span}"}.get(kind, span)
+
+
+def range_in(text: str) -> tuple[str, str] | None:
+    """The first ascending range in *text*, such as a folder name, or None.
+
+    For a name rebuilt from folder context (the watcher's fallback name for
+    a placeholder in ``Berserk Ch. 1-30``): the range labels the name, and
+    is never a chapter or volume field. Returns ``(kind, "N-M")``: the kind
+    is ``"vol"``, ``"ch"`` or ``""`` (bare), and the range is in the
+    canonical formatter's spelling (``1~30`` gives ``1-30``), the only
+    range form it accepts.
+    """
+    found = _marked_range(text)
+    if found is None:
+        return None
+    span = _ascending_range(found[1], anchored=True)
+    return found[0], f"{span.group(1)}-{span.group(2)}"
+
+
 def _ascending_range(text: str, at: int = 0, anchored: bool = False) -> re.Match | None:
     """The first ascending number range in *text* from *at* (at *at* when
     *anchored*), or None. A descending or equal pair is not a range."""
@@ -1692,6 +1751,10 @@ def parse_comic_name(
                         rebuilt = f"{english_stem} Ch. {chapter}"
                     elif volume:
                         rebuilt = f"{english_stem} Vol. {volume}"
+                    elif _range_suffix(raw_stem):
+                        # A range is never a field, so it is carried as it was
+                        # written: "Story Ch. 1-30", never "Story".
+                        rebuilt = f"{english_stem} {_range_suffix(raw_stem)}"
                     stem = rebuilt.strip() or stem
                     translated_stem = stem
 
