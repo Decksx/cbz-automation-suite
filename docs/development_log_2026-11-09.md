@@ -260,3 +260,10 @@ landing 2; an unlanded loose file is not a landing 1 (it failed nothing
 until a test of a name taken during the landing was added); a failed
 replacement restores the library copy 3; a failed quarantine removes only
 its own reservation 4.
+
+Round 1 verification at `cfca284` (this commit is docs only): full suite
+**5,080 passed / 10 skipped / 1 failed** (5,091 tests = 5,082 + 9). The
+failure is the known `tests/web` file-lock flake
+`test_alternating_overflow_compacts_map_and_physical_files`, which passes
+alone. Codex's two repro files pass 6/6 at this head. Watcher bare-LF still
+869.
