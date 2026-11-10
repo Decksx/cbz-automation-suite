@@ -20,6 +20,7 @@ import inspect
 import os
 import re
 import threading
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -165,6 +166,17 @@ _GROUP_CHAPTER_RE = re.compile(
     r"(?P<rest>\d[^_]*?)(?P<hash>(?:_[0-9a-f]{6})+)(?P<ext>\.[^.]+)$",
     re.IGNORECASE,
 )
+# The same layout without the hash: "<Group> Ch. 53.cbz", "<Group>_Chapter
+# 53.cbz". Without the downloader's hash the prefix could be a real series,
+# so it is dropped only when it is a known group (KNOWN_GROUPS_FILE).
+_KNOWN_GROUP_CHAPTER_RE = re.compile(
+    r"^(?P<group>.+?)[\s_]+(?:chapter|ch\.?|episode|ep\.?)\s*"
+    r"(?P<rest>\d.*?)(?P<ext>\.[^.]+)$",
+    re.IGNORECASE,
+)
+# Version-controlled list of known scanlation groups and source sites, one
+# per line; how to add one is written at the top of the file.
+KNOWN_GROUPS_FILE = Path(__file__).resolve().parents[1] / "config" / "known-groups.txt"
 GIBBERISH_RE = re.compile(
     r"^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}"
     r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -1548,9 +1560,53 @@ def _is_group_prefix(prefix: str) -> bool:
     """
     if any(char.isdigit() for char in prefix):
         return False
+    return not _is_structural_prefix(prefix)
+
+
+def _is_structural_prefix(prefix: str) -> bool:
+    """Whether *prefix* says where a chapter sits in a work (never a group).
+
+    A part marker, a canonical special word, a structural word, or a volume,
+    season, episode, part or chapter number (``S2``, ``V3``, ``E5``, ``P2``,
+    ``Ch 4``). Unlike the digit rule in ``_is_group_prefix``, nothing
+    overrides this, not even a listed known group.
+    """
     text = prefix.casefold()
-    return not (PART_MARKER_RE.search(text) or _SPECIAL_WORD_RE.search(text)
-                or _STRUCTURAL_WORD_RE.search(text))
+    return bool(
+        PART_MARKER_RE.search(text) or _SPECIAL_WORD_RE.search(text)
+        or _STRUCTURAL_WORD_RE.search(text)
+        or any(grammar.search(prefix) for grammar in (
+            _VOLUME_NUMBER_RE, _SEASON_NUMBER_RE, _EPISODE_NUMBER_RE,
+            _PART_NUMBER_RE, _CHAPTER_NUMBER_RE)))
+
+
+def _group_key(text: str) -> str:
+    """*text* for an exact group match: case, spacing and punctuation ignored."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold() if ch.isalnum())
+
+
+_known_groups_cache: tuple[tuple[str, float], frozenset[str]] | None = None
+
+
+def known_groups() -> frozenset[str]:
+    """The match keys of ``KNOWN_GROUPS_FILE``, re-read when the file changes.
+
+    A missing or unreadable file means no known groups: every arrival
+    without a downloader hash keeps today's name.
+    """
+    global _known_groups_cache
+    try:
+        stamp = (str(KNOWN_GROUPS_FILE), KNOWN_GROUPS_FILE.stat().st_mtime)
+        if _known_groups_cache is None or _known_groups_cache[0] != stamp:
+            lines = KNOWN_GROUPS_FILE.read_text(encoding="utf-8").splitlines()
+            keys = frozenset(
+                key for key in (_group_key(line) for line in lines
+                                if line.strip() and not line.lstrip().startswith("#"))
+                if key)
+            _known_groups_cache = (stamp, keys)
+        return _known_groups_cache[1]
+    except OSError:
+        return frozenset()
 
 
 def _without_group_prefix(name: str) -> str:
@@ -1559,14 +1615,25 @@ def _without_group_prefix(name: str) -> str:
     ``Alpha_Episode 42_2a8cb9.cbz`` becomes ``Chapter 42_2a8cb9.cbz``, which
     the stem pipeline names after the series folder (``<Series> Ch. 42``),
     exactly as a group-free ``Chapter 42_2a8cb9.cbz``. Episode and Ep. are
-    chapter tokens here. A prefix that is identity rather than a group
-    (``Vol. 3_``, ``Season 2_``, ``Part A_``, ``Side Story_``;
-    ``_is_group_prefix``) is kept, with the whole name.
+    chapter tokens here. Without the hash (``Mangakakalot Ch. 53.cbz``) the
+    prefix is dropped only when it is exactly a known group
+    (``known_groups``). Either way a prefix that is identity rather than a
+    group (``Vol. 3_``, ``Season 2_``, ``Part A_``, ``Side Story_``) is kept,
+    with the whole name. The one exception: a listed group may hold a digit
+    (``Manhwa18``; David, 2026-11-10), since the list names it exactly; the
+    structural checks (``_is_structural_prefix``) still win over the list.
     """
     match = _GROUP_CHAPTER_RE.match(name)
-    if match is None or not _is_group_prefix(match.group("group")):
+    if match is not None:
+        if not _is_group_prefix(match.group("group")):
+            return name
+        return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
+    match = _KNOWN_GROUP_CHAPTER_RE.match(name)
+    # An exact listed group overrides the digit rule only.
+    if (match is None or _is_structural_prefix(match.group("group"))
+            or _group_key(match.group("group")) not in known_groups()):
         return name
-    return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
+    return f"Chapter {match.group('rest')}{match.group('ext')}"
 
 
 def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
@@ -1787,7 +1854,8 @@ def parse_comic_name(
                     translated_stem = stem
 
     display = (
-        _display_stem(path.name, raw_stem, series, rules, translated_stem)
+        # The group-free name: a known group's prefix must not decide it either.
+        _display_stem(name, raw_stem, series, rules, translated_stem)
         if display_tokens
         else None
     )
