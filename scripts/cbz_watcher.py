@@ -3028,7 +3028,10 @@ def _claimed_items(cbz_dirs: dict[Path, list[Path]], progress):
             progress.step(len(cbz_files))
             continue
         log.info(f"  Claimed '{comic_dir.name}' -> {claim.dir}")
-        yield from _claim_item(claim, resumed=False)
+        try:
+            yield from _claim_item(claim, resumed=False)
+        finally:
+            claim.release()  # only if closed before processing took ownership over
 
 
 def _claim_item(claim: "_claims.Claim", *, resumed: bool):
@@ -3040,11 +3043,18 @@ def _claim_item(claim: "_claims.Claim", *, resumed: bool):
     here), and dispositions an earlier run recorded are carried out first.
     Any of those failing leaves the claim as it is for a later attempt.
     The claim is retired once nothing of the arrival is left in it.
+
+    A new claim arrives owned by its creator (``claims.claim_directory``),
+    which hands that ownership on here, so it is never unowned between its
+    publication and its retirement. A resumed claim is owned here, or left
+    to whoever owns it.
     """
-    lock = _claims.OwnerLock(claim.dir)
-    if not lock.acquire():
-        log.info(f"  Claim {claim.id} is owned by another watcher; skipped.")
-        return
+    lock, claim.owner = claim.owner, None
+    if lock is None:
+        lock = _claims.OwnerLock(claim.dir)
+        if not lock.acquire():
+            log.info(f"  Claim {claim.id} is owned by another watcher; skipped.")
+            return
     try:
         payload = claim.payload
         if payload is None:
@@ -3084,20 +3094,24 @@ def _claim_item(claim: "_claims.Claim", *, resumed: bool):
             with _claim_sources_lock:
                 _claim_sources.pop(key, None)
     finally:
-        lock.release()
-    _retire_claim(claim)
+        _retire_claim(claim, lock)
 
 
-def _retire_claim(claim: "_claims.Claim") -> None:
-    """Remove a claim once none of its arrival is left; otherwise report it."""
-    if not claim.dir.exists():
-        return
+def _retire_claim(claim: "_claims.Claim", owner: "_claims.OwnerLock | None" = None) -> None:
+    """Remove a claim once none of its arrival is left; otherwise report it.
+
+    Retiring needs the claim's ownership: *owner* (released here) or the
+    lock taken by ``claims.retire``, which re-checks emptiness under it. A
+    claim that only looks empty may be one its creator is still filling.
+    """
     if _claims.has_arrival_files(claim.dir):
+        if owner is not None:
+            owner.release()
         log.warning(f"  Claim {claim.id} unfinished: archive(s) remain in {claim.dir}; "
                     f"resumed on the next pass.")
         return
-    shutil.rmtree(claim.dir, ignore_errors=True)
-    log.info(f"  Claim {claim.id} complete.")
+    if _claims.retire(claim.dir, owner):
+        log.info(f"  Claim {claim.id} complete.")
 
 
 def _resume_claims() -> None:
@@ -3124,11 +3138,11 @@ def _resumed_items():
         if record is None:
             lock = _claims.OwnerLock(claim_dir)
             if not lock.acquire():
+                continue  # its creator (or another resumer) owns it
+            if not _claims.has_arrival_files(claim_dir):
+                _claims.retire(claim_dir, lock)  # re-checked while owned
                 continue
             lock.release()  # the folder cannot be renamed while its lock file is open
-            if not _claims.has_arrival_files(claim_dir):
-                shutil.rmtree(claim_dir, ignore_errors=True)
-                continue
             try:
                 target = _claims.preserve_unrecoverable(claim_dir, REVIEW_ROOT)
                 log.critical(f"Claim {claim_dir.name} has no readable record; preserved "
@@ -3166,6 +3180,7 @@ def _note_ai(claim: "_claims.Claim | None", name: str | None, entry: dict | None
     custody = claim.record.setdefault("ai", {})
     if name is None:
         custody.clear()
+        claim.record.pop("ai_naming", None)  # nothing left to follow
     else:
         custody[name] = entry
     try:
@@ -3174,6 +3189,54 @@ def _note_ai(claim: "_claims.Claim | None", name: str | None, entry: dict | None
         log.error(f"    Claim {claim.id}: AI custody not recorded ({e}).")
         return False
     return True
+
+
+def _mark_ai_naming(claim: "_claims.Claim | None") -> bool:
+    """Mark a claim holding AI custody before its archive names change.
+
+    Custody is keyed by archive name, and a pass renames archives
+    (``process_cbz_file``, then naming) before ``_rekey_ai_custody`` moves
+    the keys and clears the mark. A mark found by a later run means a name
+    may have changed unrecorded: archives under no custody entry then have
+    an unknown AI state (review), never a silent second rewrite. False when
+    the mark cannot be saved; nothing may be renamed then.
+    """
+    if claim is None or not claim.record.get("ai") or claim.record.get("ai_naming"):
+        return True
+    claim.record["ai_naming"] = True
+    try:
+        claim.save()
+    except OSError as e:
+        claim.record.pop("ai_naming", None)
+        log.error(f"    Claim {claim.id}: AI custody could not be marked ({e}); "
+                  f"nothing is renamed this pass.")
+        return False
+    return True
+
+
+def _rekey_ai_custody(claim: "_claims.Claim | None", origins: dict[Path, Path],
+                      parsed_by_path: dict) -> None:
+    """Move AI custody to each archive's name after naming, and clear the mark.
+
+    *origins* maps each pre-naming path to its ``original_path``, which
+    naming carries over (as for ``_rekey_ai_backups``). If the record cannot
+    be saved the mark stays, so a later run reviews what it cannot match.
+    """
+    if claim is None or not claim.record.get("ai_naming"):
+        return
+    current = {getattr(parsed, "original_path", path): path
+               for path, parsed in parsed_by_path.items()}
+    renamed = {before.name: current[origin].name for before, origin in origins.items()
+               if origin in current and current[origin].name != before.name}
+    claim.record["ai"] = {renamed.get(name, name): entry
+                          for name, entry in (claim.record.get("ai") or {}).items()}
+    claim.record.pop("ai_naming", None)
+    try:
+        claim.save()
+    except OSError as e:
+        claim.record["ai_naming"] = True
+        log.error(f"    Claim {claim.id}: AI custody not re-keyed after naming ({e}); "
+                  f"a resume reviews what it cannot match.")
 
 
 def _dispose(claim: "_claims.Claim | None", planned: dict, series: str,
@@ -3368,6 +3431,12 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
         # as finished: their state is unknown, so they go to review.
         ai_unknown: set[Path] = set()
         abandon = False
+        # A mark left by an earlier run (_mark_ai_naming): names may have
+        # changed since custody was recorded, so what matches no entry is
+        # reviewed. Marked again now if this pass may rename.
+        custody_unresolved = claim is not None and bool(claim.record.get("ai_naming"))
+        if not _mark_ai_naming(claim):
+            continue
         for cbz in cbz_files:
             try:
                 if not cbz.exists():
@@ -3395,6 +3464,11 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                 if parsed is not None:
                     if ai_decensor_this_directory:
                         recorded = _ai_custody(claim, result_path.name)
+                        if recorded is None and result_path.name != original_name:
+                            recorded = _ai_custody(claim, original_name)
+                            if recorded is not None:  # renamed just now: custody follows
+                                claim.record["ai"][result_path.name] = (
+                                    claim.record["ai"].pop(original_name))
                         if recorded is not None and recorded.get("done"):
                             # An earlier run of this claim decensored it: never
                             # repeat destructive processing on a resume.
@@ -3402,6 +3476,10 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                                 ai_decensor_backups.append(
                                     (result_path, Path(recorded["backup"])))
                         elif recorded is not None:
+                            ai_unknown.add(result_path)
+                        elif custody_unresolved:
+                            # Possibly a decensored archive whose new name was
+                            # never recorded: review it, never rewrite twice.
                             ai_unknown.add(result_path)
                         elif not _note_ai(claim, result_path.name, {"started": True}):
                             # Custody before the rewrite: if it cannot be
@@ -3531,6 +3609,8 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                 transient = set()
                 duplicates = _second_copies(clusters, set())
                 set_aside = {path: parsed_by_path.pop(path) for path in duplicates}
+                if not _mark_ai_naming(claim):
+                    continue  # names must not change while custody is unmarked
                 refused = _name_batch(parsed_by_path, media_originals, series_name,
                                       dest_folder, dir_number, transient)
                 while True:
@@ -3543,6 +3623,7 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                                            dest_folder, dir_number, transient)
                     parsed_by_path.update(released)
                 parsed_by_path.update(set_aside)
+                _rekey_ai_custody(claim, origins, parsed_by_path)
                 second_copies = {path: kept.name for path, kept in duplicates.items()}
                 # Decisions, made before anything lands: a refusal that can
                 # clear by itself (a locked file) stays to be retried; every
