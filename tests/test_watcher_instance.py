@@ -480,6 +480,11 @@ def test_observer_and_tracker_cleanup_finish_while_mutex_is_still_owned(tmp_path
 
     events = []
     monkeypatch.setattr(watcher, "WATCH_FOLDER", str(tmp_path))
+    # The watch root is tmp_path itself, so the claim roots go beside it:
+    # inside it they would be refused at start (validate_roots).
+    beside = tmp_path.parent / f"{tmp_path.name}-claims"
+    for name in ("PROCESSING_ROOT", "REVIEW_ROOT", "QUARANTINE_ROOT"):
+        monkeypatch.setattr(watcher, name, beside / name.lower())
     for name in ("_load_routing", "_load_routing_v2", "_load_series_resolvers",
                  "_clean_up_stale_rewrite_files", "_discover_startup_directories"):
         monkeypatch.setattr(watcher, name, lambda *args: None)
