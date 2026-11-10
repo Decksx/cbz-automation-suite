@@ -75,6 +75,7 @@ try:
         extract_volume_number,
         normalise_archive_key,
         parse_comic_name,
+        range_in,
         sanitize_without_markers,
         series_base_name,
         update_comicinfo_xml,
@@ -93,6 +94,7 @@ except ModuleNotFoundError:
         extract_volume_number,
         normalise_archive_key,
         parse_comic_name,
+        range_in,
         sanitize_without_markers,
         series_base_name,
         update_comicinfo_xml,
@@ -1415,13 +1417,27 @@ def _apply_fallback_naming(
 
         # The ComicInfo title keeps the pre-§5.5 form; only the file name
         # carries the display tokens (see ParsedComicName).
-        new_stem = f"{series_name} Ch. {dir_number}" if dir_number else series_name
-        display_stem = _fallback_display_stem(series_name, dir_number, cbz.stem,
+        # A range folder ("Berserk Ch. 1-30") labels the name with its range,
+        # which is never a chapter field (the ComicInfo chapter stays as is).
+        # A volume range has no chapter slot to carry it: such a placeholder
+        # is reviewed, never named after the series alone.
+        folder_range = None if dir_number else range_in(cbz.parent.name)
+        if folder_range is not None and folder_range[0] == "vol":
+            log.warning(
+                f"    REVIEW: fallback name refused for '{cbz.name}' (series "
+                f"'{series_name}', volumes {folder_range[1]}): a volume range "
+                f"has no chapter number. Keeping its current name."
+            )
+            refused.append(cbz)
+            continue
+        label = dir_number or (folder_range[1] if folder_range else None)
+        new_stem = f"{series_name} Ch. {label}" if label else series_name
+        display_stem = _fallback_display_stem(series_name, label, cbz.stem,
                                                number_style=number_style)
         if isinstance(display_stem, FallbackRefused):
             log.warning(
                 f"    REVIEW: fallback name refused for '{cbz.name}' "
-                f"(series '{series_name}', chapter {dir_number}): "
+                f"(series '{series_name}', chapter {label}): "
                 f"{display_stem.reason}. Keeping its current name."
             )
             refused.append(cbz)
