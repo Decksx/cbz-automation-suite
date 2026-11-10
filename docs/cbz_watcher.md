@@ -86,6 +86,29 @@ as before this change:
   facts before the rewrite, so the next pass judges it again, and a hold is
   remembered once a pass leaves it unchanged.
 
+## Name collisions never delete a different copy
+
+When an arriving archive lands on a name the destination already holds, the
+watcher keeps one copy under that name and **moves the other to the
+quarantine**; it never deletes a copy that differs from the one it keeps.
+
+- A byte-identical arrival (same size and SHA-256) is an exact duplicate and
+  is removed: nothing is lost.
+- Otherwise the larger copy is kept, as before (an arrival must be larger by
+  `REPLACEMENT_MIN_GAIN_BYTES` to replace the library copy). The other goes
+  to `<quarantine>\<YYYY-MM-DD>\<series folder>\<file>`, renamed
+  `<file> (2).cbz` and so on if that name is taken. The dated folder is the
+  day it was quarantined, which a retention purge can use.
+- The loser is moved to quarantine before anything else changes. If that
+  fails, both copies stay where they were and the arrival is retried on the
+  next pass. If the arrival then cannot take the library copy's place, the
+  quarantined library copy is moved back.
+
+The quarantine is `C:\Temp\cbz_held\quarantine` by default; set it with
+`--quarantine-root` or `CBZ_QUARANTINE_ROOT`. Resolver mode keeps its own
+quarantine root (`--resolver-quarantine-root`), which already moved losers
+rather than deleting them.
+
 ## Canonical series resolver
 
 The GUI enables **Resolve series names and import directly to Z:** by default.
