@@ -9,9 +9,8 @@ import os
 import hashlib
 from contextlib import contextmanager
 import argparse
-import glob
+import contextlib
 import re
-import uuid
 import gc
 import json
 import subprocess
@@ -1555,59 +1554,114 @@ def _reserve(path: Path, *, numbered: bool = True) -> Path | None:
             index += 1
 
 
-# Marker of a library landing in flight: a hidden sidecar
-# ``.<name>.cbzreserve-<token>`` beside the destination, created before the
-# destination is reserved and removed only once the archive is complete
-# there. It never ends in .cbz, so nothing reads it as a book.
-RESERVE_MARK = ".cbzreserve-"
+# One lock per library destination being settled, keyed by its normalized
+# physical path. Admitted directories run on independent timer threads, so
+# two of them can reach one library name at once; whichever owns it settles
+# it, and the other defers to its next pass.
+_destination_locks: dict[str, list] = {}  # key -> [lock, users]
+_destination_locks_guard = threading.Lock()
 
 
-def _landing_in_flight(dest: Path) -> bool:
-    """Whether some placement (any thread or watcher) is landing on *dest* now.
+@contextlib.contextmanager
+def _destination_lock(dest: Path):
+    """Own *dest* for one whole settlement; yields whether ownership was won.
 
-    While a landing is in flight, *dest* is an empty reservation or a
-    partial copy, not a library book: settling against it would quarantine
-    or replace it, and its owner would then overwrite, or clean up, the
-    archive that took its place. Every collision path defers instead.
+    Acquired **before** anything about *dest* is decided and held until the
+    settlement is complete: the collision decision, quarantining the
+    library copy, landing the arrival, a rollback and any cleanup. A
+    separate check ("is anyone landing here?") goes stale the moment it is
+    made; ownership cannot. Another thread that wants *dest* meanwhile does
+    not wait: it defers its arrival, untouched, to its next pass. Paths are
+    normalized (resolved, and case-folded on Windows, whose filesystem is
+    case-insensitive), so two spellings of one file share one lock.
+
+    Scope: threads of this watcher process, the single watcher-owned
+    pipeline (one watcher per watch root, ``watcher_instance_lock``).
+    Another process writing the same library names is not serialized by
+    this; it would need its own coordination.
     """
-    return any(dest.parent.glob(f".{glob.escape(dest.name)}{RESERVE_MARK}*"))
+    key = os.path.normcase(os.path.realpath(dest))
+    with _destinations_guard_lookup(key) as lock:
+        if not lock.acquire(blocking=False):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            lock.release()
+
+
+@contextlib.contextmanager
+def _destinations_guard_lookup(key: str):
+    """The lock for *key*, kept in the registry only while someone uses it."""
+    with _destination_locks_guard:
+        entry = _destination_locks.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        yield entry[0]
+    finally:
+        with _destination_locks_guard:
+            entry[1] -= 1
+            if entry[1] == 0 and _destination_locks.get(key) is entry:
+                del _destination_locks[key]
 
 
 def _land(src: Path, dest: Path) -> bool:
-    """Move *src* to the free name *dest*, owning it for the whole landing.
+    """Move *src* to the free name *dest*. The caller owns *dest* (``_destination_lock``).
 
-    The placement first creates its marker (``RESERVE_MARK``, exclusive,
-    unique token), then the destination itself exclusively (``_reserve``).
-    The marker exists for as long as *dest* is not yet a complete archive,
-    so no other placement settles against it (``_landing_in_flight``), and
-    nothing else can replace *dest* meanwhile; this placement's own cleanup
-    can therefore only ever remove its own reservation or partial copy.
-
-    False, with *src* left in place, when another placement owns *dest*
-    first: it must not be overwritten, and the next pass settles the two as
-    a collision. A failed move removes only this placement's reservation
-    (or its own partial copy) and re-raises, as the plain move did.
+    The name is also created exclusively first (``_reserve``), so a writer
+    that does not take the lock still cannot be overwritten. False, with
+    *src* left in place, when *dest* is taken. A failed move removes only
+    this placement's reservation (or its own partial copy) and re-raises,
+    as the plain move did; with the lock held, nothing else can have taken
+    the name meanwhile.
     """
-    marker = dest.with_name(f".{dest.name}{RESERVE_MARK}{uuid.uuid4().hex}")
-    try:
-        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except OSError as e:
-        log.warning(f"    Could not mark '{dest.name}' for landing ({e}); '{src}' stays.")
+    if _reserve(dest, numbered=False) is None:
+        log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
+                    f"'{src}' stays for the next pass.")
         return False
     try:
-        if _reserve(dest, numbered=False) is None:
-            log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
-                        f"'{src}' stays for the next pass.")
+        shutil.move(str(src), str(dest))
+    except (OSError, shutil.Error):
+        if src.exists():
+            dest.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _settle_or_land(src: Path, dest: Path, *, label: str, series_dir: str,
+                    display_name: str | None, conflict_quarantine_root: Path | None,
+                    quarantine_name) -> bool:
+    """Land *src* on *dest*, or settle their collision, owning *dest* throughout.
+
+    The one path every mover takes for every file (both movers, legacy and
+    resolver settlement, new names and collisions). Returns True when the
+    file completed: it landed, its collision was settled, or it was removed
+    as an exact duplicate. False leaves *src* where it is: *dest* is owned
+    by another settlement (deferred to the next pass), a stripped-tag
+    collision is held (issue #131), or the settlement failed.
+    """
+    with _destination_lock(dest) as owned:
+        if not owned:
+            log.warning(f"    '{dest.name}' is being settled by another arrival; "
+                        f"'{label}' waits for the next pass.")
             return False
-        try:
-            shutil.move(str(src), str(dest))
-        except (OSError, shutil.Error):
-            if src.exists():
-                dest.unlink(missing_ok=True)
-            raise
-        return True
-    finally:
-        marker.unlink(missing_ok=True)
+        if not dest.exists():
+            return _land(src, dest)
+        if display_name is not None and _hold_stripped_collision(src, dest, display_name):
+            return False
+        if conflict_quarantine_root is not None:
+            outcome = settle_file_conflict(
+                src, dest, conflict_quarantine_root / series_dir / quarantine_name)
+            action = outcome["action"]
+            if action == "deleted_exact_duplicate":
+                log.info(f"    Exact duplicate removed: '{label}'")
+            else:
+                log.warning(f"    Conflict '{label}': {action}; smaller file quarantined at "
+                            f"'{outcome['quarantined']}'.")
+            return True
+        return _settle_by_size(src, dest, label, series_dir)
+
 
 def _settle_by_size(src: Path, dest: Path, label: str, series_dir: str) -> bool:
     """Settle a name collision by size without deleting a different book.
@@ -1857,35 +1911,10 @@ def _merge_directories(
             if match is not None:
                 dest_item = match
 
-        if dest_item.exists():
-            if _landing_in_flight(dest_item):
-                log.warning(f"    '{dest_item.name}' is still being landed by another arrival; "
-                            f"'{relative}' waits for the next pass.")
-                continue
-            if display_name is not None and _hold_stripped_collision(
-                src_item, dest_item, display_name
-            ):
-                continue
-            if conflict_quarantine_root is not None:
-                outcome = settle_file_conflict(
-                    src_item,
-                    dest_item,
-                    conflict_quarantine_root / dest_dir.name / relative,
-                )
-                action = outcome["action"]
-                if action == "deleted_exact_duplicate":
-                    log.info(f"    Exact duplicate removed: '{relative}'")
-                else:
-                    log.warning(
-                        f"    Conflict '{relative}': {action}; smaller file quarantined at "
-                        f"'{outcome['quarantined']}'."
-                    )
-                completed += 1
-                continue
-            completed += _settle_by_size(src_item, dest_item, str(relative), dest_dir.name)
-        else:
-            dest_item.parent.mkdir(parents=True, exist_ok=True)
-            completed += _land(src_item, dest_item)
+        completed += _settle_or_land(
+            src_item, dest_item, label=str(relative), series_dir=dest_dir.name,
+            display_name=display_name, conflict_quarantine_root=conflict_quarantine_root,
+            quarantine_name=relative)
     return completed
 
 
@@ -2650,35 +2679,11 @@ def _move_loose_files(
             if match is not None:
                 dest_item = match
 
-        if dest_item.exists():
-            if _landing_in_flight(dest_item):
-                log.warning(f"    '{dest_item.name}' is still being landed by another arrival; "
-                            f"'{src.name}' waits for the next pass.")
-                continue
-            if display_name is not None and _hold_stripped_collision(
-                src, dest_item, display_name
-            ):
-                continue
-            if conflict_quarantine_root is not None:
-                outcome = settle_file_conflict(
-                    src,
-                    dest_item,
-                    conflict_quarantine_root / dest_dir.name / src.name,
-                )
-                action = outcome["action"]
-                if action == "deleted_exact_duplicate":
-                    log.info(f"    Exact duplicate removed: '{src.name}'")
-                else:
-                    log.warning(
-                        f"    Conflict '{src.name}': {action}; smaller file quarantined at "
-                        f"'{outcome['quarantined']}'."
-                    )
-                moved += 1
-                continue
-            if not _settle_by_size(src, dest_item, src.name, dest_dir.name):
-                continue  # not settled: the arrival stays and is not a landing
-        elif not _land(src, dest_item):
-            continue
+        if not _settle_or_land(
+                src, dest_item, label=src.name, series_dir=dest_dir.name,
+                display_name=display_name, conflict_quarantine_root=conflict_quarantine_root,
+                quarantine_name=src.name):
+            continue  # deferred, held or failed: the arrival stays and is not a landing
         moved += 1
 
     log.info(f"  Moved {moved} loose file(s) -> {dest_dir}")
