@@ -1,0 +1,242 @@
+# Known scanlation groups and source sites that downloaders put in front of
+# a chapter's name ("Mangakakalot Ch. 53.cbz"). An arrival whose name starts
+# with one of these, followed by a chapter or episode token, is named after
+# its series folder instead (scripts/cbz_core.py, _without_group_prefix).
+#
+# One group per line, written as it appears. Matching ignores case, spaces,
+# hyphens, underscores and punctuation ("LOST VEYL" also matches
+# "LOST_VEYL"), and must be exact: "Alpha" never matches "Alpha Scans".
+# Blank lines and lines starting with # are ignored.
+#
+# To add a group: add one line, keep the list sorted, and add a test case if
+# it is unusual. Do not add a name that is also a series title (a library
+# folder). A listed name may hold a digit ("Manhwa18"): an exact match here
+# overrides the digit rule (David, 2026-11-10). It never overrides the
+# structural checks: a line that is or holds a part, season, volume, episode
+# or chapter marker, or a structural or special word ("Part 2", "S2", "Side",
+# "Extra", "One-shot", ...), is never taken for a group, so it has no effect.
+
+# From the 2026-11-10 library audit (group and site prefixes, bucket 1).
+A.yh
+Akatsuki
+Akatsuki Scans
+Alpha
+Animated Glitched
+Anordnung des Gerichts Translations
+Art Lapsa
+Articuno
+Asura
+azusagawa
+Bato
+Bee
+Benkyou Mangás
+Benri
+BlastComic
+Bubblestea
+Butter & KDT
+Byleth
+Carib
+Carib & TOOR
+Chibi Multiverse
+Chloeveil Scans
+Coffedrug
+Comix
+Cookie Cruncher
+CRACKERTL
+Crossbone Vanguard
+Cryminals Syndicate
+Cultured Commissions
+Dark-wings
+Death Toll
+Death Toll Scans
+Delta
+Desire
+Die Braut des Elysiums
+Diva
+DivaScans
+DLsite
+DNTA
+dnta-atnd
+Doujin-Moe
+Dragon Tea
+Drake
+duaduapertujuh
+Dumbnut
+Dusk
+Electrode
+ElfToon
+Empoleon
+Estehtix Translation
+Euclasa
+FAKKU
+Fallen Games
+Fantasia
+Gamma
+Gengar
+GenZ
+Giratina
+Giratina (manhwaclub)
+gladys
+Gotbored
+Groudon
+head-Empty
+hidamari
+Hijala
+Hijala Translations
+Hyakuro Translations
+I Am Nero Wolfe
+I Get No Females Translations
+Illuminati-Manga
+Ioffertribute
+Irodori Comics
+its a secret
+Jaa Kimi Muffin
+Japanese Unloved Mangas
+Jasmine Tea
+Kayn
+KDT
+KDT SCANS
+Kirei Cake
+Koala
+Kontol Nganceng
+Kontol Nganceng + Pepek Becek = Ngentot
+KP Poseidon
+Kraken House Print
+KS Group
+Kuromi
+kurosiera
+Kusanuu
+Kwai , Benkyou Mangás
+Lagoon
+LHT
+LINE Webtoon
+Literary Curator
+LOST VEYL
+Luminare Translations
+LUNASUB
+Madex
+Magus
+Manga UP!
+mangaball
+mangadex
+MangaDistrict
+Mangakakalot
+MaveTranslates
+Meraki
+MinsaR's Translations
+Mist
+Mist Scans
+Money Minting
+Money Minting Scans
+Moshi
+Mpark
+My Darling
+Naellea
+Nameless
+NexComic
+No Group
+NocturneLab
+NTR Addict
+Official
+Omega
+OmegaScans
+Orbis Alius
+Palkia
+Philia Scans
+Platinum Crown
+Popqwasians
+QI
+Ra Yan
+rathma
+Reset
+Resetscan
+Returners
+rez a
+Rhydon Little Miss Delinquent
+Rirare Translation
+ROKARI COMICS
+Schale
+Scythe
+Seadra
+sebiodidio
+Secluded
+Setsu
+Setsu Scans
+Seven Seas Entertainment
+Shuten Doujin Translations
+SilasMeanQuite
+SnowDogScripts
+Speedstar
+Suizokukan
+Swampert
+Tamamo
+Tapas
+TappyToon
+Temple
+Testament
+THE BLANK
+The Blavatsky Project
+The Guild
+The Hours Between
+Thunder
+Timeless
+Tomoshibi
+Torterra
+TrafalgarScans
+TripolarsNotBipolars
+Twintail Tengoku
+Twisted Hel
+Underrated Manga
+Unknown
+unofficial
+UTOON
+Violet
+Vortex
+Vortexscan
+WebToon
+Wowe
+www.mangabats.com
+xscans
+Yupub
+Yuuto
+𝗧𝗔𝗥𝗢 𝗨𝗣𝗟𝗢𝗔𝗗𝗘𝗥𝗦
+
+# Group names holding a digit, from the same audit. Exact matches override
+# the digit rule (David, 2026-11-10). Left out: "Official · sugerrrrr 2.5",
+# a credit string whose trailing "2.5" looks like a chapter or version number.
+1 2 Translations
+Amin3
+KM 42
+Manhwa18
+that one guy 2123
+# "Gamma 2", "Omega 2" and "Manhwa18 2" are second copies from the same group
+# with the SAME chapter numbering as the base group, not seasons (library
+# audit, 2026-11-10). Stripped, a copy collides with the primary one and goes
+# through the review path, the intended handling for duplicates; left listed
+# off the list, it would keep the group name ("Manhwa18 2 Chapter 5").
+Gamma 2
+Manhwa18 2
+Omega 2
+
+# From the watcher log (downloader-hashed arrivals, 2026-10 to 2026-11).
+CT Scans
+Fated Circle
+Faux
+ijiise
+joobuspaidatr
+K Manga
+Money Minting (COMMISSION) Scans
+Myung
+nawking
+Project Valvrein
+Pure Pazaak
+Rei Scans
+Renascans
+RiceScan
+SDTLs
+Sonarin迫
+takaya
+tsuyoshi
+vadass
+waifusplit
+yuenai
