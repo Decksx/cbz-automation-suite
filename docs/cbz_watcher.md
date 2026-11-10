@@ -117,6 +117,12 @@ quarantine**; it never deletes a copy that differs from the one it keeps.
   stays where it is and is settled on its next pass. This covers the
   threads of one watcher process (one watcher per watch root); another
   process writing the same library names is not coordinated by it.
+- A whole series folder moves into the library only as one rename, which
+  is atomic and possible only on the same volume when the series folder is
+  not there yet. Otherwise (the library on Tower is another volume) it is
+  merged file by file, each file under its own lock as above; a folder is
+  never copied straight into the library, where another arrival could
+  settle against a half-copied book.
 - Only a settled collision or a completed landing counts as landed; a
   failed one is not reported as a landing. A folder merge in which no file
   completed returns no landing either.
