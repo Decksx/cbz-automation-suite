@@ -507,3 +507,79 @@ Nothing under `web` changes. The previous full run failed only
 `tests/test_shadow_handoff.py::test_shadow_plan_logs_would_be_case_and_moves_nothing_extra`,
 which found that a shadow-planned case recorded the processing path as its
 arrival; fixed (`observe(..., arrival=)`).
+
+### PR #177 review round 1 (Codex, at `172d064`)
+
+**P1:** a resume could delete a claim while its creator was still moving the
+arrival into it. `claim_directory` and `claim_files` published the record
+before the rename without owning the claim, and `_resumed_items` /
+`_retire_claim` removed any claim with no arrival file. Codex's
+`test_review177_probes.py` (SHA256 `525b7db2...ddc2a`) loses the book in
+both the directory and files-only cases at `172d064`.
+
+Fix: one ownership protocol for a claim's whole life (`claims.py`). The
+creator takes the owner lock right after `mkdir`, before the record exists,
+keeps it through the rename, and hands it to `_claim_item` (`Claim.owner`).
+Only an owner retires a claim (`claims.retire`): emptiness is re-checked
+under the lock, everything but the lock goes while it is held, and after the
+release only the lock file and the empty folder are removed, each without
+recursion. A party that takes the lock in that moment keeps its folder: its
+open lock file cannot be deleted, so the folder is not empty. The
+publication gap (folder made, lock not yet taken) is covered as well: a
+resume may retire that empty folder, and the creator then cannot own it, so
+the claim fails and the arrival never moved. The record-less branch of
+`_resumed_items` retires through the same call.
+
+**P2:** AI custody was keyed by the name `process_cbz_file` returned, and
+naming then renamed the archive; a resume after a failed landing missed the
+key and ran Camelia again. Codex's `test_review177_ai_identity.py`
+(`bbc427fa...1af2`) sees calls `['Group Ch.1.cbz', 'Berserk ch. 1.cbz']`.
+
+Fix: while a claim holds custody its record is marked (`ai_naming`) before
+any rename (`_mark_ai_naming`; if the mark cannot be saved nothing is
+renamed that pass). A rename by `process_cbz_file` on a resume moves the
+custody entry with it; after naming, `_rekey_ai_custody` moves every entry
+to its archive's new name (through the same `original_path` mapping as
+`_rekey_ai_backups`) and clears the mark in one save. A run that finds the
+mark still set (a crash in between) reviews every archive it cannot match,
+never rewrites it. Clearing custody after a failed AI pass clears the mark
+too.
+
+Codex's probes at this head: the creation/retirement probe now times out
+waiting for the resume to reach `rmtree`, which it no longer can; the AI
+probe stops at its own precondition (custody "detached by naming"), which no
+longer holds. Both fail **by construction**. Adapted versions are in
+`tests/test_watcher_claims.py`, with the payload and call-count assertions
+kept. The first five test IDs below fail at `172d064`; three of them by
+the defect itself (the live claim is destroyed, so the creator returns no
+claim; the AI custody stays under the old name), two only because the
+mechanism they drive does not exist there (the creation-time lock, the
+re-key helper):
+`test_resume_cannot_retire_a_claim_its_creator_is_still_filling`
+(directory, files), `test_a_claim_retired_before_its_creator_owns_it_leaves_the_arrival`,
+`test_completed_ai_follows_its_archive_through_naming`,
+`test_a_rename_whose_custody_was_never_recorded_goes_to_review`, plus
+`test_retirement_rechecks_emptiness_once_it_owns_the_claim`,
+`test_a_creator_that_owns_a_just_released_folder_keeps_it`,
+`test_custody_follows_a_name_the_resume_cleans` and
+`test_a_failed_ai_pass_clears_the_mark_with_the_custody`.
+
+Guards proven by bypass (failing tests): the creator owns the claim before
+publishing its record 4; the creator hands its ownership to processing 142;
+only an owner retires a claim 1; emptiness re-checked under ownership 1;
+after the release only the lock and the empty folder go 1; custody follows a
+rename made this pass 1; custody re-keyed after naming 1; a claim is marked
+before names change 2; unresolved custody goes to review 1; clearing
+custody clears the mark 1. Two (follows a rename this pass, clearing clears
+the mark) first failed nothing and got the last two tests above.
+
+Watcher edits byte-exact: no unchanged line changed its ending; all 97
+added lines are CRLF like their surroundings; bare LF stays 863.
+
+Full suite: **5,140 passed / 10 skipped / 2 failed** (5,152 collected =
+5,143 + the 9 new test IDs). Both failures are the Windows web flakes from
+the #176 rounds, and nothing under `web` changes:
+`tests/web/test_web_log_service.py::test_create_writer_streams_eight_mib_with_one_full_inspection`
+(three isolated reruns: 3 passed) and
+`tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`
+(three isolated reruns: 2 passed, 1 failed).
