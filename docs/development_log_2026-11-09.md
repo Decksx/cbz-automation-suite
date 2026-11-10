@@ -232,3 +232,31 @@ passed / 10 skipped / 1 failed** (5,082 tests = master `0d9eea8`'s 5,065 +
 `test_alternating_overflow_compacts_map_and_physical_files`; the branch
 changes nothing under `web` and it passes alone. `scripts/cbz_watcher.py`
 stays `mixed`; bare-LF 868 -> 869 (one new line beside an LF `global`).
+
+### PR #176 review round 1 (Codex, at `2b01b79`)
+
+**P1:** quarantine names were chosen (`unique_path`) and used later, so two
+admitted directories settling at once could pick the same name, and the
+second move overwrote the first copy. A failed move's cleanup could also
+delete another placement's completed file (it took "both exist" as proof
+of a partial copy). **P2:** `_move_loose_files` counted a failed quarantine
+or a rolled-back replacement as a moved file and returned a landing.
+
+Codex's repros `test_review176_quarantine_race.py` (SHA256
+`f016d349...29f`) and `test_review176_failed_landing.py` (`139c9e21...332`)
+fail 6/6 at `2b01b79`. My tests (`00d9f70`) fail 8/8 there, including a
+landing race that base `0d9eea8` has too: two arrivals landing one new
+name at once.
+
+Fix: `_reserve` creates the target exclusively (`O_CREAT | O_EXCL`, next
+numbered name if taken) before moving into it, for quarantine placements
+and, through `_land`, for new library names; a failed placement removes
+only the name it created. `_settle_by_size` returns whether it settled, and
+`_move_loose_files` counts only settled collisions and completed landings.
+
+Guards proven by bypass (failing tests): reservations are exclusive 6; a
+landing owns its name first 2; an unsettled loose collision is not a
+landing 2; an unlanded loose file is not a landing 1 (it failed nothing
+until a test of a name taken during the landing was added); a failed
+replacement restores the library copy 3; a failed quarantine removes only
+its own reservation 4.
