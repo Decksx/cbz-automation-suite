@@ -267,3 +267,9 @@ failure is the known `tests/web` file-lock flake
 `test_alternating_overflow_compacts_map_and_physical_files`, which passes
 alone. Codex's two repro files pass 6/6 at this head. Watcher bare-LF still
 869.
+
+Correction to the line above: the first isolated rerun of that web test
+after the full suite **also failed** (1 failed); three further isolated
+runs passed (3/3). It is intermittent on its own too, not only under the
+full suite's load. The branch changes nothing under `comic_automation/web`
+or `tests/web`.
