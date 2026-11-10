@@ -1527,52 +1527,113 @@ def _replacement_gain_is_meaningful(
     return (src_size - dest_size) >= min_gain
 
 
-def _settle_by_size(src: Path, dest: Path, label: str, series_dir: str) -> None:
+def _reserve(path: Path, *, numbered: bool = True) -> Path | None:
+    """Create *path* exclusively and return it: this placement now owns the name.
+
+    Choosing a free name and then moving into it is a race: two placements
+    (two admitted directories, or two watchers) can choose the same name,
+    and the second move overwrites the first. An exclusive create
+    (``O_CREAT | O_EXCL``) cannot be won twice. With *numbered*, a taken
+    name is followed by ``<stem> (2)``, ``(3)`` ... until one is created;
+    without it, None says the name is taken. The empty file is then
+    replaced by the archive, and on failure removed: it is the only path a
+    failed placement may clean up, because it is the only one it created.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    candidate = unique_path(path) if numbered else path
+    index = 2
+    while True:
+        try:
+            os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return candidate
+        except FileExistsError:
+            if not numbered:
+                return None
+            candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+            index += 1
+
+
+def _land(src: Path, dest: Path) -> bool:
+    """Move *src* to the free name *dest*, owning it first (``_reserve``).
+
+    False, with *src* left in place, when another placement took *dest*
+    first: it must not be overwritten, and the next pass settles the two as
+    a collision. A failed move removes only this placement's reservation
+    (or its own partial copy) and re-raises, as the plain move did.
+    """
+    if _reserve(dest, numbered=False) is None:
+        log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
+                    f"'{src}' stays for the next pass.")
+        return False
+    try:
+        shutil.move(str(src), str(dest))
+    except (OSError, shutil.Error):
+        if src.exists():
+            dest.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _settle_by_size(src: Path, dest: Path, label: str, series_dir: str) -> bool:
     """Settle a name collision by size without deleting a different book.
 
     Byte-identical copies are an exact duplicate: the incoming one is removed,
     which loses nothing. Otherwise the larger copy is kept under *dest*'s name
     (an incoming copy must win by ``REPLACEMENT_MIN_GAIN_BYTES``) and the
-    other is moved to ``QUARANTINE_ROOT/<date>/<series_dir>/`` under a unique
-    name. Size is only a proxy for quality, so the loser is kept for review.
+    other is moved to ``QUARANTINE_ROOT/<date>/<series_dir>/`` under a name
+    this placement owns (``_reserve``). Size is only a proxy for quality, so
+    the loser is kept for review.
 
     The loser is quarantined before anything else moves. If that fails, both
     copies stay where they are and the incoming one is retried on a later
     pass. If the incoming copy then cannot take *dest*'s place, the quarantined
     library copy is moved back; either way no copy is lost.
+
+    Returns True only when the collision was settled (duplicate removed,
+    loser quarantined, or replacement done); False leaves the arrival in
+    place, and the caller must not count it as landed.
     """
     src_size, dest_size = src.stat().st_size, dest.stat().st_size
     if src_size == dest_size and digest(src) == digest(dest):
         src.unlink()
         log.info(f"    Exact duplicate removed: '{label}'")
-        return
+        return True
     incoming_wins = _replacement_gain_is_meaningful(src_size, dest_size)
     loser = dest if incoming_wins else src
-    target = unique_path(QUARANTINE_ROOT / time.strftime("%Y-%m-%d") / series_dir / loser.name)
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = _reserve(QUARANTINE_ROOT / time.strftime("%Y-%m-%d") / series_dir / loser.name)
+    except OSError as e:
+        log.error(f"    Conflict '{label}': could not reserve a quarantine name ({e}); "
+                  f"both copies kept, incoming left in place for the next pass.")
+        return False
+    try:
         shutil.move(str(loser), str(target))
     except (OSError, shutil.Error) as e:
-        if loser.exists() and target.exists():
-            target.unlink(missing_ok=True)  # a partial copy; the original is intact
+        if loser.exists():
+            target.unlink(missing_ok=True)  # this placement's own reservation or partial copy
         log.error(f"    Conflict '{label}': could not quarantine '{loser}' ({e}); "
                   f"both copies kept, incoming left in place for the next pass.")
-        return
+        return False
     if not incoming_wins:
         log.warning(f"    Conflict '{label}': existing ({dest_size:,} B) kept over incoming "
                     f"({src_size:,} B); incoming quarantined at '{target}'.")
-        return
+        return True
     try:
-        shutil.move(str(src), str(dest))
+        landed = _land(src, dest)
     except (OSError, shutil.Error) as e:
         log.error(f"    Conflict '{label}': could not move the incoming copy into place ({e}); "
                   f"restoring the existing copy from '{target}'.")
-        shutil.move(str(target), str(dest))
-        return
+        landed = False
+    if not landed:
+        if _land(target, dest):
+            log.info(f"    Restored the existing copy of '{label}'.")
+        else:
+            log.error(f"    Conflict '{label}': another arrival took the name; the existing "
+                      f"copy stays quarantined at '{target}'.")
+        return False
     log.warning(f"    Conflict '{label}': incoming ({src_size:,} B) replaced existing "
                 f"({dest_size:,} B); existing quarantined at '{target}'.")
-
-
+    return True
 def _defers_rename(current_stem: str, new_stem: str) -> bool:
     """Whether renaming *current_stem* to *new_stem* drops a distinguishing tag.
 
@@ -1778,7 +1839,7 @@ def _merge_directories(
             _settle_by_size(src_item, dest_item, str(relative), dest_dir.name)
         else:
             dest_item.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src_item), str(dest_item))
+            _land(src_item, dest_item)
 
 
 # ─────────────────────────────────────────────
@@ -2556,9 +2617,10 @@ def _move_loose_files(
                     )
                 moved += 1
                 continue
-            _settle_by_size(src, dest_item, src.name, dest_dir.name)
-        else:
-            shutil.move(str(src), str(dest_item))
+            if not _settle_by_size(src, dest_item, src.name, dest_dir.name):
+                continue  # not settled: the arrival stays and is not a landing
+        elif not _land(src, dest_item):
+            continue
         moved += 1
 
     log.info(f"  Moved {moved} loose file(s) -> {dest_dir}")
