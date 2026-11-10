@@ -364,3 +364,30 @@ Round 3 verification at `9bedafc` (this commit is docs only): full suite
 failure is again `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`;
 three isolated reruns afterwards: 1 passed,1 passed,1 passed. Watcher bare-LF 870 (871 - 1: the
 round-2 `glob`/`uuid` imports became one `contextlib` import).
+
+### PR #176 review round 4 (Codex, at `088f1d0`)
+
+**P1:** `_move_cbz_dir` moved a new series folder with `shutil.move`, which
+across volumes copies the tree straight into the library (`copytree`)
+outside every destination lock; another arrival could settle against a
+half-copied book, then be overwritten. Codex's
+`test_review176_directory_copy.py` (SHA256 `dc356924...422`) fails 8/8 at
+`088f1d0`. Its `test_review176_owned_transactions.py` (`1625736c...0c0`)
+passes 6/6 there and here.
+
+Fix: a whole folder moves only by `os.rename` (atomic; same volume, series
+folder absent). Any failure (another volume, or the folder appeared
+meanwhile) merges file by file through `_settle_or_land`, each file under its
+own destination lock. No folder is ever copied into the library.
+
+`test_review176_directory_copy.py` now fails 8/8 **by construction**, not by
+loss: it pauses inside `shutil.move`'s `copytree` callback, which no longer
+runs, and its `paused.wait(timeout=10)` times out. My
+`test_a_cross_volume_folder_move_lands_file_by_file_under_ownership` covers
+the same interleaving under the new path (forced EXDEV; a folder or loose
+contender, legacy or resolver, arriving while the first file's landing is
+paused defers; both originals survive; `shutil.copytree` is never called).
+It fails 4/4 at `088f1d0`.
+
+Guards proven by bypass (failing tests): a whole folder moves only as one
+rename 4; otherwise it merges file by file under ownership 4.
