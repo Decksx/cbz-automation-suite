@@ -14,3 +14,12 @@ def _isolated_held_state(tmp_path, monkeypatch):
     """
     monkeypatch.setattr("scripts.cbz_watcher.HELD_STATE_FILE",
                         tmp_path / "_watcher_state" / "cbz_watcher_held.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_quarantine(tmp_path, monkeypatch):
+    r"""Keep keep-the-larger's quarantine (``QUARANTINE_ROOT``) in the test's tmp dir.
+
+    The default is C:\Temp\cbz_held\quarantine, a real operator folder.
+    """
+    monkeypatch.setattr("scripts.cbz_watcher.QUARANTINE_ROOT", tmp_path / "_quarantine")

@@ -52,15 +52,16 @@ def _arrange_merge(monkeypatch, source: Path, library: Path, race: bool) -> None
     if not race:
         _make_cbz(existing, 100)
         return
-    original_move = watcher.shutil.move
+    original_rename = watcher.os.rename
 
+    # A whole folder moves only by os.rename (never shutil.move: PR #176).
     def destination_appears_then_move_fails(src, dest, *args, **kwargs):
         if Path(src) == source and Path(dest) == library / "Berserk":
             _make_cbz(existing, 100)
             raise OSError("simulated: destination appeared concurrently")
-        return original_move(src, dest, *args, **kwargs)
+        return original_rename(src, dest, *args, **kwargs)
 
-    monkeypatch.setattr(watcher.shutil, "move", destination_appears_then_move_fails)
+    monkeypatch.setattr(watcher.os, "rename", destination_appears_then_move_fails)
 
 
 @pytest.mark.parametrize("race", [False, True], ids=["merge", "race-to-merge"])

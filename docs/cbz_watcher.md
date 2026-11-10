@@ -86,6 +86,52 @@ as before this change:
   facts before the rewrite, so the next pass judges it again, and a hold is
   remembered once a pass leaves it unchanged.
 
+## Name collisions never delete a different copy
+
+When an arriving archive lands on a name the destination already holds, the
+watcher keeps one copy under that name and **moves the other to the
+quarantine**; it never deletes a copy that differs from the one it keeps.
+
+- A byte-identical arrival (same size and SHA-256) is an exact duplicate and
+  is removed: nothing is lost.
+- Otherwise the larger copy is kept, as before (an arrival must be larger by
+  `REPLACEMENT_MIN_GAIN_BYTES` to replace the library copy). The other goes
+  to `<quarantine>\<YYYY-MM-DD>\<series folder>\<file>`, renamed
+  `<file> (2).cbz` and so on if that name is taken. The dated folder is the
+  day it was quarantined, which a retention purge can use.
+- The loser is moved to quarantine before anything else changes. If that
+  fails, both copies stay where they were and the arrival is retried on the
+  next pass. If the arrival then cannot take the library copy's place, the
+  quarantined library copy is moved back.
+- Every placement owns its target first: the quarantine name, and a new
+  library name, are created exclusively (`O_CREAT | O_EXCL`) before the
+  move, so two imports running at once can never pick the same name and
+  overwrite one another. A failed placement removes only the name it
+  created. A library name taken by another arrival in the meantime is
+  left alone; the arrival stays and is settled as a collision next pass.
+- One settlement owns a library name at a time. Before anything about the
+  name is decided, the watcher takes that name's lock (one per normalized
+  physical path, so names differing only in case share it) and holds it
+  through the decision, the quarantine, the landing, any rollback and any
+  cleanup. Another arrival for the same name meanwhile does not wait: it
+  stays where it is and is settled on its next pass. This covers the
+  threads of one watcher process (one watcher per watch root); another
+  process writing the same library names is not coordinated by it.
+- A whole series folder moves into the library only as one rename, which
+  is atomic and possible only on the same volume when the series folder is
+  not there yet. Otherwise (the library on Tower is another volume) it is
+  merged file by file, each file under its own lock as above; a folder is
+  never copied straight into the library, where another arrival could
+  settle against a half-copied book.
+- Only a settled collision or a completed landing counts as landed; a
+  failed one is not reported as a landing. A folder merge in which no file
+  completed returns no landing either.
+
+The quarantine is `C:\Temp\cbz_held\quarantine` by default; set it with
+`--quarantine-root` or `CBZ_QUARANTINE_ROOT`. Resolver mode keeps its own
+quarantine root (`--resolver-quarantine-root`), which already moved losers
+rather than deleting them.
+
 ## Canonical series resolver
 
 The GUI enables **Resolve series names and import directly to Z:** by default.

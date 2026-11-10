@@ -198,3 +198,209 @@ Every guard added or changed in this round fails named tests when bypassed:
 | OSError refusal is transient | 1 |
 | registry refusal is transient | 1 |
 | transient refusals left out of deliberate holds | 2 |
+
+## Non-destructive name collisions (PR A of the claim-first plan)
+
+Branch `fix/non-destructive-collisions` from master `0d9eea8`. The first of
+two PRs replacing #175 (the second moves arrivals out of the MEGA-synced
+watch folder before any change). Decided by the operator on 2026-11-09:
+quarantine on C: next to the watch root, configurable; 30-day retention for
+quarantine only (the purge itself is not part of this PR).
+
+The legacy conflict branches of `_merge_directories` and `_move_loose_files`
+unlinked the copy keep-the-larger did not keep. Both now call
+`_settle_by_size`: a byte-identical arrival is removed; otherwise the loser
+is moved to `QUARANTINE_ROOT/<date>/<series>/` under a unique name before
+anything else moves. A failed quarantine move keeps both copies in place
+(and removes a partial cross-volume copy); a failed replacement moves the
+quarantined library copy back. Resolver mode already quarantined through
+`settle_file_conflict` and is unchanged.
+
+Tests: `tests/test_watcher_non_destructive_collisions.py` (17), both movers;
+`tests/conftest.py` points `QUARANTINE_ROOT` at each test's tmp dir. At
+`0d9eea8` 15 of the 17 fail (the two byte-identical cases behaved the same
+before). Guards proven by bypass (failing tests): only byte-identical copies
+are removed 2 (it failed nothing until an equal-size, different-bytes test
+was added); the loser is quarantined, not deleted 12; a failed quarantine
+leaves no partial copy 2; a failed replacement restores the library copy 2;
+quarantine names are collision-safe 1.
+
+Verification at `cc92cd9` (this commit is docs only), Windows /
+`C:\Python311` / Python 3.11, temporary fixtures only: full suite **5,071
+passed / 10 skipped / 1 failed** (5,082 tests = master `0d9eea8`'s 5,065 +
+17). The failure is the known `tests/web` file-lock flake
+`test_alternating_overflow_compacts_map_and_physical_files`; the branch
+changes nothing under `web` and it passes alone. `scripts/cbz_watcher.py`
+stays `mixed`; bare-LF 868 -> 869 (one new line beside an LF `global`).
+
+### PR #176 review round 1 (Codex, at `2b01b79`)
+
+**P1:** quarantine names were chosen (`unique_path`) and used later, so two
+admitted directories settling at once could pick the same name, and the
+second move overwrote the first copy. A failed move's cleanup could also
+delete another placement's completed file (it took "both exist" as proof
+of a partial copy). **P2:** `_move_loose_files` counted a failed quarantine
+or a rolled-back replacement as a moved file and returned a landing.
+
+Codex's repros `test_review176_quarantine_race.py` (SHA256
+`f016d349...29f`) and `test_review176_failed_landing.py` (`139c9e21...332`)
+fail 6/6 at `2b01b79`. My tests (`00d9f70`) fail 8/8 there, including a
+landing race that base `0d9eea8` has too: two arrivals landing one new
+name at once.
+
+Fix: `_reserve` creates the target exclusively (`O_CREAT | O_EXCL`, next
+numbered name if taken) before moving into it, for quarantine placements
+and, through `_land`, for new library names; a failed placement removes
+only the name it created. `_settle_by_size` returns whether it settled, and
+`_move_loose_files` counts only settled collisions and completed landings.
+
+Guards proven by bypass (failing tests): reservations are exclusive 6; a
+landing owns its name first 2; an unsettled loose collision is not a
+landing 2; an unlanded loose file is not a landing 1 (it failed nothing
+until a test of a name taken during the landing was added); a failed
+replacement restores the library copy 3; a failed quarantine removes only
+its own reservation 4.
+
+Round 1 verification at `cfca284` (this commit is docs only): full suite
+**5,080 passed / 10 skipped / 1 failed** (5,091 tests = 5,082 + 9). The
+failure is the known `tests/web` file-lock flake
+`test_alternating_overflow_compacts_map_and_physical_files`, which passes
+alone. Codex's two repro files pass 6/6 at this head. Watcher bare-LF still
+869.
+
+Correction to the line above: the first isolated rerun of that web test
+after the full suite **also failed** (1 failed); three further isolated
+runs passed (3/3). It is intermittent on its own too, not only under the
+full suite's load. The branch changes nothing under `comic_automation/web`
+or `tests/web`.
+
+### PR #176 review round 2 (Codex, at `04cfd9a`)
+
+**P1:** a second collision treated the first import's reservation (empty)
+or its partial copy as a library book, quarantined it and landed its own;
+the first import then overwrote that archive, or its failure cleanup
+deleted it. **P2 (supplemental):** `_merge_directories` ignored a failed
+settlement and `_move_cbz_dir` returned a landing even when nothing in the
+batch completed. Codex's repros `test_review176_active_reservation.py`
+(SHA256 `ed5c8fe4...b29`) fail 8/8 and `test_review176_directory_receipt.py`
+(`7e1b5050...cd3`) fail 2/2 at `04cfd9a`. My tests (`7e3b6b2`, `d81d45b`)
+fail 14/14 and 2/2 there.
+
+Fix (`3c8a61e`): `_land` creates an exclusive hidden marker
+`.<name>.cbzreserve-<token>` before reserving the destination and removes it
+only once the archive is complete; both movers' collision paths, legacy and
+resolver, defer while a marker exists. A crashed landing's marker keeps the
+name waiting until removed by hand: deliberately conservative; a stale
+marker never loses a book. Then `_merge_directories` returns how many files
+completed and `_move_cbz_dir` returns no landing for a merge in which none
+did, on the race-fallback path too.
+
+Guards proven by bypass (failing tests): the merge defers to a landing in
+flight 9; the loose mover too 5; the marker exists before the reservation
+12; the owner removes its marker 12; a merge with nothing completed is no
+landing 2; the race-fallback merge too 1; only a settled collision completes
+3; only a landed file completes 1 (it failed nothing until a test of a name
+taken during a folder landing was added). A guard that treated an
+unreadable folder as "in flight" was unreachable (`glob` does not raise
+there) and was removed.
+
+Round 2 verification at `08b29de` (this commit is docs only): full suite
+**5,099 passed / 10 skipped / 1 failed** (5,110 tests = 5,091 + 19). The
+failure is again `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`;
+three isolated reruns afterwards: 1 passed,1 passed,1 passed. Codex also reproduced this
+WinError 5 on unmodified base. Codex's four PR #176 repro files pass 16/16
+at this head. Watcher bare-LF 871 (869 + two new import lines in the LF
+import block).
+
+### PR #176 review round 3 (Codex, at `d47b7d8`)
+
+**P1:** the landing marker was observed, not owned. A writer could see a
+complete library book, pause, and then settle against another arrival's
+reservation that replaced it meanwhile. Codex's
+`test_review176_marker_window.py` (SHA256 `bc9ca1e5...102a`) fails 16/16 at
+`d47b7d8`. Scope, narrowed by Codex (PR comment 6757585360): the
+demonstrated concurrency is two admitted timer threads in one watcher
+process, so an in-process lock per physical destination suffices; other
+processes writing the library are documented as outside the guarantee.
+
+Fix (`df2c4b5`): `_settle_or_land` is the one path both movers take for
+every file. It takes `_destination_lock(dest)` (a `threading.Lock` per
+normalized physical path, from a registry that keeps a lock only while it
+is used) **before** deciding anything and holds it through quarantine,
+landing, rollback and cleanup; a thread that cannot take it defers its
+arrival, untouched, to its next pass. The landing marker and its check
+(`RESERVE_MARK`, `_landing_in_flight`) are removed: one mechanism, and no
+marker files for a crash to leave behind. The exclusive reservation of the
+name in `_land` stays.
+
+Two of Codex's earlier probes no longer apply as written, and this is
+expected rather than a regression:
+
+- `test_review176_marker_window.py` patches `_landing_in_flight`, which no
+  longer exists (AttributeError). Its interleaving also cannot occur now:
+  while the paused writer owns the name, the second writer defers instead
+  of reserving it, so its wait for that reservation would time out. My
+  `test_a_writer_that_saw_a_clear_target_keeps_it_until_it_is_done` covers
+  the same scenario (pause after ownership and a clear observation; the
+  other writer must defer; every original survives), both movers, legacy
+  and resolver.
+- `test_review176_quarantine_race.py::test_concurrent_losing_arrivals_keep_both_quarantine_copies`
+  settles one library name from two threads at once, which ownership now
+  forbids: the second defers and never reaches the probe's barrier
+  (BrokenBarrierError after 10 s). My version of that race uses two library
+  roots, where two quarantines of one name can still meet.
+
+The other probes pass: active reservation 8/8, directory receipt 2/2,
+failed landing 2/2, and the two failure-cleanup cases of the quarantine
+race.
+
+Guards proven by bypass (failing tests): a settlement owns its destination
+18; one physical file, one lock 1; ownership ends with the settlement even
+on error 1 (it failed nothing until the test held a registry reference, as
+another thread would); the registry keeps no lock nobody uses 17.
+
+Round 3 verification at `9bedafc` (this commit is docs only): full suite
+**5,105 passed / 10 skipped / 1 failed** (5,116 tests = 5,110 + 6). The
+failure is again `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`;
+three isolated reruns afterwards: 1 passed,1 passed,1 passed. Watcher bare-LF 870 (871 - 1: the
+round-2 `glob`/`uuid` imports became one `contextlib` import).
+
+### PR #176 review round 4 (Codex, at `088f1d0`)
+
+**P1:** `_move_cbz_dir` moved a new series folder with `shutil.move`, which
+across volumes copies the tree straight into the library (`copytree`)
+outside every destination lock; another arrival could settle against a
+half-copied book, then be overwritten. Codex's
+`test_review176_directory_copy.py` (SHA256 `dc356924...422`) fails 8/8 at
+`088f1d0`. Its `test_review176_owned_transactions.py` (`1625736c...0c0`)
+passes 6/6 there and here.
+
+Fix: a whole folder moves only by `os.rename` (atomic; same volume, series
+folder absent). Any failure (another volume, or the folder appeared
+meanwhile) merges file by file through `_settle_or_land`, each file under its
+own destination lock. No folder is ever copied into the library.
+
+`test_review176_directory_copy.py` now fails 8/8 **by construction**, not by
+loss: it pauses inside `shutil.move`'s `copytree` callback, which no longer
+runs, and its `paused.wait(timeout=10)` times out. My
+`test_a_cross_volume_folder_move_lands_file_by_file_under_ownership` covers
+the same interleaving under the new path (forced EXDEV; a folder or loose
+contender, legacy or resolver, arriving while the first file's landing is
+paused defers; both originals survive; `shutil.copytree` is never called).
+It fails 4/4 at `088f1d0`.
+
+Guards proven by bypass (failing tests): a whole folder moves only as one
+rename 4; otherwise it merges file by file under ownership 4.
+
+Round 4 verification. The first full run at `e31a25f` showed 6 watcher
+failures: two test files simulated the folder-move race through
+`shutil.move`, which a folder no longer uses; `ff5a40c` and `2a4b2e2`
+simulate it through `os.rename`. That run also failed two web tests
+(`test_alternating_overflow_compacts_map_and_physical_files` and, for the
+first time here, `tests/web/test_web_browser_smoke.py::test_browser_sign_in_csrf_cross_origin_and_code_reuse`,
+which then passed 2/2 alone). At `2a4b2e2` (later commits docs only): full
+suite **5,109 passed / 10 skipped / 1 failed** (5,120 tests = 5,116 + 4); the
+failure is `tests/web/test_web_log_service.py::test_create_writer_streams_eight_mib_with_one_full_inspection`
+(the second WinError 5 web test Codex also reported); three isolated reruns:
+1 passed,1 passed,1 failed. Nothing under `web` changes. Codex's probes: owned transactions 6/6,
+active reservation 8/8, directory receipt 2/2, failed landing 2/2.

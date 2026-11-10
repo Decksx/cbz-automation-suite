@@ -9,6 +9,7 @@ import os
 import hashlib
 from contextlib import contextmanager
 import argparse
+import contextlib
 import re
 import gc
 import json
@@ -133,6 +134,10 @@ MIN_AGE       = 300  # seconds a directory must exist before processing
 AI_DECENSOR_ENABLED = False
 AI_DECENSOR_MODELS = ["black_bars"]
 AI_DECENSOR_REPROCESS = False
+# Where keep-the-larger puts the copy it does not keep: nothing that differs
+# from the kept copy is ever deleted. Placements go in a dated subfolder
+# (YYYY-MM-DD) so a retention purge can work by age.
+QUARANTINE_ROOT = Path(os.environ.get("CBZ_QUARANTINE_ROOT", r"C:\Temp\cbz_held\quarantine"))
 CAMELIA_ROOT = Path(os.environ.get("CBZ_CAMELIA_ROOT", r"C:\git\camelia"))
 CAMELIA_PYTHON = Path(os.environ.get(
     "CBZ_CAMELIA_PYTHON",
@@ -1142,7 +1147,8 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     On a match the merge works as before: the existing **name** always
     survives. The incoming bytes replace the existing bytes under that name
     only when they are larger by ``REPLACEMENT_MIN_GAIN_BYTES``; otherwise
-    the incoming copy is discarded. So a ``(2019)`` arrival that wins on size
+    the incoming copy is quarantined (``_settle_by_size``). So a ``(2019)``
+    arrival that wins on size
     loses its year token from the name -- accepted: the existing name wins,
     exactly as it did when both names were token-free.
 
@@ -1522,6 +1528,201 @@ def _replacement_gain_is_meaningful(
     return (src_size - dest_size) >= min_gain
 
 
+def _reserve(path: Path, *, numbered: bool = True) -> Path | None:
+    """Create *path* exclusively and return it: this placement now owns the name.
+
+    Choosing a free name and then moving into it is a race: two placements
+    (two admitted directories, or two watchers) can choose the same name,
+    and the second move overwrites the first. An exclusive create
+    (``O_CREAT | O_EXCL``) cannot be won twice. With *numbered*, a taken
+    name is followed by ``<stem> (2)``, ``(3)`` ... until one is created;
+    without it, None says the name is taken. The empty file is then
+    replaced by the archive, and on failure removed: it is the only path a
+    failed placement may clean up, because it is the only one it created.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    candidate = unique_path(path) if numbered else path
+    index = 2
+    while True:
+        try:
+            os.close(os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return candidate
+        except FileExistsError:
+            if not numbered:
+                return None
+            candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+            index += 1
+
+
+# One lock per library destination being settled, keyed by its normalized
+# physical path. Admitted directories run on independent timer threads, so
+# two of them can reach one library name at once; whichever owns it settles
+# it, and the other defers to its next pass.
+_destination_locks: dict[str, list] = {}  # key -> [lock, users]
+_destination_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _destination_lock(dest: Path):
+    """Own *dest* for one whole settlement; yields whether ownership was won.
+
+    Acquired **before** anything about *dest* is decided and held until the
+    settlement is complete: the collision decision, quarantining the
+    library copy, landing the arrival, a rollback and any cleanup. A
+    separate check ("is anyone landing here?") goes stale the moment it is
+    made; ownership cannot. Another thread that wants *dest* meanwhile does
+    not wait: it defers its arrival, untouched, to its next pass. Paths are
+    normalized (resolved, and case-folded on Windows, whose filesystem is
+    case-insensitive), so two spellings of one file share one lock.
+
+    Scope: threads of this watcher process, the single watcher-owned
+    pipeline (one watcher per watch root, ``watcher_instance_lock``).
+    Another process writing the same library names is not serialized by
+    this; it would need its own coordination.
+    """
+    key = os.path.normcase(os.path.realpath(dest))
+    with _destinations_guard_lookup(key) as lock:
+        if not lock.acquire(blocking=False):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            lock.release()
+
+
+@contextlib.contextmanager
+def _destinations_guard_lookup(key: str):
+    """The lock for *key*, kept in the registry only while someone uses it."""
+    with _destination_locks_guard:
+        entry = _destination_locks.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        yield entry[0]
+    finally:
+        with _destination_locks_guard:
+            entry[1] -= 1
+            if entry[1] == 0 and _destination_locks.get(key) is entry:
+                del _destination_locks[key]
+
+
+def _land(src: Path, dest: Path) -> bool:
+    """Move *src* to the free name *dest*. The caller owns *dest* (``_destination_lock``).
+
+    The name is also created exclusively first (``_reserve``), so a writer
+    that does not take the lock still cannot be overwritten. False, with
+    *src* left in place, when *dest* is taken. A failed move removes only
+    this placement's reservation (or its own partial copy) and re-raises,
+    as the plain move did; with the lock held, nothing else can have taken
+    the name meanwhile.
+    """
+    if _reserve(dest, numbered=False) is None:
+        log.warning(f"    '{dest.name}' was taken by another arrival meanwhile; "
+                    f"'{src}' stays for the next pass.")
+        return False
+    try:
+        shutil.move(str(src), str(dest))
+    except (OSError, shutil.Error):
+        if src.exists():
+            dest.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _settle_or_land(src: Path, dest: Path, *, label: str, series_dir: str,
+                    display_name: str | None, conflict_quarantine_root: Path | None,
+                    quarantine_name) -> bool:
+    """Land *src* on *dest*, or settle their collision, owning *dest* throughout.
+
+    The one path every mover takes for every file (both movers, legacy and
+    resolver settlement, new names and collisions). Returns True when the
+    file completed: it landed, its collision was settled, or it was removed
+    as an exact duplicate. False leaves *src* where it is: *dest* is owned
+    by another settlement (deferred to the next pass), a stripped-tag
+    collision is held (issue #131), or the settlement failed.
+    """
+    with _destination_lock(dest) as owned:
+        if not owned:
+            log.warning(f"    '{dest.name}' is being settled by another arrival; "
+                        f"'{label}' waits for the next pass.")
+            return False
+        if not dest.exists():
+            return _land(src, dest)
+        if display_name is not None and _hold_stripped_collision(src, dest, display_name):
+            return False
+        if conflict_quarantine_root is not None:
+            outcome = settle_file_conflict(
+                src, dest, conflict_quarantine_root / series_dir / quarantine_name)
+            action = outcome["action"]
+            if action == "deleted_exact_duplicate":
+                log.info(f"    Exact duplicate removed: '{label}'")
+            else:
+                log.warning(f"    Conflict '{label}': {action}; smaller file quarantined at "
+                            f"'{outcome['quarantined']}'.")
+            return True
+        return _settle_by_size(src, dest, label, series_dir)
+
+
+def _settle_by_size(src: Path, dest: Path, label: str, series_dir: str) -> bool:
+    """Settle a name collision by size without deleting a different book.
+
+    Byte-identical copies are an exact duplicate: the incoming one is removed,
+    which loses nothing. Otherwise the larger copy is kept under *dest*'s name
+    (an incoming copy must win by ``REPLACEMENT_MIN_GAIN_BYTES``) and the
+    other is moved to ``QUARANTINE_ROOT/<date>/<series_dir>/`` under a name
+    this placement owns (``_reserve``). Size is only a proxy for quality, so
+    the loser is kept for review.
+
+    The loser is quarantined before anything else moves. If that fails, both
+    copies stay where they are and the incoming one is retried on a later
+    pass. If the incoming copy then cannot take *dest*'s place, the quarantined
+    library copy is moved back; either way no copy is lost.
+
+    Returns True only when the collision was settled (duplicate removed,
+    loser quarantined, or replacement done); False leaves the arrival in
+    place, and the caller must not count it as landed.
+    """
+    src_size, dest_size = src.stat().st_size, dest.stat().st_size
+    if src_size == dest_size and digest(src) == digest(dest):
+        src.unlink()
+        log.info(f"    Exact duplicate removed: '{label}'")
+        return True
+    incoming_wins = _replacement_gain_is_meaningful(src_size, dest_size)
+    loser = dest if incoming_wins else src
+    try:
+        target = _reserve(QUARANTINE_ROOT / time.strftime("%Y-%m-%d") / series_dir / loser.name)
+    except OSError as e:
+        log.error(f"    Conflict '{label}': could not reserve a quarantine name ({e}); "
+                  f"both copies kept, incoming left in place for the next pass.")
+        return False
+    try:
+        shutil.move(str(loser), str(target))
+    except (OSError, shutil.Error) as e:
+        if loser.exists():
+            target.unlink(missing_ok=True)  # this placement's own reservation or partial copy
+        log.error(f"    Conflict '{label}': could not quarantine '{loser}' ({e}); "
+                  f"both copies kept, incoming left in place for the next pass.")
+        return False
+    if not incoming_wins:
+        log.warning(f"    Conflict '{label}': existing ({dest_size:,} B) kept over incoming "
+                    f"({src_size:,} B); incoming quarantined at '{target}'.")
+        return True
+    try:
+        landed = _land(src, dest)
+    except (OSError, shutil.Error) as e:
+        log.error(f"    Conflict '{label}': could not move the incoming copy into place ({e}); "
+                  f"restoring the existing copy from '{target}'.")
+        landed = False
+    if not landed:
+        if _land(target, dest):
+            log.info(f"    Restored the existing copy of '{label}'.")
+        else:
+            log.error(f"    Conflict '{label}': another arrival took the name; the existing "
+                      f"copy stays quarantined at '{target}'.")
+        return False
+    log.warning(f"    Conflict '{label}': incoming ({src_size:,} B) replaced existing "
+                f"({dest_size:,} B); existing quarantined at '{target}'.")
+    return True
 def _defers_rename(current_stem: str, new_stem: str) -> bool:
     """Whether renaming *current_stem* to *new_stem* drops a distinguishing tag.
 
@@ -1658,12 +1859,14 @@ def _merge_directories(
     conflict_quarantine_root: Path | None = None,
     stripped_arrivals: dict[Path, str] | None = None,
     held: frozenset[Path] = frozenset(),
-) -> None:
-    """Recursively merge *src_dir* into *dest_dir*.
+) -> int:
+    """Recursively merge *src_dir* into *dest_dir*; return how many files completed.
 
     Legacy imports retain the measured replacement threshold. Resolver imports
     compare exact duplicates and quarantine the smaller non-identical file
-    outside the library instead of discarding it.
+    outside the library instead of discarding it. Legacy imports quarantine
+    the copy they do not keep too (``_settle_by_size``): no mode deletes a
+    copy that differs from the one it keeps.
 
     *stripped_arrivals* (``_stripped_arrivals``) names the archives whose
     match with an existing file may exist only because a tag was stripped.
@@ -1676,8 +1879,14 @@ def _merge_directories(
     review (a refused name, or a second copy of a chapter). They are never
     moved, replaced or deleted here, so ``_remove_merged_source`` finds them
     still in *src_dir* and leaves it in place.
+
+    A file completes when it lands, when its collision is settled, or when
+    it is removed as an exact duplicate. A held, deferred or failed file
+    does not; ``_move_cbz_dir`` gives no landing receipt for a merge in which
+    nothing completed.
     """
     stripped_arrivals = stripped_arrivals or {}
+    completed = 0
     for src_item in iter_paths_excluding_directories(src_dir):
         relative  = src_item.relative_to(src_dir)
         dest_item = dest_dir / relative
@@ -1702,41 +1911,11 @@ def _merge_directories(
             if match is not None:
                 dest_item = match
 
-        if dest_item.exists():
-            if display_name is not None and _hold_stripped_collision(
-                src_item, dest_item, display_name
-            ):
-                continue
-            if conflict_quarantine_root is not None:
-                outcome = settle_file_conflict(
-                    src_item,
-                    dest_item,
-                    conflict_quarantine_root / dest_dir.name / relative,
-                )
-                action = outcome["action"]
-                if action == "deleted_exact_duplicate":
-                    log.info(f"    Exact duplicate removed: '{relative}'")
-                else:
-                    log.warning(
-                        f"    Conflict '{relative}': {action}; smaller file quarantined at "
-                        f"'{outcome['quarantined']}'."
-                    )
-                continue
-            src_size  = src_item.stat().st_size
-            dest_size = dest_item.stat().st_size
-            if _replacement_gain_is_meaningful(src_size, dest_size):
-                log.warning(f"    Conflict '{relative}': incoming ({src_size:,} B) > existing ({dest_size:,} B) - replacing (existing file discarded).")
-                dest_item.unlink()
-                shutil.move(str(src_item), str(dest_item))
-            elif src_size > dest_size:
-                log.warning(f"    Conflict '{relative}': incoming ({src_size:,} B) exceeds existing ({dest_size:,} B) by only {src_size - dest_size:,} B (< {REPLACEMENT_MIN_GAIN_BYTES:,} B) - keeping existing (incoming file discarded).")
-                src_item.unlink()
-            else:
-                log.warning(f"    Conflict '{relative}': existing ({dest_size:,} B) >= incoming ({src_size:,} B) - keeping existing (incoming file discarded).")
-                src_item.unlink()
-        else:
-            dest_item.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src_item), str(dest_item))
+        completed += _settle_or_land(
+            src_item, dest_item, label=str(relative), series_dir=dest_dir.name,
+            display_name=display_name, conflict_quarantine_root=conflict_quarantine_root,
+            quarantine_name=relative)
+    return completed
 
 
 # ─────────────────────────────────────────────
@@ -2413,39 +2592,51 @@ def _move_cbz_dir(
             if chapter_number:
                 _backfill_chapter_one(dest_dir, folder_name)
             log.info(f"  Destination exists - merging, keeping larger files on conflict.")
-            _merge_directories(
+            completed = _merge_directories(
                 dir_path, dest_dir,
                 conflict_quarantine_root=conflict_quarantine_root,
                 stripped_arrivals=stripped_arrivals,
                 held=held,
             )
             _remove_merged_source(dir_path)
+            if not completed:
+                log.warning(f"  Nothing from '{dir_path.name}' completed; it stays for the next pass.")
+                return None
             log.info(f"  Merge complete.")
             return dest_dir
         else:
+            # A whole folder moves only as one rename (same volume, and the
+            # destination folder not there yet): atomic, so nothing in it is
+            # visible before it is complete. Never shutil.move: across volumes
+            # it copies the tree straight into the library, file by file,
+            # outside every destination's ownership, where another arrival can
+            # settle against a half-copied book.
             try:
-                shutil.move(str(dir_path), str(dest_dir))
+                os.rename(dir_path, dest_dir)
                 log.info(f"  Moved successfully.")
                 _land_deferred_names(dir_path, dest_dir, stripped_arrivals)
                 return dest_dir
-            except (OSError, shutil.Error):
-                # WinError 183: dest was created by a concurrent thread between
-                # our exists() check and the move — fall back to merge.
-                if dest_dir.exists():
-                    if chapter_number:
-                        _backfill_chapter_one(dest_dir, folder_name)
-                    log.info(f"  Race on move — destination appeared, falling back to merge.")
-                    _merge_directories(
-                        dir_path, dest_dir,
-                        conflict_quarantine_root=conflict_quarantine_root,
-                        stripped_arrivals=stripped_arrivals,
-                        held=held,
-                    )
-                    _remove_merged_source(dir_path)
-                    log.info(f"  Merge complete.")
-                    return dest_dir
-                else:
-                    raise
+            except OSError:
+                # Another volume (the library on Tower), or the destination
+                # appeared meanwhile (WinError 183): merge file by file, each
+                # under its own destination lock (_settle_or_land).
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                if chapter_number:
+                    _backfill_chapter_one(dest_dir, folder_name)
+                log.info(f"  Not a same-volume rename; merging file by file.")
+                completed = _merge_directories(
+                    dir_path, dest_dir,
+                    conflict_quarantine_root=conflict_quarantine_root,
+                    stripped_arrivals=stripped_arrivals,
+                    held=held,
+                )
+                _remove_merged_source(dir_path)
+                if not completed:
+                    log.warning(f"  Nothing from '{dir_path.name}' completed; it stays "
+                                f"for the next pass.")
+                    return None
+                log.info(f"  Merge complete.")
+                return dest_dir
 
     except Exception as e:
         log.error(f"  Failed to move directory '{dir_path.name}': {e}")
@@ -2493,52 +2684,11 @@ def _move_loose_files(
             if match is not None:
                 dest_item = match
 
-        if dest_item.exists():
-            if display_name is not None and _hold_stripped_collision(
-                src, dest_item, display_name
-            ):
-                continue
-            if conflict_quarantine_root is not None:
-                outcome = settle_file_conflict(
-                    src,
-                    dest_item,
-                    conflict_quarantine_root / dest_dir.name / src.name,
-                )
-                action = outcome["action"]
-                if action == "deleted_exact_duplicate":
-                    log.info(f"    Exact duplicate removed: '{src.name}'")
-                else:
-                    log.warning(
-                        f"    Conflict '{src.name}': {action}; smaller file quarantined at "
-                        f"'{outcome['quarantined']}'."
-                    )
-                moved += 1
-                continue
-            src_size  = src.stat().st_size
-            dest_size = dest_item.stat().st_size
-            if _replacement_gain_is_meaningful(src_size, dest_size):
-                log.warning(
-                    f"    Conflict '{src.name}': incoming ({src_size:,} B) > "
-                    f"existing ({dest_size:,} B) - replacing (existing file discarded)."
-                )
-                dest_item.unlink()
-                shutil.move(str(src), str(dest_item))
-            elif src_size > dest_size:
-                log.warning(
-                    f"    Conflict '{src.name}': incoming ({src_size:,} B) exceeds "
-                    f"existing ({dest_size:,} B) by only {src_size - dest_size:,} B "
-                    f"(< {REPLACEMENT_MIN_GAIN_BYTES:,} B) - keeping existing "
-                    f"(incoming file discarded)."
-                )
-                src.unlink()
-            else:
-                log.warning(
-                    f"    Conflict '{src.name}': existing ({dest_size:,} B) >= "
-                    f"incoming ({src_size:,} B) - keeping existing (incoming file discarded)."
-                )
-                src.unlink()
-        else:
-            shutil.move(str(src), str(dest_item))
+        if not _settle_or_land(
+                src, dest_item, label=src.name, series_dir=dest_dir.name,
+                display_name=display_name, conflict_quarantine_root=conflict_quarantine_root,
+                quarantine_name=src.name):
+            continue  # deferred, held or failed: the arrival stays and is not a landing
         moved += 1
 
     log.info(f"  Moved {moved} loose file(s) -> {dest_dir}")
@@ -2751,8 +2901,9 @@ def _carried_second_copies(comic_dir: Path, paths) -> dict[Path, str]:
 
     Once the kept copy has landed, the import folder alone no longer shows
     the held copy as a second translation. Released, it would be named onto
-    the kept copy's library name and settled by keep-the-larger, discarding
-    one translation. So a held copy stays held while its name and bytes are
+    the kept copy's library name and settled by keep-the-larger, which
+    quarantines one translation the operator never chose between. So a held
+    copy stays held while its name and bytes are
     unchanged, whatever else arrives beside it. Maps path -> kept copy's name.
     """
     with _held_state_lock:
@@ -3870,6 +4021,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "defaults to black_bars."
         ),
     )
+    parser.add_argument(
+        "--quarantine-root", type=Path, default=QUARANTINE_ROOT,
+        help="Where a file-name collision's losing copy is moved (never deleted).",
+    )
     parser.add_argument("--camelia-root", type=Path, default=CAMELIA_ROOT)
     parser.add_argument("--camelia-python", type=Path, default=CAMELIA_PYTHON)
     parser.add_argument(
@@ -3940,6 +4095,7 @@ def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
     """Apply session globals only after exclusive root ownership is held."""
     global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
+    global QUARANTINE_ROOT
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
     global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
@@ -3956,6 +4112,7 @@ def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
     AI_DECENSOR_REPROCESS = args.ai_decensor_reprocess
     CAMELIA_ROOT = args.camelia_root
     CAMELIA_PYTHON = args.camelia_python
+    QUARANTINE_ROOT = args.quarantine_root
     AI_DECENSOR_BACKUP_DIR = args.ai_decensor_backup_dir
     AI_DECENSOR_ARCHIVE_DIR = args.ai_decensor_archive_dir
     SERIES_RESOLVER_ENABLED = args.series_resolver
