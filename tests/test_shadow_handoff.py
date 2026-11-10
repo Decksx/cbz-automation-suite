@@ -180,8 +180,12 @@ def test_shadow_plan_logs_would_be_case_and_moves_nothing_extra(
 
     assert len(plans) == 1
     args, expected = plans[0]
-    assert args[:6] == (review, arrival, arrival, "Untagged Series",
-                        series_key("Untagged Series"), "Untagged Series")
+    # Claim-first: the arrival path is where it arrived; the payload the plan
+    # would stage is the claimed copy in processing.
+    assert args[1] == arrival
+    assert Path(watcher.PROCESSING_ROOT) in args[2].parents and args[2].name == arrival.name
+    assert (args[0],) + args[3:6] == (review, "Untagged Series",
+                                      series_key("Untagged Series"), "Untagged Series")
     lines = _handoff_lines(caplog)
     assert len(lines) == 1
     assert "[handoff:review_handoff]" in lines[0]
