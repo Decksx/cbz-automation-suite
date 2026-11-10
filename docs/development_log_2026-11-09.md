@@ -391,3 +391,16 @@ It fails 4/4 at `088f1d0`.
 
 Guards proven by bypass (failing tests): a whole folder moves only as one
 rename 4; otherwise it merges file by file under ownership 4.
+
+Round 4 verification. The first full run at `e31a25f` showed 6 watcher
+failures: two test files simulated the folder-move race through
+`shutil.move`, which a folder no longer uses; `ff5a40c` and `2a4b2e2`
+simulate it through `os.rename`. That run also failed two web tests
+(`test_alternating_overflow_compacts_map_and_physical_files` and, for the
+first time here, `tests/web/test_web_browser_smoke.py::test_browser_sign_in_csrf_cross_origin_and_code_reuse`,
+which then passed 2/2 alone). At `2a4b2e2` (later commits docs only): full
+suite **5,109 passed / 10 skipped / 1 failed** (5,120 tests = 5,116 + 4); the
+failure is `tests/web/test_web_log_service.py::test_create_writer_streams_eight_mib_with_one_full_inspection`
+(the second WinError 5 web test Codex also reported); three isolated reruns:
+1 passed,1 passed,1 failed. Nothing under `web` changes. Codex's probes: owned transactions 6/6,
+active reservation 8/8, directory receipt 2/2, failed landing 2/2.
