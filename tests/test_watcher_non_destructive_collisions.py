@@ -10,6 +10,7 @@ byte-identical incoming copy is removed, which loses nothing.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import time
@@ -474,17 +475,21 @@ def test_an_all_failed_merge_after_a_destination_race_has_no_landing_receipt(tmp
     library = tmp_path / "library"
     series = library / "Berserk"
     src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
-    real_move = watcher.shutil.move
+    real_move, real_rename = watcher.shutil.move, watcher.os.rename
 
-    def race_then_refuse(source, target):
+    def race(source, target):
         if Path(source) == src.parent:
             _make_cbz(series / "Berserk ch. 1.cbz", 100)  # the other thread's copy
             raise FileExistsError("destination appeared")
+        return real_rename(source, target)
+
+    def refuse(source, target):
         if "_quarantine" in Path(target).parts:
             raise PermissionError("quarantine refused")
         return real_move(source, target)
 
-    monkeypatch.setattr(watcher.shutil, "move", race_then_refuse)
+    monkeypatch.setattr(watcher.os, "rename", race)
+    monkeypatch.setattr(watcher.shutil, "move", refuse)
     landed = watcher._move_cbz_dir(src.parent, str(library), target_name="Berserk")
 
     assert landed is None and src.is_file()
@@ -588,3 +593,64 @@ def test_a_lock_is_released_when_the_settlement_raises(tmp_path, monkeypatch):
     assert watcher._destination_locks == {}
     with watcher._destination_lock(library / src.name) as owned:
         assert owned
+
+
+
+# ---------------------------------------------------------------------------
+# PR #176 review round 4: a whole-folder move never bypasses ownership
+# ---------------------------------------------------------------------------
+
+def _cross_volume(monkeypatch, folder: Path):
+    """Make the folder rename fail as it does across volumes (EXDEV)."""
+    real_rename = watcher.os.rename
+
+    def rename(source, target):
+        if Path(source) == folder:
+            raise OSError(errno.EXDEV, "not the same volume")
+        return real_rename(source, target)
+
+    monkeypatch.setattr(watcher.os, "rename", rename)
+
+
+@pytest.mark.parametrize("contender", ["directory", "loose"])
+@pytest.mark.parametrize("resolver", [False, True], ids=["legacy", "resolver"])
+def test_a_cross_volume_folder_move_lands_file_by_file_under_ownership(tmp_path, monkeypatch, contender, resolver):
+    """Codex's directory-copy interleaving (round 4): the first arrival's
+    folder cannot be renamed into the library (another volume), so it lands
+    file by file, each under its own destination lock. A contender for the
+    same name while that landing is paused defers; both survive."""
+    library_root = tmp_path / "library"
+    library_root.mkdir()
+    library = library_root / "Berserk"
+    first = _make_cbz(tmp_path / "incoming" / "first" / "Berserk" / "Berserk ch. 9.cbz", 20000)
+    second = _make_cbz(tmp_path / "incoming" / "second" / "Berserk" / first.name, 30000)
+    _cross_volume(monkeypatch, first.parent)
+    monkeypatch.setattr(watcher.shutil, "copytree",
+                        lambda *a, **k: pytest.fail("a folder was copied straight into the library"))
+    paused, release = threading.Event(), threading.Event()
+    real_move = watcher.shutil.move
+
+    def pause_first(source, target):
+        if Path(source) == first:
+            paused.set()
+            assert release.wait(timeout=10)
+        return real_move(source, target)
+
+    monkeypatch.setattr(watcher.shutil, "move", pause_first)
+    options = {"conflict_quarantine_root": tmp_path / "_resolver_q"} if resolver else {}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_done = pool.submit(watcher._move_cbz_dir, first.parent, str(library_root),
+                                 target_name="Berserk")
+        assert paused.wait(timeout=10)
+        try:
+            if contender == "directory":
+                watcher._move_cbz_dir(second.parent, str(library_root), target_name="Berserk", **options)
+            else:
+                watcher._move_loose_files([second], str(library_root), "Berserk", **options)
+            assert second.is_file()  # deferred while the first owns the name
+        finally:
+            release.set()
+        assert first_done.result(timeout=10) == library
+
+    assert _all_payloads(tmp_path) == [20000, 30000]
+    assert _payload_size(library / first.name) == 20000
