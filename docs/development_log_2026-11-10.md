@@ -130,3 +130,61 @@ tag-distinguished name 2).
 
 Full suite: **5,206 passed / 10 skipped / 0 failed** (5,216 collected =
 5,188 + 28 new).
+
+### PR #178 review round 2 (Codex, at `d1bc97b`)
+
+**P2 (same finding, two spellings):** the word splitter missed `PartA` /
+`PartB` (which the watcher's own `_PART_RE` reads as parts A and B) and the
+canonical `One-shot`. The compact parts still shared one name and one went
+to review as a second copy. Codex's `test_review178_known_prefixes.py`
+(SHA256 `602a1cb8...8a10`) fails 7/7 at `d1bc97b` and passes 7/7 on base.
+
+Fix: the separate word list is gone; the grammar already in the code
+decides.
+
+- Parts: `_PART_RE` moved into `cbz_core` as `PART_MARKER_RE`, and the
+  watcher's `_PART_RE` is now that object, so the same-chapter copy check
+  and the group check read parts identically.
+- Specials: `SPECIAL_WORDS` from `cbz_canonical_name` (Omnibus,
+  Compilation, Complete, Special, Extra, Bonus, Omake, One-shot).
+- Volume, season, chapter, episode and `pt` have grammars only with a
+  number, which the digit rule (kept) covers; their bare words, and arc,
+  book, story, side story, prologue, epilogue, afterword, interlude and act,
+  which have no grammar here, stay in a small conservative list.
+- Every word matches whole, with or without spaces, hyphens or underscores
+  between its parts (`One-shot`, `One shot`, `Oneshot`; `Side Story`,
+  `Side-Story`, `SideStory`); the part grammar reads `PartA` itself.
+
+The live log's groups are unaffected (69 of 70 dropped, `Amin3` kept as
+before). Codex's round-1 and round-2 probes pass 13/13 at this head.
+
+New tests: 10 identity spellings in plain and display parsing (20 cases),
+the shared part grammar, and `PartA`/`PartB` landing as two books. With
+`cbz_core.py` and `cbz_watcher.py` at `d1bc97b`, 12 of the 20 cases, the
+grammar test and the end-to-end test fail: `PartA`, `PartB`, `One-shot`,
+`One shot`, `SideStory` and `Complete` were dropped there; `Omake`,
+`Oneshot`, `Side-Story` and `Extra2` were already kept.
+
+Guards proven by bypass (failing tests): a part marker is not a group 10;
+a canonical special word is not a group 16; another structural word is not
+a group 8; words match with or without separators 6; a prefix with a digit
+is not a group 2; the group test decides 53; the earlier guards still fail
+as before. A split of run-together words at capitals failed nothing under
+bypass (the separator-tolerant words and the part grammar already catch
+`sidestory` and `parta`), so it was removed. The watcher's `_PART_RE` being
+`PART_MARKER_RE` cannot be shown by bypass: an identical pattern recompiled
+in the watcher is the same object (the `re` module's cache), so the
+behaviour cannot differ. The shared reference stays, to keep one source.
+
+Process note: during the bypass run I copied the two sources aside, and
+those copies were the run's temporary (LF-normalised, guard-removed)
+versions; restoring from them broke the files. The watcher was rebuilt from
+HEAD with the three edits re-applied byte-exactly, and the one changed
+`cbz_core.py` line restored; every guard was then proven again on the final
+tree, and the full suite ran on it.
+
+Watcher edit byte-exact: no unchanged line changed its ending; the 4 added
+lines are CRLF like their surroundings; bare LF stays 863.
+
+Full suite: **5,228 passed / 10 skipped / 0 failed** (5,238 collected =
+5,216 + 22 new); both sources hashed before the run and unchanged after.
