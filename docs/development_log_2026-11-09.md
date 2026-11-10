@@ -583,3 +583,55 @@ the #176 rounds, and nothing under `web` changes:
 (three isolated reruns: 3 passed) and
 `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`
 (three isolated reruns: 2 passed, 1 failed).
+
+### PR #177 review round 2 (Codex, at `b979fd6`)
+
+Codex closed round 1's P1 and P2. **New P2:** `_resumed_items` read
+`claim.json` before `_claim_item` took ownership, and `_claim_item` saved
+that snapshot as the record. Two passes for disjoint sibling folders both
+resume first: A reads an unfinished claim with no AI custody and waits; B
+takes the claim, decensors, records the custody, cannot land and lets go;
+A then takes it, saves its old record over B's custody and decensors again.
+Codex's `test_review177_r2_record_snapshot.py` (SHA256 `70f66c03...faef0a`)
+sees calls `['Berserk ch. 1.cbz', 'Berserk ch. 1.cbz']` at `b979fd6`.
+
+Fix: `_resumed_items` takes the owner lock first and only then reads the
+record; every judgement (missing or corrupt record, another watch root,
+nothing left) is made while owning it, and the lock is handed to
+`_claim_item` with the record read under it (`Claim.owner`). Another watch
+root's claim is let go explicitly. `_claim_item` no longer locks a claim
+itself: every claim reaches it owned (by its creator or by the resume), and
+an unowned one is refused (`ValueError`), since its record was read without
+the lock. The only other source of a claim is its creator, which owns it
+from before the record exists, so no other pre-lock read remains.
+
+Codex's probe at this head fails **by construction**: A now owns the claim
+while it waits in `read_record`, so B skips it and the probe's mid-way
+`len(calls) == 1` sees 0; its final assertion (one rewrite) holds. The
+adapted `test_a_waiting_resumer_never_saves_a_record_it_read_before_owning`
+fails at `b979fd6` with exactly Codex's calls, and
+`test_processing_refuses_a_claim_that_is_not_owned` fails there (no
+refusal). `test_a_claim_for_another_watch_root_is_left_to_its_watcher` now
+also has that root's watcher take the claim afterwards.
+
+Guards proven by bypass (failing tests): a resumer owns the claim before
+reading its record 1; processing refuses an unowned claim 1; the resume
+hands its ownership to processing 28 (+1 error). Letting go of another
+watch root's claim fails nothing under bypass, and cannot: the dropped lock
+object is freed (closing its file, which releases the lock) when the loop
+rebinds `lock` for the next folder. The explicit release stays.
+
+Web flake A/B (Codex asked, since the autouse fixture changed):
+`tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`
+run isolated 30 times on base `9c26775` and 30 on this head, alternating,
+same machine: **base 13 failed / 30, head 9 failed / 30**. Not worse. The
+test is single-threaded (about 300 `os.replace` of `index.tmp` over
+`index.json` in its own `tmp_path`); the changed fixture only sets two
+module attributes and creates nothing, and importing the claims module
+starts no thread and opens no handle.
+
+Watcher edits byte-exact: no unchanged line changed its ending; every added
+line is CRLF like its surroundings; bare LF stays 863.
+
+Full suite: **5,144 passed / 10 skipped / 0 failed** (5,154 collected =
+5,152 + the 2 new test IDs).
