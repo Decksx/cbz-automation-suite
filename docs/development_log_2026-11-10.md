@@ -398,3 +398,63 @@ unchanged after each.
 
 Full suite: **5,604 passed / 10 skipped / 0 failed** (5,614 collected =
 5,327 + 287 new).
+
+### PR #180 review round 3 (Codex, at `a1e36f9`)
+
+Codex closed the CJK finding. **P2 (a regression from this PR):** the
+translated-title rebuild wrote `<translation> Ch. <chapter>` or
+`<translation> Vol. <volume>`, and a range sets neither field any more, so
+`漫画 Ch. 1-30` and `漫画 Ch. 31-60` both became `Story.cbz`; one landed and
+the other was sent to review. On base they landed as two names (each with
+one endpoint). Codex's `test_review180_translated_ranges.py` (SHA256
+`7ace1d39...3895`) fails 6/8 at `a1e36f9`.
+
+Fix: the rebuild carries the range as it was written, with its kind
+(`_range_suffix`): `Story Ch. 1-30`, `Story Vol. 1-3` (from `Vol. 1-3` or
+`第1-3巻`), a bare `Story 1-30`. Single chapters are unchanged (`Story Ch.
+30`).
+
+The audit now covers the name **rebuilders** too, not only the readers:
+
+- the translated-title rebuild (`parse_comic_name`): the 264-case matrix
+  again with a translator on, plain and display (528 cases);
+- the watcher's fallback name for a placeholder (`_apply_fallback_naming`):
+  in a range folder (`Berserk Ch. 1-30`) it took the first end on master
+  (`Berserk ch. 1.cbz`) and nothing after round 2 (`Berserk.cbz`, which two
+  range folders would share). It now carries the range, in the canonical
+  formatter's spelling (`1~30` becomes `1-30`, the only range form the
+  formatter accepts): `Berserk ch. 1-30.cbz`, chapter field unset. A
+  volume-range folder (`Berserk Vol. 1-3`) has no chapter slot to carry its
+  range, so its placeholder is reviewed rather than named after the series
+  alone (`range_in`).
+- the other rebuilders were already covered: `normalize_stem`'s generic
+  branches and the mixed-title suffix (rounds 1 and 2), and media naming,
+  which keeps the legacy name for any range.
+
+**Placeholder case (David, 2026-11-10):** the fallback name comes from the
+canonical formatter, as every fallback name has on master (`Berserk ch. 4`,
+pinned by `test_round_group_tags` and `test_watcher_canonical_convergence`),
+so a range placeholder is `Berserk ch. 1-30.cbz`, consistent with them,
+while the legacy translated rebuild gives `Story Ch. 1-30`. David decided
+on uppercase `Ch.` everywhere the watcher names a file; that is a separate
+follow-up PR switching the canonical formatter's display to `Ch.`, not part
+of this one.
+
+Codex's three #180 probes pass 24/24. New tests: the translated audit
+(528), a translated single chapter, two translated compilations landing as
+two books, placeholders in range folders (4, the single-number case as
+before), a placeholder in a volume-range folder reviewed, and translated
+range kinds (4). At `a1e36f9` 192 fail; the single-number cases pass.
+
+Guards proven by bypass (failing tests): the translated rebuild carries the
+range 192; a placeholder in a range folder is labelled with it 4; the label
+is in the formatter's spelling 2; a volume range is rebuilt as a volume
+range 3; a placeholder in a volume-range folder is reviewed 1. The sources
+were hashed before the bypass run and the full suite and were unchanged
+after each.
+
+Watcher edit byte-exact: no unchanged line changed its ending; the 19 added
+lines are CRLF like their surroundings; bare LF stays 863.
+
+Full suite: **6,145 passed / 10 skipped / 0 failed** (6,155 collected =
+5,614 + 541 new).
