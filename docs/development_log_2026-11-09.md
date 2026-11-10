@@ -287,3 +287,67 @@ Windows / `C:\Python311` / Python 3.11, temporary fixtures only:
   4/4, `test_review173_r2_preprocessing.py` 2/2,
   `test_review173_probes.py` 8/8, `test_review173_r2_guards.py` 4/4;
 - `scripts/cbz_watcher.py` stored bare-LF count still 868.
+
+### PR #175 review round 2 (Codex, at `ed79a8a`): fail closed
+
+Two failure-path P1s. **(1)** A failed move after naming left Alpha's copies
+under canonical names; on the retry Beta was carried, so Alpha was alone, no
+longer in a cluster, unprotected, and keep-the-larger discarded Alpha 1.
+**(2)** A failed state write dropped a real collision hold; the next pass read
+the file as fresh history and discarded the held copy.
+
+Codex's repro `test_review175_failures.py` changed after review: the SHA256
+the coordinator gave, `49f98b21...a8a6b4`, is the 2-case version; the file
+on disk is now `64917643...edddf83`, which adds an `existing-history` case.
+Both were kept (scratchpad `codex175/`); at `ed79a8a` they fail 2/2 and 3/3.
+
+Applied principle: protection fails closed. If a step that would establish
+or remember protection fails, the affected copies stay protected this pass
+and on the retry; only an affected copy's own landing or hold releases it.
+
+- While a directory has any remembered second copy (on disk or unsaved),
+  every archive in it is protected (`under_review`).
+- A failed state write keeps the copies in `_unsaved_second_copies`, merged
+  into every later read until a write for that directory succeeds.
+- An unreadable state file is never overwritten; the pass protects
+  everything and keeps its holds in memory.
+- A copy that cannot be hashed is remembered with no hash (judged again,
+  still protected); a directory that cannot be listed keeps its copies.
+- An exception from either mover is a failed move, so the pass still
+  records the holds it made.
+- Known gap: a watcher restart while the state file cannot be written loses
+  the in-memory holds.
+
+Tests first (`ad86698`): one pass with an injected failure at each step --
+state read at the start, state read when recording, state write, the
+directory move (returning None or raising), one archive's file move, the
+loose-file move, hashing, listing -- then two clean passes; every original
+copy must still exist, the library copy be unchanged, and the unaffected
+siblings land. At `ed79a8a` the state-write, both directory-move and
+loose-move cases fail. A separate test (`c23ebfb`, `736f8e1`) pins that a
+transient read failure never overwrites other directories' holds.
+
+Guards proven by bypass (held-archive tests, failing per guard): directory
+under review protects everything 5; unreadable state at the start puts the
+directory under review 2; unsaved copies count as recorded 1; a failed
+write keeps copies in memory 1; an unreadable file is never overwritten 1
+(it failed nothing until the targeted test above); an unhashable copy is
+still remembered 1; an unlistable directory keeps its copies 1; a raising
+directory move is a failed move 1; a raising loose move is a failed move 1.
+An unreachable clause (a recorded hash of None never equals a real hash)
+was removed.
+
+Verification at `004d728` (later commits are docs only), Windows /
+`C:\Python311` / Python 3.11, temporary fixtures only:
+
+- full suite: **5,075 passed / 10 skipped / 1 failed** (5,086 tests) = the
+  5,076 at `146f1b5` + 10 new. The failure is the known `tests/web`
+  file-lock flake `test_alternating_overflow_compacts_map_and_physical_files`
+  (the branch changes nothing under `web`; it passes alone). The same code
+  at `c91128f`, before two test-only commits, ran **5,075 passed / 10
+  skipped / 0 failed** (5,085 tests);
+- Codex's files at this head, **23/23**: `test_review175_failures.py` (on
+  disk, `64917643...`) 3/3 with `test_review175_persistence.py` 4/4,
+  `test_review173_r2_preprocessing.py` 2/2, `test_review173_probes.py` 8/8,
+  `test_review173_r2_guards.py` 4/4; and the `49f98b21...` version 2/2;
+- `scripts/cbz_watcher.py` stored bare-LF count still 868.
