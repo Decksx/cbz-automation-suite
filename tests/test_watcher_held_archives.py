@@ -896,15 +896,26 @@ def test_a_transient_state_read_failure_never_overwrites_other_directories(media
     for chapter in (1, 2):
         _make_cbz(other / f"Delta Ch.{chapter}.cbz", 700 + chapter)
     real_load = watcher._load_held_state
-    calls = {"n": 0}
+    real_remember = watcher._remember_held_directory
+    recording = {"on": False}
 
     def unreadable_when_recording():
-        calls["n"] += 1
-        return None if calls["n"] == 2 else real_load()
+        return None if recording["on"] else real_load()
+
+    def remember(*args, **kwargs):
+        # Only the read inside the record step fails: the start-of-pass
+        # reads succeed, so this pass itself is not under protect-all.
+        recording["on"] = True
+        try:
+            return real_remember(*args, **kwargs)
+        finally:
+            recording["on"] = False
 
     monkeypatch.setattr(watcher, "_load_held_state", unreadable_when_recording)
+    monkeypatch.setattr(watcher, "_remember_held_directory", remember)
     watcher.process_and_move_directory(other)
     monkeypatch.setattr(watcher, "_load_held_state", real_load)
+    monkeypatch.setattr(watcher, "_remember_held_directory", real_remember)
 
     _make_cbz(usogui / "Alpha Ch.4.cbz", 104)
     watcher.process_and_move_directory(usogui)
