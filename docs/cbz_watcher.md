@@ -81,7 +81,10 @@ rename and hands it to the processing that follows. Only the owner retires a
 claim, after re-checking under the lock that no arrival file is left; once it
 lets go it removes only the lock file and the empty folder, so a claim another
 party has just taken over is never deleted. A claim that merely looks empty is
-not taken as proof that its creator crashed. An unfinished claim is resumed before new arrivals;
+not taken as proof that its creator crashed. A resume takes the lock before it
+reads the claim's record, and judges it (missing, corrupt, another watch root,
+nothing left) only while owning it, so a record another owner has since
+replaced is never acted on or saved back. An unfinished claim is resumed before new arrivals;
 every archive in it is treated as already processed for collision purposes,
 and a crashed landing (an empty reservation or a hidden `.<name>.cbz-landing`
 partial copy in the library) is cleared first. A claim folder whose record is
