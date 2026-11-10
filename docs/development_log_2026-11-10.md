@@ -508,3 +508,93 @@ unchanged after each.
 
 Full suite: **6,330 passed / 10 skipped / 0 failed** (6,340 collected =
 6,155 + 185 new).
+
+## Watcher: known group prefixes without a downloader hash
+
+### Incident
+
+Live at `eb32d3e` (#178 merged), 2026-11-10 11:58: Comick (Unoriginal)
+delivered `Mangakakalot Ch. 53.cbz` into "City of Sins", and it kept that
+name. #178 drops a group prefix only with the downloader's trailing hex
+hash, because without it the prefix could be a real series. David approved
+dropping a prefix without the hash when it is a known group.
+
+### Changes
+
+- `config/known-groups.txt` (new, version-controlled; not the gitignored
+  `routing.json`): 212 known scanlation groups and source sites, one per
+  line, with the format and how to add a group at the top. 191 come from
+  the 2026-11-10 library audit's bucket 1 (`scratchpad/groupnames/
+  classify.py`, `GROUPS`) and 21 from the watcher log's hashed arrivals.
+- `scripts/cbz_core.py`: `_KNOWN_GROUP_CHAPTER_RE`, `known_groups()`,
+  `_group_key()`, `_is_structural_prefix()`. Without a hash,
+  `<Group> Ch. N`, `<Group> Chapter N`, `<Group> Episode N` and
+  `<Group>_Chapter N` (a title may follow) become `Chapter N`, named
+  `<Series> Ch. N` by the existing pipeline (uppercase `Ch.`, as David keeps
+  it), when the prefix is exactly a known group: case, spacing and
+  punctuation ignored, nothing else. The list is re-read when the file
+  changes; a missing file means no known groups. The display-name step now
+  receives the group-free name: with the original, `Mangakakalot Chapter 53`
+  came out as `Chapter 53.cbz` in display mode.
+- **David's decision (2026-11-10): an exact listed match overrides the digit
+  rule only.** `_is_structural_prefix` (`PART_MARKER_RE`, `SPECIAL_WORDS`,
+  `STRUCTURAL_PREFIX_WORDS`, and the volume, season, episode, part and
+  chapter number grammars, so `S2`, `V3`, `E5`, `P2`, `Ch 4`) always wins,
+  even over a listed line: `Part 2` or `S2` added to the file can never strip.
+  The hashed path keeps its digit rule unchanged.
+- `docs/cbz_watcher.md`: "Group prefixes in chapter names", including how to
+  add a known group.
+
+### Which candidates were shipped
+
+Of 222 candidates, 212 are listed. Of the 9 the digit rule had dropped, 8
+are shipped: `Manhwa18`, `Amin3`, `KM 42`, `1 2 Translations` and
+`that one guy 2123` (the digits are part of the group name), and
+`Gamma 2`, `Omega 2` and `Manhwa18 2`, which the morning's audit found are
+second copies from the same group with the same chapter numbering as the
+base group, not seasons; stripped, a copy collides with the primary one and
+goes to review, the intended handling for duplicates (noted in the file).
+Left out: `Official · sugerrrrr 2.5`, a credit string whose trailing `2.5`
+looks like a chapter or version number. Also left out: 5 duplicate
+spellings (`LOST_VEYL`, `The Blank`, `UToon`, `Utoon`, `Webtoon`), 3
+generic words from the log (`group`, `manga`, `doujinshi`) and one empty
+(zero-width) entry. No candidate matched a bucket-3 alternate title or any
+series folder in the audit, so none was dropped for that, and none is
+rejected by the structural checks.
+
+### Deliberately not done
+
+- A short group name that is also a real series (say `Desire`) would be
+  dropped where its files arrive outside their own folder. The audit found
+  no such overlap with library series folders.
+- Library files on Z: are not touched (another agent handles them).
+
+### Tests
+
+New `tests/test_known_group_prefixes.py` (54): the live Mangakakalot case
+and the other forms, plain and display; a prefix equal to the folder
+series; unknown, non-exact, unlisted-digit, structural and token-less
+prefixes without a hash (unchanged); the data file deciding (a temporary
+list; listed `Part A`, `Part 2`, `S2`, `V3`, `Ep4` still blocked; a missing
+file); every shipped entry passing the structural checks; the digit
+override (`Manhwa18 Chapter 1.cbz` -> `3XLOVE Uncensored Ch. 1.cbz`, and
+the other digit groups); the hashed path unchanged; `Manhwa18` and
+`Manhwa18 2` copies of one chapter (one lands, the other is reviewed, both
+kept); and an end-to-end watcher pass landing `City of Sins Ch. 53.cbz`. At
+`eb32d3e` 38 fail and the 16 "unchanged" ones pass.
+
+Guards proven by bypass (failing tests): without a hash only a known group
+is dropped 13; the match is exact 6; the display name uses the group-free
+name 9; a missing list means no known groups 1; the list is re-read when the
+file changes 1; a hashed name still uses the hash rule 4; a listed group
+overrides the digit rule 13; nothing overrides the structural checks 1;
+number markers are structural 1; the hashed path keeps its digit rule 2.
+The sources were hashed before the bypass run and the full suite and were
+unchanged after each.
+
+Process note: a failed helper script truncated the new test file once; it
+was rewritten in full and re-checked against `eb32d3e` before the bypass
+run.
+
+Full suite: **5,322 passed / 10 skipped / 0 failed** (5,332 collected =
+5,278 on master + 54 new).
