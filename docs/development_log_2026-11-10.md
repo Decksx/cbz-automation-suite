@@ -300,3 +300,35 @@ Full suite: **5,303 passed / 10 skipped / 1 failed** (5,314 collected =
 5,278 on master + 36 new). The failure is
 `tests/web/test_web_browser_smoke.py::test_a_service_worker_left_on_a_reused_port_cannot_reach_the_console`;
 three isolated reruns passed 3/3, and nothing under `web` changes.
+
+### PR #180 review round 1 (Codex, at `2042bfa`)
+
+**P2 (pre-existing, inside this fix's scope):** a range was still cut before
+the new guard ran. `shorten_mixed_original_title` keeps the Latin segment of
+a mixed-language title and carries the number over from the discarded one
+(`_extract_num_suffix`), but copied only the first number: `Series - 漫画
+Ch. 1-30.cbz` became `Series Ch. 1.cbz` with ComicInfo `<Number>1</Number>`,
+and `Series - 漫画 Vol. 1-3.cbz` became `Series Vol. 1.cbz` and then went to
+review. Codex's `test_review180_ranges.py` (SHA256 `22a006db...9446`) fails
+6/8 at `2042bfa` and 8/8 on base.
+
+Fix: `_token_end` carries both ends when the number starts an ascending
+range (the same `_starts_range` test the extraction uses); a descending
+tail is left behind as before. `_extract_num_suffix` has one caller
+(`shorten_mixed_original_title`); single numbers come out exactly as
+before, including `Series - 漫画 Ch. 5 - 3 Kittens.cbz` -> `3 Kittens Ch.
+5.cbz`.
+
+Codex's probe passes 8/8. New tests: the shortened `Ch. 1-30` and
+`Vol. 1-3` (plain and display), two single-number cases unchanged, two
+end-to-end landings with media naming on (range kept, no `Number`/`Volume`
+1, nothing reviewed), and `shorten_mixed_original_title` itself with
+ascending and descending tails. At `2042bfa` the 6 range tests and the 2
+ascending shortening cases fail; the unchanged cases pass.
+
+Guards proven by bypass (failing tests): a shortened title keeps both ends
+of a range 8; only an ascending range keeps its second end there 2. The
+earlier six still fail as before (14/7/2/6/9/2).
+
+Full suite: **5,317 passed / 10 skipped / 0 failed** (5,327 collected =
+5,314 + 13 new).
