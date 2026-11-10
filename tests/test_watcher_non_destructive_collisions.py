@@ -10,6 +10,7 @@ byte-identical incoming copy is removed, which loses nothing.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 import zipfile
@@ -215,11 +216,14 @@ def _payloads(root: Path) -> list[int]:
 
 @pytest.mark.parametrize("mover", MOVERS)
 def test_two_concurrent_quarantines_of_one_name_keep_both_copies(tmp_path, monkeypatch, mover):
-    """Both losers pick their candidate name before either moves (the gap
-    between choosing a free name and using it). Neither may overwrite the
-    other."""
-    library = tmp_path / "library" / "Berserk"
-    existing = _make_cbz(library / "Berserk ch. 1.cbz", 10000)
+    """Two settlements of *different* library names (two library roots
+    holding the same series) quarantine losers with one name on one day.
+    Both pick their candidate before either moves; neither may overwrite
+    the other. (One library name is owned by one settlement at a time, so
+    this is where two quarantines of one name can still meet.)"""
+    libraries = [tmp_path / f"library-{n}" / "Berserk" for n in (1, 2)]
+    for library in libraries:
+        _make_cbz(library / "Berserk ch. 1.cbz", 10000)
     sources = [_make_cbz(tmp_path / "incoming" / f"drop-{n}" / "Berserk ch. 1.cbz", n)
                for n in (100, 200)]
     chosen = threading.Barrier(2, timeout=10)
@@ -232,11 +236,12 @@ def test_two_concurrent_quarantines_of_one_name_keep_both_copies(tmp_path, monke
 
     monkeypatch.setattr(watcher, "unique_path", choose_then_wait)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        for future in [pool.submit(_settle, mover, src, library) for src in sources]:
+        for future in [pool.submit(_settle, mover, src, library)
+                       for src, library in zip(sources, libraries)]:
             future.result(timeout=20)
 
-    assert _payload_size(existing) == 10000
-    assert _payloads(tmp_path) == [100, 200, 10000]
+    assert _payloads(tmp_path) == [100, 200, 10000, 10000]
+    assert _payloads(tmp_path / "_quarantine") == [100, 200]
 
 
 @pytest.mark.parametrize("mover", MOVERS)
@@ -367,7 +372,7 @@ def test_a_second_collision_defers_to_a_landing_in_flight(tmp_path, monkeypatch,
 
     def pause_first(source, target):
         if Path(source) == first and Path(target) == dest:
-            assert list(library.glob(f".{dest.name}{watcher.RESERVE_MARK}*"))
+            assert watcher._destination_locks  # the first settlement owns the name
             if partial:
                 dest.write_bytes(b"partial" * 9)
             paused.set()
@@ -400,20 +405,21 @@ def test_a_second_collision_defers_to_a_landing_in_flight(tmp_path, monkeypatch,
     if mover == "loose":
         assert second_result is None
     assert _all_payloads(tmp_path) == [10000, 20000]
-    assert not list(library.glob(f".*{watcher.RESERVE_MARK}*"))  # the owner cleaned up its marker
+    assert watcher._destination_locks == {}  # released, and nothing left behind
 
 
 @pytest.mark.parametrize("mover", MOVERS)
-def test_another_watchers_marker_defers_the_collision(tmp_path, mover):
-    """A marker left by another watcher (same library, another process) is
-    respected the same way: the arrival stays, nothing is replaced."""
+def test_an_owned_destination_defers_the_collision(tmp_path, mover):
+    """While another settlement in this watcher owns the name, a collision
+    with it defers: the arrival stays and nothing is replaced."""
     library = tmp_path / "library" / "Berserk"
     existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
     before = existing.read_bytes()
-    (library / f".{existing.name}{watcher.RESERVE_MARK}other-process").write_text("{}")
     src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
 
-    _settle(mover, src, library)
+    with watcher._destination_lock(existing) as owned:
+        assert owned
+        _settle(mover, src, library)
 
     assert src.is_file() and existing.read_bytes() == before
     assert _quarantined(tmp_path) == []
@@ -499,3 +505,86 @@ def test_a_directory_whose_only_name_was_taken_meanwhile_has_no_landing_receipt(
 
     assert landed is None
     assert src.is_file() and _payload_size(winner) == 300
+
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+@pytest.mark.parametrize("resolver", [False, True], ids=["legacy", "resolver"])
+def test_a_writer_that_saw_a_clear_target_keeps_it_until_it_is_done(tmp_path, monkeypatch, mover, resolver):
+    """Codex's interleaving (PR #176, round 3) under ownership: the first
+    writer has taken the destination and seen a complete library book, and
+    pauses mid-settlement. A second arrival for the same name must not
+    quarantine, replace or reserve anything meanwhile: it defers. Every
+    original survives."""
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 9.cbz", 100)
+    first = _make_cbz(tmp_path / "incoming" / "first" / existing.name, 20000)
+    second = _make_cbz(tmp_path / "incoming" / "second" / existing.name, 30000)
+    settled, release = threading.Event(), threading.Event()
+    target = "settle_file_conflict" if resolver else "_settle_by_size"
+    real_settle = getattr(watcher, target)
+
+    def pause_inside(src, dest, *args):
+        if Path(src) == first:
+            settled.set()
+            assert release.wait(timeout=10)
+        return real_settle(src, dest, *args)
+
+    def run(src):
+        options = {"conflict_quarantine_root": tmp_path / "_resolver_q"} if resolver else {}
+        if mover == "merge":
+            return watcher._merge_directories(src.parent, library, **options)
+        return watcher._move_loose_files([src], str(library.parent), library.name, **options)
+
+    monkeypatch.setattr(watcher, target, pause_inside)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_done = pool.submit(run, first)
+        assert settled.wait(timeout=10)
+        try:
+            second_result = run(second)
+            assert second.is_file()  # deferred while the first owns the name
+            assert (library / existing.name).is_file()
+        finally:
+            release.set()
+        first_done.result(timeout=10)
+
+    if mover == "loose":
+        assert second_result is None
+    else:
+        assert second_result == 0
+    assert _all_payloads(tmp_path) == [100, 20000, 30000]
+    assert watcher._destination_locks == {}
+
+
+def test_names_differing_only_in_case_share_one_owner(tmp_path):
+    """On Windows the filesystem is case-insensitive: one name, one lock."""
+    library = tmp_path / "library" / "Berserk"
+    library.mkdir(parents=True)
+    with watcher._destination_lock(library / "Berserk ch. 9.cbz") as first:
+        with watcher._destination_lock(library / "BERSERK CH. 9.cbz") as second:
+            assert first and not second
+    with watcher._destination_lock(library / "BERSERK CH. 9.cbz") as again:
+        assert again
+
+
+def test_a_lock_is_released_when_the_settlement_raises(tmp_path, monkeypatch):
+    library = tmp_path / "library" / "Berserk"
+    library.mkdir(parents=True)
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 9.cbz", 100)
+
+    def explode(*_args):
+        raise PermissionError("move refused")
+
+    monkeypatch.setattr(watcher.shutil, "move", explode)
+    key = os.path.normcase(os.path.realpath(library / src.name))
+    # Another thread holding a reference keeps the registry entry alive, so
+    # only a real release frees the name for it.
+    with watcher._destinations_guard_lookup(key) as lock:
+        with pytest.raises(PermissionError):
+            watcher._merge_directories(src.parent, library)
+        assert lock.acquire(blocking=False)
+        lock.release()
+
+    assert watcher._destination_locks == {}
+    with watcher._destination_lock(library / src.name) as owned:
+        assert owned
