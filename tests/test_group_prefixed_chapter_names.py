@@ -10,6 +10,7 @@ chapter token and never put the folder's series in front. The group-free
 
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 
@@ -199,3 +200,50 @@ def test_compact_parts_land_as_distinct_books(tmp_path, monkeypatch):
     assert _payloads(library) == [101, 102]
     assert len(list(library.rglob("*.cbz"))) == 2
     assert _payloads(tmp_path / "_review") == [] and _payloads(tmp_path / "_quarantine") == []
+
+
+# PR #178 review round 3: the grammars are used in addition to the earlier
+# word guards, never instead of them.
+
+def _identity(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.casefold())
+
+
+@pytest.mark.parametrize("prefix", ["Part-A", "Part-B", "Side A", "Side B", "Extras", "Specials"])
+def test_previously_protected_identity_stays_protected(prefix, display):
+    """Codex's round-3 probe, adapted."""
+    name = _name("Berserk", f"{prefix}_Chapter 5_ab12cd.cbz", display)
+    assert _identity(prefix) in _identity(name), f"{prefix} lost in {name}"
+
+
+@pytest.mark.parametrize("pair", [("Part-A", "Part-B"), ("Side A", "Side B")],
+                         ids=["hyphenated-parts", "lettered-sides"])
+def test_paired_structural_books_both_land(tmp_path, monkeypatch, pair):
+    incoming, library = _watch(tmp_path, monkeypatch)
+    arrival = incoming / "Berserk"
+    for i, part in enumerate(pair):
+        _make_cbz(arrival / f"{part}_Chapter 5_ab12cd.cbz", 101 + i)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert _payloads(library) == [101, 102]
+    assert len(list(library.rglob("*.cbz"))) == 2
+    assert _payloads(tmp_path / "_review") == [] and _payloads(tmp_path / "_quarantine") == []
+
+
+# The word set the group check had at d1bc97b, written out here rather than
+# read from the code, so no word can leave the guard unnoticed.
+_D1BC97B_WORDS = (
+    "part", "parts", "pt", "arc", "book", "story", "side", "extra", "extras",
+    "special", "specials", "bonus", "omake", "oneshot", "prologue", "epilogue",
+    "afterword", "interlude", "act", "season", "volume", "vol", "chapter", "ch",
+    "episode", "ep",
+)
+
+
+@pytest.mark.parametrize("word", _D1BC97B_WORDS)
+def test_every_earlier_structural_word_is_still_identity(word):
+    for spelling in (word, word.title(), word.upper(), f"{word.title()} A", f"{word.title()}-B"):
+        assert not cbz_core._is_group_prefix(spelling), spelling
+        arrival = f"{spelling}_Chapter 5_ab12cd.cbz"
+        assert cbz_core._without_group_prefix(arrival) == arrival  # left to today's parse
