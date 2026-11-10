@@ -327,6 +327,28 @@ does not create rollback originals in this C: folder.
 
 The watcher uses a rolling size window and tolerates limited SMB metadata jitter. Meaningful growth means a copy is still active. Missing files or exhausted retries are skipped.
 
+## Group prefixes in chapter names
+
+Downloaders put the scanlation group or source site in front of a chapter's
+name. The watcher drops that prefix, so the series folder names the chapter
+(`<Series> Ch. N`):
+
+- with the downloader's hash, any group: `Alpha_Episode 42_2a8cb9.cbz` in
+  "Life of a Demon Hunter" becomes `Life of a Demon Hunter Ch. 42.cbz`;
+- without a hash, only a known group or site, listed in
+  `config/known-groups.txt`: `Mangakakalot Ch. 53.cbz` in "City of Sins"
+  becomes `City of Sins Ch. 53.cbz`. Any other prefix without a hash keeps
+  today's name, since it could be a real series.
+
+A prefix is never taken for a group when it holds a digit, a part marker or
+a structural or special word (`Part A`, `Side B`, `Vol. 3`, `Extras`,
+`One-shot`): those tell chapters apart.
+
+To add a known group, add one line to `config/known-groups.txt` (the file's
+header explains the format). Matching is exact but ignores case, spacing and
+punctuation. The watcher re-reads the file when it changes; no restart is
+needed. Do not add a name that is also a series title.
+
 ## ComicInfo behavior
 
 When an archive lacks `ComicInfo.xml`, the watcher starts from a template containing Komga/Mihon-related namespace fields. Existing metadata is passed through shared `update_comicinfo_xml()` decisions.
