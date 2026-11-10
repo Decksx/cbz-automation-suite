@@ -51,6 +51,7 @@ except ImportError:
 try:
     from scripts.cbz_canonical_name import (
         EDITION_WORDS,
+        SPECIAL_WORDS,
         CanonicalNameError,
         format_canonical_name,
         parse_canonical_name,
@@ -58,6 +59,7 @@ try:
 except ModuleNotFoundError:  # run from inside scripts/ without the package
     from cbz_canonical_name import (  # type: ignore[no-redef]
         EDITION_WORDS,
+        SPECIAL_WORDS,
         CanonicalNameError,
         format_canonical_name,
         parse_canonical_name,
@@ -1314,29 +1316,50 @@ def infer_series_name(path: Path, library_root: Path | None = None) -> str:
     return candidates[-1] if candidates else parent.name
 
 
-# Words that say where a chapter sits in a work, not who translated it. A
-# prefix holding one of them is never taken for a scanlation group.
-_STRUCTURAL_PREFIX_WORDS = frozenset({
-    "part", "parts", "pt", "arc", "book", "story", "side", "extra", "extras",
-    "special", "specials", "bonus", "omake", "oneshot", "prologue", "epilogue",
+# A part marker ("Part A", "PartB", "part 2"), read on casefolded text. The
+# watcher's same-chapter copy check uses this same grammar (its _PART_RE), so
+# what counts as a part cannot drift between the two.
+PART_MARKER_RE = re.compile(r"(?<![a-z])part\.?\s*([0-9a-z]+)\b")
+
+
+def _word_pattern(words) -> re.Pattern:
+    """Whole-word *words* on casefolded text, each written with or without
+    spaces, hyphens or underscores between its parts ("one-shot",
+    "One shot", "Oneshot"; "side story", "SideStory")."""
+    alternatives = sorted(
+        (r"[\s_\-]*".join(map(re.escape, re.split(r"[\s\-]+", word.casefold())))
+         for word in words),
+        key=len, reverse=True)
+    return re.compile(r"(?<![a-z])(?:" + "|".join(alternatives) + r")(?![a-z])")
+
+
+# The canonical special words (Special, Extra, Bonus, Omake, One-shot, ...).
+_SPECIAL_WORD_RE = _word_pattern(SPECIAL_WORDS)
+# Structural words with no grammar of their own, or whose grammar needs a
+# number (volume, season, chapter, episode, pt): the bare word is identity too.
+_STRUCTURAL_WORD_RE = _word_pattern((
+    "parts", "pt", "arc", "book", "story", "side story", "prologue", "epilogue",
     "afterword", "interlude", "act", "season", "volume", "vol", "chapter", "ch",
     "episode", "ep",
-})
+))
 
 
 def _is_group_prefix(prefix: str) -> bool:
     """Whether a downloader prefix names a scanlation group (conservative).
 
     Not a group when it holds a digit (``Part 2``, ``S2``, ``Vol. 3``,
-    ``Book 1``) or a structural word (``Part A``, ``Side Story``, ``Extra``):
+    ``Extra2``), a part marker (``Part A``, ``PartB``; ``PART_MARKER_RE``), a
+    canonical special word (``One-shot``, ``Extra``; ``SPECIAL_WORDS``) or
+    another structural word (``Side Story``, ``SideStory``, ``Act II``):
     those are identity, and dropping them would give two different chapters
     one name. When in doubt it is not a group, and the arrival keeps the
     name it had before (PR #178 review).
     """
     if any(char.isdigit() for char in prefix):
         return False
-    words = re.findall(r"[^\W\d_]+", prefix.casefold())
-    return not _STRUCTURAL_PREFIX_WORDS.intersection(words)
+    text = prefix.casefold()
+    return not (PART_MARKER_RE.search(text) or _SPECIAL_WORD_RE.search(text)
+                or _STRUCTURAL_WORD_RE.search(text))
 
 
 def _without_group_prefix(name: str) -> str:
