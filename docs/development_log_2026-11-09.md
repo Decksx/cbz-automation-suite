@@ -273,3 +273,33 @@ after the full suite **also failed** (1 failed); three further isolated
 runs passed (3/3). It is intermittent on its own too, not only under the
 full suite's load. The branch changes nothing under `comic_automation/web`
 or `tests/web`.
+
+### PR #176 review round 2 (Codex, at `04cfd9a`)
+
+**P1:** a second collision treated the first import's reservation (empty)
+or its partial copy as a library book, quarantined it and landed its own;
+the first import then overwrote that archive, or its failure cleanup
+deleted it. **P2 (supplemental):** `_merge_directories` ignored a failed
+settlement and `_move_cbz_dir` returned a landing even when nothing in the
+batch completed. Codex's repros `test_review176_active_reservation.py`
+(SHA256 `ed5c8fe4...b29`) fail 8/8 and `test_review176_directory_receipt.py`
+(`7e1b5050...cd3`) fail 2/2 at `04cfd9a`. My tests (`7e3b6b2`, `d81d45b`)
+fail 14/14 and 2/2 there.
+
+Fix (`3c8a61e`): `_land` creates an exclusive hidden marker
+`.<name>.cbzreserve-<token>` before reserving the destination and removes it
+only once the archive is complete; both movers' collision paths, legacy and
+resolver, defer while a marker exists. A crashed landing's marker keeps the
+name waiting until removed by hand: deliberately conservative; a stale
+marker never loses a book. Then `_merge_directories` returns how many files
+completed and `_move_cbz_dir` returns no landing for a merge in which none
+did, on the race-fallback path too.
+
+Guards proven by bypass (failing tests): the merge defers to a landing in
+flight 9; the loose mover too 5; the marker exists before the reservation
+12; the owner removes its marker 12; a merge with nothing completed is no
+landing 2; the race-fallback merge too 1; only a settled collision completes
+3; only a landed file completes 1 (it failed nothing until a test of a name
+taken during a folder landing was added). A guard that treated an
+unreadable folder as "in flight" was unreachable (`glob` does not raise
+there) and was removed.
