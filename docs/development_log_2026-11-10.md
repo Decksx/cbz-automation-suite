@@ -93,3 +93,40 @@ lines are CRLF like their surroundings; bare LF stays 863.
 
 Full suite: **5,178 passed / 10 skipped / 0 failed** (5,188 collected =
 5,154 on master + 34 new).
+
+### PR #178 review round 1 (Codex, at `aa4c248`)
+
+**P2:** `_without_group_prefix` protected Vol./Season prefixes but took
+`Part A`, `Part B`, `Part 1` and `Part 2` for groups. `Part A_Chapter 5_ab12cd`
+and `Part B_Chapter 5_ab12cd` both became `Berserk Ch. 5.cbz`: one landed and
+the other went to review as a second copy, and the landed name lost its
+part. Codex's `test_review178_part_prefixes.py` (SHA256 `6b020e53...8c49`)
+fails 6/6 at `aa4c248` and passes 6/6 on base.
+
+Fix: `_is_group_prefix`, conservative. A prefix is not a group when it holds
+a digit (`Part 2`, `S2`, `Vol. 3`, `Book 1`, `Arc 3`) or a structural word
+(part, pt, arc, book, story, side, extra(s), special(s), bonus, omake,
+oneshot, prologue, epilogue, afterword, interlude, act, season, vol(ume),
+chapter, ch, episode, ep): `Part A`, `Side Story`, `Extra`, `Act II`. Such an
+arrival keeps the name it had on master; numeric parts keep master's older
+spelling (`Berserk Ch. 1 Chapter 5.cbz`), not redesigned here. This replaces
+the Vol./Season-only guard. Of the 70 group prefixes in the live log, 69 are
+still dropped; `Amin3` (one file) holds a digit and keeps its old name.
+
+Codex's probe passes 6/6 at this head. New tests: 13 structural prefixes in
+plain and display parsing (26 cases, each the master name) and an
+end-to-end pass in which `Part 1`/`Part 2` and `Part A`/`Part B` land as two
+books with nothing reviewed or quarantined. With `cbz_core.py` at `aa4c248`,
+24 of the 26 cases and both end-to-end tests fail; the two that pass are
+`S2`, which the old season guard already kept.
+
+Guards proven by bypass (failing tests): a prefix with a digit is not a
+group 2; a prefix with a structural word is not a group 15; the group test
+decides 32; the earlier guards still fail as before (prefix dropped 22,
+Episode/Ep. 10, hash required 2, episode number 1, same-named sibling 1,
+tag-distinguished name 2).
+
+`scripts/cbz_watcher.py` is not changed in this round.
+
+Full suite: **5,206 passed / 10 skipped / 0 failed** (5,216 collected =
+5,188 + 28 new).
