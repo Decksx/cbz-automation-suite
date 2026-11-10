@@ -358,3 +358,9 @@ Guards proven by bypass (failing tests): a settlement owns its destination
 18; one physical file, one lock 1; ownership ends with the settlement even
 on error 1 (it failed nothing until the test held a registry reference, as
 another thread would); the registry keeps no lock nobody uses 17.
+
+Round 3 verification at `9bedafc` (this commit is docs only): full suite
+**5,105 passed / 10 skipped / 1 failed** (5,116 tests = 5,110 + 6). The
+failure is again `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`;
+three isolated reruns afterwards: 1 passed,1 passed,1 passed. Watcher bare-LF 870 (871 - 1: the
+round-2 `glob`/`uuid` imports became one `contextlib` import).
