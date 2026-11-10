@@ -315,3 +315,121 @@ def test_a_cjk_compilation_lands_without_a_number(tmp_path, monkeypatch, token):
     with zipfile.ZipFile(landed) as zf:
         info = _ET.fromstring(zf.read("ComicInfo.xml"))
     assert not info.findtext("Number") and not info.findtext("Volume")
+
+
+# PR #180 review round 3: the name REBUILDERS too, not only the readers.
+# A title translation rebuilds the name from the parsed fields, and the
+# watcher's fallback names a placeholder from its folder; neither may drop
+# a range or reduce it to one end.
+def _translate_cjk_titles(text):
+    """A deterministic stand-in translator: any CJK title becomes 'Story'."""
+    return ("Story", text) if _re.search(r"[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]", text) \
+        else (text, None)
+
+
+@pytest.mark.parametrize("prefixed", [True, False], ids=["series-prefixed", "whole-name"])
+@pytest.mark.parametrize("sep", _SEPARATORS, ids=["hyphen", "en-dash", "tilde", "wave-dash",
+                                                   "fullwidth-tilde", "spaced-hyphen"])
+@pytest.mark.parametrize("form", _RANGE_FORMS)
+@pytest.mark.parametrize("display", [False, True], ids=["plain", "display"])
+def test_a_translated_title_rebuild_keeps_the_range(tmp_path, monkeypatch, form, sep, prefixed,
+                                                     display):
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    token = form.format(s=sep)
+    stem = f"\u6f2b\u753b {token}" if prefixed else token
+    path = tmp_path / "Series" / f"{stem}.cbz"
+    path.parent.mkdir()
+    path.write_bytes(b"")
+    parsed = parse_comic_name(path, display_tokens=display)
+    assert (parsed.chapter, parsed.volume) == (None, None)
+    assert _KEPT.search(parsed.filename), parsed.filename
+
+
+@pytest.mark.parametrize("display", [False, True], ids=["plain", "display"])
+def test_a_translated_single_chapter_keeps_its_number(monkeypatch, display):
+    """Codex's round-3 probe, adapted: passes before and after."""
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    parsed = parse_comic_name(Path("C:/intake/Series") / "\u6f2b\u753b Ch. 30.cbz",
+                              display_tokens=display)
+    assert parsed.chapter == "30" and "30" in parsed.filename
+
+
+def test_two_translated_compilations_land_as_two_books(tmp_path, monkeypatch):
+    """Codex's round-3 probe, adapted: '漫画 Ch. 1-30' and '漫画 Ch. 31-60'
+    become 'Story Ch. 1-30' and 'Story Ch. 31-60'; neither is reviewed."""
+    incoming, library = tmp_path / "incoming", tmp_path / "Manga"
+    incoming.mkdir()
+    library.mkdir()
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(incoming))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(library))
+    monkeypatch.setattr(watcher, "_series_resolvers", {})
+    monkeypatch.setattr(watcher, "_router", None)
+    monkeypatch.setattr(watcher, "_number_style_registry", None)
+    monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    arrival = incoming / "Series"
+    arrival.mkdir()
+    for span in ("1-30", "31-60"):
+        with zipfile.ZipFile(arrival / f"\u6f2b\u753b Ch. {span}.cbz", "w") as zf:
+            zf.writestr("page.jpg", span.encode())
+
+    watcher.process_and_move_directory(arrival)
+
+    names = sorted(p.name for p in library.rglob("*.cbz"))
+    assert names == ["Story Ch. 1-30.cbz", "Story Ch. 31-60.cbz"]
+    assert not list((tmp_path / "_review").rglob("*.cbz"))
+
+
+@pytest.mark.parametrize("folder, expected", [
+    ("Berserk Ch. 1-30", "Berserk ch. 1-30.cbz"),
+    ("Berserk Ch. 1~30", "Berserk ch. 1-30.cbz"),       # the formatter's spelling
+    ("Berserk Ch. 1\u301c30", "Berserk ch. 1-30.cbz"),
+    ("Berserk 1-30", "Berserk ch. 1-30.cbz"),
+    ("Berserk Ch. 4", "Berserk ch. 4.cbz"),  # a single number, as before
+])
+def test_a_placeholder_in_a_range_folder_is_named_with_the_range(tmp_path, folder, expected):
+    """The fallback writer: on master the placeholder took the range's first
+    end ('ch. 1'), so two range folders' placeholders differed only by luck;
+    now it carries the range, and the chapter field stays unset.
+
+    Lowercase 'ch.' on purpose (David, 2026-11-10): every fallback name
+    comes from the canonical formatter, as 'Berserk ch. 4' does on master. A
+    separate follow-up PR switches that formatter's display to 'Ch.'."""
+    path = tmp_path / folder / "volvox_Chapter.cbz"
+    path.parent.mkdir()
+    path.write_bytes(b"")
+    parsed = parse_comic_name(path, display_tokens=True)
+    _name, number = watcher._resolve_series_dir_name(path.parent, [path], str(tmp_path))
+    mapping = {path: parsed}
+    assert watcher._apply_fallback_naming(mapping, "Berserk", number) == []
+    (renamed, patched), = mapping.items()
+    assert renamed.name == expected
+    if expected != "Berserk ch. 4.cbz":
+        assert patched.chapter is None
+
+
+def test_a_placeholder_in_a_volume_range_folder_is_reviewed(tmp_path):
+    """A volume range has no chapter slot: never 'Berserk.cbz' (which two such
+    folders would share), never a chapter label; the placeholder is held."""
+    path = tmp_path / "Berserk Vol. 1-3" / "volvox_Chapter.cbz"
+    path.parent.mkdir()
+    path.write_bytes(b"")
+    parsed = parse_comic_name(path, display_tokens=True)
+    _name, number = watcher._resolve_series_dir_name(path.parent, [path], str(tmp_path))
+    mapping = {path: parsed}
+    assert watcher._apply_fallback_naming(mapping, "Berserk", number) == [path]
+    assert list(mapping) == [path]
+
+
+@pytest.mark.parametrize("arrival, expected", [
+    ("\u6f2b\u753b Vol. 1-3.cbz", "Story Vol. 1-3.cbz"),
+    ("\u6f2b\u753b \u7b2c1-3\u5dfb.cbz", "Story Vol. 1-3.cbz"),
+    ("\u6f2b\u753b \u7b2c1-30\u8a71.cbz", "Story Ch. 1-30.cbz"),
+    ("\u6f2b\u753b 1-30.cbz", "Story 1-30.cbz"),
+])
+def test_a_translated_rebuild_keeps_the_ranges_kind(monkeypatch, arrival, expected):
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", _translate_cjk_titles)
+    assert parse_comic_name(Path("C:/intake/Series") / arrival).filename == expected
