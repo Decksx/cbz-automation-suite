@@ -230,3 +230,73 @@ unchanged after each; nothing was copied or restored during either.
 
 Full suite: **5,268 passed / 10 skipped / 0 failed** (5,278 collected =
 5,238 + 40 new).
+
+## Watcher: a chapter range is never merged into one number
+
+### Incident and the gap
+
+A compilation of chapters 1 to 30 (inside: `00 - Chapter 1.cbz -
+001__001.jpg` to `29 - Chapter 30.cbz - 010.jpg`) is in the library as
+`The Toy of 100 Baseball Players 130.cbz`: the hyphen was lost and the
+range became one bogus number. **That collapse could not be reproduced**:
+on master `eb32d3e` and on the March 2026 code (`5ca4a3b`), `clean_filename`,
+`clean_directory_name`, `sanitize`, `normalise_number_tokens` and
+`parse_comic_name` (plain and display) all keep `... 1-30`, `1–30`, `1~30`
+and `Chapters 1-30`. The name was already `...130` in the oldest log lines
+(`strip_duplicates.log`, 2026-03-13; `cbz_compilation_resolver.log`,
+2026-03-15); the watcher logs of that time have rotated away, so neither
+the arrival's original name nor the step that dropped the hyphen can be
+recovered. Recorded as a gap.
+
+What does still lose a range on master, and is fixed here:
+
+1. `Ch. 1-30`, `#1-30` and `Vol. 1-3` were read as chapter or volume 1
+   (`extract_chapter_number` / `extract_volume_number`). With media naming
+   on, `watcher_naming` then named `...Ch. 1-30.cbz` `...ch. 1.cbz` (chapter
+   style) or `...#001.cbz` (issue style), and ComicInfo `<Number>` became 1.
+2. A bracketed range, `(1-30)` or `[1~30]`, was dropped with the brackets:
+   `X (1-30).cbz` became `X.cbz`.
+
+### Changes
+
+- `scripts/cbz_core.py`: a number that starts an ascending range
+  (`N-M`, `N - M`, `N–M`, `N~M`, `M > N`) is never taken for its first
+  number; the field is left unset. A descending or equal second number
+  (`Ch. 5 - 3 Kittens`, `Ch. 7 - 7`) is a title, not a range.
+  `BRACKETED_RANGE_RE`: a bracket that holds only a number range is kept,
+  unbracketed, when brackets are dropped (`X (1-30).cbz` -> `X 1-30.cbz`).
+- `comic_automation/library/media_naming.py`: a range number, or a bracketed
+  range in the arrival's name, keeps the legacy name (`KeepArrivalName`),
+  which spells it as it arrived with the uppercase `Ch.` David keeps; the
+  formatter would write `ch. 1-30`, and its own bracket stripping would lose
+  a bracketed range. ComicInfo `<Number>` stays unset rather than taking the
+  range's first number.
+
+The canonical formatter already accepts ascending chapter ranges
+(`ch. 1-30`); the compilation words (`SPECIAL_WORDS`: Compilation,
+Omnibus, ...) are a different thing, a word after the series, and are not
+changed. Keeping the legacy name is only about the uppercase `Ch.`.
+
+### Tests
+
+New `tests/test_chapter_range_names.py` (36): ranges kept and never read as
+their first number (`Ch. 1-30`, `Ch. 1 - 30`, `#1-30`, `Vol. 1-3`,
+`(1-30)`, `[1~30]`, `(01–12)`), plain and display; bare ranges
+(`1-30`, `1–30`, `1~30`, `Chapters 1-30`) pinned unchanged; single
+numbers still read (`Ch. 5`, `Ch. 1.5`, `Ch. 5 - 3 Kittens`, `Ch. 7 - 7`);
+media naming keeping the legacy name for a range in both styles and still
+naming a single chapter; and an end-to-end landing with media naming on:
+`... Ch. 1-30.cbz` with no ComicInfo `<Number>`. At `eb32d3e` 23 fail and
+the 13 "unchanged" ones pass.
+
+Guards proven by bypass (failing tests): a chapter range is not its first
+number 11; a volume range is not its first number 4; only an ascending
+second number makes a range 2; a bracketed range survives bracket cleaning
+6; media naming keeps the legacy name for a range 7; and for a bracketed
+range 2. The sources were hashed before the bypass run and the full suite
+and were unchanged after each.
+
+Full suite: **5,303 passed / 10 skipped / 1 failed** (5,314 collected =
+5,278 on master + 36 new). The failure is
+`tests/web/test_web_browser_smoke.py::test_a_service_worker_left_on_a_reused_port_cannot_reach_the_console`;
+three isolated reruns passed 3/3, and nothing under `web` changes.
