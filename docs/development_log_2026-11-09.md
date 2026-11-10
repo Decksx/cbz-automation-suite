@@ -303,3 +303,11 @@ landing 2; the race-fallback merge too 1; only a settled collision completes
 taken during a folder landing was added). A guard that treated an
 unreadable folder as "in flight" was unreachable (`glob` does not raise
 there) and was removed.
+
+Round 2 verification at `08b29de` (this commit is docs only): full suite
+**5,099 passed / 10 skipped / 1 failed** (5,110 tests = 5,091 + 19). The
+failure is again `tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`;
+three isolated reruns afterwards: 1 passed,1 passed,1 passed. Codex also reproduced this
+WinError 5 on unmodified base. Codex's four PR #176 repro files pass 16/16
+at this head. Watcher bare-LF 871 (869 + two new import lines in the LF
+import block).
