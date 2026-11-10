@@ -1335,13 +1335,18 @@ def _word_pattern(words) -> re.Pattern:
 
 # The canonical special words (Special, Extra, Bonus, Omake, One-shot, ...).
 _SPECIAL_WORD_RE = _word_pattern(SPECIAL_WORDS)
-# Structural words with no grammar of their own, or whose grammar needs a
-# number (volume, season, chapter, episode, pt): the bare word is identity too.
-_STRUCTURAL_WORD_RE = _word_pattern((
-    "parts", "pt", "arc", "book", "story", "side story", "prologue", "epilogue",
-    "afterword", "interlude", "act", "season", "volume", "vol", "chapter", "ch",
-    "episode", "ep",
-))
+# Words that say where a chapter sits in a work, not who translated it. This
+# is in addition to the grammars above, never instead of them: each word here
+# was a guard before they were used, and none may quietly stop being one
+# (PR #178 review round 3). "Part-A" and "Side A" are read through "part" and
+# "side"; "side story" also catches the run-together "SideStory".
+STRUCTURAL_PREFIX_WORDS: tuple[str, ...] = (
+    "part", "parts", "pt", "arc", "book", "story", "side", "side story",
+    "extra", "extras", "special", "specials", "bonus", "omake", "oneshot",
+    "prologue", "epilogue", "afterword", "interlude", "act", "season",
+    "volume", "vol", "chapter", "ch", "episode", "ep",
+)
+_STRUCTURAL_WORD_RE = _word_pattern(STRUCTURAL_PREFIX_WORDS)
 
 
 def _is_group_prefix(prefix: str) -> bool:
@@ -1349,8 +1354,9 @@ def _is_group_prefix(prefix: str) -> bool:
 
     Not a group when it holds a digit (``Part 2``, ``S2``, ``Vol. 3``,
     ``Extra2``), a part marker (``Part A``, ``PartB``; ``PART_MARKER_RE``), a
-    canonical special word (``One-shot``, ``Extra``; ``SPECIAL_WORDS``) or
-    another structural word (``Side Story``, ``SideStory``, ``Act II``):
+    canonical special word (``One-shot``, ``Extra``; ``SPECIAL_WORDS``) or a
+    structural word (``Part-A``, ``Side B``, ``Specials``, ``SideStory``,
+    ``Act II``; ``STRUCTURAL_PREFIX_WORDS``), any one of them:
     those are identity, and dropping them would give two different chapters
     one name. When in doubt it is not a group, and the arrival keeps the
     name it had before (PR #178 review).
