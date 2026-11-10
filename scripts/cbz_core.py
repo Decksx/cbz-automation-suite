@@ -174,11 +174,35 @@ GIBBERISH_RE = re.compile(
 _BRACKET_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
 # A bracket that holds only a number range ("(1-30)", "[01~12]"): a
 # compilation's chapter span, kept (unbracketed) when brackets are dropped.
+# The separators a number range is written with: hyphen, en dash, tilde, and
+# the CJK wave dash and fullwidth tilde ("1-30", "1\u201330", "1~30",
+# "1\u301c30", "1\uff5e30"), with or without spaces around them.
+_RANGE_SEP = r"[-\u2013~\u301c\uff5e]"
 BRACKETED_RANGE_RE = re.compile(
-    r"[\[(]\s*(\d+(?:\.\d+)?\s*[-\u2013~]\s*\d+(?:\.\d+)?)\s*[\])]")
+    r"[\[(]\s*(\d+(?:\.\d+)?\s*" + _RANGE_SEP + r"\s*\d+(?:\.\d+)?)\s*[\])]")
 # What follows a number when it starts a range: "1-30", "1 - 30", "1–30",
 # "1~30".
-_RANGE_TAIL_RE = re.compile(r"\s*[-\u2013~]\s*(\d+(?:\.\d+)?)")
+_RANGE_TAIL_RE = re.compile(r"\s*" + _RANGE_SEP + r"\s*(\d+(?:\.\d+)?)")
+# What precedes a number when it ends a range: "1-" of "1-30" (CJK markers and
+# trailing bare numbers come after the last number, "\u7b2c1-30\u8a71").
+_RANGE_HEAD_RE = re.compile(r"(\d+(?:\.\d+)?)\s*" + _RANGE_SEP + r"\s*$")
+# A number range anywhere in a text ("1-30", "1 ~ 30").
+_RANGE_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*" + _RANGE_SEP + r"\s*(\d+(?:\.\d+)?)")
+
+
+def _ascending_range(text: str, at: int = 0, anchored: bool = False) -> re.Match | None:
+    """The first ascending number range in *text* from *at* (at *at* when
+    *anchored*), or None. A descending or equal pair is not a range."""
+    found = (_RANGE_RE.match(text, at),) if anchored else _RANGE_RE.finditer(text, at)
+    for match in found:
+        if match is None:
+            continue
+        try:
+            if float(match.group(2)) > float(match.group(1)):
+                return match
+        except ValueError:
+            pass
+    return None
 _DECENSOR_MARKER_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
 _STRAY_RE = re.compile(r"[\[\]()]")
 _SPACES_RE = re.compile(r" {2,}")
@@ -396,7 +420,23 @@ def shorten_mixed_original_title(text: str, max_length: int = 120) -> str:
     if not _CJK_RE.search(text):
         return text
 
-    parts = [p.strip() for p in _MIXED_TITLE_SPLIT_RE.split(text) if p.strip()]
+    # An ascending range ("1 ~ 30", "1 - 30") is one number, never two title
+    # segments; a descending pair ("5 - 3 Kittens") still splits as before.
+    spans: list[str] = []
+
+    def hold(match: re.Match) -> str:
+        try:
+            ascending = float(match.group(2)) > float(match.group(1))
+        except ValueError:
+            ascending = False
+        if not ascending:
+            return match.group(0)
+        spans.append(match.group(0))
+        return f"\ue000{len(spans) - 1}\ue001"
+
+    held = _RANGE_RE.sub(hold, text)
+    parts = [re.sub("\ue000(\\d+)\ue001", lambda m: spans[int(m.group(1))], p).strip()
+             for p in _MIXED_TITLE_SPLIT_RE.split(held) if p.strip()]
     if len(parts) < 2 and len(text) <= max_length:
         return text
 
@@ -1174,7 +1214,9 @@ def extract_trailing_bare_number(name: str) -> str | None:
     which this function is meant to be paired with.
     """
     m = _TRAILING_BARE_NUMBER_RE.search(name)
-    return _num_field(m.group(1)) if m else None
+    if m is None or _ends_range(name, m.start(1), m.group(1)):
+        return None  # "Series 1-30": a range's last number is not a chapter
+    return _num_field(m.group(1))
 
 
 def is_generic(text: str) -> bool:
@@ -1258,7 +1300,14 @@ def normalize_stem(stem: str, dir_name: str) -> str:
     generic = GENERIC_CHAPTER_RE.match(stem)
     if generic:
         number = _fmt_num_text(generic.group(1))
-        suffix = generic.group(2).strip(" -_")
+        rest = generic.group(2)
+        span = _ascending_range(stem, generic.start(1), anchored=True)
+        if span is not None:
+            # "Chapter 1-30" is chapters 1 to 30: the range is the number,
+            # never "Ch. 1" followed by a stray "30" (PR #180 review).
+            number = span.group(0)
+            rest = stem[span.end():]
+        suffix = rest.strip(" -_")
         result = f"{dir_name} Ch. {number}"
         return result + (f" {suffix}" if suffix else "")
 
@@ -1272,6 +1321,9 @@ def normalize_stem(stem: str, dir_name: str) -> str:
         return f"{dir_name} Ch. {number}"
 
     if is_generic(stem):
+        span = _ascending_range(stem)
+        if span is not None:  # "Chapters 1-30": the range, never just the folder
+            return f"{dir_name} Ch. {span.group(0)}"
         return dir_name
 
     return stem
@@ -1289,6 +1341,22 @@ def _starts_range(stem: str, match: re.Match, value: str) -> bool:
         return False
     try:
         return float(tail.group(1)) > float(value.rstrip("."))
+    except ValueError:
+        return False
+
+
+def _ends_range(text: str, start: int, value: str) -> bool:
+    """Whether the number at *start* is the last end of an ascending range.
+
+    The counterpart of ``_starts_range`` for numbers read after the range:
+    the CJK markers (``\u7b2c1-30\u8a71`` reads ``30`` before ``\u8a71``) and a
+    trailing bare number (``Series 1-30``). Never a field (PR #180 review).
+    """
+    head = _RANGE_HEAD_RE.search(text[:start])
+    if head is None:
+        return False
+    try:
+        return float(head.group(1)) < float(value.rstrip("."))
     except ValueError:
         return False
 
@@ -1426,7 +1494,8 @@ def _without_group_prefix(name: str) -> str:
 
 def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
     """The stem normalisation that follows cleaning in :func:`parse_comic_name`."""
-    if "leading_nums" in rules:
+    if "leading_nums" in rules and _ascending_range(stem, anchored=True) is None:
+        # A leading index ("01 - Title") goes; a leading range ("1-30") stays.
         stem = NUMBER_PREFIX_RE.sub("", stem).strip()
     stem = _SCANLATION_HASH_RE.sub("", stem).strip()
     if "normalize_stem" in rules:
@@ -1571,13 +1640,14 @@ def parse_comic_name(
     # malformed one leaves the field unset instead of a guessed number.
     # The greedy run already starts at the leftmost digit; the lookbehind is
     # for a run that starts with a dot (".5話"), whose "5" is a fragment too.
+    # A range's last end ("第1-30話", "1~3巻") is not the field either.
     if chapter is None:
         m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[話话章]", raw_stem)
-        if m:
+        if m and not _ends_range(raw_stem, m.start(1), m.group(1)):
             chapter = _num_field(m.group(1))
     if volume is None:
         m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[巻卷]", raw_stem)
-        if m:
+        if m and not _ends_range(raw_stem, m.start(1), m.group(1)):
             volume = _num_field(m.group(1))
 
     # Translation handling: native CJK titles are always eligible; romanized
