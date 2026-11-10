@@ -133,6 +133,10 @@ MIN_AGE       = 300  # seconds a directory must exist before processing
 AI_DECENSOR_ENABLED = False
 AI_DECENSOR_MODELS = ["black_bars"]
 AI_DECENSOR_REPROCESS = False
+# Where keep-the-larger puts the copy it does not keep: nothing that differs
+# from the kept copy is ever deleted. Placements go in a dated subfolder
+# (YYYY-MM-DD) so a retention purge can work by age.
+QUARANTINE_ROOT = Path(os.environ.get("CBZ_QUARANTINE_ROOT", r"C:\Temp\cbz_held\quarantine"))
 CAMELIA_ROOT = Path(os.environ.get("CBZ_CAMELIA_ROOT", r"C:\git\camelia"))
 CAMELIA_PYTHON = Path(os.environ.get(
     "CBZ_CAMELIA_PYTHON",
@@ -1142,7 +1146,8 @@ def _find_archive_collision(target_dir: Path, stem: str) -> Path | None:
     On a match the merge works as before: the existing **name** always
     survives. The incoming bytes replace the existing bytes under that name
     only when they are larger by ``REPLACEMENT_MIN_GAIN_BYTES``; otherwise
-    the incoming copy is discarded. So a ``(2019)`` arrival that wins on size
+    the incoming copy is quarantined (``_settle_by_size``). So a ``(2019)``
+    arrival that wins on size
     loses its year token from the name -- accepted: the existing name wins,
     exactly as it did when both names were token-free.
 
@@ -1522,6 +1527,52 @@ def _replacement_gain_is_meaningful(
     return (src_size - dest_size) >= min_gain
 
 
+def _settle_by_size(src: Path, dest: Path, label: str, series_dir: str) -> None:
+    """Settle a name collision by size without deleting a different book.
+
+    Byte-identical copies are an exact duplicate: the incoming one is removed,
+    which loses nothing. Otherwise the larger copy is kept under *dest*'s name
+    (an incoming copy must win by ``REPLACEMENT_MIN_GAIN_BYTES``) and the
+    other is moved to ``QUARANTINE_ROOT/<date>/<series_dir>/`` under a unique
+    name. Size is only a proxy for quality, so the loser is kept for review.
+
+    The loser is quarantined before anything else moves. If that fails, both
+    copies stay where they are and the incoming one is retried on a later
+    pass. If the incoming copy then cannot take *dest*'s place, the quarantined
+    library copy is moved back; either way no copy is lost.
+    """
+    src_size, dest_size = src.stat().st_size, dest.stat().st_size
+    if src_size == dest_size and digest(src) == digest(dest):
+        src.unlink()
+        log.info(f"    Exact duplicate removed: '{label}'")
+        return
+    incoming_wins = _replacement_gain_is_meaningful(src_size, dest_size)
+    loser = dest if incoming_wins else src
+    target = unique_path(QUARANTINE_ROOT / time.strftime("%Y-%m-%d") / series_dir / loser.name)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(loser), str(target))
+    except (OSError, shutil.Error) as e:
+        if loser.exists() and target.exists():
+            target.unlink(missing_ok=True)  # a partial copy; the original is intact
+        log.error(f"    Conflict '{label}': could not quarantine '{loser}' ({e}); "
+                  f"both copies kept, incoming left in place for the next pass.")
+        return
+    if not incoming_wins:
+        log.warning(f"    Conflict '{label}': existing ({dest_size:,} B) kept over incoming "
+                    f"({src_size:,} B); incoming quarantined at '{target}'.")
+        return
+    try:
+        shutil.move(str(src), str(dest))
+    except (OSError, shutil.Error) as e:
+        log.error(f"    Conflict '{label}': could not move the incoming copy into place ({e}); "
+                  f"restoring the existing copy from '{target}'.")
+        shutil.move(str(target), str(dest))
+        return
+    log.warning(f"    Conflict '{label}': incoming ({src_size:,} B) replaced existing "
+                f"({dest_size:,} B); existing quarantined at '{target}'.")
+
+
 def _defers_rename(current_stem: str, new_stem: str) -> bool:
     """Whether renaming *current_stem* to *new_stem* drops a distinguishing tag.
 
@@ -1663,7 +1714,9 @@ def _merge_directories(
 
     Legacy imports retain the measured replacement threshold. Resolver imports
     compare exact duplicates and quarantine the smaller non-identical file
-    outside the library instead of discarding it.
+    outside the library instead of discarding it. Legacy imports quarantine
+    the copy they do not keep too (``_settle_by_size``): no mode deletes a
+    copy that differs from the one it keeps.
 
     *stripped_arrivals* (``_stripped_arrivals``) names the archives whose
     match with an existing file may exist only because a tag was stripped.
@@ -1722,18 +1775,7 @@ def _merge_directories(
                         f"'{outcome['quarantined']}'."
                     )
                 continue
-            src_size  = src_item.stat().st_size
-            dest_size = dest_item.stat().st_size
-            if _replacement_gain_is_meaningful(src_size, dest_size):
-                log.warning(f"    Conflict '{relative}': incoming ({src_size:,} B) > existing ({dest_size:,} B) - replacing (existing file discarded).")
-                dest_item.unlink()
-                shutil.move(str(src_item), str(dest_item))
-            elif src_size > dest_size:
-                log.warning(f"    Conflict '{relative}': incoming ({src_size:,} B) exceeds existing ({dest_size:,} B) by only {src_size - dest_size:,} B (< {REPLACEMENT_MIN_GAIN_BYTES:,} B) - keeping existing (incoming file discarded).")
-                src_item.unlink()
-            else:
-                log.warning(f"    Conflict '{relative}': existing ({dest_size:,} B) >= incoming ({src_size:,} B) - keeping existing (incoming file discarded).")
-                src_item.unlink()
+            _settle_by_size(src_item, dest_item, str(relative), dest_dir.name)
         else:
             dest_item.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src_item), str(dest_item))
@@ -2514,29 +2556,7 @@ def _move_loose_files(
                     )
                 moved += 1
                 continue
-            src_size  = src.stat().st_size
-            dest_size = dest_item.stat().st_size
-            if _replacement_gain_is_meaningful(src_size, dest_size):
-                log.warning(
-                    f"    Conflict '{src.name}': incoming ({src_size:,} B) > "
-                    f"existing ({dest_size:,} B) - replacing (existing file discarded)."
-                )
-                dest_item.unlink()
-                shutil.move(str(src), str(dest_item))
-            elif src_size > dest_size:
-                log.warning(
-                    f"    Conflict '{src.name}': incoming ({src_size:,} B) exceeds "
-                    f"existing ({dest_size:,} B) by only {src_size - dest_size:,} B "
-                    f"(< {REPLACEMENT_MIN_GAIN_BYTES:,} B) - keeping existing "
-                    f"(incoming file discarded)."
-                )
-                src.unlink()
-            else:
-                log.warning(
-                    f"    Conflict '{src.name}': existing ({dest_size:,} B) >= "
-                    f"incoming ({src_size:,} B) - keeping existing (incoming file discarded)."
-                )
-                src.unlink()
+            _settle_by_size(src, dest_item, src.name, dest_dir.name)
         else:
             shutil.move(str(src), str(dest_item))
         moved += 1
@@ -2751,8 +2771,9 @@ def _carried_second_copies(comic_dir: Path, paths) -> dict[Path, str]:
 
     Once the kept copy has landed, the import folder alone no longer shows
     the held copy as a second translation. Released, it would be named onto
-    the kept copy's library name and settled by keep-the-larger, discarding
-    one translation. So a held copy stays held while its name and bytes are
+    the kept copy's library name and settled by keep-the-larger, which
+    quarantines one translation the operator never chose between. So a held
+    copy stays held while its name and bytes are
     unchanged, whatever else arrives beside it. Maps path -> kept copy's name.
     """
     with _held_state_lock:
@@ -3870,6 +3891,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "defaults to black_bars."
         ),
     )
+    parser.add_argument(
+        "--quarantine-root", type=Path, default=QUARANTINE_ROOT,
+        help="Where a file-name collision's losing copy is moved (never deleted).",
+    )
     parser.add_argument("--camelia-root", type=Path, default=CAMELIA_ROOT)
     parser.add_argument("--camelia-python", type=Path, default=CAMELIA_PYTHON)
     parser.add_argument(
@@ -3940,6 +3965,7 @@ def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
     """Apply session globals only after exclusive root ownership is held."""
     global AI_DECENSOR_ENABLED, AI_DECENSOR_MODELS, AI_DECENSOR_REPROCESS
     global CAMELIA_ROOT, CAMELIA_PYTHON, AI_DECENSOR_BACKUP_DIR, AI_DECENSOR_ARCHIVE_DIR
+    global QUARANTINE_ROOT
     global SERIES_RESOLVER_ENABLED, SERIES_RESOLVER_ROOTS
     global SERIES_RESOLVER_QUARANTINE_ROOT, SERIES_RESOLVER_THRESHOLD
     global SERIES_RESOLVER_REFRESH, SERIES_RESOLVER_NORMALIZE_APOSTROPHES
@@ -3956,6 +3982,7 @@ def _configure_and_watch(args: argparse.Namespace, watch_path: Path):
     AI_DECENSOR_REPROCESS = args.ai_decensor_reprocess
     CAMELIA_ROOT = args.camelia_root
     CAMELIA_PYTHON = args.camelia_python
+    QUARANTINE_ROOT = args.quarantine_root
     AI_DECENSOR_BACKUP_DIR = args.ai_decensor_backup_dir
     AI_DECENSOR_ARCHIVE_DIR = args.ai_decensor_archive_dir
     SERIES_RESOLVER_ENABLED = args.series_resolver
