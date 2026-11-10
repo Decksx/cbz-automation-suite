@@ -172,6 +172,13 @@ GIBBERISH_RE = re.compile(
 )
 
 _BRACKET_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+# A bracket that holds only a number range ("(1-30)", "[01~12]"): a
+# compilation's chapter span, kept (unbracketed) when brackets are dropped.
+BRACKETED_RANGE_RE = re.compile(
+    r"[\[(]\s*(\d+(?:\.\d+)?\s*[-\u2013~]\s*\d+(?:\.\d+)?)\s*[\])]")
+# What follows a number when it starts a range: "1-30", "1 - 30", "1–30",
+# "1~30".
+_RANGE_TAIL_RE = re.compile(r"\s*[-\u2013~]\s*(\d+(?:\.\d+)?)")
 _DECENSOR_MARKER_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
 _STRAY_RE = re.compile(r"[\[\]()]")
 _SPACES_RE = re.compile(r" {2,}")
@@ -694,6 +701,8 @@ def _sanitize_core(text: str, rules: set[str]) -> str:
     text = _GCODE_RE.sub("", text)
 
     if "brackets" in rules:
+        # A bracketed chapter range is the name's number, not a tag: kept.
+        text = BRACKETED_RANGE_RE.sub(r" \1 ", text)
         text = _BRACKET_RE.sub("", text)
         text = _STRAY_RE.sub("", text)
 
@@ -1257,11 +1266,29 @@ def normalize_stem(stem: str, dir_name: str) -> str:
     return stem
 
 
+def _starts_range(stem: str, match: re.Match, value: str) -> bool:
+    """Whether the number *match* read is the first end of an ascending range.
+
+    ``Ch. 1-30`` is chapters 1 to 30, not chapter 1: a range is never taken
+    for its first number (the field is then left unset). A descending or
+    equal second number (``Ch. 5 - 3 Kittens``) is not a range.
+    """
+    tail = _RANGE_TAIL_RE.match(stem, match.end())
+    if tail is None:
+        return False
+    try:
+        return float(tail.group(1)) > float(value.rstrip("."))
+    except ValueError:
+        return False
+
+
 def extract_chapter_number(stem: str) -> str | None:
     match = _CHAPTER_NUMBER_RE.search(stem)
     if not match:
         return None
     value = next(group for group in match.groups() if group is not None)
+    if _starts_range(stem, match, value):
+        return None
     return _num_field(value)
 
 
@@ -1270,6 +1297,8 @@ def extract_volume_number(stem: str) -> str | None:
     if not match:
         return None
     value = match.group(1) or match.group(2)
+    if _starts_range(stem, match, value):
+        return None
     return _num_field(value)
 
 
