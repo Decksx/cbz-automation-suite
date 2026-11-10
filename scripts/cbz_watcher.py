@@ -2605,33 +2605,38 @@ def _move_cbz_dir(
             log.info(f"  Merge complete.")
             return dest_dir
         else:
+            # A whole folder moves only as one rename (same volume, and the
+            # destination folder not there yet): atomic, so nothing in it is
+            # visible before it is complete. Never shutil.move: across volumes
+            # it copies the tree straight into the library, file by file,
+            # outside every destination's ownership, where another arrival can
+            # settle against a half-copied book.
             try:
-                shutil.move(str(dir_path), str(dest_dir))
+                os.rename(dir_path, dest_dir)
                 log.info(f"  Moved successfully.")
                 _land_deferred_names(dir_path, dest_dir, stripped_arrivals)
                 return dest_dir
-            except (OSError, shutil.Error):
-                # WinError 183: dest was created by a concurrent thread between
-                # our exists() check and the move — fall back to merge.
-                if dest_dir.exists():
-                    if chapter_number:
-                        _backfill_chapter_one(dest_dir, folder_name)
-                    log.info(f"  Race on move — destination appeared, falling back to merge.")
-                    completed = _merge_directories(
-                        dir_path, dest_dir,
-                        conflict_quarantine_root=conflict_quarantine_root,
-                        stripped_arrivals=stripped_arrivals,
-                        held=held,
-                    )
-                    _remove_merged_source(dir_path)
-                    if not completed:
-                        log.warning(f"  Nothing from '{dir_path.name}' completed; it stays "
-                                    f"for the next pass.")
-                        return None
-                    log.info(f"  Merge complete.")
-                    return dest_dir
-                else:
-                    raise
+            except OSError:
+                # Another volume (the library on Tower), or the destination
+                # appeared meanwhile (WinError 183): merge file by file, each
+                # under its own destination lock (_settle_or_land).
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                if chapter_number:
+                    _backfill_chapter_one(dest_dir, folder_name)
+                log.info(f"  Not a same-volume rename; merging file by file.")
+                completed = _merge_directories(
+                    dir_path, dest_dir,
+                    conflict_quarantine_root=conflict_quarantine_root,
+                    stripped_arrivals=stripped_arrivals,
+                    held=held,
+                )
+                _remove_merged_source(dir_path)
+                if not completed:
+                    log.warning(f"  Nothing from '{dir_path.name}' completed; it stays "
+                                f"for the next pass.")
+                    return None
+                log.info(f"  Merge complete.")
+                return dest_dir
 
     except Exception as e:
         log.error(f"  Failed to move directory '{dir_path.name}': {e}")
