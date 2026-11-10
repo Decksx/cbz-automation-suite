@@ -63,6 +63,7 @@ from scripts.cbz_lock_order import (
 
 try:
     from scripts.cbz_core import (
+        PART_MARKER_RE,
         ParsedComicName,
         clean_directory_name,
         clean_filename,
@@ -80,6 +81,7 @@ try:
     )
 except ModuleNotFoundError:
     from cbz_core import (  # type: ignore[no-redef]
+        PART_MARKER_RE,
         ParsedComicName,
         clean_directory_name,
         clean_filename,
@@ -2831,7 +2833,8 @@ def _move_loose_files(
 # HELD ARCHIVES: same-chapter copies and unchanged held directories
 # ─────────────────────────────────────────────
 _BRACKET_TAG_RE = re.compile(r"[\[(]([^\[\]()]*)[\])]")
-_PART_RE = re.compile(r"(?<![a-z])part\.?\s*([0-9a-z]+)\b")
+# One grammar for parts, shared with cbz_core's group-prefix check.
+_PART_RE = PART_MARKER_RE
 
 
 def _duplicate_chapter_copies(
