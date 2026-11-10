@@ -217,19 +217,37 @@ def _marked_range(text: str) -> tuple[str, str] | None:
     return None
 
 
-def _range_suffix(text: str) -> str:
-    """The first ascending range in *text* as a name suffix, or ``""``.
+# Where a name's numbering starts: the first volume, chapter, issue or episode
+# token, a CJK or Korean number marker, or a range ("Vol. 1-3", "Ch.30", "#5",
+# "第1-30話", "3巻", "1-30"). Everything from there to the end is the numbering
+# span a translated title keeps verbatim (``_split_numbering``).
+_NUMBERING_START_RE = re.compile(
+    r"(?<![^\W\d_])(?:"
+    r"vol(?:ume)?s?\.?\s*\d|v\d|ch(?:ap(?:ter)?)?s?p?\.?\s*\d|#\s*\d"
+    r"|issues?\.?\s*\d|ep(?:isode)?s?\.?\s*\d|\u7b2c\s*\d"
+    r"|\d+(?:\.\d+)?\s*[\u8a71\u8bdd\u7ae0\u56de\u5dfb\u5377\ud654\uad8c]"
+    r"|\d+(?:\.\d+)?\s*" + _RANGE_SEP + r"\s*\d)",
+    re.IGNORECASE,
+)
 
-    ``"... Ch. 1-30"`` gives ``"Ch. 1-30"``, a volume range ``"Vol. 1-3"``,
-    a bare range itself. A name rebuilt from parsed fields (the translated
-    title) carries it, since a range is never a chapter or volume field
-    (PR #180 review).
+
+def _split_numbering(stem: str) -> tuple[str, str] | None:
+    """Split *stem* into its title and its numbering span, or None.
+
+    The span runs from the first numbering token to the end, untouched
+    (``"漫画 Vol. 1-3 Ch. 31-60"`` -> ``("漫画", "Vol. 1-3 Ch. 31-60")``). A
+    stem with no numbering is all title (``("漫画", "")``). None when the two
+    cannot be told apart cleanly: no title before the numbering, or a digit
+    left in the title (a bare number the markers do not cover). A translated
+    title then keeps the arrival's name rather than lose its numbering
+    (PR #180 review round 4).
     """
-    found = _marked_range(text)
-    if found is None:
-        return ""
-    kind, span = found
-    return {"vol": f"Vol. {span}", "ch": f"Ch. {span}"}.get(kind, span)
+    match = _NUMBERING_START_RE.search(stem)
+    title = (stem[:match.start()] if match else stem).strip(" .-_")
+    span = stem[match.start():].strip() if match else ""
+    if not title or any(char.isdigit() for char in title):
+        return None
+    return title, span
 
 
 def range_in(text: str) -> tuple[str, str] | None:
@@ -1723,6 +1741,9 @@ def parse_comic_name(
         if original is not None:
             # Translate only the title portion; strip chapter/volume tokens so the
             # translator sees just the name (e.g. "鬼滅の刃 Ch. 5" -> "鬼滅の刃").
+            # For the file's own name the title is split from its numbering
+            # first (_split_numbering): the numbering is kept, not rebuilt.
+            split = _split_numbering(source) if source == raw_stem else None
             title_part = _NUM_TOKEN_RE.sub("", source)
             title_part = re.sub(
                 r"\b(?:ch|chap|chapter|chp|vol|volume|v|ep|episode|issue|part)\b\.?",
@@ -1731,6 +1752,8 @@ def parse_comic_name(
             # CJK volume/chapter markers: 第N話 / 第N巻 / 第N章 and bare N話/N巻/N章.
             title_part = re.sub(r"第?\s*\d+\s*[話巻章话卷]", "", title_part).strip(" .-_#")
             title_part = title_part or source
+            if split is not None:
+                title_part = split[0]
             english, original = translate_metadata_text(title_part)
             if original is not None and english and english != title_part:
                 original_title = original
@@ -1739,23 +1762,28 @@ def parse_comic_name(
                 # non-Latin (empty, punctuation-only, or still CJK), so the file
                 # gets a human/Komga-readable name. The untouched original and the
                 # translation are preserved in ComicInfo metadata regardless.
-                if source == raw_stem and (
+                if source == raw_stem and split is not None and (
                     not stem
                     or not _LATIN_RE.search(stem)
                     or _CJK_RE.search(stem)
                     or _looks_romanized_cjk(title_part, None)
                 ):
+                    # The translated title, then the arrival's numbering. One
+                    # number that is a chapter or volume is written as before,
+                    # David's style ("漫画 第3話" -> "Story Ch. 3"). A range, or
+                    # more than one number, is kept as written, apart from the
+                    # usual cleaning ("漫画 Vol. 1-3 Ch. 31-60" -> "Story Vol.
+                    # 1-3 Ch. 31-60"): the parsed fields hold one number at most.
                     english_stem = sanitize(english, rules) or english
-                    rebuilt = english_stem
-                    if chapter:
-                        rebuilt = f"{english_stem} Ch. {chapter}"
-                    elif volume:
-                        rebuilt = f"{english_stem} Vol. {volume}"
-                    elif _range_suffix(raw_stem):
-                        # A range is never a field, so it is carried as it was
-                        # written: "Story Ch. 1-30", never "Story".
-                        rebuilt = f"{english_stem} {_range_suffix(raw_stem)}"
-                    stem = rebuilt.strip() or stem
+                    span = sanitize(split[1], rules) if split[1] else ""
+                    # One number (a range always holds two).
+                    single = len(re.findall(r"\d+(?:\.\d+)?", span)) == 1
+                    if single and chapter:
+                        stem = f"{english_stem} Ch. {chapter}"
+                    elif single and volume:
+                        stem = f"{english_stem} Vol. {volume}"
+                    else:
+                        stem = f"{english_stem} {span}".strip() or stem
                     translated_stem = stem
 
     display = (
