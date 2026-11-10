@@ -313,7 +313,7 @@ def watcher_naming(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
     A parenthesised filename year is never discarded: it is the decided
     series year, the issue year (filename or XML), or the arrival name is kept.
     """
-    from scripts.cbz_core import display_tokens_for
+    from scripts.cbz_core import BRACKETED_RANGE_RE, display_tokens_for
 
     ci = fact.comicinfo
     if ci.status == fr.COMICINFO_INCONSISTENT:
@@ -363,6 +363,16 @@ def watcher_naming(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
                 number = offered
             else:
                 volume = offered
+    # A range ("Ch. 1-30", a compilation) keeps its legacy name, which spells
+    # it as it arrived with the uppercase "Ch." David keeps; the formatter
+    # would rewrite it ("ch. 1-30", or "#001" when only the first number was
+    # read), and ComicInfo Number stays unset rather than its first number.
+    if (any("-" in (fr.normalize_number(value) or "") for value in (number, volume)
+            if value is not None)
+            or BRACKETED_RANGE_RE.search(fact.filename)):
+        # A bracketed range ("(1-30)") would otherwise vanish with the
+        # bracket tokens below.
+        raise KeepArrivalName("number range; retaining legacy arrival name")
     # Number-like text is never disposable merely because it has no parsed
     # field. Remove only the decided title, bracket display/source tokens,
     # and number occurrences actually consumed by the arrival parsers.
