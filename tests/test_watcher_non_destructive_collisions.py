@@ -332,3 +332,88 @@ def test_a_loose_file_whose_name_was_taken_meanwhile_is_not_reported_as_landed(t
 
     assert landed is None
     assert src.is_file() and _payload_size(winner) == 300
+
+
+# ---------------------------------------------------------------------------
+# PR #176 review round 2: a placement in flight is never a library book
+# ---------------------------------------------------------------------------
+
+def _all_payloads(root: Path) -> list[int]:
+    found = []
+    for path in root.rglob("*.cbz"):
+        try:
+            found.append(_payload_size(path))
+        except (zipfile.BadZipFile, KeyError, OSError):
+            pass  # an empty reservation or a partial copy is not a book
+    return sorted(found)
+
+
+@pytest.mark.parametrize("mover", MOVERS + ["resolver-merge"])
+@pytest.mark.parametrize("first_fails", [False, True], ids=["completes", "fails"])
+@pytest.mark.parametrize("partial", [False, True], ids=["empty", "partial-copy"])
+def test_a_second_collision_defers_to_a_landing_in_flight(tmp_path, monkeypatch, mover, first_fails, partial):
+    """The first arrival owns the new library name and pauses mid-landing
+    (its reservation empty, or part-copied). A second arrival for the same
+    name must not treat that as a library book to quarantine or replace:
+    it defers. Whether the first then completes or fails, both copies
+    survive."""
+    library = tmp_path / "library" / "Berserk"
+    library.mkdir(parents=True)
+    dest = library / "Berserk ch. 9.cbz"
+    first = _make_cbz(tmp_path / "incoming" / "first" / dest.name, 10000)
+    second = _make_cbz(tmp_path / "incoming" / "second" / dest.name, 20000)
+    paused, release = threading.Event(), threading.Event()
+    real_move = watcher.shutil.move
+
+    def pause_first(source, target):
+        if Path(source) == first and Path(target) == dest:
+            assert list(library.glob(f".{dest.name}{watcher.RESERVE_MARK}*"))
+            if partial:
+                dest.write_bytes(b"partial" * 9)
+            paused.set()
+            assert release.wait(timeout=10)
+            if first_fails:
+                raise PermissionError("first landing failed")
+        return real_move(source, target)
+
+    def settle(src):
+        if mover == "loose":
+            return watcher._move_loose_files([src], str(library.parent), library.name)
+        quarantine = tmp_path / "_resolver_q" if mover == "resolver-merge" else None
+        return watcher._merge_directories(src.parent, library, conflict_quarantine_root=quarantine)
+
+    monkeypatch.setattr(watcher.shutil, "move", pause_first)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_done = pool.submit(settle, first)
+        assert paused.wait(timeout=10)
+        try:
+            second_result = settle(second)
+        finally:
+            release.set()
+        if first_fails:
+            with pytest.raises(PermissionError):
+                first_done.result(timeout=10)
+        else:
+            first_done.result(timeout=10)
+
+    assert second.is_file()  # deferred, not settled against the placement in flight
+    if mover == "loose":
+        assert second_result is None
+    assert _all_payloads(tmp_path) == [10000, 20000]
+    assert not list(library.glob(f".*{watcher.RESERVE_MARK}*"))  # the owner cleaned up its marker
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_another_watchers_marker_defers_the_collision(tmp_path, mover):
+    """A marker left by another watcher (same library, another process) is
+    respected the same way: the arrival stays, nothing is replaced."""
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    (library / f".{existing.name}{watcher.RESERVE_MARK}other-process").write_text("{}")
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+
+    _settle(mover, src, library)
+
+    assert src.is_file() and existing.read_bytes() == before
+    assert _quarantined(tmp_path) == []
