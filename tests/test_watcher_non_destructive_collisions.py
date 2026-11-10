@@ -199,3 +199,117 @@ def test_the_quarantine_root_is_configurable(tmp_path):
     assert args.quarantine_root == tmp_path / "q"
     default = watcher.build_argument_parser().parse_args([])
     assert default.quarantine_root == watcher.QUARANTINE_ROOT
+
+
+# ---------------------------------------------------------------------------
+# PR #176 review: every placement owns its path; a failure reports a failure
+# ---------------------------------------------------------------------------
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+
+def _payloads(root: Path) -> list[int]:
+    return sorted(_payload_size(p) for p in root.rglob("*.cbz"))
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_two_concurrent_quarantines_of_one_name_keep_both_copies(tmp_path, monkeypatch, mover):
+    """Both losers pick their candidate name before either moves (the gap
+    between choosing a free name and using it). Neither may overwrite the
+    other."""
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 10000)
+    sources = [_make_cbz(tmp_path / "incoming" / f"drop-{n}" / "Berserk ch. 1.cbz", n)
+               for n in (100, 200)]
+    chosen = threading.Barrier(2, timeout=10)
+    real_unique = watcher.unique_path
+
+    def choose_then_wait(path):
+        candidate = real_unique(path)
+        chosen.wait()
+        return candidate
+
+    monkeypatch.setattr(watcher, "unique_path", choose_then_wait)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(_settle, mover, src, library) for src in sources]:
+            future.result(timeout=20)
+
+    assert _payload_size(existing) == 10000
+    assert _payloads(tmp_path) == [100, 200, 10000]
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_a_failed_quarantine_never_removes_another_placements_file(tmp_path, monkeypatch, mover):
+    library = tmp_path / "library" / "Berserk"
+    _make_cbz(library / "Berserk ch. 1.cbz", 10000)
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100)
+    real_unique, real_move = watcher.unique_path, watcher.shutil.move
+    others: list[Path] = []
+
+    def another_placement_takes_it(path):
+        candidate = real_unique(path)
+        others.append(_make_cbz(candidate, 300))  # completed before this one moves
+        return candidate
+
+    def refuse(source, target):
+        if Path(source) == src:
+            raise PermissionError("quarantine refused")
+        return real_move(source, target)
+
+    monkeypatch.setattr(watcher, "unique_path", another_placement_takes_it)
+    monkeypatch.setattr(watcher.shutil, "move", refuse)
+    _settle(mover, src, library)
+
+    assert others[0].is_file() and _payload_size(others[0]) == 300
+    assert _payloads(tmp_path) == [100, 300, 10000]
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_two_concurrent_landings_of_one_new_name_keep_both(tmp_path, monkeypatch, mover):
+    """Two arrivals land the same new name at once; the second must not
+    overwrite the first."""
+    library = tmp_path / "library" / "Berserk"
+    library.mkdir(parents=True)
+    sources = [_make_cbz(tmp_path / "incoming" / f"drop-{n}" / "Berserk ch. 9.cbz", n)
+               for n in (100, 200)]
+    both_checked = threading.Barrier(2, timeout=10)
+    real_exists = Path.exists
+
+    def exists_then_wait(self):
+        result = real_exists(self)
+        if self.name == "Berserk ch. 9.cbz" and self.parent == library:
+            try:
+                both_checked.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return result
+
+    monkeypatch.setattr(Path, "exists", exists_then_wait)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(_settle, mover, src, library) for src in sources]:
+            future.result(timeout=20)
+    monkeypatch.setattr(Path, "exists", real_exists)
+
+    assert _payloads(tmp_path) == [100, 200]
+
+
+@pytest.mark.parametrize("failure", ["quarantine", "replacement"])
+def test_a_failed_loose_settlement_is_not_reported_as_landed(tmp_path, monkeypatch, failure):
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+    real_move = watcher.shutil.move
+
+    def refuse(source, target):
+        if ((failure == "quarantine" and "_quarantine" in Path(target).parts)
+                or (failure == "replacement" and Path(source) == src)):
+            raise PermissionError("placement refused")
+        return real_move(source, target)
+
+    monkeypatch.setattr(watcher.shutil, "move", refuse)
+    landed = watcher._move_loose_files([src], str(library.parent), library.name)
+
+    assert landed is None
+    assert src.is_file() and existing.read_bytes() == before
