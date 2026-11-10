@@ -356,6 +356,9 @@ def _extract_num_suffix(parts: list[str], chosen: str) -> str:
     Prevents ``shorten_mixed_original_title`` from silently dropping chapter
     numbers that happen to sit in the non-Latin segment, e.g.
     ``"One Piece / ワンピース Ch.005"`` -> chosen ``"One Piece"``, suffix ``" Ch.005"``.
+    A token that starts an ascending range keeps both ends (``" Ch. 1-30"``),
+    so the range is never cut to its first number here, before
+    ``extract_chapter_number`` can see it (PR #180 review).
     """
     for part in parts:
         if part == chosen:
@@ -364,12 +367,20 @@ def _extract_num_suffix(parts: list[str], chosen: str) -> str:
         vol = _VOLUME_NUMBER_RE.search(part)
         ch  = _CHAPTER_NUMBER_RE.search(part)
         if vol:
-            tokens.append(part[vol.start():vol.end()])
+            tokens.append(part[vol.start():_token_end(part, vol)])
         if ch:
-            tokens.append(part[ch.start():ch.end()])
+            tokens.append(part[ch.start():_token_end(part, ch)])
         if tokens:
             return " " + " ".join(tokens)
     return ""
+
+
+def _token_end(text: str, match: re.Match) -> int:
+    """Where a number token ends: after its range's second end, if it starts one."""
+    value = next(group for group in match.groups() if group is not None)
+    if _starts_range(text, match, value):
+        return _RANGE_TAIL_RE.match(text, match.end()).end()
+    return match.end()
 
 
 def shorten_mixed_original_title(text: str, max_length: int = 120) -> str:
