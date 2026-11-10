@@ -215,13 +215,20 @@ def test_a_recreated_source_path_is_a_new_arrival_beside_the_old_claim(watch, tm
     assert claims.claim_dirs(tmp_path / "_processing") == []
 
 
-def test_a_claim_for_another_watch_root_is_left_to_its_watcher(watch, tmp_path):
+def test_a_claim_for_another_watch_root_is_left_to_its_watcher(watch, tmp_path, monkeypatch):
+    """Passed over untouched, and let go: its own watcher (here the same
+    process, as with watcher roots sharing a processing root) then takes it."""
     watch_root, library = watch
-    claim_dir = _claim_folder(tmp_path, tmp_path / "another-root", payload={"Berserk Ch. 1.cbz": 101})
+    other_root = tmp_path / "another-root"
+    other_root.mkdir()
+    claim_dir = _claim_folder(tmp_path, other_root, payload={"Berserk Ch. 1.cbz": 101})
 
     watcher.process_and_move_directory(watch_root)
-
     assert _payloads(claim_dir) == [101]
+
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(other_root))
+    watcher.process_and_move_directory(other_root)
+    assert _payloads(library) == [101]
 
 
 def test_one_claim_has_one_owner(tmp_path):
@@ -1014,3 +1021,71 @@ def test_a_failed_ai_pass_clears_the_mark_with_the_custody(watch, tmp_path, monk
     assert calls == ["Berserk Ch. 2.cbz", "Berserk Ch. 1.cbz", "Berserk Ch. 2.cbz"]
     assert _payloads(library) == [101, 102]
     assert not (tmp_path / "_review").exists()
+
+
+# PR #177 review round 2: a claim's record is read only under its ownership
+
+def test_a_waiting_resumer_never_saves_a_record_it_read_before_owning(watch, tmp_path,
+                                                                     monkeypatch):
+    """Codex's round-2 probe, adapted. Pass A reads an unfinished claim's
+    record (no AI custody yet) and is held there. Pass B, for a disjoint
+    sibling folder, takes the claim, decensors the archive, records the
+    custody, cannot land and lets go. A must not then act on, or save, what
+    it read before it owned the claim: the archive is rewritten once."""
+    watch_root, library = watch
+    calls = _ai_naming_setup(tmp_path, monkeypatch, library)
+    arrival = watch_root / "Berserk"
+    _make_cbz(arrival / "Berserk ch. 1.cbz", 101)
+    claim = claims.claim_directory(arrival, watcher.PROCESSING_ROOT,
+                                   watcher._claim_context(arrival))
+    claim.release()  # an earlier run claimed it, then stopped
+    (watch_root / "callback-A").mkdir()
+    (watch_root / "callback-B").mkdir()
+    read_old, allow_old = threading.Event(), threading.Event()
+    lagger = {}
+    real_read = claims.read_record
+
+    def paused_read(folder):
+        record = real_read(folder)
+        if threading.get_ident() == lagger.get("ident") and not read_old.is_set():
+            read_old.set()
+            assert allow_old.wait(timeout=10)
+        return record
+
+    monkeypatch.setattr(claims, "read_record", paused_read)
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+
+    def stale_pass():
+        lagger["ident"] = threading.get_ident()
+        watcher.process_and_move_directory(watch_root / "callback-A")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiting = pool.submit(stale_pass)
+        try:
+            # A is held with the record it read: before owning the claim at
+            # b979fd6 (B then takes it), while owning it now (B skips it).
+            assert read_old.wait(timeout=10)
+            watcher.process_and_move_directory(watch_root / "callback-B")
+        finally:
+            allow_old.set()
+        waiting.result(timeout=30)
+
+    assert len(calls) == 1, f"a stale record repeated the AI rewrite: {calls}"
+    assert _payloads(claim.dir) == [102]
+    custody = real_read(claim.dir)["ai"]
+    assert [entry.get("done") for entry in custody.values()] == [True]
+
+
+def test_processing_refuses_a_claim_that_is_not_owned(watch, tmp_path):
+    """Every claim reaches processing owned (by its creator or the resume
+    that read it under the lock). An unowned claim's record may be stale,
+    so it is refused rather than locked and trusted."""
+    watch_root, _library = watch
+    arrival = watch_root / "Berserk"
+    _make_cbz(arrival / "Berserk ch. 1.cbz", 101)
+    claim = claims.claim_directory(arrival, watcher.PROCESSING_ROOT,
+                                   watcher._claim_context(arrival))
+    claim.release()
+    with pytest.raises(ValueError, match="without its ownership"):
+        next(watcher._claim_item(claim, resumed=True))
+    assert _payloads(claim.dir) == [101]
