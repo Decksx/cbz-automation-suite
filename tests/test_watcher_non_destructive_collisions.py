@@ -417,3 +417,45 @@ def test_another_watchers_marker_defers_the_collision(tmp_path, mover):
 
     assert src.is_file() and existing.read_bytes() == before
     assert _quarantined(tmp_path) == []
+
+
+@pytest.mark.parametrize("failure", ["quarantine", "replacement"])
+def test_an_all_failed_directory_merge_has_no_landing_receipt(tmp_path, monkeypatch, failure):
+    """The directory version of the loose-file receipt: nothing completed,
+    so ``_move_cbz_dir`` must not return the library folder as landed."""
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+    real_move = watcher.shutil.move
+
+    def refuse(source, target):
+        if ((failure == "quarantine" and "_quarantine" in Path(target).parts)
+                or (failure == "replacement" and Path(source) == src)):
+            raise PermissionError("placement refused")
+        return real_move(source, target)
+
+    monkeypatch.setattr(watcher.shutil, "move", refuse)
+    landed = watcher._move_cbz_dir(src.parent, str(library.parent), target_name=library.name)
+
+    assert landed is None
+    assert src.is_file() and existing.read_bytes() == before
+
+
+def test_a_directory_merge_with_one_completed_archive_is_a_landing(tmp_path, monkeypatch):
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    failed = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+    _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 2.cbz", 200)
+    real_move = watcher.shutil.move
+
+    def refuse(source, target):
+        if "_quarantine" in Path(target).parts:
+            raise PermissionError("quarantine refused")
+        return real_move(source, target)
+
+    monkeypatch.setattr(watcher.shutil, "move", refuse)
+    landed = watcher._move_cbz_dir(failed.parent, str(library.parent), target_name=library.name)
+
+    assert landed == library
+    assert (library / "Berserk ch. 2.cbz").is_file() and failed.is_file()
