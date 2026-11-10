@@ -56,7 +56,8 @@ def _arrange_merge(monkeypatch, source: Path, library: Path, race: bool) -> None
 
     # A whole folder moves only by os.rename (never shutil.move: PR #176).
     def destination_appears_then_move_fails(src, dest, *args, **kwargs):
-        if Path(src) == source and Path(dest) == library / "Berserk":
+        # The source is the claim in processing, not the import folder.
+        if Path(src).name == source.name and Path(dest) == library / "Berserk":
             _make_cbz(existing, 100)
             raise OSError("simulated: destination appeared concurrently")
         return original_rename(src, dest, *args, **kwargs)
