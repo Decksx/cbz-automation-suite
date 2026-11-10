@@ -188,3 +188,45 @@ lines are CRLF like their surroundings; bare LF stays 863.
 
 Full suite: **5,228 passed / 10 skipped / 0 failed** (5,238 collected =
 5,216 + 22 new); both sources hashed before the run and unchanged after.
+
+### PR #178 review round 3 (Codex, at `8b3891f`)
+
+**P2 (a regression of round 2):** replacing the word list with the existing
+grammars dropped guards `d1bc97b` had. `Part-A`/`Part-B` (`PART_MARKER_RE`
+takes no hyphen), `Side A`/`Side B` (bare "side" was gone) and
+`Extras`/`Specials` (plurals are not in `SPECIAL_WORDS`) were read as
+groups again, so paired parts and sides shared one name and one went to
+review. Codex's `test_review178_preserved_guards.py` (SHA256
+`8ca5d18d...d305`) fails 14/14 at `8b3891f` and passes 14/14 at `d1bc97b`.
+The direction ("replace the list with the grammar") should have been the
+union, as the coordinator noted.
+
+Fix: the grammars are used in addition to the earlier words, never instead
+of them. A prefix is not a group when it matches any of: the digit rule,
+`PART_MARKER_RE` (unchanged, still the watcher's shared grammar),
+`SPECIAL_WORDS`, or `STRUCTURAL_PREFIX_WORDS`, which is `d1bc97b`'s full
+set (part, parts, pt, arc, book, story, side, extra, extras, special,
+specials, bonus, omake, oneshot, prologue, epilogue, afterword, interlude,
+act, season, volume, vol, chapter, ch, episode, ep) plus "side story", each
+whole word with or without separators. `Part-A` is read through "part",
+`Side B` through "side". The live log's groups are unaffected (69 of 70
+dropped, `Amin3` kept). Codex's three probes pass 27/27.
+
+New tests: the 14 probe cases (six prefixes in plain and display parsing,
+and the hyphenated-part and lettered-side pairs landing as two books), and
+a test that runs every word of `d1bc97b`'s set, written out in the test
+rather than read from the code, in five spellings each, asserting the group
+rule leaves the arrival untouched. With `cbz_core.py` at `8b3891f`, 18 fail
+(the 14, and the word test for part, side, extras and specials). Left as
+they are, both nonblocking per Codex: `Partners Scans` (read as a part, so
+kept: conservative) and the regex-cache limit on proving the shared part
+grammar.
+
+Guards proven by bypass (failing tests): a structural word is not a group
+42; a part marker 5; a special word 6; separator-tolerant matching 4; the
+digit rule 2; the group test decides 93; a group prefix is dropped 22. Both
+sources were hashed before the bypass run and the full suite and were
+unchanged after each; nothing was copied or restored during either.
+
+Full suite: **5,268 passed / 10 skipped / 0 failed** (5,278 collected =
+5,238 + 40 new).
