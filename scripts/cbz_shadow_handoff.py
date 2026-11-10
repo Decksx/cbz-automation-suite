@@ -149,7 +149,8 @@ def configured_review_root() -> Path | None:
 
 def observe(comic_dir: Path, series_name: str, source_name: str, decision, *,
             mixed_parent: bool, archives: list[Path], error: str = "",
-            review_root: Path | None = None) -> HandoffObservation:
+            review_root: Path | None = None,
+            arrival: Path | None = None) -> HandoffObservation:
     """Decide, and for a would-be review handoff plan the case read-only.
 
     Never raises for a planning failure: shadow must not be able to stop the
@@ -171,7 +172,8 @@ def observe(comic_dir: Path, series_name: str, source_name: str, decision, *,
         return HandoffObservation(series_name, handoff,
                                   PLAN_REVIEW_ROOT_UNAVAILABLE, detail=str(root))
     try:
-        plan = plan_case(root, comic_dir, comic_dir, series_name,
+        # *arrival* is where it arrived; *comic_dir* (a claim) holds it now.
+        plan = plan_case(root, arrival or comic_dir, comic_dir, series_name,
                          series_key(series_name), source_name, decision)
     except Exception as exc:                     # noqa: BLE001 — never fatal
         return HandoffObservation(series_name, handoff, PLAN_FAILED,

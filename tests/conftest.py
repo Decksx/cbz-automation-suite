@@ -4,16 +4,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolated_held_state(tmp_path, monkeypatch):
-    """Keep the watcher's held-directory record out of the real Logs folder.
+def _isolated_claim_roots(tmp_path, monkeypatch):
+    r"""Claim into, and hold for review in, the test's tmp dir.
 
-    Any test that runs a watcher pass may record a held directory
-    (``scripts.cbz_watcher.HELD_STATE_FILE``). Without this, the record
-    would land in the checkout's ``Logs`` and leak between tests, so a
-    later test's directory could be skipped as "unchanged".
+    The defaults are real operator folders under C:\Temp. Both sit beside
+    the test's watch folders, on the same volume, as claims require.
     """
-    monkeypatch.setattr("scripts.cbz_watcher.HELD_STATE_FILE",
-                        tmp_path / "_watcher_state" / "cbz_watcher_held.json")
+    monkeypatch.setattr("scripts.cbz_watcher.PROCESSING_ROOT", tmp_path / "_processing")
+    monkeypatch.setattr("scripts.cbz_watcher.REVIEW_ROOT", tmp_path / "_review")
 
 
 @pytest.fixture(autouse=True)

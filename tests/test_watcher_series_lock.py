@@ -71,11 +71,11 @@ def wired(tmp_path, monkeypatch):
                     handoffs=None, mixed_parent=False):
         record("classify", series_name)
 
-    def fake_move_dir(comic_dir, dest, *, target_name, chapter_number=None):
+    def fake_move_dir(comic_dir, dest, *, target_name, chapter_number=None, **_options):
         record("mutate:move", target_name)
         return Path(dest) / target_name
 
-    def fake_move_loose(archives, dest, series_name):
+    def fake_move_loose(archives, dest, series_name, **_options):
         record("mutate:move_loose", series_name)
         return Path(dest) / series_name
 
@@ -173,9 +173,10 @@ def test_every_mutation_holds_the_final_series_lock(wired):
 
 
 def test_an_unstable_identity_defers_without_mutating(wired):
-    """K1 -> K2 -> K3. The arrival is left where it is for a later pass.
+    """K1 -> K2 -> K3. The arrival waits in its claim for a later pass.
 
-    The payload stays in the watch folder; its *filename* may already have
+    The payload stays in processing (not review: deferring is transient);
+    its *filename* may already have
     been normalized, because per-file cleaning happens before the lock is
     taken. That is deliberate -- holding a series lock across file processing
     would serialize unrelated series on unrelated work -- and it is why the
@@ -188,8 +189,9 @@ def test_an_unstable_identity_defers_without_mutating(wired):
     watcher.process_and_move_directory(arrival)
 
     assert _mutations(trace) == [], "something mutated on an unsettled identity"
-    assert arrival.is_dir(), "the arrival was consumed despite deferring"
-    assert list(arrival.glob("*.cbz")), "the payload left the watch folder"
+    processing = Path(watcher.PROCESSING_ROOT)
+    assert list(processing.rglob("*.cbz")), "the claim was consumed despite deferring"
+    assert not list(Path(watcher.REVIEW_ROOT).rglob("*.cbz")), "a deferral went to review"
     assert list(dest_root.iterdir()) == [], "something reached the destination"
     assert held_locks() == ()
 
@@ -214,7 +216,7 @@ def test_a_second_thread_cannot_acquire_the_series_lock_mid_move(wired):
 
     real_move = watcher._move_cbz_dir
 
-    def move_and_probe(comic_dir, dest, *, target_name, chapter_number=None):
+    def move_and_probe(comic_dir, dest, *, target_name, chapter_number=None, **_options):
         lock = watcher._SERIES_LOCKS.for_series(target_name)
 
         def probe() -> None:
@@ -450,9 +452,11 @@ def test_failed_move_publishes_nothing_and_the_next_ingest_acquires_the_lock(
     assert case.router.index.lookup("Berserk") is None
     assert not (case.library / "Berserk").exists()
 
+    # A's failed move left its claim in processing; the next ingest resumes
+    # it first, then takes its own: the lock is free both times.
     _finish_ingest(case.start("b", "Berserk"))
     assert not case.errors
-    assert case.b_lock_free == [True], "the failed move retained the series lock"
-    assert [name for name, _, _ in case.published] == ["ingest-b"]
+    assert case.b_lock_free == [True, True], "the failed move retained the series lock"
+    assert [name for name, _, _ in case.published] == ["ingest-b", "ingest-b"]
     assert case.router.index.lookup("Berserk") == ("library", case.library / "Berserk")
-    assert [path.name for path in (case.library / "Berserk").glob("*.cbz")] == ["b.cbz"]
+    assert sorted(path.name for path in (case.library / "Berserk").glob("*.cbz")) == ["a.cbz", "b.cbz"]

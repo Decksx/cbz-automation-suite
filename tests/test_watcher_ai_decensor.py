@@ -164,7 +164,7 @@ def test_ai_failure_restores_prior_books_and_stops_directory_import(
     def fake_decensor(path, destination_dir):
         assert destination_dir == str(destination)
         calls.append(path.name)
-        if path == second:
+        if path.name == second.name:  # the claimed copy, in processing
             raise watcher.AiDecensorError("injected failure")
         backup = quarantine / path.name
         backup.parent.mkdir(parents=True, exist_ok=True)
@@ -177,9 +177,11 @@ def test_ai_failure_restores_prior_books_and_stops_directory_import(
     watcher.process_and_move_directory(comic_dir)
 
     assert calls == ["01.cbz", "02.cbz"]
-    assert first.read_bytes() == first_original
-    assert second.read_bytes() == second_original
-    assert comic_dir.is_dir()
+    # The claim stays in processing, both originals restored, for a retry.
+    claimed = {p.name: p for p in Path(watcher.PROCESSING_ROOT).rglob("*.cbz")}
+    assert claimed["01.cbz"].read_bytes() == first_original
+    assert claimed["02.cbz"].read_bytes() == second_original
+    assert sorted(claimed) == ["01.cbz", "02.cbz"]
     assert not destination.exists()
     assert "AI decensor failed for 02.cbz: injected failure" in caplog.text
 

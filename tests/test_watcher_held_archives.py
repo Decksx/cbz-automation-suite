@@ -1,26 +1,30 @@
-"""Held archives: one refusal no longer holds back a whole series.
+"""Held archives: decided once, then moved out of the way.
 
 Incident (2026-11-09): a 710-archive Usogui arrival had 54 archives refused
 by media naming. The watcher deferred the whole directory, so none of the
-656 good archives moved, and every restart re-processed all 710 (about 45
-minutes) only to defer them again. The folder also held two scanlations of
-112 chapters, which the watcher passed through as different books.
+656 good archives moved, and every restart re-processed all 710. The folder
+also held two scanlations of 112 chapters, which passed through as
+different books. Keeping held copies in the (MEGA-synced) watch folder then
+needed a persisted memory of every hold, and each way of losing that memory
+lost a book (issue #174, PRs #173 and #175).
 
-These tests pin the three changes:
+With claim-first processing (``comic_automation.library.claims``) a held
+archive leaves the arrival as soon as it is decided:
 
-* only the refused archives stay in the import folder; their siblings move
-  (``_move_cbz_dir``'s *held*), and a refused placeholder still never
-  reaches the library;
-* a second copy of a chapter from another group is held for the operator,
-  never deleted (``_duplicate_chapter_copies``);
-* a directory left holding only held archives is skipped while it is
-  unchanged (``_held_directory_unchanged`` / ``_remember_held_directory``).
+* a refused archive, or one whose AI rewrite was interrupted, goes to
+  review (``REVIEW_ROOT``); its siblings land;
+* a second translation of a chapter from another group goes to
+  quarantine (``QUARANTINE_ROOT``); the kept copy lands;
+* a refusal that may clear by itself (a locked file, a registry style
+  refusal) stays in processing and is retried.
+
+The folder an archive is in is its state, so nothing about a hold needs
+remembering, and a new arrival can never release it.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import zipfile
 from pathlib import Path
 
@@ -48,9 +52,18 @@ def _names(folder: Path) -> list[str]:
     return sorted(p.name for p in folder.glob("*.cbz")) if folder.exists() else []
 
 
+def _placed(root: Path) -> list[str]:
+    """Names placed anywhere below a review or quarantine root."""
+    return sorted(p.name for p in root.rglob("*.cbz")) if root.exists() else []
+
+
+def _payloads(root: Path) -> list[int]:
+    return sorted(_payload_size(p) for p in root.rglob("*.cbz")) if root.exists() else []
+
+
 @pytest.fixture
 def watch(tmp_path, monkeypatch):
-    """A tmp watch folder, library and held-state file, offline."""
+    """A tmp watch folder and library wired into the watcher, offline."""
     watch_root = tmp_path / "incoming"
     library = tmp_path / "library"
     watch_root.mkdir()
@@ -59,7 +72,6 @@ def watch(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "_routing_rules", [])
     monkeypatch.setattr(watcher, "_routing_default", str(library))
     monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
-    monkeypatch.setattr(watcher, "HELD_STATE_FILE", tmp_path / "state" / "held.json")
     monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
     monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
     return watch_root, library
@@ -77,19 +89,21 @@ def media_watch(watch, tmp_path, monkeypatch):
     return watch_root, library
 
 
-def _held_state(tmp_path: Path) -> dict:
-    path = tmp_path / "state" / "held.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+def _with_number(path: Path, number) -> Path:
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("ComicInfo.xml",
+                         f"<ComicInfo><Series>Usogui</Series><Number>{number}</Number></ComicInfo>")
+    return path
 
 
 # ---------------------------------------------------------------------------
-# Fix 1: only the refused archives stay behind
+# A refusal holds back only the refused archive, which goes to review
 # ---------------------------------------------------------------------------
 
-def test_one_refused_archive_no_longer_holds_back_its_series(media_watch):
+def test_one_refused_archive_no_longer_holds_back_its_series(media_watch, tmp_path):
     """The Usogui shape: media naming refuses one archive (two different
     chapter numbers in its name). The other two land under their canonical
-    names; only the refused one stays in the import folder."""
+    names; the refused one goes to review, intact."""
     watch_root, library = media_watch
     arrival = watch_root / "Usogui"
     _make_cbz(arrival / "Team Duwang Vol.1 Ch.1 - Gambler.cbz", 101)
@@ -99,11 +113,12 @@ def test_one_refused_archive_no_longer_holds_back_its_series(media_watch):
     watcher.process_and_move_directory(arrival)
 
     assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz", "Usogui v01 ch. 2.cbz"]
-    assert _names(arrival) == ["Team Duwang Vol.30 Ch.323 - Chapter 1, Fin.cbz"]
-    assert _payload_size(arrival / "Team Duwang Vol.30 Ch.323 - Chapter 1, Fin.cbz") == 323
+    assert _placed(tmp_path / "_review") == ["Team Duwang Vol.30 Ch.323 - Chapter 1, Fin.cbz"]
+    assert _payloads(tmp_path / "_review") == [323]
+    assert not arrival.exists()
 
 
-def test_a_refused_placeholder_stays_while_its_numbered_sibling_lands(watch):
+def test_a_refused_placeholder_goes_to_review_while_its_numbered_sibling_lands(watch, tmp_path):
     """Legacy naming: the generic placeholder is refused (two editions) and
     must never reach the series folder, where the next chapter sharing its
     generic name would collide with it. Its numbered sibling lands."""
@@ -116,12 +131,11 @@ def test_a_refused_placeholder_stays_while_its_numbered_sibling_lands(watch):
 
     assert _names(library / "Berserk") == ["Berserk Ch. 5.cbz"]
     assert not list(library.rglob("*volvox*"))
-    left = list(watch_root.rglob("*.cbz"))
-    assert len(left) == 1 and _payload_size(left[0]) == 400
+    assert _payloads(tmp_path / "_review") == [400]
 
 
-def test_an_all_held_directory_creates_no_empty_series_folder(watch):
-    """With every archive held there is nothing to move, so the series
+def test_an_all_held_directory_creates_no_empty_series_folder(watch, tmp_path):
+    """With every archive held there is nothing to land, so the series
     folder must not be created just to stay empty."""
     watch_root, library = watch
     arrival = watch_root / "Berserk Ch. 4"
@@ -130,7 +144,7 @@ def test_an_all_held_directory_creates_no_empty_series_folder(watch):
     watcher.process_and_move_directory(arrival)
 
     assert list(library.iterdir()) == []
-    assert len(list(watch_root.rglob("*.cbz"))) == 1
+    assert _payloads(tmp_path / "_review") == [400]
 
 
 def test_held_archives_are_skipped_by_the_merge_itself(tmp_path):
@@ -148,17 +162,17 @@ def test_held_archives_are_skipped_by_the_merge_itself(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Fix 4: a second translation of a chapter is held, never deleted
+# A second translation of a chapter goes to quarantine, never deleted
 # ---------------------------------------------------------------------------
 
-def test_a_second_groups_copy_of_a_chapter_is_held_for_review(watch):
+def test_a_second_groups_copy_of_a_chapter_is_quarantined(watch, tmp_path):
     """Two scanlations of Ch.26. Team Duwang has more archives here, so its
-    copy lands; Easy Going's copy stays in the import folder, intact."""
+    copy lands; Easy Going's copy goes to quarantine, intact."""
     watch_root, library = watch
     arrival = watch_root / "Usogui"
     for chapter in (26, 27, 28):
         _make_cbz(arrival / f"Team Duwang Vol.3 Ch.{chapter} - T{chapter}.cbz", 200 + chapter)
-    _make_cbz(arrival / "Easy Going Vol.3 Ch.26 - I bet!.cbz", 926)  # larger, still held
+    _make_cbz(arrival / "Easy Going Vol.3 Ch.26 - I bet!.cbz", 926)  # larger, still not kept
     _make_cbz(arrival / "Easy Going Vol.3 Ch.30 - Other.cbz", 930)
 
     watcher.process_and_move_directory(arrival)
@@ -167,8 +181,8 @@ def test_a_second_groups_copy_of_a_chapter_is_held_for_review(watch):
     assert "Team Duwang Vol.3 Ch.26 - T26.cbz" in landed
     assert "Easy Going Vol.3 Ch.30 - Other.cbz" in landed
     assert not any("I bet" in name for name in landed)
-    assert _names(arrival) == ["Easy Going Vol.3 Ch.26 - I bet!.cbz"]
-    assert _payload_size(arrival / "Easy Going Vol.3 Ch.26 - I bet!.cbz") == 926
+    assert _placed(tmp_path / "_quarantine") == ["Easy Going Vol.3 Ch.26 - I bet!.cbz"]
+    assert _payloads(tmp_path / "_quarantine") == [926]
 
 
 def _parsed(paths):
@@ -208,181 +222,6 @@ def test_only_true_second_translations_are_held(tmp_path, series, names):
     assert _held_copies(paths, series) == {}
 
 
-# ---------------------------------------------------------------------------
-# Fix 2: an unchanged held directory is not re-processed
-# ---------------------------------------------------------------------------
-
-def _count_processing(monkeypatch) -> list[Path]:
-    calls: list[Path] = []
-    real = watcher.process_cbz_file
-
-    def counting(path, *args, **kwargs):
-        calls.append(path)
-        return real(path, *args, **kwargs)
-
-    monkeypatch.setattr(watcher, "process_cbz_file", counting)
-    return calls
-
-
-def _held_arrival(watch_root: Path) -> Path:
-    arrival = watch_root / "Berserk Ch. 4"
-    _make_cbz(arrival / "volvox_Chapter (Colored) (Uncensored).cbz", 400)
-    _make_cbz(arrival / "Berserk Ch. 5.cbz", 500)
-    return arrival
-
-
-def _settle(arrival: Path) -> None:
-    """Run passes until the held archive's hold is remembered.
-
-    The first pass writes ComicInfo into the held placeholder after judging
-    it, so that hold is not remembered yet (it must be judged again on the
-    rewritten archive). The second pass leaves it unchanged and records it.
-    """
-    watcher.process_and_move_directory(arrival)
-    watcher.process_and_move_directory(arrival)
-
-
-def test_an_unchanged_held_directory_is_skipped_on_the_next_pass(watch, tmp_path, monkeypatch):
-    watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    _settle(arrival)
-    state = _held_state(tmp_path)
-    assert list(state) == [str(arrival)]
-    assert state[str(arrival)]["held"] == ["volvox Chapter (Colored) (Uncensored).cbz"]
-
-    calls = _count_processing(monkeypatch)
-    watcher.process_and_move_directory(arrival)
-    assert calls == []
-
-
-def test_any_change_to_a_held_directory_retries_it(watch, tmp_path, monkeypatch):
-    watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    _settle(arrival)
-    calls = _count_processing(monkeypatch)
-
-    _make_cbz(arrival / "Berserk Ch. 6.cbz", 600)
-    watcher.process_and_move_directory(arrival)
-
-    assert calls  # re-processed
-    assert "Berserk Ch. 6.cbz" in _names(library / "Berserk")
-
-    # Touching the held file alone is also a change.
-    calls.clear()
-    held = next(arrival.glob("*.cbz"))
-    stat = held.stat()
-    os.utime(held, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
-    watcher.process_and_move_directory(arrival)
-    assert calls == [held]
-
-
-def test_a_watcher_upgrade_retries_every_held_directory(watch, monkeypatch):
-    watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    _settle(arrival)
-    calls = _count_processing(monkeypatch)
-    monkeypatch.setattr(watcher, "WATCHER_SOURCE_VERSION", "sha256:new")
-
-    watcher.process_and_move_directory(arrival)
-
-    assert calls
-
-
-def test_deleting_the_entry_forces_a_retry(watch, tmp_path, monkeypatch):
-    watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    _settle(arrival)
-    (tmp_path / "state" / "held.json").unlink()
-    calls = _count_processing(monkeypatch)
-
-    watcher.process_and_move_directory(arrival)
-
-    assert calls
-
-
-def test_a_failed_move_is_not_remembered_as_held(watch, tmp_path, monkeypatch):
-    """A move that failed (the library share dropped, say) leaves archives
-    that were never held. Recording the directory would turn a transient
-    failure into a permanent skip, so nothing is recorded."""
-    watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
-
-    watcher.process_and_move_directory(arrival)
-
-    assert len(_names(arrival)) == 2
-    assert _held_state(tmp_path) == {}
-
-
-def test_an_emptied_directory_is_forgotten(watch, tmp_path):
-    watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    _settle(arrival)
-    assert _held_state(tmp_path)
-
-    # The operator resolves the held file by hand; the next pass lands the
-    # replacement and the entry is dropped.
-    for path in arrival.glob("*.cbz"):
-        path.unlink()
-    _make_cbz(arrival / "Berserk Ch. 7.cbz", 700)
-    watcher.process_and_move_directory(arrival)
-
-    assert _held_state(tmp_path) == {}
-    assert "Berserk Ch. 7.cbz" in _names(library / "Berserk")
-
-
-def test_a_registry_refusal_is_retried_not_remembered(media_watch, tmp_path, monkeypatch):
-    """A style the registry cannot select (a root briefly inaccessible, say)
-    refuses every archive without any file being wrong. Remembering that as
-    held would skip the directory after the cause cleared, so it is not."""
-    from comic_automation.library.number_style import NumberStyleRefused
-
-    watch_root, library = media_watch
-    arrival = watch_root / "Usogui"
-    _make_cbz(arrival / "Team Duwang Vol.1 Ch.1 - Gambler.cbz")
-
-    def refuse(*_args, **_kwargs):
-        raise NumberStyleRefused("auto number style needs exactly one registered root")
-
-    monkeypatch.setattr(type(watcher._number_style_registry), "select", refuse)
-    # Two passes: the first writes ComicInfo (so is never remembered); the
-    # second leaves the archive unchanged, so only the refusal being
-    # transient keeps it from being remembered.
-    watcher.process_and_move_directory(arrival)
-    watcher.process_and_move_directory(arrival)
-
-    assert _names(arrival) == ["Team Duwang Vol.1 Ch.1 - Gambler.cbz"]
-    assert _held_state(tmp_path) == {}
-
-
-# ---------------------------------------------------------------------------
-# PR #173 review (2026-11-09): five cases reproduced by Codex, plus the
-# connector's P1. Each failed at c2805816.
-# ---------------------------------------------------------------------------
-
-def _with_number(path: Path, number) -> Path:
-    with zipfile.ZipFile(path, "a") as archive:
-        archive.writestr("ComicInfo.xml",
-                         f"<ComicInfo><Series>Usogui</Series><Number>{number}</Number></ComicInfo>")
-    return path
-
-
-def test_a_failed_move_of_a_deferred_tagged_arrival_is_retried(watch, tmp_path, monkeypatch):
-    """A deferred tag-stripping rename is a plan, not a hold. If the move
-    fails, the arrival was never held on purpose and must be retried."""
-    watch_root, library = watch
-    arrival = watch_root / "Solo Leveling"
-    _make_cbz(arrival / "Solo Leveling ch. 4 (s2).cbz")
-    real_move = watcher._move_cbz_dir
-    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
-    watcher.process_and_move_directory(arrival)
-    assert _held_state(tmp_path) == {}
-
-    monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
-    watcher.process_and_move_directory(arrival)
-    assert (library / "Solo Leveling" / "Solo Leveling ch. 4.cbz").is_file()
-
-
 @pytest.mark.parametrize("tag_a, tag_b", [
     pytest.param("(2019)", "(2020)", id="years"),
     pytest.param("(s1)", "(s2)", id="seasons"),
@@ -397,33 +236,22 @@ def test_year_and_season_variants_are_not_second_translations(watch, tag_a, tag_
     watcher.process_and_move_directory(arrival)
 
     assert len(list(library.rglob("*.cbz"))) == 4
-    assert not list(arrival.glob("*.cbz"))
 
 
-def test_a_replacement_with_the_same_size_and_mtime_is_retried(watch, tmp_path, monkeypatch):
-    """Different page bytes, same archive length and mtime, swapped in with
-    os.replace: names, sizes and mtimes alone cannot see it."""
+def test_part_markers_are_not_second_translations(watch):
+    """Part A and Part B of chapter 1 are two halves, not two translations."""
     watch_root, library = watch
-    arrival = _held_arrival(watch_root)
-    _settle(arrival)
-    assert _held_state(tmp_path)[str(arrival)]["fingerprint"]
-    held = next(arrival.glob("*.cbz"))
-    before = held.stat()
-    replacement = held.with_suffix(".new")
-    with zipfile.ZipFile(held) as source, zipfile.ZipFile(replacement, "w") as target:
-        for info in source.infolist():
-            data = source.read(info)
-            target.writestr(info, b"\1" * len(data) if info.filename == "page1.jpg" else data)
-    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
-    os.replace(replacement, held)
-    assert held.stat().st_size == before.st_size and held.stat().st_mtime_ns == before.st_mtime_ns
+    arrival = watch_root / "Usogui"
+    for group, part in (("Alpha", "A"), ("Beta", "B")):
+        for chapter in (1, 2):
+            _make_cbz(arrival / f"{group} Ch.{chapter} - Part {part}.cbz")
 
-    calls = _count_processing(monkeypatch)
     watcher.process_and_move_directory(arrival)
-    assert calls
+
+    assert len(list(library.rglob("*.cbz"))) == 4
 
 
-def test_a_refused_preferred_copy_does_not_hold_back_the_valid_one(media_watch):
+def test_a_refused_preferred_copy_does_not_hold_back_the_valid_one(media_watch, tmp_path):
     """Beta has more archives, so its Ch.1 is preferred, but its ComicInfo
     Number (99) conflicts and naming refuses it. Alpha's valid Ch.1 must
     then land instead of waiting behind a copy that cannot."""
@@ -437,31 +265,7 @@ def test_a_refused_preferred_copy_does_not_hold_back_the_valid_one(media_watch):
     watcher.process_and_move_directory(arrival)
 
     assert (library / "Usogui" / "Usogui ch. 1.cbz").is_file()
-    assert _names(arrival) == ["Beta Ch.1.cbz"]
-
-
-def test_held_second_copies_stay_held_when_a_new_chapter_arrives(media_watch):
-    """The connector's P1. After the first pass the kept copies are in the
-    library, so the intake alone no longer shows the held copies as second
-    translations. A new arrival must not release them into a merge that
-    renames them onto the library's names and discards one."""
-    watch_root, library = media_watch
-    arrival = watch_root / "Usogui"
-    for chapter in (1, 2, 3):
-        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
-    for chapter in (1, 2):
-        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
-    watcher.process_and_move_directory(arrival)
-    assert _names(arrival) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
-
-    _make_cbz(arrival / "Alpha Ch.4.cbz", 104)
-    watcher.process_and_move_directory(arrival)
-
-    assert _names(arrival) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
-    assert _payload_size(arrival / "Beta Ch.1.cbz") == 901
-    landed = library / "Usogui"
-    assert _names(landed) == [f"Usogui ch. {n}.cbz" for n in (1, 2, 3, 4)]
-    assert _payload_size(landed / "Usogui ch. 1.cbz") == 101
+    assert _placed(tmp_path / "_review") == ["Beta Ch.1.cbz"]
 
 
 def test_a_refused_kept_copy_promotes_the_next_copy(tmp_path):
@@ -476,57 +280,6 @@ def test_a_refused_kept_copy_promotes_the_next_copy(tmp_path):
     assert watcher._second_copies(clusters, {alpha[0], beta[0]}) == {beta[1]: alpha[1]}
 
 
-def test_part_markers_are_not_second_translations(watch):
-    """Probe from the same review: Part A and Part B of chapter 1 are two
-    halves, not two translations."""
-    watch_root, library = watch
-    arrival = watch_root / "Usogui"
-    for group, part in (("Alpha", "A"), ("Beta", "B")):
-        for chapter in (1, 2):
-            _make_cbz(arrival / f"{group} Ch.{chapter} - Part {part}.cbz")
-
-    watcher.process_and_move_directory(arrival)
-
-    assert len(list(library.rglob("*.cbz"))) == 4
-
-
-def test_a_hold_judged_before_this_pass_rewrote_the_archive_is_re_judged(media_watch, monkeypatch):
-    """The pass rewrites ComicInfo after reading the facts it judged, so
-    the held archive changed under its own decision. The next pass must
-    judge the rewritten archive rather than skip it."""
-    watch_root, library = media_watch
-    arrival = watch_root / "Usogui"
-    _with_number(_make_cbz(arrival / "Alpha Ch.1.cbz"), 99)
-    watcher.process_and_move_directory(arrival)
-    calls = _count_processing(monkeypatch)
-
-    watcher.process_and_move_directory(arrival)
-
-    assert calls
-
-
-def test_a_failed_rename_is_retried_not_remembered(media_watch, tmp_path, monkeypatch):
-    """An OSError during naming (a locked archive) refuses without anything
-    being wrong with the archive. Even once a pass leaves it unchanged, it
-    is retried, and lands when the lock clears."""
-    watch_root, library = media_watch
-    arrival = watch_root / "Usogui"
-    _make_cbz(arrival / "Team Duwang Vol.1 Ch.1 - Gambler.cbz")
-
-    def locked(*_args, **_kwargs):
-        raise PermissionError("locked by another process")
-
-    real_rename = watcher.rename_arrival
-    monkeypatch.setattr(watcher, "rename_arrival", locked)
-    watcher.process_and_move_directory(arrival)
-    watcher.process_and_move_directory(arrival)
-    assert _held_state(tmp_path) == {}
-
-    monkeypatch.setattr(watcher, "rename_arrival", real_rename)
-    watcher.process_and_move_directory(arrival)
-    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz"]
-
-
 def test_a_groups_own_second_copy_is_not_held_behind_it(tmp_path):
     """Two same-numbered archives from the kept copy's own group are parts
     or re-uploads, not a second translation; only the other group's copy
@@ -538,14 +291,112 @@ def test_a_groups_own_second_copy_is_not_held_behind_it(tmp_path):
     assert set(held) == {beta[0], beta[1]}
 
 
-def test_a_changed_second_copy_is_no_longer_carried(tmp_path, monkeypatch):
-    """A remembered second copy stays held only while its bytes match: once
-    the operator replaces it, it is judged again like any arrival."""
-    monkeypatch.setattr(watcher, "HELD_STATE_FILE", tmp_path / "held.json")
-    folder = tmp_path / "Usogui"
-    copy = _make_cbz(folder / "Beta Ch.1.cbz", 10)
-    watcher._remember_held_directory(folder, {copy}, {copy: "Alpha Ch.1.cbz"})
-    assert watcher._carried_second_copies(folder, [copy]) == {copy: "Alpha Ch.1.cbz"}
+# ---------------------------------------------------------------------------
+# A decided hold is out of the watch folder: no later arrival can release it
+# ---------------------------------------------------------------------------
 
-    _make_cbz(copy, 11)
-    assert watcher._carried_second_copies(folder, [copy]) == {}
+def test_quarantined_second_copies_are_untouched_when_a_new_chapter_arrives(media_watch, tmp_path):
+    """Issue #174's shape. The second copies left the arrival on the first
+    pass, so a new chapter arriving under the same series name is just a
+    new arrival: nothing can rename them onto the library's names."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    for chapter in (1, 2, 3):
+        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
+    watcher.process_and_move_directory(arrival)
+    assert _payloads(tmp_path / "_quarantine") == [901, 902]
+
+    _make_cbz(watch_root / "Usogui" / "Alpha Ch.4.cbz", 104)
+    watcher.process_and_move_directory(watch_root / "Usogui")
+
+    assert _payloads(tmp_path / "_quarantine") == [901, 902]
+    landed = library / "Usogui"
+    assert _names(landed) == [f"Usogui ch. {n}.cbz" for n in (1, 2, 3, 4)]
+    assert _payload_size(landed / "Usogui ch. 1.cbz") == 101
+
+
+def test_a_second_copy_never_replaces_a_different_library_book(media_watch, tmp_path):
+    """A kept copy that lands on a name the library already holds with
+    different bytes goes to review; the library copy is untouched."""
+    watch_root, library = media_watch
+    existing = _make_cbz(library / "Usogui" / "Usogui ch. 1.cbz", 50)
+    before = existing.read_bytes()
+    arrival = watch_root / "Usogui"
+    for chapter in (1, 2, 3):
+        _make_cbz(arrival / f"Alpha Ch.{chapter}.cbz", 100 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(arrival / f"Beta Ch.{chapter}.cbz", 900 + chapter)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert existing.read_bytes() == before
+    assert _payloads(tmp_path / "_review") == [101]
+    assert _payloads(tmp_path / "_quarantine") == [901, 902]
+
+
+# ---------------------------------------------------------------------------
+# A failure that may clear by itself stays in processing and is retried
+# ---------------------------------------------------------------------------
+
+def test_a_failed_move_stays_in_processing_and_lands_on_the_next_pass(watch, tmp_path, monkeypatch):
+    watch_root, library = watch
+    arrival = watch_root / "Solo Leveling"
+    _make_cbz(arrival / "Solo Leveling ch. 4 (s2).cbz")
+    real_move = watcher._move_cbz_dir
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+    watcher.process_and_move_directory(arrival)
+    assert not arrival.exists()
+    assert len(list((tmp_path / "_processing").rglob("*.cbz"))) == 1
+    assert _placed(tmp_path / "_review") == []
+
+    monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
+    watcher.process_and_move_directory(watch_root)
+    assert (library / "Solo Leveling" / "Solo Leveling ch. 4.cbz").is_file()
+    assert not list((tmp_path / "_processing").rglob("*.cbz"))
+
+
+def test_a_registry_refusal_stays_in_processing_not_review(media_watch, tmp_path, monkeypatch):
+    """A style the registry cannot select (a root briefly inaccessible, say)
+    refuses every archive without any file being wrong: that is retried,
+    not sent to review as a decision."""
+    from comic_automation.library.number_style import NumberStyleRefused
+
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _make_cbz(arrival / "Team Duwang Vol.1 Ch.1 - Gambler.cbz")
+
+    def refuse(*_args, **_kwargs):
+        raise NumberStyleRefused("auto number style needs exactly one registered root")
+
+    real_select = type(watcher._number_style_registry).select
+    monkeypatch.setattr(type(watcher._number_style_registry), "select", refuse)
+    watcher.process_and_move_directory(arrival)
+    assert _placed(tmp_path / "_review") == []
+    assert len(list((tmp_path / "_processing").rglob("*.cbz"))) == 1
+
+    monkeypatch.setattr(type(watcher._number_style_registry), "select", real_select)
+    watcher.process_and_move_directory(watch_root)
+    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz"]
+
+
+def test_a_failed_rename_stays_in_processing_and_lands_when_it_clears(media_watch, tmp_path, monkeypatch):
+    """An OSError during naming (a locked archive) refuses without anything
+    being wrong with the archive. It is retried, and lands when the lock
+    clears."""
+    watch_root, library = media_watch
+    arrival = watch_root / "Usogui"
+    _make_cbz(arrival / "Team Duwang Vol.1 Ch.1 - Gambler.cbz")
+
+    def locked(*_args, **_kwargs):
+        raise PermissionError("locked by another process")
+
+    real_rename = watcher.rename_arrival
+    monkeypatch.setattr(watcher, "rename_arrival", locked)
+    watcher.process_and_move_directory(arrival)
+    assert _placed(tmp_path / "_review") == []
+
+    monkeypatch.setattr(watcher, "rename_arrival", real_rename)
+    watcher.process_and_move_directory(watch_root)
+    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz"]

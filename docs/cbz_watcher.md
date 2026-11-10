@@ -23,68 +23,96 @@ The immediate comic directory is the batch:
 
 1. Wait for inactivity and minimum-age requirements.
 2. Suppress events caused by the watcher's own operations.
-3. Clean the top-level directory name.
-4. Enumerate and stabilize all CBZ files.
-5. Parse each filename with `cbz_core.parse_comic_name()`.
-6. Rename archives when needed.
-7. Create or update `ComicInfo.xml`.
-8. Optionally AI-decensor each archive with Camelia, one book at a time.
-9. Use `routing.json` to obtain a fallback category for a new series.
-10. Optionally resolve the canonical series directory across both libraries.
-11. Move the directory.
-12. Merge file-by-file if the destination exists.
+3. **Claim** it: move it out of the watch folder into the processing root
+   (see below). Nothing in the watch folder is renamed or rewritten.
+4. Re-check, inside the claim, that every CBZ is complete.
+5. Clean the series folder name.
+6. Parse each filename with `cbz_core.parse_comic_name()`.
+7. Rename archives when needed.
+8. Create or update `ComicInfo.xml`.
+9. Optionally AI-decensor each archive with Camelia, one book at a time.
+10. Use `routing.json` to obtain a fallback category for a new series.
+11. Optionally resolve the canonical series directory across both libraries.
+12. Move the directory, or merge it file by file if the destination exists.
+13. Send what cannot land to review or quarantine, and retire the claim.
 
-## Held archives
+## Claim-first processing
 
-Some archives in a batch are held in the import folder for review instead of
-moving. Since 2026-11-09 only those archives stay behind; their siblings move
-as normal (before then one held archive deferred the whole directory, so a
-710-archive series waited on 54 refusals and was re-processed on every pass).
+The watch folder is synced by MEGA: every rename or ComicInfo write there is
+uploaded, and an archive held in place was re-processed on every pass.
+Remembering what had been decided about held archives was what lost books in
+issue #174. Since 2026-11-09 an arrival leaves the watch folder before
+anything changes it, and **the folder an archive is in is its state**:
 
-An archive is held when:
+| Root | Default | Meaning | Kept |
+| --- | --- | --- | --- |
+| processing | `C:\Temp\cbz_processing` | claimed, work not finished | until finished |
+| review | `C:\Temp\cbz_held\review` | needs a decision | indefinitely |
+| quarantine | `C:\Temp\cbz_held\quarantine` | not kept | 30 days |
+| library | routed destination | done | |
 
-- media or fallback naming refuses it (a `REVIEW:` line gives the reason). A
-  refused placeholder keeps its generic name, and merging it into the series
-  folder is where the next chapter sharing that name would collide;
-- it is a second copy of a chapter from another scanlation group
-  (`_duplicate_chapter_copies`). The copy whose group has the most archives
-  in the directory lands, then the larger file. If naming refuses that copy,
-  the next one is named instead, so a copy that cannot land never holds a
-  valid one back. Copies need the same single chapter/issue number, volume,
-  years, bracketed tags (`(s2)`), `Part` markers, specials, editions and
-  version markers; both groups need two or more archives in the directory;
-  a prefix that is the series name plus more words (`Batman Annual` in
-  `Batman`) is another title, not a group. A held copy stays held by name
-  and content on later passes, even after new chapters arrive. Nothing is
-  deleted: choose a copy, and remove or swap the other by hand;
-- it meets a different library book only because a tag was stripped from
-  its name (`HELD FOR REVIEW`, issue #131).
+Set them with `--processing-root`, `--review-root` and `--quarantine-root`
+(or `CBZ_PROCESSING_ROOT`, `CBZ_REVIEW_ROOT`, `CBZ_QUARANTINE_ROOT`).
 
-Each pass logs `Holding N of M archive(s)` and one `HELD (...)` line per
-archive. When every archive is held, nothing moves and no series folder is
-created.
+**Claiming.** Each comic directory becomes a claim folder
+`<processing>\<YYYYMMDD-HHMMSS-id>\` holding `claim.json` and the payload.
+The record (watch root, source folder, relative path, routing) is written
+first; then the series folder moves in with one same-volume rename, the first
+change ever made to the arrival. A failed record write or rename leaves the
+arrival untouched for the next pass. The loose archives of a mixed drop point
+are claimed one by one (its subfolders are other series and are claimed on
+their own). A series folder that also holds subfolders, such as Syncthing's
+`.stversions`, has only its files claimed; the subfolders stay, and folders
+left empty are removed.
 
-A directory left holding only held archives is recorded in
-`Logs\cbz_watcher_held.json` with a fingerprint of its files (names, sizes,
-modification times and SHA-256 of their contents), the watcher's source hash
-and the number-style registry hash. Later passes and restarts skip it with
-one `Skipping ...` line while the fingerprint matches. Adding, removing,
-replacing, rewriting or touching a file, or upgrading the watcher or the
-registry, retries it. To force a retry, delete the directory's entry or the
-whole file. Second copies are recorded in the same entry (`second_copies`,
-by name and SHA-256); deleting the entry also releases them.
+**Startup.** The three roots must be outside the watch root and every library
+root, must not overlap one another, and must be on the watch root's volume
+(physical paths, junctions resolved), so every claim and disposition is one
+atomic rename. Otherwise the watcher refuses to start (exit 3) rather than
+copy and delete inside the synced folder. It then purges quarantine, removes
+stale `.tmp.cbz`/`.bak.cbz` rewrite files in the processing root (never in
+the watch folder) and finishes unfinished claims before discovering new
+arrivals.
 
-Some holds are never recorded, so their directories are retried every pass,
-as before this change:
+**Resume.** Each claim has one owner at a time (`owner.lock`, released by the
+OS if its process dies), for its whole life: the creator takes the lock right
+after making the claim folder, before the record exists, keeps it through the
+rename and hands it to the processing that follows. Only the owner retires a
+claim, after re-checking under the lock that no arrival file is left; once it
+lets go it removes only the lock file and the empty folder, so a claim another
+party has just taken over is never deleted. A claim that merely looks empty is
+not taken as proof that its creator crashed. A resume takes the lock before it
+reads the claim's record, and judges it (missing, corrupt, another watch root,
+nothing left) only while owning it, so a record another owner has since
+replaced is never acted on or saved back. An unfinished claim is resumed before new arrivals;
+every archive in it is treated as already processed for collision purposes,
+and a crashed landing (an empty reservation or a hidden `.<name>.cbz-landing`
+partial copy in the library) is cleared first. A claim folder whose record is
+missing or unreadable is moved whole to `<review>\_unrecovered_claims\`
+instead of being guessed at. A claim recorded for another watch root is left
+to its watcher. A source path recreated after a claim is a new arrival.
 
-- a move that failed, or any archive not held on purpose;
-- a refusal that can clear without a file changing (an OSError such as a
-  locked archive, or a number-style registry refusal);
-- a tag-stripped collision hold: it depends on the library copy, which the
-  fingerprint cannot see;
-- an archive this pass rewrote (ComicInfo, AI decensor). It was judged on its
-  facts before the rewrite, so the next pass judges it again, and a hold is
-  remembered once a pass leaves it unchanged.
+**Dispositions.** Decisions are written to the record before anything moves,
+so a crash in between is finished on the next run:
+
+- to **review** (`<review>\<YYYY-MM-DD>\<series>\<file>`): an archive media
+  or fallback naming refuses (a `REVIEW:` line gives the reason), an archive
+  that would collide with a different library book only because a tag was
+  stripped (issue #131), and an archive whose AI rewrite state is unknown;
+- to **quarantine**: a second copy of a chapter from another scanlation group
+  (`_duplicate_chapter_copies`: the copy whose group has the most archives in
+  the directory lands, then the larger file; a refused preferred copy never
+  holds a valid one back) and the losing copy of a name collision (below);
+- **stay in processing** and retry next pass: anything transient, such as a
+  locked file, a failed move, a number-style registry refusal, an unsettled
+  series identity or an incomplete archive.
+
+A failed move to review or quarantine keeps that archive in processing. Their
+siblings land as usual; when every archive is held, no series folder is
+created. Review is never purged: move or delete what is there by hand.
+Quarantine is purged by placement date after 30 days; only the dated
+`YYYY-MM-DD` folders the watcher creates are removed, so hand-placed items
+there are left alone.
 
 ## Name collisions never delete a different copy
 
@@ -108,13 +136,14 @@ quarantine**; it never deletes a copy that differs from the one it keeps.
   move, so two imports running at once can never pick the same name and
   overwrite one another. A failed placement removes only the name it
   created. A library name taken by another arrival in the meantime is
-  left alone; the arrival stays and is settled as a collision next pass.
+  left alone; the arrival stays in its claim and is settled as a collision
+  next pass.
 - One settlement owns a library name at a time. Before anything about the
   name is decided, the watcher takes that name's lock (one per normalized
   physical path, so names differing only in case share it) and holds it
   through the decision, the quarantine, the landing, any rollback and any
   cleanup. Another arrival for the same name meanwhile does not wait: it
-  stays where it is and is settled on its next pass. This covers the
+  stays in its claim and is settled on its next pass. This covers the
   threads of one watcher process (one watcher per watch root); another
   process writing the same library names is not coordinated by it.
 - A whole series folder moves into the library only as one rename, which
@@ -122,7 +151,10 @@ quarantine**; it never deletes a copy that differs from the one it keeps.
   not there yet. Otherwise (the library on Tower is another volume) it is
   merged file by file, each file under its own lock as above; a folder is
   never copied straight into the library, where another arrival could
-  settle against a half-copied book.
+  settle against a half-copied book. Across volumes each file is copied to
+  a hidden `.<name>.cbz-landing` partial, flushed, and renamed over the
+  name's reservation, so the library name only ever holds an empty
+  reservation or the complete book; the claimed copy is removed after.
 - Only a settled collision or a completed landing counts as landed; a
   failed one is not reported as a landing. A folder merge in which no file
   completed returns no landing either.
@@ -252,7 +284,20 @@ archive root, or the CLI can use `--ai-decensor-archive-dir`.
 
 This stage fails closed. If Camelia fails on any book, the directory is not
 routed. Any earlier AI replacements from that directory pass are restored from
-their quarantined originals, preventing partially decensored imports.
+their quarantined originals, preventing partially decensored imports; the
+claim stays in processing for a retry.
+
+The claim record keeps custody of each rewrite: it is marked started before
+Camelia runs (if that cannot be written, nothing is rewritten) and done, with
+its backup path, afterwards. A resumed claim never runs Camelia again on a
+book recorded done, and sends a book recorded started but not done to review,
+since its state is unknown.
+
+Custody is recorded under the archive's name, and names change during a pass
+(cleaning, then chapter naming). While a claim holds custody, its record is
+marked before any rename and the custody is moved to the new names once
+naming is done. A resume that finds the mark still set (a crash in between)
+sends every archive it cannot match to review instead of rewriting it again.
 
 Equivalent command-line use:
 

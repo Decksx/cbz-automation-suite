@@ -404,3 +404,234 @@ failure is `tests/web/test_web_log_service.py::test_create_writer_streams_eight_
 (the second WinError 5 web test Codex also reported); three isolated reruns:
 1 passed,1 passed,1 failed. Nothing under `web` changes. Codex's probes: owned transactions 6/6,
 active reservation 8/8, directory receipt 2/2, failed landing 2/2.
+
+## Claim-first processing (PR B of the claim-first plan; supersedes #175, fixes #174)
+
+### Why
+
+Issue #174: holding an archive in the MEGA-synced import folder meant every
+pass re-processed it, and what had been decided about it had to be
+remembered (`Logs\cbz_watcher_held.json`). #175 tried to make that memory
+durable; each review round found another way to lose it (restart, failure
+paths, write-ahead gaps). Codex approved replacing the memory instead: an
+arrival leaves the watch folder before anything changes it, and the folder
+an archive is in is its state. David's decisions: MEGA deleting the cloud
+copy on claim is wanted; roots `C:\Temp\cbz_processing`,
+`C:\Temp\cbz_held\review`, `C:\Temp\cbz_held\quarantine` (configurable; the
+last two already hold hand-cleared items); 30-day retention for quarantine
+only.
+
+### Changes
+
+- New `comic_automation/library/claims.py`: root validation (physical
+  paths, same volume, no overlap with the watch root, libraries or each
+  other), the claim record (`claim.json`, atomic, written before the
+  rename), `claim_directory` / `claim_files`, `OwnerLock` (msvcrt, released
+  by the OS on death), unrecoverable-claim preservation, `place` for
+  review/quarantine, `purge_quarantine` (watcher-dated folders only; a
+  locked folder is skipped).
+- `scripts/cbz_watcher.py`: the held-state layer (`HELD_STATE_FILE`,
+  fingerprints, skip lines) is deleted. `--processing-root`,
+  `--review-root` (`CBZ_PROCESSING_ROOT`, `CBZ_REVIEW_ROOT`). The pipeline
+  claims each comic directory first (`_claimed_items`), resumes unfinished
+  claims before new arrivals (`_resume_claims`), re-probes readiness inside
+  the claim, records dispositions before moving (`_dispose`,
+  `_dispose_recorded`), and keeps AI custody in the record (`_note_ai`:
+  started before Camelia, done with the backup after; done is never
+  repeated, started-not-done goes to review). Tag-stripped collision holds
+  go to review with the library untouched. A cross-volume landing copies to
+  a hidden `.<name>.cbz-landing` partial and renames it over the
+  reservation; a resumed claim clears crashed reservations and partials
+  under each name's lock. Startup refuses unsafe roots (exit 3), purges
+  quarantine, cleans rewrite leftovers in the processing root (never the
+  watch folder) and resumes claims before discovery. A series folder with
+  subfolders (`.stversions`) has only its files claimed; folders left empty
+  are pruned. Routing and the shadow plan use the recorded source and
+  arrival path, not the processing path.
+- `scripts/cbz_shadow_handoff.py`: `observe(..., arrival=)` so a planned
+  case records where it arrived and stages the claimed copy.
+- Tests: new `tests/test_watcher_claims.py` (fresh-process crashes with
+  `os._exit` at after-claim, before-place, mid-landing, before-retire,
+  after-ai, inside-ai; record/rename failures; missing/corrupt records;
+  owner lock; mixed drop points; recorded routing; failed dispositions;
+  late writers; unrecordable custody; startup refusal and cleanup;
+  retention). `tests/test_watcher_held_archives.py` rewritten for review
+  and quarantine. Older tests that asserted a hold stays in the import
+  folder now find it in review (held) or processing (transient).
+
+### Deliberately not done
+
+- Live watcher stays at `5755290` until this is approved.
+- External processes writing the library are still not coordinated (as
+  #176).
+- A permanently unreadable archive waits in processing, as it waited in
+  the import folder before.
+
+### Verification
+
+Guards proven by bypass (26; each bypass removes one guard, runs the nine
+claim-first test files, restores the files byte for byte; failing tests in
+parentheses): failed record write stops the claim (1); failed rename returns
+no claim (1); unreadable record preserved for review (2); another watch
+root's claim left alone (1); one owner per claim (1); readiness re-checked in
+the claim (1); recorded dispositions carried out first (1); crashed landings
+cleared on resume (1); a recorded-done rewrite never repeated (1);
+started-not-done goes to review (1); custody recorded before the rewrite
+(1); decisions recorded before any move (1); failed disposition keeps the
+claim (1); unsafe roots refuse the start (1); rewrite cleanup in processing,
+not the watch folder (1); a series folder's subfolders stay (9); empty
+arrival folders pruned (12); cross-volume partial landing (1); roots outside
+the watch root (3), libraries (1), on its volume (1), not overlapping (1);
+only watcher-dated quarantine folders purged (1); collision holds go to
+review (41); shadow plan names the original arrival (1); a locked
+quarantine folder does not stop the purge (1).
+
+Five of those first passed or hung under bypass: one owner, recorded
+dispositions first, and decisions before moves failed nothing, so each got
+a test; unsafe-roots refusal and roots-outside-the-watch-root hung (the
+start ran on into the observer loop), so the startup test now stops at
+discovery and fails instead. All five fail under bypass now.
+
+Test accounting: 5,120 collected on master `9c26775`, 5,143 here: +31
+`tests/test_watcher_claims.py`; `tests/test_watcher_held_archives.py` 29 -> 21
+(14 kept, 15 removed, 7 added: 6 renamed/re-targeted to review, quarantine
+or processing; 1 new; 9 removed with the held-state layer). The IDs are
+listed in the PR.
+
+Full suite: **5,132 passed / 10 skipped / 1 failed** (5,143). The failure is
+`tests/web/test_web_logs.py::test_zero_writes_do_not_leak_empty_segments`;
+three isolated reruns passed 3/3, and the whole file run alone failed a
+different test (`test_alternating_overflow_compacts_map_and_physical_files`,
+WinError 5 on the index rename), the web flake seen in the #176 rounds.
+Nothing under `web` changes. The previous full run failed only
+`tests/test_shadow_handoff.py::test_shadow_plan_logs_would_be_case_and_moves_nothing_extra`,
+which found that a shadow-planned case recorded the processing path as its
+arrival; fixed (`observe(..., arrival=)`).
+
+### PR #177 review round 1 (Codex, at `172d064`)
+
+**P1:** a resume could delete a claim while its creator was still moving the
+arrival into it. `claim_directory` and `claim_files` published the record
+before the rename without owning the claim, and `_resumed_items` /
+`_retire_claim` removed any claim with no arrival file. Codex's
+`test_review177_probes.py` (SHA256 `525b7db2...ddc2a`) loses the book in
+both the directory and files-only cases at `172d064`.
+
+Fix: one ownership protocol for a claim's whole life (`claims.py`). The
+creator takes the owner lock right after `mkdir`, before the record exists,
+keeps it through the rename, and hands it to `_claim_item` (`Claim.owner`).
+Only an owner retires a claim (`claims.retire`): emptiness is re-checked
+under the lock, everything but the lock goes while it is held, and after the
+release only the lock file and the empty folder are removed, each without
+recursion. A party that takes the lock in that moment keeps its folder: its
+open lock file cannot be deleted, so the folder is not empty. The
+publication gap (folder made, lock not yet taken) is covered as well: a
+resume may retire that empty folder, and the creator then cannot own it, so
+the claim fails and the arrival never moved. The record-less branch of
+`_resumed_items` retires through the same call.
+
+**P2:** AI custody was keyed by the name `process_cbz_file` returned, and
+naming then renamed the archive; a resume after a failed landing missed the
+key and ran Camelia again. Codex's `test_review177_ai_identity.py`
+(`bbc427fa...1af2`) sees calls `['Group Ch.1.cbz', 'Berserk ch. 1.cbz']`.
+
+Fix: while a claim holds custody its record is marked (`ai_naming`) before
+any rename (`_mark_ai_naming`; if the mark cannot be saved nothing is
+renamed that pass). A rename by `process_cbz_file` on a resume moves the
+custody entry with it; after naming, `_rekey_ai_custody` moves every entry
+to its archive's new name (through the same `original_path` mapping as
+`_rekey_ai_backups`) and clears the mark in one save. A run that finds the
+mark still set (a crash in between) reviews every archive it cannot match,
+never rewrites it. Clearing custody after a failed AI pass clears the mark
+too.
+
+Codex's probes at this head: the creation/retirement probe now times out
+waiting for the resume to reach `rmtree`, which it no longer can; the AI
+probe stops at its own precondition (custody "detached by naming"), which no
+longer holds. Both fail **by construction**. Adapted versions are in
+`tests/test_watcher_claims.py`, with the payload and call-count assertions
+kept. The first five test IDs below fail at `172d064`; three of them by
+the defect itself (the live claim is destroyed, so the creator returns no
+claim; the AI custody stays under the old name), two only because the
+mechanism they drive does not exist there (the creation-time lock, the
+re-key helper):
+`test_resume_cannot_retire_a_claim_its_creator_is_still_filling`
+(directory, files), `test_a_claim_retired_before_its_creator_owns_it_leaves_the_arrival`,
+`test_completed_ai_follows_its_archive_through_naming`,
+`test_a_rename_whose_custody_was_never_recorded_goes_to_review`, plus
+`test_retirement_rechecks_emptiness_once_it_owns_the_claim`,
+`test_a_creator_that_owns_a_just_released_folder_keeps_it`,
+`test_custody_follows_a_name_the_resume_cleans` and
+`test_a_failed_ai_pass_clears_the_mark_with_the_custody`.
+
+Guards proven by bypass (failing tests): the creator owns the claim before
+publishing its record 4; the creator hands its ownership to processing 142;
+only an owner retires a claim 1; emptiness re-checked under ownership 1;
+after the release only the lock and the empty folder go 1; custody follows a
+rename made this pass 1; custody re-keyed after naming 1; a claim is marked
+before names change 2; unresolved custody goes to review 1; clearing
+custody clears the mark 1. Two (follows a rename this pass, clearing clears
+the mark) first failed nothing and got the last two tests above.
+
+Watcher edits byte-exact: no unchanged line changed its ending; all 97
+added lines are CRLF like their surroundings; bare LF stays 863.
+
+Full suite: **5,140 passed / 10 skipped / 2 failed** (5,152 collected =
+5,143 + the 9 new test IDs). Both failures are the Windows web flakes from
+the #176 rounds, and nothing under `web` changes:
+`tests/web/test_web_log_service.py::test_create_writer_streams_eight_mib_with_one_full_inspection`
+(three isolated reruns: 3 passed) and
+`tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`
+(three isolated reruns: 2 passed, 1 failed).
+
+### PR #177 review round 2 (Codex, at `b979fd6`)
+
+Codex closed round 1's P1 and P2. **New P2:** `_resumed_items` read
+`claim.json` before `_claim_item` took ownership, and `_claim_item` saved
+that snapshot as the record. Two passes for disjoint sibling folders both
+resume first: A reads an unfinished claim with no AI custody and waits; B
+takes the claim, decensors, records the custody, cannot land and lets go;
+A then takes it, saves its old record over B's custody and decensors again.
+Codex's `test_review177_r2_record_snapshot.py` (SHA256 `70f66c03...faef0a`)
+sees calls `['Berserk ch. 1.cbz', 'Berserk ch. 1.cbz']` at `b979fd6`.
+
+Fix: `_resumed_items` takes the owner lock first and only then reads the
+record; every judgement (missing or corrupt record, another watch root,
+nothing left) is made while owning it, and the lock is handed to
+`_claim_item` with the record read under it (`Claim.owner`). Another watch
+root's claim is let go explicitly. `_claim_item` no longer locks a claim
+itself: every claim reaches it owned (by its creator or by the resume), and
+an unowned one is refused (`ValueError`), since its record was read without
+the lock. The only other source of a claim is its creator, which owns it
+from before the record exists, so no other pre-lock read remains.
+
+Codex's probe at this head fails **by construction**: A now owns the claim
+while it waits in `read_record`, so B skips it and the probe's mid-way
+`len(calls) == 1` sees 0; its final assertion (one rewrite) holds. The
+adapted `test_a_waiting_resumer_never_saves_a_record_it_read_before_owning`
+fails at `b979fd6` with exactly Codex's calls, and
+`test_processing_refuses_a_claim_that_is_not_owned` fails there (no
+refusal). `test_a_claim_for_another_watch_root_is_left_to_its_watcher` now
+also has that root's watcher take the claim afterwards.
+
+Guards proven by bypass (failing tests): a resumer owns the claim before
+reading its record 1; processing refuses an unowned claim 1; the resume
+hands its ownership to processing 28 (+1 error). Letting go of another
+watch root's claim fails nothing under bypass, and cannot: the dropped lock
+object is freed (closing its file, which releases the lock) when the loop
+rebinds `lock` for the next folder. The explicit release stays.
+
+Web flake A/B (Codex asked, since the autouse fixture changed):
+`tests/web/test_web_logs.py::test_alternating_overflow_compacts_map_and_physical_files`
+run isolated 30 times on base `9c26775` and 30 on this head, alternating,
+same machine: **base 13 failed / 30, head 9 failed / 30**. Not worse. The
+test is single-threaded (about 300 `os.replace` of `index.tmp` over
+`index.json` in its own `tmp_path`); the changed fixture only sets two
+module attributes and creates nothing, and importing the claims module
+starts no thread and opens no handle.
+
+Watcher edits byte-exact: no unchanged line changed its ending; every added
+line is CRLF like its surroundings; bare LF stays 863.
+
+Full suite: **5,144 passed / 10 skipped / 0 failed** (5,154 collected =
+5,152 + the 2 new test IDs).
