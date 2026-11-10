@@ -3046,15 +3046,14 @@ def _claim_item(claim: "_claims.Claim", *, resumed: bool):
 
     A new claim arrives owned by its creator (``claims.claim_directory``),
     which hands that ownership on here, so it is never unowned between its
-    publication and its retirement. A resumed claim is owned here, or left
-    to whoever owns it.
+    publication and its retirement. A resumed claim arrives owned by
+    ``_resumed_items``, which read its record under that ownership. Every
+    claim comes owned: one that is not was read without its lock, and its
+    record cannot be trusted to be current.
     """
     lock, claim.owner = claim.owner, None
     if lock is None:
-        lock = _claims.OwnerLock(claim.dir)
-        if not lock.acquire():
-            log.info(f"  Claim {claim.id} is owned by another watcher; skipped.")
-            return
+        raise ValueError(f"claim {claim.id} reached processing without its ownership")
     try:
         payload = claim.payload
         if payload is None:
@@ -3132,13 +3131,22 @@ def _resume_claims() -> None:
 
 
 def _resumed_items():
+    """Each resumable claim, owned before anything about it is read.
+
+    Its record is read and judged (missing, corrupt, another watch root,
+    nothing left) only under the claim's ownership: read before it, a
+    resumer waiting for the lock could act on, and later save, a record that
+    the owner meanwhile replaced, such as completed AI custody (PR #177
+    review). The ownership is handed on to ``_claim_item``, which keeps it
+    through processing and retirement.
+    """
     watch_key = os.path.normcase(str(Path(WATCH_FOLDER)))
     for claim_dir in _claims.claim_dirs(PROCESSING_ROOT):
+        lock = _claims.OwnerLock(claim_dir)
+        if not lock.acquire():
+            continue  # its creator, another resumer or another watcher owns it
         record = _claims.read_record(claim_dir)
         if record is None:
-            lock = _claims.OwnerLock(claim_dir)
-            if not lock.acquire():
-                continue  # its creator (or another resumer) owns it
             if not _claims.has_arrival_files(claim_dir):
                 _claims.retire(claim_dir, lock)  # re-checked while owned
                 continue
@@ -3152,13 +3160,17 @@ def _resumed_items():
                              f"moved to review ({e}); left in processing.")
             continue
         if os.path.normcase(str(record.get("watch_root", ""))) != watch_key:
+            lock.release()
             continue
-        claim = _claims.Claim(claim_dir, record)
         if not _claims.has_arrival_files(claim_dir):
-            _retire_claim(claim)
+            _retire_claim(_claims.Claim(claim_dir, record), lock)
             continue
+        claim = _claims.Claim(claim_dir, record, lock)
         log.info(f"Resuming claim {claim.id} ({record.get('relative')}).")
-        yield from _claim_item(claim, resumed=True)
+        try:
+            yield from _claim_item(claim, resumed=True)
+        finally:
+            claim.release()  # only if closed before processing took ownership over
 
 
 def _ai_custody(claim: "_claims.Claim | None", name: str) -> dict | None:
