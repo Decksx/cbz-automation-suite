@@ -75,7 +75,13 @@ the watch folder) and finishes unfinished claims before discovering new
 arrivals.
 
 **Resume.** Each claim has one owner at a time (`owner.lock`, released by the
-OS if its process dies). An unfinished claim is resumed before new arrivals;
+OS if its process dies), for its whole life: the creator takes the lock right
+after making the claim folder, before the record exists, keeps it through the
+rename and hands it to the processing that follows. Only the owner retires a
+claim, after re-checking under the lock that no arrival file is left; once it
+lets go it removes only the lock file and the empty folder, so a claim another
+party has just taken over is never deleted. A claim that merely looks empty is
+not taken as proof that its creator crashed. An unfinished claim is resumed before new arrivals;
 every archive in it is treated as already processed for collision purposes,
 and a crashed landing (an empty reservation or a hidden `.<name>.cbz-landing`
 partial copy in the library) is cleared first. A claim folder whose record is
@@ -283,6 +289,12 @@ Camelia runs (if that cannot be written, nothing is rewritten) and done, with
 its backup path, afterwards. A resumed claim never runs Camelia again on a
 book recorded done, and sends a book recorded started but not done to review,
 since its state is unknown.
+
+Custody is recorded under the archive's name, and names change during a pass
+(cleaning, then chapter naming). While a claim holds custody, its record is
+marked before any rename and the custody is moved to the new names once
+naming is done. A resume that finds the mark still set (a crash in between)
+sends every archive it cannot match to review instead of rewriting it again.
 
 Equivalent command-line use:
 
