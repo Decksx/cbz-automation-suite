@@ -1,0 +1,201 @@
+"""Keep-the-larger never deletes a copy that differs from the one it keeps.
+
+Before this change the legacy conflict branches of ``_merge_directories`` and
+``_move_loose_files`` unlinked the smaller copy: an incoming archive that lost
+on size, or the library archive an incoming one replaced. Issue #174 showed
+how a mistaken decision upstream then became a permanent loss. Now the loser
+is moved to ``QUARANTINE_ROOT/<date>/<series>/`` (``_settle_by_size``); only a
+byte-identical incoming copy is removed, which loses nothing.
+"""
+
+from __future__ import annotations
+
+import shutil
+import time
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from scripts import cbz_core
+from scripts import cbz_watcher as watcher
+
+BIG_GAIN = watcher.REPLACEMENT_MIN_GAIN_BYTES + 5000
+
+
+def _make_cbz(path: Path, payload_size: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("page1.jpg", b"\0" * payload_size)
+    return path
+
+
+def _payload_size(path: Path) -> int:
+    with zipfile.ZipFile(path) as zf:
+        return len(zf.read("page1.jpg"))
+
+
+def _quarantined(tmp_path: Path) -> list[Path]:
+    return sorted((tmp_path / "_quarantine").rglob("*.cbz"))
+
+
+def _today_folder(tmp_path: Path, series: str) -> Path:
+    return tmp_path / "_quarantine" / time.strftime("%Y-%m-%d") / series
+
+
+def _settle(mover: str, src: Path, dest_dir: Path) -> None:
+    """Run one collision through either mover, as the watcher would."""
+    if mover == "merge":
+        watcher._merge_directories(src.parent, dest_dir)
+    else:
+        watcher._move_loose_files([src], str(dest_dir.parent), dest_dir.name)
+
+
+MOVERS = ["merge", "loose"]
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_a_meaningfully_larger_arrival_replaces_and_quarantines_the_library_copy(tmp_path, mover):
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+
+    _settle(mover, src, library)
+
+    assert _payload_size(existing) == 100 + BIG_GAIN
+    assert not src.exists()
+    (old,) = _quarantined(tmp_path)
+    assert old.parent == _today_folder(tmp_path, "Berserk") and _payload_size(old) == 100
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+@pytest.mark.parametrize("incoming", [50, 100 + 10], ids=["smaller", "larger-below-threshold"])
+def test_an_arrival_that_loses_on_size_is_quarantined_not_deleted(tmp_path, mover, incoming):
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", incoming)
+
+    _settle(mover, src, library)
+
+    assert existing.read_bytes() == before
+    assert not src.exists()
+    (kept,) = _quarantined(tmp_path)
+    assert _payload_size(kept) == incoming
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_a_byte_identical_arrival_is_removed_and_nothing_is_quarantined(tmp_path, mover):
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    src = tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz"
+    src.parent.mkdir(parents=True)
+    shutil.copyfile(existing, src)
+
+    _settle(mover, src, library)
+
+    assert not src.exists() and existing.is_file()
+    assert _quarantined(tmp_path) == []
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_an_equal_size_arrival_with_different_bytes_is_not_a_duplicate(tmp_path, mover):
+    """Equal size is not equal bytes: only a digest match may delete."""
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    src = tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz"
+    src.parent.mkdir(parents=True)
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("page1.jpg", b"" * 100)
+    assert src.stat().st_size == existing.stat().st_size
+
+    _settle(mover, src, library)
+
+    assert existing.read_bytes() == before
+    (kept,) = _quarantined(tmp_path)
+    with zipfile.ZipFile(kept) as zf:
+        assert zf.read("page1.jpg") == b"" * 100
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_a_failed_quarantine_keeps_both_copies_where_they_were(tmp_path, monkeypatch, mover):
+    """If the loser cannot be moved aside, nothing else moves: the library
+    copy is untouched and the arrival stays for the next pass."""
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+    real_move = watcher.shutil.move
+
+    def refuse_quarantine(source, destination):
+        if "_quarantine" in str(destination):
+            Path(destination).write_bytes(b"partial")  # a cross-volume copy that died midway
+            raise PermissionError("quarantine unavailable")
+        return real_move(source, destination)
+
+    monkeypatch.setattr(watcher.shutil, "move", refuse_quarantine)
+    _settle(mover, src, library)
+
+    assert existing.read_bytes() == before
+    assert src.is_file() and _payload_size(src) == 100 + BIG_GAIN
+    assert _quarantined(tmp_path) == []  # the partial copy was cleaned up
+
+
+@pytest.mark.parametrize("mover", MOVERS)
+def test_a_failed_replacement_restores_the_quarantined_library_copy(tmp_path, monkeypatch, mover):
+    library = tmp_path / "library" / "Berserk"
+    existing = _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    before = existing.read_bytes()
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+    real_move = watcher.shutil.move
+
+    def refuse_replacement(source, destination):
+        if Path(source) == src:
+            raise PermissionError("library share went away")
+        return real_move(source, destination)
+
+    monkeypatch.setattr(watcher.shutil, "move", refuse_replacement)
+    _settle(mover, src, library)
+
+    assert existing.read_bytes() == before
+    assert src.is_file()
+    assert _quarantined(tmp_path) == []
+
+
+def test_two_losers_with_one_name_on_one_day_both_survive(tmp_path):
+    library = tmp_path / "library" / "Berserk"
+    _make_cbz(library / "Berserk ch. 1.cbz", 100)
+    for size in (40, 60):
+        src = _make_cbz(tmp_path / "incoming" / f"drop-{size}" / "Berserk ch. 1.cbz", size)
+        watcher._merge_directories(src.parent, library)
+
+    assert sorted(_payload_size(p) for p in _quarantined(tmp_path)) == [40, 60]
+
+
+def test_a_real_watcher_pass_quarantines_instead_of_discarding(tmp_path, monkeypatch):
+    """End to end through the normal entry point (legacy routing)."""
+    watch_root, library = tmp_path / "incoming", tmp_path / "library"
+    watch_root.mkdir()
+    library.mkdir()
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(watch_root))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(library))
+    monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
+    existing = _make_cbz(library / "Berserk" / "Berserk Ch. 1.cbz", 5000)
+    before = existing.read_bytes()
+    arrival = _make_cbz(watch_root / "Berserk" / "Berserk Ch. 1.cbz", 100)
+
+    watcher.process_and_move_directory(arrival.parent)
+
+    assert existing.read_bytes() == before
+    assert [_payload_size(p) for p in _quarantined(tmp_path)] == [100]
+
+
+def test_the_quarantine_root_is_configurable(tmp_path):
+    args = watcher.build_argument_parser().parse_args(["--quarantine-root", str(tmp_path / "q")])
+    assert args.quarantine_root == tmp_path / "q"
+    default = watcher.build_argument_parser().parse_args([])
+    assert default.quarantine_root == watcher.QUARANTINE_ROOT
