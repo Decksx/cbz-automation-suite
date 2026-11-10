@@ -17,15 +17,19 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from comic_automation.library import claims
+from comic_automation.library.number_style import NumberStyleRegistry
 from scripts import cbz_core
 from scripts import cbz_watcher as watcher
 
@@ -603,6 +607,7 @@ def test_a_claim_owned_by_another_watcher_is_left_to_it(watch, tmp_path):
     _make_cbz(arrival / "Berserk Ch. 1.cbz", 101)
     claim = claims.claim_directory(arrival, tmp_path / "_processing",
                                    watcher._claim_context(arrival))
+    claim.release()  # its creator lets go, as after a crash
     owner = claims.OwnerLock(claim.dir)
     assert owner.acquire()
     try:
@@ -629,6 +634,7 @@ def test_a_recorded_disposition_is_carried_out_before_anything_else(watch, tmp_p
     claim.record["dispositions"] = {
         "Berserk Ch. 2.cbz": {"to": "review", "reason": "recorded decision", "series": "Berserk"}}
     claim.save()
+    claim.release()  # an earlier run that recorded the decision, then stopped
 
     watcher.process_and_move_directory(watch_root)
 
@@ -657,3 +663,354 @@ def test_an_unrecordable_decision_moves_nothing(watch, tmp_path, monkeypatch):
     assert _payloads(tmp_path / "_processing") == [400]
     assert not (tmp_path / "_review").exists()
     assert _payloads(library) == []
+
+
+# ---------------------------------------------------------------------------
+# PR #177 review: claim lifetime, and AI custody across naming
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("kind", ["directory", "files"])
+def test_resume_cannot_retire_a_claim_its_creator_is_still_filling(watch, tmp_path,
+                                                                  monkeypatch, kind):
+    """Codex's #177 probe, adapted: the creator has published the record and
+    is paused before its rename; a resume in another thread sees a claim
+    with no arrival file. It must not retire it: the creator owns it."""
+    watch_root, _library = watch
+    arrival = watch_root / "Berserk"
+    book = _make_cbz(arrival / "Berserk Ch.1.cbz", 101)
+    context = watcher._claim_context(arrival)
+    source = arrival if kind == "directory" else book
+    record_ready, allow_rename = threading.Event(), threading.Event()
+    real_rename = claims.os.rename
+
+    def pause_rename(src, dst, *args, **kwargs):
+        if Path(src) == source:
+            record_ready.set()
+            assert allow_rename.wait(timeout=10)
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(claims.os, "rename", pause_rename)
+
+    def create():
+        if kind == "directory":
+            return claims.claim_directory(arrival, watcher.PROCESSING_ROOT, context)
+        return claims.claim_files(arrival, [book], watcher.PROCESSING_ROOT, context, kind="files")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        creating = pool.submit(create)
+        try:
+            assert record_ready.wait(timeout=10)
+            pool.submit(watcher._resume_claims).result(timeout=30)
+        finally:
+            allow_rename.set()
+        claim = creating.result(timeout=10)
+
+    assert claim is not None
+    claim.release()
+    assert _payloads(tmp_path) == [101]
+    assert _payloads(claim.dir) == [101]
+
+
+def test_a_claim_retired_before_its_creator_owns_it_leaves_the_arrival(watch, tmp_path,
+                                                                      monkeypatch):
+    """The publication gap: the creator has made the claim folder but not yet
+    taken its lock. A resume may retire that empty folder; the creator then
+    cannot own it, so the claim fails and nothing has moved."""
+    watch_root, _library = watch
+    arrival = watch_root / "Berserk"
+    _make_cbz(arrival / "Berserk Ch.1.cbz", 101)
+    before = _snapshot(watch_root)
+    context = watcher._claim_context(arrival)
+    folder_made, allow_lock = threading.Event(), threading.Event()
+    creator = {}
+    real_acquire = claims.OwnerLock.acquire
+
+    def paused_acquire(self):
+        if threading.get_ident() == creator.get("ident") and not folder_made.is_set():
+            folder_made.set()
+            assert allow_lock.wait(timeout=10)
+        return real_acquire(self)
+
+    monkeypatch.setattr(claims.OwnerLock, "acquire", paused_acquire)
+
+    def create():
+        creator["ident"] = threading.get_ident()
+        return claims.claim_directory(arrival, watcher.PROCESSING_ROOT, context)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        creating = pool.submit(create)
+        try:
+            assert folder_made.wait(timeout=10)
+            pool.submit(watcher._resume_claims).result(timeout=30)
+            assert claims.claim_dirs(watcher.PROCESSING_ROOT) == []  # retired while unowned
+        finally:
+            allow_lock.set()
+        assert creating.result(timeout=10) is None
+
+    assert _snapshot(watch_root) == before
+    assert claims.claim_dirs(watcher.PROCESSING_ROOT) == []
+
+
+def _ai_naming_setup(tmp_path, monkeypatch, library):
+    """Chapter naming plus an AI rewrite that changes the payload, as in
+    Codex's #177 probe; returns the list of rewritten names."""
+    registry = tmp_path / "number-styles.json"
+    registry.write_text(json.dumps({"version": 1, "roots": [{"path": str(library), "style": "chapter"}]}))
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(registry))
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", True)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_REPROCESS", True)
+    monkeypatch.setattr(watcher, "destination_is_comix", lambda *a: True)
+    monkeypatch.setattr(watcher, "archive_completed_ai_backups", lambda *a: None)
+    calls = []
+
+    def rewrite(path, destination):
+        calls.append(path.name)
+        backup = tmp_path / "ai-backups" / str(len(calls)) / path.name
+        backup.parent.mkdir(parents=True)
+        shutil.copy2(path, backup)
+        rebuilt = path.with_suffix(".ai-tmp")
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(rebuilt, "w") as dst:
+            for info in src.infolist():
+                data = src.read(info)
+                dst.writestr(info, data + b"\1" if info.filename == "page1.jpg" else data)
+        rebuilt.replace(path)
+        return backup
+
+    monkeypatch.setattr(watcher, "run_ai_decensor", rewrite)
+    return calls
+
+
+def test_completed_ai_follows_its_archive_through_naming(watch, tmp_path, monkeypatch):
+    """Codex's #177 probe: AI-processed as 'Group Ch.1.cbz', named
+    'Berserk ch. 1.cbz', landing refused once. The resume finds the custody
+    under the new name and never rewrites it again."""
+    watch_root, library = watch
+    calls = _ai_naming_setup(tmp_path, monkeypatch, library)
+    _make_cbz(watch_root / "Berserk" / "Group Ch.1.cbz", 101)
+    real_move = watcher._move_cbz_dir
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+    watcher.process_and_move_directory(watch_root / "Berserk")
+    assert calls == ["Group Ch.1.cbz"]
+    (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
+    record = claims.read_record(claim_dir)
+    assert list(record["ai"]) == ["Berserk ch. 1.cbz"] and "ai_naming" not in record
+
+    monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
+    watcher.process_and_move_directory(watch_root)
+    assert calls == ["Group Ch.1.cbz"]
+    assert _payloads(library) == [102]  # the rewritten book, rewritten once
+
+
+def test_a_rename_whose_custody_was_never_recorded_goes_to_review(watch, tmp_path, monkeypatch):
+    """A crash after naming renamed the archive but before the custody was
+    re-keyed: the record still carries the mark. The resume cannot tell
+    whether the archive under its new name was rewritten, so it goes to
+    review; it is never rewritten a second time."""
+    watch_root, library = watch
+    calls = _ai_naming_setup(tmp_path, monkeypatch, library)
+    _make_cbz(watch_root / "Berserk" / "Group Ch.1.cbz", 101)
+    real_move, real_rekey = watcher._move_cbz_dir, watcher._rekey_ai_custody
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+    monkeypatch.setattr(watcher, "_rekey_ai_custody", lambda *a, **k: None)  # "crashed"
+    watcher.process_and_move_directory(watch_root / "Berserk")
+    (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
+    record = claims.read_record(claim_dir)
+    assert record["ai_naming"] and list(record["ai"]) == ["Group Ch.1.cbz"]
+
+    monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
+    monkeypatch.setattr(watcher, "_rekey_ai_custody", real_rekey)
+    watcher.process_and_move_directory(watch_root)
+    assert calls == ["Group Ch.1.cbz"]
+    assert _payloads(library) == []
+    assert _payloads(tmp_path / "_review") == [102]
+
+
+def test_retirement_rechecks_emptiness_once_it_owns_the_claim(watch, tmp_path, monkeypatch):
+    """A resume saw the claim empty while its creator owned it, and waits
+    for the lock. When it gets the lock the creator has filled the claim and
+    let go; the re-check under ownership keeps the payload."""
+    watch_root, _library = watch
+    arrival = watch_root / "Berserk"
+    _make_cbz(arrival / "Berserk Ch.1.cbz", 101)
+    context = watcher._claim_context(arrival)
+    record_ready, allow_rename = threading.Event(), threading.Event()
+    retiree_waiting, allow_retiree = threading.Event(), threading.Event()
+    retiree = {}
+    real_rename, real_acquire = claims.os.rename, claims.OwnerLock.acquire
+
+    def pause_rename(src, dst, *args, **kwargs):
+        if Path(src) == arrival:
+            record_ready.set()
+            assert allow_rename.wait(timeout=10)
+        return real_rename(src, dst, *args, **kwargs)
+
+    def waiting_acquire(self):
+        if threading.get_ident() == retiree.get("ident") and not retiree_waiting.is_set():
+            retiree_waiting.set()
+            assert allow_retiree.wait(timeout=10)
+        return real_acquire(self)
+
+    monkeypatch.setattr(claims.os, "rename", pause_rename)
+    monkeypatch.setattr(claims.OwnerLock, "acquire", waiting_acquire)
+
+    def retire_seen_empty(claim_dir):
+        retiree["ident"] = threading.get_ident()
+        assert not claims.has_arrival_files(claim_dir)  # what the resume saw
+        return claims.retire(claim_dir)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        creating = pool.submit(claims.claim_directory, arrival, watcher.PROCESSING_ROOT, context)
+        try:
+            assert record_ready.wait(timeout=10)
+            (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
+            retiring = pool.submit(retire_seen_empty, claim_dir)
+            assert retiree_waiting.wait(timeout=10)
+            allow_rename.set()
+            claim = creating.result(timeout=10)
+            claim.release()  # filled, then let go
+        finally:
+            allow_rename.set()
+            allow_retiree.set()
+        assert retiring.result(timeout=10) is False
+
+    assert _payloads(claim.dir) == [101]
+
+
+def test_a_creator_that_owns_a_just_released_folder_keeps_it(watch, tmp_path, monkeypatch):
+    """A resume retired the empty folder of a claim being created and let go
+    of the lock; before it removed the folder the creator took the lock and
+    filled the claim. The removal after the release is only of the lock file
+    and the empty folder, so it fails and the payload stays."""
+    watch_root, _library = watch
+    arrival = watch_root / "Berserk"
+    _make_cbz(arrival / "Berserk Ch.1.cbz", 101)
+    context = watcher._claim_context(arrival)
+    folder_made, allow_lock = threading.Event(), threading.Event()
+    released, allow_removal = threading.Event(), threading.Event()
+    creator, retiree = {}, {}
+    real_acquire, real_release = claims.OwnerLock.acquire, claims.OwnerLock.release
+
+    def paused_acquire(self):
+        if threading.get_ident() == creator.get("ident") and not folder_made.is_set():
+            folder_made.set()
+            assert allow_lock.wait(timeout=10)
+        return real_acquire(self)
+
+    def paused_release(self):
+        real_release(self)
+        if threading.get_ident() == retiree.get("ident") and not released.is_set():
+            released.set()
+            assert allow_removal.wait(timeout=10)
+
+    monkeypatch.setattr(claims.OwnerLock, "acquire", paused_acquire)
+    monkeypatch.setattr(claims.OwnerLock, "release", paused_release)
+
+    def create():
+        creator["ident"] = threading.get_ident()
+        return claims.claim_directory(arrival, watcher.PROCESSING_ROOT, context)
+
+    def retire_unowned():
+        retiree["ident"] = threading.get_ident()
+        (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
+        return claims.retire(claim_dir)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        creating = pool.submit(create)
+        try:
+            assert folder_made.wait(timeout=10)
+            retiring = pool.submit(retire_unowned)
+            assert released.wait(timeout=10)
+            allow_lock.set()
+            claim = creating.result(timeout=10)
+            assert claim is not None
+        finally:
+            allow_lock.set()
+            allow_removal.set()
+        assert retiring.result(timeout=10) is False
+
+    claim.release()
+    assert _payloads(claim.dir) == [101]
+
+
+def _recorded_ai_claim(watch_root, tmp_path, names, done):
+    """A claim an earlier run left: archives *names*, custody for *done*
+    (each with a real backup), owner released."""
+    arrival = watch_root / "Berserk"
+    for i, name in enumerate(names):
+        _make_cbz(arrival / name, 101 + i)
+    claim = claims.claim_directory(arrival, watcher.PROCESSING_ROOT,
+                                   watcher._claim_context(arrival))
+    custody = {}
+    for name in done:
+        backup = tmp_path / "ai-backups" / "earlier" / name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(claim.payload / name, backup)
+        custody[name] = {"started": True, "done": True, "backup": str(backup)}
+    claim.record.update(started=True, ai=custody)
+    claim.save()
+    claim.release()
+    return claim
+
+
+def test_custody_follows_a_name_the_resume_cleans(watch, tmp_path, monkeypatch):
+    """On a resume ``process_cbz_file`` may clean an archive's name again
+    ('Group_Ch.1.cbz' -> 'Group Ch.1.cbz'). The custody recorded under the
+    name it had is found and moved with it, so neither this resume nor one
+    after a landing that fails again rewrites the archive twice."""
+    watch_root, library = watch
+    _recorded_ai_claim(watch_root, tmp_path, ["Group_Ch.1.cbz"], ["Group_Ch.1.cbz"])
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", True)
+    monkeypatch.setattr(watcher, "destination_is_comix", lambda *a: True)
+    monkeypatch.setattr(watcher, "archive_completed_ai_backups", lambda *a: None)
+    calls = []
+    monkeypatch.setattr(watcher, "run_ai_decensor",
+                        lambda path, destination: calls.append(path.name))
+    real_move = watcher._move_cbz_dir
+    monkeypatch.setattr(watcher, "_move_cbz_dir", lambda *a, **k: None)
+
+    watcher.process_and_move_directory(watch_root)
+    (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
+    assert list(claims.read_record(claim_dir)["ai"]) == ["Group Ch.1.cbz"]
+    monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
+    watcher.process_and_move_directory(watch_root)
+
+    assert calls == []
+    assert _payloads(library) == [101]
+    assert claims.claim_dirs(watcher.PROCESSING_ROOT) == []
+
+
+def test_a_failed_ai_pass_clears_the_mark_with_the_custody(watch, tmp_path, monkeypatch):
+    """A resumed claim is marked (it holds custody) and then an AI rewrite
+    fails: the originals are restored and the custody cleared. The mark goes
+    with it, so the retry rewrites both archives and lands them instead of
+    reviewing them as unresolved."""
+    watch_root, library = watch
+    _recorded_ai_claim(watch_root, tmp_path, ["Berserk Ch. 1.cbz", "Berserk Ch. 2.cbz"],
+                       ["Berserk Ch. 1.cbz"])
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", True)
+    monkeypatch.setattr(watcher, "destination_is_comix", lambda *a: True)
+    monkeypatch.setattr(watcher, "archive_completed_ai_backups", lambda *a: None)
+    failing = {"on": True}
+    calls = []
+
+    def rewrite(path, destination):
+        calls.append(path.name)
+        if failing["on"]:
+            raise watcher.AiDecensorError("injected")
+        backup = tmp_path / "ai-backups" / "retry" / path.name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup)
+        return backup
+
+    monkeypatch.setattr(watcher, "run_ai_decensor", rewrite)
+    watcher.process_and_move_directory(watch_root)
+    assert calls == ["Berserk Ch. 2.cbz"]
+    (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
+    record = claims.read_record(claim_dir)
+    assert not record.get("ai") and "ai_naming" not in record
+
+    failing["on"] = False
+    watcher.process_and_move_directory(watch_root)
+    assert calls == ["Berserk Ch. 2.cbz", "Berserk Ch. 1.cbz", "Berserk Ch. 2.cbz"]
+    assert _payloads(library) == [101, 102]
+    assert not (tmp_path / "_review").exists()
