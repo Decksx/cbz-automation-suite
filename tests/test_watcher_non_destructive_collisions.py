@@ -459,3 +459,43 @@ def test_a_directory_merge_with_one_completed_archive_is_a_landing(tmp_path, mon
 
     assert landed == library
     assert (library / "Berserk ch. 2.cbz").is_file() and failed.is_file()
+
+
+def test_an_all_failed_merge_after_a_destination_race_has_no_landing_receipt(tmp_path, monkeypatch):
+    """The series folder appears between the existence check and the
+    whole-folder move (another thread created it); the fallback merge then
+    fails to settle anything, so no landing is reported."""
+    library = tmp_path / "library"
+    series = library / "Berserk"
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 1.cbz", 100 + BIG_GAIN)
+    real_move = watcher.shutil.move
+
+    def race_then_refuse(source, target):
+        if Path(source) == src.parent:
+            _make_cbz(series / "Berserk ch. 1.cbz", 100)  # the other thread's copy
+            raise FileExistsError("destination appeared")
+        if "_quarantine" in Path(target).parts:
+            raise PermissionError("quarantine refused")
+        return real_move(source, target)
+
+    monkeypatch.setattr(watcher.shutil, "move", race_then_refuse)
+    landed = watcher._move_cbz_dir(src.parent, str(library), target_name="Berserk")
+
+    assert landed is None and src.is_file()
+    assert _payload_size(series / "Berserk ch. 1.cbz") == 100
+
+
+def test_a_directory_whose_only_name_was_taken_meanwhile_has_no_landing_receipt(tmp_path, monkeypatch):
+    library = tmp_path / "library" / "Berserk"
+    winner = _make_cbz(library / "Berserk ch. 9.cbz", 300)
+    src = _make_cbz(tmp_path / "incoming" / "Berserk" / "Berserk ch. 9.cbz", 100)
+    real_exists = Path.exists
+    monkeypatch.setattr(Path, "exists",
+                        lambda self: False if self == winner else real_exists(self))
+    monkeypatch.setattr(watcher, "_find_archive_collision", lambda *a, **k: None)
+
+    landed = watcher._move_cbz_dir(src.parent, str(library.parent), target_name="Berserk")
+    monkeypatch.setattr(Path, "exists", real_exists)
+
+    assert landed is None
+    assert src.is_file() and _payload_size(winner) == 300
