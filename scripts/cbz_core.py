@@ -152,6 +152,17 @@ NUMBER_PREFIX_RE = re.compile(
 )
 TRAILING_JUNK_RE = re.compile(r"[\s\-_–—]+$")
 _SCANLATION_HASH_RE = re.compile(r"(?:[\s_-][0-9a-f]{6})+$", re.IGNORECASE)
+# A downloader's chapter name: "<Group>_<Chapter|Ch.|Episode|Ep.> N[ - title]
+# _<hash6>.cbz" ("Asura_Chapter 42_d1a897.cbz"). The text before the first
+# underscore is the scanlation group, not the series; it is only recognised
+# with the trailing hash and an underscore right before the chapter token,
+# the downloader's own layout. Cleaning turns the underscores into spaces, so
+# this is matched on the arrival's name, before cleaning.
+_GROUP_CHAPTER_RE = re.compile(
+    r"^(?P<group>[^_]+)_(?:chapter|ch\.?|episode|ep\.?)\s*"
+    r"(?P<rest>\d[^_]*?)(?P<hash>(?:_[0-9a-f]{6})+)(?P<ext>\.[^.]+)$",
+    re.IGNORECASE,
+)
 GIBBERISH_RE = re.compile(
     r"^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}"
     r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -1303,6 +1314,24 @@ def infer_series_name(path: Path, library_root: Path | None = None) -> str:
     return candidates[-1] if candidates else parent.name
 
 
+def _without_group_prefix(name: str) -> str:
+    """*name* without a downloader's scanlation-group prefix (``_GROUP_CHAPTER_RE``).
+
+    ``Alpha_Episode 42_2a8cb9.cbz`` becomes ``Chapter 42_2a8cb9.cbz``, which
+    the stem pipeline names after the series folder (``<Series> Ch. 42``),
+    exactly as a group-free ``Chapter 42_2a8cb9.cbz``. Episode and Ep. are
+    chapter tokens here. A prefix that carries a volume or season (``Vol. 3_
+    Chapter 12_...``) is information, not a group, and the name is kept.
+    """
+    match = _GROUP_CHAPTER_RE.match(name)
+    if match is None:
+        return name
+    group = match.group("group")
+    if _VOLUME_NUMBER_RE.search(group) or _SEASON_NUMBER_RE.search(group):
+        return name
+    return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
+
+
 def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
     """The stem normalisation that follows cleaning in :func:`parse_comic_name`."""
     if "leading_nums" in rules:
@@ -1410,12 +1439,15 @@ def parse_comic_name(
     raw_series = infer_series_name(path, library_root=library_root)
     series = clean_directory_name(raw_series, rules)
 
+    # A downloader's scanlation-group prefix names the group, not the series:
+    # without it the folder's series names the chapter.
+    name = _without_group_prefix(path.name)
     # Capture the raw title (filename stem before cleaning) so we can detect a
     # CJK-only name and translate it. clean_filename() strips most non-Latin
     # text, so this must happen on the raw stem.
-    raw_stem, _raw_ext = _split_name(path.name)
+    raw_stem, _raw_ext = _split_name(name)
 
-    stem, ext = _split_name(clean_filename(path.name, rules))
+    stem, ext = _split_name(clean_filename(name, rules))
     stem = _stem_pipeline(stem, series, rules)
     translated_stem: str | None = None
 
@@ -1426,9 +1458,18 @@ def parse_comic_name(
     # are looked for in the cleaned stem and, failing that, the raw stem (the
     # cleaning pipeline may drop a token like "Ep. 1"). Chapter still owns the
     # native ComicInfo <Number>; these are recorded separately in <Notes>.
-    season = extract_season_number(stem) or extract_season_number(raw_stem)
-    episode = extract_episode_number(stem) or extract_episode_number(raw_stem)
-    part = extract_part_number(stem) or extract_part_number(raw_stem)
+    # A dropped group prefix also turned "Episode 42" into "Chapter 42"; the
+    # arrival's own words are read too, so it is still episode 42.
+    arrival_stems = [raw_stem]
+    if name != path.name:
+        arrival_stems += [_split_name(clean_filename(path.name, rules))[0],
+                          _split_name(path.name)[0]]
+    season = extract_season_number(stem) or next(
+        filter(None, map(extract_season_number, arrival_stems)), None)
+    episode = extract_episode_number(stem) or next(
+        filter(None, map(extract_episode_number, arrival_stems)), None)
+    part = extract_part_number(stem) or next(
+        filter(None, map(extract_part_number, arrival_stems)), None)
 
     # Fallback: pull chapter/volume from CJK markers (第N話/N話 -> chapter,
     # 第N巻/N巻 -> volume) when Latin-token extraction found nothing.
