@@ -447,6 +447,12 @@ def _payload_size(cbz_path: Path) -> int:
         return len(zf.read("page1.jpg"))
 
 
+def _reviewed(pattern: str = "*.cbz") -> list[Path]:
+    """Archives held for review (claim-first: a refusal leaves the import
+    folder for the review root, not a spot beside its arrival)."""
+    return sorted(Path(watcher.REVIEW_ROOT).rglob(pattern))
+
+
 @pytest.fixture
 def watch(tmp_path, monkeypatch):
     """A tmp watch folder and library wired into the watcher, offline."""
@@ -705,8 +711,7 @@ def test_the_real_fallback_caller_keeps_the_name_on_refusal(tmp_path, monkeypatc
 def test_a_refused_placeholder_is_not_merged_into_the_library(watch, folder, source):
     """End to end: the refused generic placeholder must not reach the series
     folder, where the next chapter sharing its name would collide with it.
-    The directory stays in the import folder for review; the library is
-    untouched."""
+    It goes to review; the library is untouched."""
     watch_root, library = watch
     _make_cbz(library / "Berserk" / "Berserk ch. 3.cbz", 100)
     _make_cbz(library / "Series Special" / "Series Special ch. 3.cbz", 100)
@@ -717,7 +722,8 @@ def test_a_refused_placeholder_is_not_merged_into_the_library(watch, folder, sou
     watcher.process_and_move_directory(arrival)
 
     assert sorted(str(p.relative_to(library)) for p in library.rglob("*")) == before
-    left = list(watch_root.rglob("*.cbz"))
+    assert not list(watch_root.rglob("*.cbz"))
+    left = _reviewed()
     assert len(left) == 1
     # Still the arrival's own (display-cleaned) name, never a fallback name.
     assert "ch. 4" not in left[0].name.casefold()
@@ -726,7 +732,7 @@ def test_a_refused_placeholder_is_not_merged_into_the_library(watch, folder, sou
 
 def test_a_refused_loose_placeholder_stays_while_its_siblings_move(watch):
     """Mixed drop point: loose files beside comic subfolders are moved one by
-    one. A refused placeholder stays behind; the subfolder still moves."""
+    one. A refused placeholder goes to review; the subfolder still moves."""
     watch_root, library = watch
     drop = watch_root / "Series Special Ch. 4"
     _make_cbz(drop / "volvox_Chapter (2019).cbz", 400)
@@ -737,7 +743,8 @@ def test_a_refused_loose_placeholder_stays_while_its_siblings_move(watch):
     assert (library / "Other" / "Other Ch. 1.cbz").is_file()
     assert not list((library).rglob("*volvox*"))
     assert not (library / "Series Special").exists()
-    assert [p.name for p in watch_root.rglob("*.cbz")] == ["volvox Chapter (2019).cbz"]
+    assert not list(watch_root.rglob("*.cbz"))
+    assert [p.name for p in _reviewed()] == ["volvox Chapter (2019).cbz"]
 
 
 def test_backfill_renames_nothing_when_the_formatter_refuses(watch):
@@ -889,8 +896,8 @@ def ai_watch(tmp_path, monkeypatch):
 
 def test_a_refused_loose_placeholder_keeps_its_ai_original(ai_watch):
     """Codex's round-2 probe, plus a fallback rename. In one mixed-directory
-    pass a placeholder is refused (two editions) and stays in the import
-    folder, while an accepted placeholder is fallback-renamed and moves.
+    pass a placeholder is refused (two editions) and goes to review,
+    while an accepted placeholder is fallback-renamed and moves.
     The accepted sibling's landed folder must not count as a receipt for
     the refused archive: only the accepted original is offloaded, keyed by
     the archive's renamed path; the refused archive and its original stay."""
@@ -902,7 +909,7 @@ def test_a_refused_loose_placeholder_keeps_its_ai_original(ai_watch):
 
     watcher.process_and_move_directory(drop)
 
-    refused = drop / "volvox Chapter (Colored) (Uncensored).cbz"
+    refused, = _reviewed("volvox Chapter (Colored) (Uncensored).cbz")
     accepted_backup = backup_of["Other Chapter (2019).cbz"]
     refused_backup = backup_of[refused.name]
     assert refused.is_file()
@@ -915,7 +922,8 @@ def test_a_refused_loose_placeholder_keeps_its_ai_original(ai_watch):
     assert ("Berserk", ) == tuple(s for b, s in offloaded if b == accepted_backup)
 
     (parent_pairs, landed), = [c for c in calls if c[1] and c[1].name == "Berserk"]
-    assert parent_pairs == [(drop / "Berserk ch. 4 (2019).cbz", accepted_backup)]
+    # Keyed by the renamed path, which is now inside the claim in processing.
+    assert [(p.name, b) for p, b in parent_pairs] == [("Berserk ch. 4 (2019).cbz", accepted_backup)]
 
 
 def test_the_probe_layout_offloads_only_the_routed_original(ai_watch):
@@ -929,7 +937,7 @@ def test_the_probe_layout_offloads_only_the_routed_original(ai_watch):
 
     watcher.process_and_move_directory(drop)
 
-    assert (drop / "volvox Chapter (2019).cbz").is_file()
+    assert [p.name for p in _reviewed()] == ["volvox Chapter (2019).cbz"]
     offloaded_backups = {backup for backup, _series in offloaded}
     assert backup_of["Series Special Ch. 5.cbz"] in offloaded_backups
     assert backup_of["volvox Chapter (2019).cbz"] not in offloaded_backups
@@ -948,7 +956,7 @@ def test_a_refused_archive_keeps_its_original_while_its_sibling_routes(ai_watch)
     watcher.process_and_move_directory(arrival)
 
     refused = "volvox Chapter (Colored) (Uncensored).cbz"
-    assert [p.name for p in arrival.glob("*.cbz")] == [refused]
+    assert [p.name for p in _reviewed()] == [refused]
     assert not list(library.rglob("*volvox*"))
     offloaded_backups = [backup for backup, _series in offloaded]
     assert backup_of[refused] not in offloaded_backups
