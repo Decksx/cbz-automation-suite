@@ -458,3 +458,53 @@ lines are CRLF like their surroundings; bare LF stays 863.
 
 Full suite: **6,145 passed / 10 skipped / 0 failed** (6,155 collected =
 5,614 + 541 new).
+
+### PR #180 review round 4 (Codex, at `b52a4fd`)
+
+Codex closed the single-range finding. **P2:** compound numbering in the
+translated path: `漫画 Vol. 1-3 Ch. 1-30` and `漫画 Vol. 1-3 Ch. 31-60` both
+became `Story Vol. 1-3`, and a scalar `Ch. 30` was suppressed by `Vol. 1-3`.
+Codex's `test_review180_compound_ranges.py` (SHA256 `46177de1...2390`)
+fails 8/10 at `b52a4fd`.
+
+The class is closed rather than the example: the translated-title rebuild
+no longer rebuilds the numbering. `_split_numbering` splits the arrival's
+name at its first numbering token (a Vol./v/Ch./Chapter/#/Issue/Ep. token,
+a 第 or CJK/Korean number marker, or a range); only the title part is
+translated, and the numbering span is kept as written apart from the usual
+cleaning. If the two cannot be split cleanly (no title before the
+numbering, or a digit left in the title, such as `漫画 30`), the arrival
+keeps its name. The per-kind carry helper `_range_suffix` is removed.
+
+**David's rule for single numbers (2026-11-10):** a span holding exactly one
+number that is a chapter or volume is written as master writes it
+(`漫画 第3話` -> `Story Ch. 3`, `漫画 3巻` -> `Story Vol. 3`), his preferred
+style and the common case; checked identical to `eb32d3e` on 11 cases. A
+range or more than one number is kept verbatim (`Story Vol. 1-3 Ch. 31-60`,
+`Story 第1-30話`). One exception, kept verbatim too: a single episode
+(`漫画 Ep. 3` -> `Story Ep. 3`). Master writes plain `Story` there (an
+episode is no chapter or volume field), which would give `Ep. 3` and
+`Ep. 30` one name.
+
+Tests: a property over 168 generated numbering spans (every mix of
+Vol./v/巻/Ch./Chapter/#/第話/Ep. markers, scalars and ranges with every
+separator, and volume-plus-chapter compounds), each with its exact expected
+name; a uniqueness property by meaning (the same number spelled two ways,
+`Ch. 30` / `#30` / `第30話`, may share a name; numbering that means different
+books never does), plain and display; single numbers pinned to master's
+output; the two unsplittable cases; a title without numbering; and Codex's
+compound end-to-end. The round-3 test's two range cases now expect the
+verbatim span (`Story 第1-3巻`, `Story 第1-30話`). At `b52a4fd` 130 fail; the
+master-output pins pass there too. Codex's four #180 witnesses pass 34/34,
+unmodified (hashes checked).
+
+Guards proven by bypass (failing tests): a range or compound span is kept
+verbatim 294; a title that cannot be split keeps the arrival name 1; the
+span starts at the first numbering token 115; a range counts as numbering
+13; one chapter number is written as on master 14; one volume number is
+written as on master 9; only exactly one number is written as on master 32.
+The sources were hashed before the bypass run and the full suite and were
+unchanged after each.
+
+Full suite: **6,330 passed / 10 skipped / 0 failed** (6,340 collected =
+6,155 + 185 new).
