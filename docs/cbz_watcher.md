@@ -109,8 +109,17 @@ quarantine**; it never deletes a copy that differs from the one it keeps.
   overwrite one another. A failed placement removes only the name it
   created. A library name taken by another arrival in the meantime is
   left alone; the arrival stays and is settled as a collision next pass.
+- A landing in flight is never a library book. Before reserving a new
+  library name, the placement creates a hidden marker beside it,
+  `.<name>.cbzreserve-<token>`, and removes it only once the archive is
+  complete there. Any other arrival, in this watcher or another, that meets
+  that name while a marker exists waits for the next pass instead of
+  settling against the empty reservation or partial copy. A marker left by
+  a crash keeps that name waiting until it is removed by hand (check that
+  the file it marks is complete first).
 - Only a settled collision or a completed landing counts as landed; a
-  failed one is not reported as a landing.
+  failed one is not reported as a landing. A folder merge in which no file
+  completed returns no landing either.
 
 The quarantine is `C:\Temp\cbz_held\quarantine` by default; set it with
 `--quarantine-root` or `CBZ_QUARANTINE_ROOT`. Resolver mode keeps its own
