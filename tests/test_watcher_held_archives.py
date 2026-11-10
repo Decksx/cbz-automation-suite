@@ -878,3 +878,37 @@ def test_a_failure_at_any_step_never_discards_a_copy(media_watch, monkeypatch, s
     assert all(survivors.count(size) >= originals.count(size) for size in set(originals))
     # Unaffected siblings still land once the failure clears.
     assert {"Usogui ch. 2.cbz", "Usogui ch. 3.cbz"} <= {p.name for p in (library / "Usogui").glob("*.cbz")}
+
+
+def test_a_transient_state_read_failure_never_overwrites_other_directories(media_watch, monkeypatch):
+    """A state file that cannot be read for a moment still holds every other
+    directory's held copies. Writing this directory's record over it would
+    erase them, and those copies would then be released into keep-the-larger.
+    So an unreadable file is never overwritten."""
+    watch_root, library = media_watch
+    usogui = watch_root / "Usogui"
+    _hold_two_second_copies(usogui)
+    before = _library_bytes(library)
+
+    other = watch_root / "Other"
+    for chapter in (1, 2, 3):
+        _make_cbz(other / f"Gamma Ch.{chapter}.cbz", 300 + chapter)
+    for chapter in (1, 2):
+        _make_cbz(other / f"Delta Ch.{chapter}.cbz", 700 + chapter)
+    real_load = watcher._load_held_state
+    calls = {"n": 0}
+
+    def unreadable_when_recording():
+        calls["n"] += 1
+        return None if calls["n"] == 2 else real_load()
+
+    monkeypatch.setattr(watcher, "_load_held_state", unreadable_when_recording)
+    watcher.process_and_move_directory(other)
+    monkeypatch.setattr(watcher, "_load_held_state", real_load)
+
+    _make_cbz(usogui / "Alpha Ch.4.cbz", 104)
+    watcher.process_and_move_directory(usogui)
+
+    assert _names(usogui) == ["Beta Ch.1.cbz", "Beta Ch.2.cbz"]
+    after = _library_bytes(library)
+    assert {name: after[name] for name in before} == before
