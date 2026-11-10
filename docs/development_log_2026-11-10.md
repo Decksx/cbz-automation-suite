@@ -332,3 +332,69 @@ earlier six still fail as before (14/7/2/6/9/2).
 
 Full suite: **5,317 passed / 10 skipped / 0 failed** (5,327 collected =
 5,314 + 13 new).
+
+### PR #180 review round 2 (Codex, at `ad2e731`)
+
+Codex closed the suffix finding. **P2 (pre-existing):** the CJK fallback read
+a range's last end: `Series 第1-30話` landed with Number 30 and `第1-3巻`
+with Volume 3. Codex's `test_review180_cjk_ranges.py` (SHA256
+`7bbaa4ca...587b`) fails 6/8 at `ad2e731` and on base.
+
+To avoid a third round, every reader of a chapter, volume or issue number in
+a name was audited against an ascending range with each separator (`-`,
+`–`, `~`, `〜`, `～`, ` - `), each form both after the series name and as the
+whole name: 22 forms x 6 separators x 2 = 264 cases. Readers covered:
+`extract_chapter_number` (Ch./Chapter/#/Issue/c001), `extract_volume_number`
+(Vol./Volume/v01), `extract_trailing_bare_number` (the watcher's folder
+fallback), `normalize_stem` (the generic-chapter and generic-title branches),
+the leading-index strip, the CJK fallback (第N話/N話/章/回, 第N巻/N巻),
+`shorten_mixed_original_title` with `_extract_num_suffix`, Korean 화/권 and
+fullwidth digits, and media naming (`field_resolution.parse_name_tokens` via
+`watcher_naming`). At `ad2e731` 166 of 264 took an end of the range or lost
+it from the name; now none does.
+
+Fixed (all pre-existing on master):
+
+- CJK fallback: a number that ends an ascending range (`_ends_range`) is not
+  the chapter or volume.
+- `〜` (U+301C) and `～` (U+FF5E) are range separators (`_RANGE_SEP`):
+  `Ch. 1〜30` was read as chapter 1.
+- `extract_trailing_bare_number`: `Series 1-30` gave the folder chapter 30.
+- `shorten_mixed_original_title` split a title at `~` and ` - ` even between
+  two numbers: `Series 第1~30話` became `Series 第1.cbz`. An ascending range
+  is now held together; a descending pair (`5 - 3 Kittens`) splits as before.
+- `normalize_stem`, generic chapter: a whole name `Chapter 1-30` or `#1-30`
+  became `Series Ch. 1 30.cbz` with chapter 1, the hyphen lost and the range
+  read as two numbers; the closest reproduction found of the historic `130`.
+  Now `Series Ch. 1-30.cbz`.
+- `normalize_stem`, generic title: a whole name `Chapters 1-30` became
+  `Series.cbz`. Now `Series Ch. 1-30.cbz`.
+- The leading-index strip removed `1-` from `1-30` (`30.cbz`). A leading
+  ascending range is kept. Consequence: a leading index followed by a title
+  that starts with a larger number (`01 - 30 Days of Night`) keeps its index
+  now; a smaller or equal one (`05 - 3 Kittens`, `12 - 12 Angry Men`) is
+  still dropped.
+
+Not fixed (cosmetic, the range survives): fullwidth `Ch. １-３０` becomes
+`Ch. 1-３０`, only the first number normalised to ASCII.
+
+Tests: the audit is pinned as `test_no_reader_takes_an_end_of_a_range` (264
+cases); whole-name ranges (6); single numbers still read, CJK included
+(11); leading indexes still dropped (3); trailing bare numbers still used;
+Codex's CJK landing (2). At `ad2e731` 174 fail (166 audit, 6 whole-name, 2
+landing) and the single-number, index and trailing pins pass. Codex's two
+#180 probes pass 16/16.
+
+Guards proven by bypass (failing tests): CJK chapter marker 50; CJK volume
+marker 25; trailing bare number 52; only an ascending pair ends a range 1;
+the wave dash and fullwidth tilde 54; a range never split as a title
+separator 19; only an ascending pair held together 1; `Chapter 1-30` keeps
+the range 7; `Chapters 1-30` keeps the range 7; a leading range is not an
+index 11; only an ascending pair is a range there 2. A first bypass run
+proved nothing (a script error passed `-X utf8` to pytest, so every run
+stopped at argument parsing); it was rerun with the flag on the interpreter.
+The sources were hashed before each run and the full suite and were
+unchanged after each.
+
+Full suite: **5,604 passed / 10 skipped / 0 failed** (5,614 collected =
+5,327 + 287 new).
