@@ -96,10 +96,8 @@ def _payloads(root: Path) -> list[int]:
     return sorted(found)
 
 
-def test_two_translations_of_one_chapter_meet_the_collision_path(tmp_path, monkeypatch):
-    """Alpha's Episode 42 and Asura's Chapter 42 now share one canonical name.
-    The second never overwrites the first: one lands, the other is set aside
-    (quarantine or review), and both books survive."""
+def _watch(tmp_path, monkeypatch):
+    """A watch folder and library under *tmp_path*, wired into the watcher."""
     incoming, library = tmp_path / "incoming", tmp_path / "Manga"
     incoming.mkdir()
     library.mkdir()
@@ -111,6 +109,14 @@ def test_two_translations_of_one_chapter_meet_the_collision_path(tmp_path, monke
     monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
     monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
     monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
+    return incoming, library
+
+
+def test_two_translations_of_one_chapter_meet_the_collision_path(tmp_path, monkeypatch):
+    """Alpha's Episode 42 and Asura's Chapter 42 now share one canonical name.
+    The second never overwrites the first: one lands, the other is set aside
+    (quarantine or review), and both books survive."""
+    incoming, library = _watch(tmp_path, monkeypatch)
     arrival = incoming / "Life of a Demon Hunter"
     _make_cbz(arrival / "Alpha_Episode 42_2a8cb9.cbz", 400)
     _make_cbz(arrival / "Asura_Chapter 42_d1a897.cbz", 300)
@@ -123,3 +129,42 @@ def test_two_translations_of_one_chapter_meet_the_collision_path(tmp_path, monke
     assert sorted(_payloads(series) + set_aside) == [300, 400]
     assert len(set_aside) == 1
     assert not list(incoming.rglob("*.cbz"))
+
+
+# PR #178 review: a structural prefix is identity, never a group. Each name
+# keeps what it was named before this change (numeric parts keep master's
+# older spelling, which is not redesigned here).
+@pytest.mark.parametrize("prefix, expected", [
+    ("Part A", "Part A Chapter 5.cbz"),
+    ("Part B", "Part B Chapter 5.cbz"),
+    ("Part 1", "Berserk Ch. 1 Chapter 5.cbz"),
+    ("Part 2", "Berserk Ch. 2 Chapter 5.cbz"),
+    ("Pt. 3", "Pt. 3 Chapter 5.cbz"),
+    ("S2", "S2 Chapter 5.cbz"),
+    ("Arc 3", "Arc 3 Chapter 5.cbz"),
+    ("Book 1", "Book 1 Chapter 5.cbz"),
+    ("Side Story", "Side Story Chapter 5.cbz"),
+    ("Extra", "Extra Chapter 5.cbz"),
+    ("Special", "Special Chapter 5.cbz"),
+    ("Bonus", "Bonus Chapter 5.cbz"),
+    ("Act II", "Act II Chapter 5.cbz"),
+])
+def test_a_structural_prefix_is_not_taken_for_a_group(prefix, expected, display):
+    assert _name("Berserk", f"{prefix}_Chapter 5_ab12cd.cbz", display) == expected
+
+
+@pytest.mark.parametrize("parts", [("Part 1", "Part 2"), ("Part A", "Part B")],
+                         ids=["numeric", "letters"])
+def test_distinct_parts_land_as_distinct_books(tmp_path, monkeypatch, parts):
+    """Codex's #178 probe, adapted: two parts of one chapter are two books.
+    They must not share a name, so neither is reviewed as a second copy."""
+    incoming, library = _watch(tmp_path, monkeypatch)
+    arrival = incoming / "Berserk"
+    for i, part in enumerate(parts):
+        _make_cbz(arrival / f"{part}_Chapter 5_ab12cd.cbz", 101 + i)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert _payloads(library) == [101, 102]
+    assert len(list(library.rglob("*.cbz"))) == 2
+    assert _payloads(tmp_path / "_review") == [] and _payloads(tmp_path / "_quarantine") == []
