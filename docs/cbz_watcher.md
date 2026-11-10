@@ -109,14 +109,14 @@ quarantine**; it never deletes a copy that differs from the one it keeps.
   overwrite one another. A failed placement removes only the name it
   created. A library name taken by another arrival in the meantime is
   left alone; the arrival stays and is settled as a collision next pass.
-- A landing in flight is never a library book. Before reserving a new
-  library name, the placement creates a hidden marker beside it,
-  `.<name>.cbzreserve-<token>`, and removes it only once the archive is
-  complete there. Any other arrival, in this watcher or another, that meets
-  that name while a marker exists waits for the next pass instead of
-  settling against the empty reservation or partial copy. A marker left by
-  a crash keeps that name waiting until it is removed by hand (check that
-  the file it marks is complete first).
+- One settlement owns a library name at a time. Before anything about the
+  name is decided, the watcher takes that name's lock (one per normalized
+  physical path, so names differing only in case share it) and holds it
+  through the decision, the quarantine, the landing, any rollback and any
+  cleanup. Another arrival for the same name meanwhile does not wait: it
+  stays where it is and is settled on its next pass. This covers the
+  threads of one watcher process (one watcher per watch root); another
+  process writing the same library names is not coordinated by it.
 - Only a settled collision or a completed landing counts as landed; a
   failed one is not reported as a landing. A folder merge in which no file
   completed returns no landing either.
