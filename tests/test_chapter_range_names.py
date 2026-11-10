@@ -131,3 +131,70 @@ def test_a_compilation_lands_with_its_range_and_no_comicinfo_number(tmp_path, mo
     with zipfile.ZipFile(landed) as zf:
         info = zf.read("ComicInfo.xml").decode("utf-8")
     assert "<Number>" not in info
+
+
+# PR #180 review: a mixed-language title is shortened to its Latin segment
+# (shorten_mixed_original_title), and the number carried over from the
+# other segment must keep both ends of a range.
+@pytest.mark.parametrize("token", ["Ch. 1-30", "Vol. 1-3"])
+def test_a_range_survives_mixed_title_shortening(token, display):
+    """Codex's #180 probe, adapted."""
+    parsed = parse_comic_name(Path("C:/intake/Series") / f"Series - \u6f2b\u753b {token}.cbz",
+                              rules=cbz_core.ALL_RULES - {"translate"}, display_tokens=display)
+    assert parsed.filename == f"Series {token}.cbz"
+    assert (parsed.chapter, parsed.volume) == (None, None)
+
+
+@pytest.mark.parametrize("arrival, expected, chapter", [
+    ("Series - \u6f2b\u753b Ch. 5.cbz", "Series Ch. 5.cbz", "5"),
+    ("Series - \u6f2b\u753b Ch. 5 - 3 Kittens.cbz", "3 Kittens Ch. 5.cbz", "5"),
+])
+def test_a_single_number_through_shortening_is_unchanged(arrival, expected, chapter):
+    """Pass before and after: only a range keeps its second end."""
+    parsed = parse_comic_name(Path("C:/intake/Series") / arrival,
+                              rules=cbz_core.ALL_RULES - {"translate"}, display_tokens=True)
+    assert (parsed.filename, parsed.chapter) == (expected, chapter)
+
+
+@pytest.mark.parametrize("token", ["Ch. 1-30", "Vol. 1-3"])
+def test_a_shortened_compilation_lands_with_its_range(tmp_path, monkeypatch, token):
+    incoming, library = tmp_path / "incoming", tmp_path / "Manga"
+    incoming.mkdir()
+    library.mkdir()
+    registry = tmp_path / "number-styles.json"
+    registry.write_text(json.dumps({"version": 1, "roots": [{"path": str(library), "style": "chapter"}]}))
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(incoming))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(library))
+    monkeypatch.setattr(watcher, "_series_resolvers", {})
+    monkeypatch.setattr(watcher, "_router", None)
+    monkeypatch.setattr(watcher, "_number_style_registry", NumberStyleRegistry.load(registry))
+    monkeypatch.setattr(watcher, "_number_style_requested", "auto")
+    monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *a, **k: True)
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
+    arrival = incoming / "Series" / f"Series - \u6f2b\u753b {token}.cbz"
+    arrival.parent.mkdir(parents=True)
+    with zipfile.ZipFile(arrival, "w") as zf:
+        zf.writestr("page.jpg", b"compilation-pages")
+
+    watcher.process_and_move_directory(arrival.parent)
+
+    landed, = library.rglob("*.cbz")
+    assert landed.name == f"Series {token}.cbz"
+    with zipfile.ZipFile(landed) as zf:
+        info = zf.read("ComicInfo.xml").decode("utf-8")
+    assert "<Number>1</Number>" not in info and "<Volume>1</Volume>" not in info
+    assert not list((tmp_path / "_review").rglob("*.cbz"))
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Series / 漫画 Ch. 1-30", "Series Ch. 1-30"),
+    ("Series / 漫画 Vol. 1-3", "Series Vol. 1-3"),
+    ("Series / 漫画 Ch. 7-3", "Series Ch. 7"),   # descending: as before
+    ("Series / 漫画 Vol. 4-2", "Series Vol. 4"),  # descending: as before
+    ("One Piece / ワンピース Ch.005", "One Piece Ch.005"),
+])
+def test_shortening_carries_a_range_but_never_a_descending_tail(text, expected):
+    assert cbz_core.shorten_mixed_original_title(text) == expected
