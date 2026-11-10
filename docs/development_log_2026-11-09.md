@@ -404,3 +404,106 @@ failure is `tests/web/test_web_log_service.py::test_create_writer_streams_eight_
 (the second WinError 5 web test Codex also reported); three isolated reruns:
 1 passed,1 passed,1 failed. Nothing under `web` changes. Codex's probes: owned transactions 6/6,
 active reservation 8/8, directory receipt 2/2, failed landing 2/2.
+
+## Claim-first processing (PR B of the claim-first plan; supersedes #175, fixes #174)
+
+### Why
+
+Issue #174: holding an archive in the MEGA-synced import folder meant every
+pass re-processed it, and what had been decided about it had to be
+remembered (`Logs\cbz_watcher_held.json`). #175 tried to make that memory
+durable; each review round found another way to lose it (restart, failure
+paths, write-ahead gaps). Codex approved replacing the memory instead: an
+arrival leaves the watch folder before anything changes it, and the folder
+an archive is in is its state. David's decisions: MEGA deleting the cloud
+copy on claim is wanted; roots `C:\Temp\cbz_processing`,
+`C:\Temp\cbz_held\review`, `C:\Temp\cbz_held\quarantine` (configurable; the
+last two already hold hand-cleared items); 30-day retention for quarantine
+only.
+
+### Changes
+
+- New `comic_automation/library/claims.py`: root validation (physical
+  paths, same volume, no overlap with the watch root, libraries or each
+  other), the claim record (`claim.json`, atomic, written before the
+  rename), `claim_directory` / `claim_files`, `OwnerLock` (msvcrt, released
+  by the OS on death), unrecoverable-claim preservation, `place` for
+  review/quarantine, `purge_quarantine` (watcher-dated folders only; a
+  locked folder is skipped).
+- `scripts/cbz_watcher.py`: the held-state layer (`HELD_STATE_FILE`,
+  fingerprints, skip lines) is deleted. `--processing-root`,
+  `--review-root` (`CBZ_PROCESSING_ROOT`, `CBZ_REVIEW_ROOT`). The pipeline
+  claims each comic directory first (`_claimed_items`), resumes unfinished
+  claims before new arrivals (`_resume_claims`), re-probes readiness inside
+  the claim, records dispositions before moving (`_dispose`,
+  `_dispose_recorded`), and keeps AI custody in the record (`_note_ai`:
+  started before Camelia, done with the backup after; done is never
+  repeated, started-not-done goes to review). Tag-stripped collision holds
+  go to review with the library untouched. A cross-volume landing copies to
+  a hidden `.<name>.cbz-landing` partial and renames it over the
+  reservation; a resumed claim clears crashed reservations and partials
+  under each name's lock. Startup refuses unsafe roots (exit 3), purges
+  quarantine, cleans rewrite leftovers in the processing root (never the
+  watch folder) and resumes claims before discovery. A series folder with
+  subfolders (`.stversions`) has only its files claimed; folders left empty
+  are pruned. Routing and the shadow plan use the recorded source and
+  arrival path, not the processing path.
+- `scripts/cbz_shadow_handoff.py`: `observe(..., arrival=)` so a planned
+  case records where it arrived and stages the claimed copy.
+- Tests: new `tests/test_watcher_claims.py` (fresh-process crashes with
+  `os._exit` at after-claim, before-place, mid-landing, before-retire,
+  after-ai, inside-ai; record/rename failures; missing/corrupt records;
+  owner lock; mixed drop points; recorded routing; failed dispositions;
+  late writers; unrecordable custody; startup refusal and cleanup;
+  retention). `tests/test_watcher_held_archives.py` rewritten for review
+  and quarantine. Older tests that asserted a hold stays in the import
+  folder now find it in review (held) or processing (transient).
+
+### Deliberately not done
+
+- Live watcher stays at `5755290` until this is approved.
+- External processes writing the library are still not coordinated (as
+  #176).
+- A permanently unreadable archive waits in processing, as it waited in
+  the import folder before.
+
+### Verification
+
+Guards proven by bypass (26; each bypass removes one guard, runs the nine
+claim-first test files, restores the files byte for byte; failing tests in
+parentheses): failed record write stops the claim (1); failed rename returns
+no claim (1); unreadable record preserved for review (2); another watch
+root's claim left alone (1); one owner per claim (1); readiness re-checked in
+the claim (1); recorded dispositions carried out first (1); crashed landings
+cleared on resume (1); a recorded-done rewrite never repeated (1);
+started-not-done goes to review (1); custody recorded before the rewrite
+(1); decisions recorded before any move (1); failed disposition keeps the
+claim (1); unsafe roots refuse the start (1); rewrite cleanup in processing,
+not the watch folder (1); a series folder's subfolders stay (9); empty
+arrival folders pruned (12); cross-volume partial landing (1); roots outside
+the watch root (3), libraries (1), on its volume (1), not overlapping (1);
+only watcher-dated quarantine folders purged (1); collision holds go to
+review (41); shadow plan names the original arrival (1); a locked
+quarantine folder does not stop the purge (1).
+
+Five of those first passed or hung under bypass: one owner, recorded
+dispositions first, and decisions before moves failed nothing, so each got
+a test; unsafe-roots refusal and roots-outside-the-watch-root hung (the
+start ran on into the observer loop), so the startup test now stops at
+discovery and fails instead. All five fail under bypass now.
+
+Test accounting: 5,120 collected on master `9c26775`, 5,143 here: +31
+`tests/test_watcher_claims.py`; `tests/test_watcher_held_archives.py` 29 -> 21
+(14 kept, 15 removed, 7 added: 6 renamed/re-targeted to review, quarantine
+or processing; 1 new; 9 removed with the held-state layer). The IDs are
+listed in the PR.
+
+Full suite: **5,132 passed / 10 skipped / 1 failed** (5,143). The failure is
+`tests/web/test_web_logs.py::test_zero_writes_do_not_leak_empty_segments`;
+three isolated reruns passed 3/3, and the whole file run alone failed a
+different test (`test_alternating_overflow_compacts_map_and_physical_files`,
+WinError 5 on the index rename), the web flake seen in the #176 rounds.
+Nothing under `web` changes. The previous full run failed only
+`tests/test_shadow_handoff.py::test_shadow_plan_logs_would_be_case_and_moves_nothing_extra`,
+which found that a shadow-planned case recorded the processing path as its
+arrival; fixed (`observe(..., arrival=)`).
