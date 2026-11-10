@@ -198,3 +198,29 @@ Every guard added or changed in this round fails named tests when bypassed:
 | OSError refusal is transient | 1 |
 | registry refusal is transient | 1 |
 | transient refusals left out of deliberate holds | 2 |
+
+## Non-destructive name collisions (PR A of the claim-first plan)
+
+Branch `fix/non-destructive-collisions` from master `0d9eea8`. The first of
+two PRs replacing #175 (the second moves arrivals out of the MEGA-synced
+watch folder before any change). Decided by the operator on 2026-11-09:
+quarantine on C: next to the watch root, configurable; 30-day retention for
+quarantine only (the purge itself is not part of this PR).
+
+The legacy conflict branches of `_merge_directories` and `_move_loose_files`
+unlinked the copy keep-the-larger did not keep. Both now call
+`_settle_by_size`: a byte-identical arrival is removed; otherwise the loser
+is moved to `QUARANTINE_ROOT/<date>/<series>/` under a unique name before
+anything else moves. A failed quarantine move keeps both copies in place
+(and removes a partial cross-volume copy); a failed replacement moves the
+quarantined library copy back. Resolver mode already quarantined through
+`settle_file_conflict` and is unchanged.
+
+Tests: `tests/test_watcher_non_destructive_collisions.py` (17), both movers;
+`tests/conftest.py` points `QUARANTINE_ROOT` at each test's tmp dir. At
+`0d9eea8` 15 of the 17 fail (the two byte-identical cases behaved the same
+before). Guards proven by bypass (failing tests): only byte-identical copies
+are removed 2 (it failed nothing until an equal-size, different-bytes test
+was added); the loser is quarantined, not deleted 12; a failed quarantine
+leaves no partial copy 2; a failed replacement restores the library copy 2;
+quarantine names are collision-safe 1.
