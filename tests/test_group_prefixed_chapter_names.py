@@ -168,3 +168,34 @@ def test_distinct_parts_land_as_distinct_books(tmp_path, monkeypatch, parts):
     assert _payloads(library) == [101, 102]
     assert len(list(library.rglob("*.cbz"))) == 2
     assert _payloads(tmp_path / "_review") == [] and _payloads(tmp_path / "_quarantine") == []
+
+
+# PR #178 review round 2: the identity grammar already in the code decides,
+# in every spelling it accepts (run together, hyphenated, with a number).
+@pytest.mark.parametrize("prefix", [
+    "PartA", "PartB", "One-shot", "Oneshot", "One shot", "SideStory", "Side-Story",
+    "Extra2", "Omake", "Complete",
+])
+def test_known_identity_spellings_are_not_taken_for_a_group(prefix, display):
+    assert _name("Berserk", f"{prefix}_Chapter 5_ab12cd.cbz", display) == f"{prefix} Chapter 5.cbz"
+
+
+def test_the_watcher_and_the_group_check_share_one_part_grammar():
+    """The watcher's same-chapter copy check reads parts with the grammar
+    that keeps them here, so the two cannot drift apart."""
+    assert watcher._PART_RE is cbz_core.PART_MARKER_RE
+    assert watcher._PART_RE.search("parta").group(1) == "a"
+
+
+def test_compact_parts_land_as_distinct_books(tmp_path, monkeypatch):
+    """Codex's round-2 probe, adapted: 'PartA' and 'PartB' are two books."""
+    incoming, library = _watch(tmp_path, monkeypatch)
+    arrival = incoming / "Berserk"
+    for i, part in enumerate(("PartA", "PartB")):
+        _make_cbz(arrival / f"{part}_Chapter 5_ab12cd.cbz", 101 + i)
+
+    watcher.process_and_move_directory(arrival)
+
+    assert _payloads(library) == [101, 102]
+    assert len(list(library.rglob("*.cbz"))) == 2
+    assert _payloads(tmp_path / "_review") == [] and _payloads(tmp_path / "_quarantine") == []
