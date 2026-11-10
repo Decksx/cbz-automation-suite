@@ -224,3 +224,11 @@ are removed 2 (it failed nothing until an equal-size, different-bytes test
 was added); the loser is quarantined, not deleted 12; a failed quarantine
 leaves no partial copy 2; a failed replacement restores the library copy 2;
 quarantine names are collision-safe 1.
+
+Verification at `cc92cd9` (this commit is docs only), Windows /
+`C:\Python311` / Python 3.11, temporary fixtures only: full suite **5,071
+passed / 10 skipped / 1 failed** (5,082 tests = master `0d9eea8`'s 5,065 +
+17). The failure is the known `tests/web` file-lock flake
+`test_alternating_overflow_compacts_map_and_physical_files`; the branch
+changes nothing under `web` and it passes alone. `scripts/cbz_watcher.py`
+stays `mixed`; bare-LF 868 -> 869 (one new line beside an LF `global`).
