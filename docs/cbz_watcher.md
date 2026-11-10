@@ -87,7 +87,19 @@ be read, what was held is unknown, so every archive in that pass is
 protected the same way. A hold made this way is remembered as a second copy
 under the name and bytes it was held with (often its new canonical name),
 so later passes keep holding it; a protected archive whose move failed was
-never held, and is retried as an ordinary arrival.
+never held, and is retried.
+
+Protection fails closed. While a directory has any remembered second copy,
+every archive in it is protected, so a copy renamed by a pass whose move
+then failed is still protected on the retry; only its own landing or hold
+releases it. If the state file cannot be written, the pass keeps its holds
+in memory and merges them into every later read until a write succeeds. An
+unreadable state file is never overwritten (that could erase every other
+directory's holds): the watcher protects everything and logs a warning each
+pass until the file is fixed or moved aside. A copy that cannot be hashed is
+remembered with no hash and judged again; a move that raises is a failed
+move. The one gap is a watcher restart while the state file cannot be
+written: holds kept only in memory are then lost.
 
 Some holds are never recorded, so their directories are retried every pass,
 as before this change:
