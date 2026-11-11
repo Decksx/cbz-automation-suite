@@ -73,6 +73,7 @@ try:
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
+        known_groups_mixed_drop,
         normalise_archive_key,
         parse_comic_name,
         range_in,
@@ -92,6 +93,7 @@ except ModuleNotFoundError:
         extract_chapter_number,
         extract_trailing_bare_number,
         extract_volume_number,
+        known_groups_mixed_drop,
         normalise_archive_key,
         parse_comic_name,
         range_in,
@@ -3406,6 +3408,9 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
     total_processed = total_skipped = total_renamed = 0
     for comic_dir, cbz_files, claim, resumed, mixed_parent, route in items:
         route_category, legacy_dest = route
+        # A mixed drop point's loose archives are not one series, so their
+        # folder cannot confirm a known group's prefix (cbz_core).
+        known_groups_mixed_drop(mixed_parent)
         incoming_series_alias = comic_dir.name
         clean_dir_name = clean_directory_name(comic_dir.name)
         if _media_naming_enabled():
