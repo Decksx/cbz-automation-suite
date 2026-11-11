@@ -347,10 +347,13 @@ too ("Desire", "Violet"). So the folder must back it up: it holds one series
 archive in it either carries that same listed prefix before a chapter token,
 or is already named after the folder's series and nothing else: the series
 followed by pure numbering (`City of Sins Ch. 5`, `City of Sins v2 Ch. 3`,
-`City of Sins Ch. 1-30`). A different title that merely starts with the
-series (`City of Sins Side Story`, `City of Sins Extra`), a glued digit
-(`City of Sins2`) or words after the number do not count. Anything else, or
-a folder that cannot be read, keeps the arrival's name.
+`City of Sins Ch. 1-30`). The whole series name is matched first, digits
+in it included (`3XLOVE Uncensored Ch. 5`, `20th Century Boys v3 Ch. 12`),
+and only what follows it is read as numbering. A different title that
+merely starts with the series (`City of Sins Side Story`, `City of Sins
+Extra`), a glued digit (`City of Sins2`) or words after the number do not
+count. Anything else, or a folder that cannot be read, keeps the arrival's
+name.
 
 A prefix is never taken for a group when it holds a part marker, a
 structural or special word, or a volume, season, episode or chapter marker
