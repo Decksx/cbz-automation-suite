@@ -364,9 +364,9 @@ def watcher_naming(parsed, fact: fr.ArchiveFacts, *, series: str, style: str) ->
             else:
                 volume = offered
     # A range ("Ch. 1-30", a compilation) keeps its legacy name, which spells
-    # it as it arrived with the uppercase "Ch." David keeps; the formatter
-    # would rewrite it ("ch. 1-30", or "#001" when only the first number was
-    # read), and ComicInfo Number stays unset rather than its first number.
+    # it as it arrived; the formatter would rewrite it ("Ch. 1-30" for
+    # "Ch.1~30", or "#001" when only the first number was read), and
+    # ComicInfo Number stays unset rather than its first number.
     if (any("-" in (fr.normalize_number(value) or "") for value in (number, volume)
             if value is not None)
             or BRACKETED_RANGE_RE.search(fact.filename)):
