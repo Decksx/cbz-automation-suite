@@ -96,7 +96,7 @@ def test_media_naming_still_names_a_single_chapter(tmp_path):
     path, fact = _fact(tmp_path, f"{SERIES} Ch. 5.cbz")
     fields, _ = watcher_naming(parse_comic_name(path, display_tokens=True), fact,
                                series=SERIES, style="chapter")
-    assert format_canonical_name(fields) == f"{SERIES} ch. 5.cbz"
+    assert format_canonical_name(fields) == f"{SERIES} Ch. 5.cbz"
 
 
 def test_a_compilation_lands_with_its_range_and_no_comicinfo_number(tmp_path, monkeypatch):
@@ -384,20 +384,20 @@ def test_two_translated_compilations_land_as_two_books(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("folder, expected", [
-    ("Berserk Ch. 1-30", "Berserk ch. 1-30.cbz"),
-    ("Berserk Ch. 1~30", "Berserk ch. 1-30.cbz"),       # the formatter's spelling
-    ("Berserk Ch. 1\u301c30", "Berserk ch. 1-30.cbz"),
-    ("Berserk 1-30", "Berserk ch. 1-30.cbz"),
-    ("Berserk Ch. 4", "Berserk ch. 4.cbz"),  # a single number, as before
+    ("Berserk Ch. 1-30", "Berserk Ch. 1-30.cbz"),
+    ("Berserk Ch. 1~30", "Berserk Ch. 1-30.cbz"),       # the formatter's spelling
+    ("Berserk Ch. 1\u301c30", "Berserk Ch. 1-30.cbz"),
+    ("Berserk 1-30", "Berserk Ch. 1-30.cbz"),
+    ("Berserk Ch. 4", "Berserk Ch. 4.cbz"),  # a single number, as before
 ])
 def test_a_placeholder_in_a_range_folder_is_named_with_the_range(tmp_path, folder, expected):
     """The fallback writer: on master the placeholder took the range's first
     end ('ch. 1'), so two range folders' placeholders differed only by luck;
     now it carries the range, and the chapter field stays unset.
 
-    Lowercase 'ch.' on purpose (David, 2026-11-10): every fallback name
-    comes from the canonical formatter, as 'Berserk ch. 4' does on master. A
-    separate follow-up PR switches that formatter's display to 'Ch.'."""
+    Every fallback name comes from the canonical formatter, which writes
+    'Ch.' since PR (C) (David, 2026-11-10; it wrote 'ch.' when #180
+    pinned this)."""
     path = tmp_path / folder / "volvox_Chapter.cbz"
     path.parent.mkdir()
     path.write_bytes(b"")
@@ -407,7 +407,7 @@ def test_a_placeholder_in_a_range_folder_is_named_with_the_range(tmp_path, folde
     assert watcher._apply_fallback_naming(mapping, "Berserk", number) == []
     (renamed, patched), = mapping.items()
     assert renamed.name == expected
-    if expected != "Berserk ch. 4.cbz":
+    if expected != "Berserk Ch. 4.cbz":
         assert patched.chapter is None
 
 
