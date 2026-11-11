@@ -737,3 +737,188 @@ matched first, digits included, and only what follows is read as numbering.
 
 Full suite: **6,468 passed / 10 skipped / 0 failed** (6,478 collected =
 6,451 + 27 new).
+
+## PR (C): the canonical chapter token is "Ch."
+
+David, 2026-11-10: uppercase "Ch." everywhere the watcher names a file. Until
+now `format_canonical_name` wrote `ch. <C>`, so the watcher's fallback names,
+the chapter-1 backfill and media naming's chapter style (all through that
+formatter) wrote "ch.", while most arrivals and the legacy names say "Ch.".
+Branch `fix/uppercase-ch` off `c996135` (#179 and #180 merged).
+
+### What changed
+
+- `scripts/cbz_canonical_name.py`: `_assemble` writes `Ch. <C>`; the parser's
+  chapter slot and the series-year lookahead read `[Cc]h\.`.
+  `parse_canonical_name` still accepts exactly the formatter's image, now the
+  `Ch.` name, so `Series ch. 5.cbz` is refused ("canonical form is 'Series Ch.
+  5.cbz'"). A new `lowercase_chapter=True` accepts the formatter's earlier
+  image too: the same fields with `ch.` in the chapter slot, byte for byte
+  otherwise, and nothing else (`CH.`, `ch. 04`, `v1 ch. 4`, `ch.4` are still
+  refused).
+- `scripts/cbz_core.py` (`_display_stem`): reads canonical names with
+  `lowercase_chapter=True`, so an arrival that already carries a `ch.`
+  canonical name keeps it verbatim, exactly as before (the watcher's naming
+  stays a no-op on its own output). Translation: an arrival like
+  `漫画 Ch. 1-30` used to be a legacy name and was translated; it is now a
+  canonical chapter name, and the verbatim keep would have skipped the
+  translation (#180's translated-compilation tests caught it). A canonical
+  chapter name with a translated title is therefore not kept; other canonical
+  names (`漫画 #003`, `漫画 v01`) are kept as before.
+- `comic_automation/archive/field_resolution.py` (`_canonical_tokens`): reads
+  the `ch.` image as the canonical name it was, so the planner reads those
+  library files exactly as before and proposes the `Ch.` name.
+- `comic_automation/library/canonical_plan.py` (`_lone_canonical_unchanged`):
+  a lone book whose version label is from its file name only stays a no-op in
+  either spelling. A rename could not certify the label, so its `ch.` name is
+  left as it is, rather than held for review (which would also make the
+  planner exit 1).
+- Comments: `media_naming.py` (range note) and two `cbz_watcher.py`
+  docstrings (fallback example, backfill spelling); byte-exact, bare LF still
+  863.
+- Docs: §2.1 grammar, its table and a note on the token's case in
+  `docs/canonical_naming_and_version_supersession.md`; one line each in
+  `docs/canonical_naming_plan.md` and `docs/media_aware_naming.md`.
+
+### Existing "ch." library files: renamed once, by the planner
+
+- The canonical planner proposes one case-only rename, `Series ch. 7.cbz` to
+  `Series Ch. 7.cbz` (the existing own-case-only collision rule lets it
+  through), and the `Ch.` name then plans as unchanged. Tested on its own
+  and through the real executor (Windows): one file, `Series Ch. 7 (2019).cbz`,
+  and a replan with no renames or review.
+- Exception: a lone filename-only version label (`Series ch. 1 [v2].cbz`)
+  keeps its name, as above.
+- The watcher never renames a library file for this. An arrival already named
+  `... ch. N` keeps it. The one place a library copy can change spelling is a
+  keep-the-larger replacement the watcher was making anyway: the existing
+  `Solo Leveling ch. 4.cbz` replaced by a larger `ch. 4 (English)` arrival
+  (re-formatted to `Ch. 4`) is now `Solo Leveling Ch. 4.cbz`.
+- Nothing can go back: no code path writes `ch.` any more, and both spellings
+  read as the same fields.
+- Live count (read-only walk, names only): `X:\Comix` holds 13 `ch.` names out
+  of 40,381 archives (6,633 `Ch.`), none with `[vN]`; `X:\Manga` holds none
+  (6,694 `Ch.` of 25,752).
+
+### Checks
+
+- Corpus: every `.cbz` literal in the test suite (888 names, plain and display,
+  in a "Series" folder and in a folder named after the name: 3,550 results),
+  old (`c996135`) against new. 22 differ, all in display mode and all
+  intended: `Ch.` canonical names now kept verbatim (`Usogui v01 Ch. 1` keeps
+  `v01`, `S Ch. 12.50` keeps `12.50`; the legacy path unpadded them), and
+  `Solo Leveling ch. 4 (English)` re-formatted as `Solo Leveling Ch. 4`.
+- Display idempotence (each display result parsed again): 1 name changes on
+  the second pass, the same one as on `c996135` (`Manhwa18_Chapter 1_ab12cd`,
+  #178/#179 territory). An earlier draft that also turned an arrival's `ch.`
+  canonical name into `Ch.` made 19 names unstable (legacy output keeps an
+  arrival's `ch.`, which the next pass then upgraded), so it was dropped.
+- Case-exact witness: a pytest plugin that makes `Path.is_file`/`exists`
+  called from a test require the exact case of the last component (Windows
+  is case-blind, so a pinned `ch.` name passes against a `Ch.` file). Full
+  suite under it: only `test_arrival_rename.py::test_case_alias_requires_same_file_identity`
+  fails, and it fails the same way on `c996135` (it tests a case alias).
+
+### Pinned tests updated deliberately
+
+Expected names `ch.` to `Ch.` (listed by file):
+
+- `test_canonical_name.py`: `test_version_marker_can_never_parse_as_a_volume`,
+  `test_fractional_range_and_special_numbers_round_trip`,
+  `test_display_name_keeps_year_version_and_edition_tokens`,
+  `test_operator_examples_format_exactly`, `test_chapter_is_unpadded`,
+  `test_fraction_digits_are_kept_verbatim`, `test_volume_combines_with_chapter`;
+  `test_parse_accepts_only_the_formatters_image` now refuses the `Ch.` forms
+  of its padded / no-space / issue-and-chapter cases.
+- `test_canonical_plan.py`: expected destinations in
+  `test_ordinary_rename_uses_current_bytes_catalog_ids_and_resolved_fields`,
+  `test_a_strict_prefix_family_has_one_keeper_and_owned_quarantine_proposals`,
+  `test_the_current_formatter_owns_edition_vocabulary`,
+  `test_case_only_rename_remains_a_proposal_for_the_executor`,
+  `test_conclusively_volume_classified_v_is_not_an_unresolved_version`,
+  `test_a_generated_volume_plan_applies_recovers_and_undoes_through_the_real_executor`,
+  `test_an_applied_family_keeper_is_unchanged_without_certifying_its_lone_version`;
+  "already canonical" fixtures in
+  `test_unresolved_or_protected_identity_is_reviewed_instead_of_silently_dropped`,
+  `test_an_occupied_canonical_destination_is_held_even_with_identical_bytes`,
+  `test_a_keeper_collision_holds_the_entire_family`,
+  `test_a_lone_canonical_version_is_reviewed_when_a_resolved_field_would_change_it`,
+  `test_another_book_in_the_same_identity_group_restores_normal_version_evidence_rules`,
+  `test_a_canonical_version_with_an_unverified_label_is_a_zero_exit_noop`,
+  `test_an_already_canonical_archive_is_unchanged`,
+  `test_lone_label_is_scoped_to_its_identity_group`,
+  `test_saved_receipt_preserves_nonzero_diagnostics`,
+  `test_a_skipped_scope_drops_its_unchanged_rows`.
+- `test_chapter_range_names.py`: `test_media_naming_still_names_a_single_chapter`;
+  #180's range placeholder test
+  `test_a_placeholder_in_a_range_folder_is_named_with_the_range` (all five
+  cases; its "lowercase on purpose" note now records the change).
+- `test_field_resolution.py`: `test_equal_valued_volume_and_chapter_keep_their_own_spellings`.
+- `test_media_naming.py`: `test_a_volume_stated_twice_with_one_value_is_one_claim`.
+- `test_media_naming_callers.py`:
+  `test_planner_and_real_watcher_rename_have_identical_media_names`; the
+  case-only witnesses flipped (`Series ch. 3` arrives, `Series Ch. 3` lands):
+  `test_configured_real_watcher_lands_case_only_names_through_two_steps`,
+  `test_media_refusal_tracks_the_retained_archive_after_case_rollback_collision`.
+- `test_round_group_tags.py`: `test_fallback_name_drops_english_and_keeps_colored`
+  (line 198); `test_scanned_round_tags_are_dropped_from_the_display_name` and
+  `test_english_is_dropped_in_any_case` now use `Ch.` inputs (a `ch. 5
+  (English)` canonical name is re-formatted as `Ch. 5`, other tags keep the
+  arrival's spelling); `test_an_english_tagged_arrival_meets_the_existing_copy`
+  (the replacement lands as `Ch. 4`).
+- `test_watcher_canonical_convergence.py`:
+  `test_fallback_name_comes_from_the_canonical_formatter` (lines 418/421 and
+  the other two cases), `test_square_colored_yields_exactly_one_edition_token`,
+  `test_fallback_naming_end_to_end_keeps_every_display_token` (the library's
+  existing `ch. 3` is left as it is),
+  `test_two_placeholder_chapters_with_tokens_do_not_collide`,
+  `test_backfill_control_still_renames_when_the_formatter_accepts`,
+  `test_a_refused_loose_placeholder_keeps_its_ai_original` (line 917),
+  `test_an_all_success_directory_still_offloads_its_originals`.
+- `test_watcher_chapter_fallback.py`: `test_generic_same_name_releases_get_unique_chapter_names`.
+- `test_watcher_claims.py`: `test_completed_ai_follows_its_archive_through_naming`.
+- `test_watcher_held_archives.py`: `test_one_refused_archive_no_longer_holds_back_its_series`,
+  `test_a_refused_preferred_copy_does_not_hold_back_the_valid_one`,
+  `test_quarantined_second_copies_are_untouched_when_a_new_chapter_arrives`,
+  `test_a_registry_refusal_stays_in_processing_not_review`,
+  `test_a_failed_rename_stays_in_processing_and_lands_when_it_clears`.
+
+### New tests (28)
+
+`tests/test_uppercase_chapter_names.py` (25): the formatter writes and reads
+`Ch.` (five shapes, series year included); the `ch.` image is canonical only
+when asked (four); the option admits nothing else (five); both spellings read
+as chapter 5 in field resolution and in `parse_comic_name`, plain and display
+(two); an arrival's canonical name is kept in either spelling (three); a
+`ch.` name with a dropped `(English)` is re-formatted as `Ch.` and is then a
+fixpoint; translation of canonical CJK names (five). `tests/test_canonical_plan.py`
+(3): renamed once then unchanged; the same through the real executor; a lone
+`ch.` version label keeps its name. At `c996135` 20 of the 28 fail; the 8 that
+pass pin behaviour this PR keeps (a `ch.` arrival kept verbatim, translation
+of `漫画 Ch. 3` and of issue/volume names, `Ch.` read as chapter 5, the lone
+`ch.` no-op).
+
+### Bypass proofs
+
+Each guard removed or inverted, naming tests run, sources restored byte for
+byte (hashed before; `sha256sum -c` after):
+
+| Guard | Failing tests |
+| --- | --- |
+| C1 the formatter writes `Ch.` | 58 |
+| C2 the chapter slot reads `Ch.` | 101 |
+| C3 the chapter slot reads `ch.` | 9 |
+| C4 the series-year lookahead sees `Ch.` | 2 |
+| C5 the series-year lookahead sees `ch.` | 1 |
+| C6 the lowercase option admits the `ch.` image | 9 |
+| C7 the option is off by default | 4 |
+| C8 an arrival's `ch.` canonical name is kept | 3 |
+| C9 a translated canonical chapter is translated | 5 |
+| C10 only a chapter: other canonical names stay kept | 2 |
+| C11 field resolution reads the `ch.` image as canonical | 1 |
+| C12 a lone `ch.` version label parses as a no-op | 1 |
+| C13 the lone no-op compares with the formatted name | 1 |
+
+Full suite: **6,496 passed / 10 skipped / 0 failed** (6,506 collected =
+6,478 on `c996135` + 28 new). Under the case-exact plugin: 6,495 passed and
+the one baseline case-alias failure.
