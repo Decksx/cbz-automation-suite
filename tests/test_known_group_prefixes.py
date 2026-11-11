@@ -301,3 +301,52 @@ def test_a_second_copy_from_a_numbered_group_meets_the_review_path(tmp_path, mon
     assert [p.name for p in series.glob("*.cbz")] == ["3XLOVE Uncensored Ch. 5.cbz"]
     set_aside = _payloads(tmp_path / "_review") + _payloads(tmp_path / "_quarantine")
     assert sorted(_payloads(series) + set_aside) == [400, 500]
+
+
+# PR #179 review round 2: a sibling confirms the folder only when it is the
+# folder's series itself followed by pure numbering, not a different title
+# that merely starts with it.
+@pytest.mark.parametrize("sibling", [
+    "City of Sins Side Story Ch. 2.cbz",
+    "City of Sins Extra Ch. 2.cbz",
+    "City of Sins2 Ch. 2.cbz",
+])
+def test_a_different_title_cannot_confirm_the_folder_series(sibling, display):
+    """Codex's round-2 probe, adapted: 'Desire' keeps its title."""
+    assert _name("City of Sins", "Desire Ch. 1.cbz", display, sibling) == "Desire Ch. 1.cbz"
+
+
+@pytest.mark.parametrize("sibling", [
+    "City of Sins Ch. 5.cbz", "City of Sins v2 Ch. 3.cbz", "City of Sins Ch. 1-30.cbz",
+    "City of Sins ch. 4.cbz", "City of Sins #6.cbz", "City of Sins 第7話.cbz",
+])
+def test_a_sibling_named_after_the_series_still_confirms(sibling, display):
+    assert _name("City of Sins", "Mangakakalot Ch. 53.cbz", display, sibling) \
+        == "City of Sins Ch. 53.cbz"
+
+
+@pytest.mark.parametrize("stem, named", [
+    ("City of Sins Ch. 5", True), ("City of Sins v2 Ch. 3", True),
+    ("City of Sins Ch. 1-30", True), ("city  of sins ch. 7", True),
+    ("City of Sins Side Story Ch. 2", False), ("City of Sins Extra Ch. 2", False),
+    ("City of Sins2 Ch. 2", False), ("City of Sins Ch. 5 Eclipse", False),
+    ("City of Sins Ch. 4 (2019)", False), ("City of Sins", False),
+])
+def test_named_after_series_is_the_series_and_pure_numbering(stem, named):
+    assert cbz_core._named_after_series(stem, "City of Sins") is named
+
+
+def test_a_different_title_does_not_erase_a_listed_title_on_landing(tmp_path, monkeypatch):
+    """Codex's round-2 probe, adapted: both books land, 'Desire' under its own
+    name, nothing reviewed."""
+    incoming, library = _watch(tmp_path, monkeypatch)
+    folder = incoming / "City of Sins"
+    _make_cbz(folder / "Desire Ch. 1.cbz", 101)
+    _make_cbz(folder / "City of Sins Side Story Ch. 2.cbz", 202)
+
+    watcher.process_and_move_directory(folder)
+
+    names = {p.name for p in library.rglob("*.cbz")}
+    assert "Desire Ch. 1.cbz" in names
+    assert _payloads(library) == [101, 202]
+    assert _payloads(tmp_path / "_review") == []
