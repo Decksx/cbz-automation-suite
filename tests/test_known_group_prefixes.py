@@ -350,3 +350,63 @@ def test_a_different_title_does_not_erase_a_listed_title_on_landing(tmp_path, mo
     assert "Desire Ch. 1.cbz" in names
     assert _payloads(library) == [101, 202]
     assert _payloads(tmp_path / "_review") == []
+
+
+# PR #179 review round 3: a series title can carry digits of its own.
+_DIGIT_SERIES = ["3XLOVE Uncensored", "The Toy of 100 Baseball Players",
+                 "The Toy of 100 Baseball Players Uncensored", "20th Century Boys"]
+
+
+@pytest.mark.parametrize("display", [False, True])
+@pytest.mark.parametrize("series", _DIGIT_SERIES)
+def test_a_canonical_sibling_with_digits_in_its_series_still_confirms(series, display):
+    assert _name(series, "Manhwa18 Chapter 6.cbz", display, f"{series} Ch. 5.cbz")         == f"{series} Ch. 6.cbz"
+
+
+@pytest.mark.parametrize("display", [False, True])
+@pytest.mark.parametrize("series, sibling, arrival, expected", [
+    ("3XLOVE Uncensored", "3XLOVE Uncensored Ch. 5.cbz", "Manhwa18 Chapter 6.cbz",
+     "3XLOVE Uncensored Ch. 6.cbz"),
+    ("The Toy of 100 Baseball Players Uncensored",
+     "The Toy of 100 Baseball Players Uncensored Ch. 49.cbz", "Manhwa18 Chapter 50.cbz",
+     "The Toy of 100 Baseball Players Uncensored Ch. 50.cbz"),
+    ("20th Century Boys", "20th Century Boys v3 Ch. 12.cbz", "Manhwa18 Chapter 13.cbz",
+     "20th Century Boys Ch. 13.cbz"),
+])
+def test_the_named_positives_with_digit_titles(series, sibling, arrival, expected, display):
+    assert _name(series, arrival, display, sibling) == expected
+
+
+@pytest.mark.parametrize("stem, series, named", [
+    ("3XLOVE Uncensored Ch. 5", "3XLOVE Uncensored", True),
+    ("3xlove  uncensored ch. 5", "3XLOVE Uncensored", True),
+    ("The Toy of 100 Baseball Players Uncensored Ch. 49",
+     "The Toy of 100 Baseball Players Uncensored", True),
+    ("20th Century Boys v3 Ch. 12", "20th Century Boys", True),
+    ("20th Century Boys.Ch. 12", "20th Century Boys", True),
+    ("3XLOVE Uncensored2 Ch. 5", "3XLOVE Uncensored", False),
+    ("3XLOVE Ch. 5", "3XLOVE Uncensored", False),
+    ("4XLOVE Uncensored Ch. 5", "3XLOVE Uncensored", False),
+    ("20th Century Boys Side Story Ch. 2", "20th Century Boys", False),
+    ("20th Century Boys", "20th Century Boys", False),
+    ("20th Century Boys - ", "20th Century Boys", False),
+    ("#5", "", False),
+])
+def test_named_after_series_anchors_on_the_whole_series_key(stem, series, named):
+    assert cbz_core._named_after_series(stem, series) is named
+
+
+def test_numbered_series_batch_keeps_normalising_after_a_sibling_is_named(tmp_path, monkeypatch):
+    """Codex's round-3 probe, adapted: the second archive is renamed after
+    the first, and both land."""
+    incoming, library = _watch(tmp_path, monkeypatch)
+    folder = incoming / "3XLOVE Uncensored"
+    _make_cbz(folder / "3XLOVE Uncensored Ch. 5.cbz", 105)
+    _make_cbz(folder / "Manhwa18 Chapter 6.cbz", 106)
+
+    watcher.process_and_move_directory(folder)
+
+    names = {p.name for p in library.rglob("*.cbz")}
+    assert names == {"3XLOVE Uncensored Ch. 5.cbz", "3XLOVE Uncensored Ch. 6.cbz"}
+    assert _payloads(library) == [105, 106]
+    assert _payloads(tmp_path / "_review") == []
