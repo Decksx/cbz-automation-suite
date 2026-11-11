@@ -654,3 +654,43 @@ ending; the 5 added lines are CRLF; bare LF stays 863.
 
 Full suite on the rebased tree: **6,412 passed / 10 skipped / 0 failed**
 (6,422 collected = 6,340 on `b87b7c8` + 82 in `test_known_group_prefixes.py`).
+
+### PR #179 review round 2 (Codex, at `f6d18aa`)
+
+Codex accepted the normalised veto and the undecodable-list fallback. **P2:**
+the folder proof counted a sibling as "already named after the series" by a
+normalised prefix match, so `City of Sins Side Story Ch. 2`, `City of Sins
+Extra Ch. 2` and `City of Sins2 Ch. 2` counted as City of Sins; next to
+`Desire Ch. 1` that confirmed the folder, and Desire was renamed `City of
+Sins Ch. 1`. Codex's `test_review179_folder_evidence.py` (SHA256
+`2dd25232...ec61`) fails 7/7 at `f6d18aa`.
+
+Fix, without another heuristic: `_named_after_series` splits the sibling's
+name the way a translated title is split (`_split_numbering`, from #180).
+It counts only when the title is exactly the folder's series (case,
+spacing and punctuation aside) and everything after it is pure numbering
+(`Ch. 5`, `v2 Ch. 3`, `Ch. 1-30`, `#6`, `第7話`): numbering tokens and
+nothing else. A different title that starts with the series, a glued digit,
+any word after the number (`Ch. 5 Eclipse`) or a display token (`(2019)`)
+does not count, nor does a name that cannot be split. Such a sibling means
+the folder confirms nothing, and the arrival keeps its name.
+
+`docs/cbz_watcher.md` now states the folder-confirmation rule and the
+listed-group digit exception (`Manhwa18`, `Manhwa18 2`, `Gamma 2`, `KM 42`;
+David, 2026-11-10), and that an unreadable list counts as none.
+
+Tests: Codex's probe passes 7/7 unmodified, and the round-1 identity probe
+still 12/12. New: Codex's three siblings (plain and display) and its
+landing case, six positive siblings (`City of Sins Ch. 5`, `v2 Ch. 3`,
+`Ch. 1-30`, `ch. 4`, `#6`, `第7話`) still confirming, and the helper on ten
+names. At `f6d18aa` the 7 Codex cases fail (and the 10 helper cases, the
+helper being new); the positives pass there too.
+
+Guards proven by bypass (failing tests): already-named siblings confirm
+(P5, anchor moved) 15; the strict check, not a prefix match 7; the title is
+exactly the series 11; the rest is pure numbering 2; there is numbering 1.
+The sources were hashed before the bypass run and the full suite and were
+unchanged after each.
+
+Full suite: **6,441 passed / 10 skipped / 0 failed** (6,451 collected =
+6,422 + 29 new).
