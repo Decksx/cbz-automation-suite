@@ -789,7 +789,7 @@ def _ai_naming_setup(tmp_path, monkeypatch, library):
 
 def test_completed_ai_follows_its_archive_through_naming(watch, tmp_path, monkeypatch):
     """Codex's #177 probe: AI-processed as 'Group Ch.1.cbz', named
-    'Berserk ch. 1.cbz', landing refused once. The resume finds the custody
+    'Berserk Ch. 1.cbz', landing refused once. The resume finds the custody
     under the new name and never rewrites it again."""
     watch_root, library = watch
     calls = _ai_naming_setup(tmp_path, monkeypatch, library)
@@ -800,7 +800,7 @@ def test_completed_ai_follows_its_archive_through_naming(watch, tmp_path, monkey
     assert calls == ["Group Ch.1.cbz"]
     (claim_dir,) = claims.claim_dirs(watcher.PROCESSING_ROOT)
     record = claims.read_record(claim_dir)
-    assert list(record["ai"]) == ["Berserk ch. 1.cbz"] and "ai_naming" not in record
+    assert list(record["ai"]) == ["Berserk Ch. 1.cbz"] and "ai_naming" not in record
 
     monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
     watcher.process_and_move_directory(watch_root)

@@ -112,7 +112,7 @@ def test_one_refused_archive_no_longer_holds_back_its_series(media_watch, tmp_pa
 
     watcher.process_and_move_directory(arrival)
 
-    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz", "Usogui v01 ch. 2.cbz"]
+    assert _names(library / "Usogui") == ["Usogui v01 Ch. 1.cbz", "Usogui v01 Ch. 2.cbz"]
     assert _placed(tmp_path / "_review") == ["Team Duwang Vol.30 Ch.323 - Chapter 1, Fin.cbz"]
     assert _payloads(tmp_path / "_review") == [323]
     assert not arrival.exists()
@@ -264,7 +264,7 @@ def test_a_refused_preferred_copy_does_not_hold_back_the_valid_one(media_watch, 
 
     watcher.process_and_move_directory(arrival)
 
-    assert (library / "Usogui" / "Usogui ch. 1.cbz").is_file()
+    assert (library / "Usogui" / "Usogui Ch. 1.cbz").is_file()
     assert _placed(tmp_path / "_review") == ["Beta Ch.1.cbz"]
 
 
@@ -313,8 +313,8 @@ def test_quarantined_second_copies_are_untouched_when_a_new_chapter_arrives(medi
 
     assert _payloads(tmp_path / "_quarantine") == [901, 902]
     landed = library / "Usogui"
-    assert _names(landed) == [f"Usogui ch. {n}.cbz" for n in (1, 2, 3, 4)]
-    assert _payload_size(landed / "Usogui ch. 1.cbz") == 101
+    assert _names(landed) == [f"Usogui Ch. {n}.cbz" for n in (1, 2, 3, 4)]
+    assert _payload_size(landed / "Usogui Ch. 1.cbz") == 101
 
 
 def test_a_second_copy_never_replaces_a_different_library_book(media_watch, tmp_path):
@@ -378,7 +378,7 @@ def test_a_registry_refusal_stays_in_processing_not_review(media_watch, tmp_path
 
     monkeypatch.setattr(type(watcher._number_style_registry), "select", real_select)
     watcher.process_and_move_directory(watch_root)
-    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz"]
+    assert _names(library / "Usogui") == ["Usogui v01 Ch. 1.cbz"]
 
 
 def test_a_failed_rename_stays_in_processing_and_lands_when_it_clears(media_watch, tmp_path, monkeypatch):
@@ -399,4 +399,4 @@ def test_a_failed_rename_stays_in_processing_and_lands_when_it_clears(media_watc
 
     monkeypatch.setattr(watcher, "rename_arrival", real_rename)
     watcher.process_and_move_directory(watch_root)
-    assert _names(library / "Usogui") == ["Usogui v01 ch. 1.cbz"]
+    assert _names(library / "Usogui") == ["Usogui v01 Ch. 1.cbz"]

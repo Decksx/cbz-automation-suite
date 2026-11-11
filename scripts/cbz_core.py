@@ -1776,7 +1776,9 @@ def _display_stem(
 ) -> str | None:
     """The display stem for :func:`parse_comic_name`, or ``None`` for legacy.
 
-    * A name the canonical formatter already produced is kept verbatim:
+    * A name the canonical formatter already produced is kept verbatim,
+      including one it produced before PR (C) with ``ch.``, which an arrival
+      keeps as it was (the watcher's naming is a no-op on its own output):
       re-running the stem pipeline would undo its padding (``v01`` ->
       ``v1``), and keeping it classifies nothing. "Already produced" needs
       more than ``parse_canonical_name``, whose series slot accepts any text:
@@ -1786,7 +1788,10 @@ def _display_stem(
       the display name drops (``_DISPLAY_LANGUAGE_WORDS``, hive #2646), the
       name is not kept verbatim. It is re-formatted without the edition, so
       ``Berserk v01 (English)`` becomes ``Berserk v01``: only the
-      ``(English)`` token goes, and the padding stays.
+      ``(English)`` token goes, and the padding stays. A canonical chapter
+      name whose title was translated is not kept either: the canonical
+      chapter is spelt ``Ch.``, as most arrivals already are, and such an
+      arrival (``漫画 Ch. 1-30``) was always translated (PR (C)).
     * A translated name keeps the translation and gains the tokens.
     * Otherwise the stem pipeline runs on the identity core and the tokens
       are appended, repeated to a fixpoint so the watcher's naming step is a
@@ -1803,12 +1808,13 @@ def _display_stem(
     if "brackets" not in rules:
         return None
     try:
-        fields = parse_canonical_name(name)
+        fields = parse_canonical_name(name, lowercase_chapter=True)
     except CanonicalNameError:
         pass
     else:
         core = sanitize_without_markers(fields.series, rules)
-        if core == fields.series and _stem_pipeline(core, series, rules) == core:
+        if (core == fields.series and _stem_pipeline(core, series, rules) == core
+                and (translated_stem is None or fields.chapter is None)):
             if (
                 fields.edition is None
                 or fields.edition.casefold() not in _DISPLAY_LANGUAGE_WORDS

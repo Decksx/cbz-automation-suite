@@ -69,7 +69,7 @@ def config(tmp_path, rows):
 
 @pytest.mark.parametrize("name,number,style,expected", [
     ("Series #3.cbz", "3", "issue", "Series #003 (2019).cbz"),
-    ("Series Ch. 3.cbz", "3", "chapter", "Series ch. 3 (2019).cbz"),
+    ("Series Ch. 3.cbz", "3", "chapter", "Series Ch. 3 (2019).cbz"),
     ("Series TPB 1.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
     ("Series Vol. 1 (Colored).cbz", "1", "issue", "Series v01 (2019) (TPB) (Colored).cbz"),
     ("Series Full 1.cbz", "1", "issue", "Series v01 (2019) (TPB).cbz"),
@@ -285,7 +285,7 @@ def test_two_bare_number_arrivals_keep_distinct_names_and_both_land(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive rename witness")
 @pytest.mark.parametrize("name,style,expected", [
-    ("Series Ch. 3.cbz", "chapter", "Series ch. 3.cbz"),
+    ("Series ch. 3.cbz", "chapter", "Series Ch. 3.cbz"),
     ("series #003.cbz", "issue", "Series #003.cbz"),
 ])
 def test_configured_real_watcher_lands_case_only_names_through_two_steps(
@@ -344,13 +344,13 @@ def test_empty_registry_runs_real_legacy_watcher_import_without_stalling(library
 def test_media_refusal_tracks_the_retained_archive_after_case_rollback_collision(
         library, configured_watcher, monkeypatch):
     _, _, book = library
-    source = book("Series Ch. 3.cbz", number="3")
+    source = book("Series ch. 3.cbz", number="3")
     facts = {source: fr.archive_facts_from_file(source)}
     values = {source: parse_comic_name(source, rules=ALL_RULES - {"translate"}, display_tokens=True)}
     original = Path.rename
 
     def collide(path, destination):
-        if path.name.startswith(".media-case-") and Path(destination).name == "Series ch. 3.cbz":
+        if path.name.startswith(".media-case-") and Path(destination).name == "Series Ch. 3.cbz":
             source.write_bytes(b"interloper")
             raise PermissionError("final step blocked")
         return original(path, destination)

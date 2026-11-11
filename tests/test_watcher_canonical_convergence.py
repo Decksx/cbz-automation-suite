@@ -292,7 +292,7 @@ def test_square_colored_yields_exactly_one_edition_token():
     assert cbz_core.append_display_tokens("Book", source) == "Book (Colored)"
     assert (
         watcher._fallback_display_stem("Berserk", "4", "Chapter (Colored) [Colored]")
-        == "Berserk ch. 4 (Colored)"
+        == "Berserk Ch. 4 (Colored)"
     )
 
 
@@ -415,13 +415,13 @@ def test_preserve_decensor_markers_is_unchanged():
 @pytest.mark.parametrize(
     ("series", "chapter", "source", "expected"),
     [
-        ("Berserk", "4", "volvox Chapter", "Berserk ch. 4"),
+        ("Berserk", "4", "volvox Chapter", "Berserk Ch. 4"),
         ("Berserk", None, "volvox Chapter", "Berserk"),
         ("Berserk", "4", "volvox Chapter (2019) (Uncensored) [v2]",
-         "Berserk ch. 4 (2019) (Uncensored) [v2]"),
-        ("Berserk", "12.5", "Chapter (1989)", "Berserk ch. 12.5 (1989)"),
+         "Berserk Ch. 4 (2019) (Uncensored) [v2]"),
+        ("Berserk", "12.5", "Chapter (1989)", "Berserk Ch. 12.5 (1989)"),
         # A decensor word the folder already carries is not repeated.
-        ("Berserk Uncensored", "4", "Chapter (Uncensored)", "Berserk Uncensored ch. 4"),
+        ("Berserk Uncensored", "4", "Chapter (Uncensored)", "Berserk Uncensored Ch. 4"),
     ],
 )
 def test_fallback_name_comes_from_the_canonical_formatter(series, chapter, source, expected):
@@ -540,10 +540,11 @@ def test_fallback_naming_end_to_end_keeps_every_display_token(watch):
     watcher.process_and_move_directory(arrival)
 
     assert sorted(p.name for p in library.iterdir()) == ["Berserk"]
-    landed = existing / "Berserk ch. 4 (2019) (Uncensored) [v2].cbz"
+    landed = existing / "Berserk Ch. 4 (2019) (Uncensored) [v2].cbz"
+    # The library's earlier lowercase "ch. 3" is left as it is (PR (C)).
     assert sorted(p.name for p in existing.iterdir()) == [
-        "Berserk ch. 3.cbz",
         landed.name,
+        "Berserk ch. 3.cbz",
     ]
     assert _payload_size(landed) == 400
     with zipfile.ZipFile(landed) as zf:
@@ -566,7 +567,7 @@ def test_two_placeholder_chapters_with_tokens_do_not_collide(watch):
     names = sorted(p.name for p in series.iterdir())
     assert names == [
         "Arrest Thy Neighbor (Uncensored).cbz",
-        "Arrest Thy Neighbor ch. 2 (Uncensored).cbz",
+        "Arrest Thy Neighbor Ch. 2 (Uncensored).cbz",
     ]
     assert _payload_size(series / names[0]) == 200
     assert _payload_size(series / names[1]) == 400
@@ -773,8 +774,8 @@ def test_backfill_control_still_renames_when_the_formatter_accepts(watch):
     watcher.process_and_move_directory(arrival)
 
     assert sorted(p.name for p in (library / "Berserk").iterdir()) == [
+        "Berserk Ch. 1.cbz",
         "Berserk Ch. 2.cbz",
-        "Berserk ch. 1.cbz",
     ]
 
 
@@ -914,7 +915,7 @@ def test_a_refused_loose_placeholder_keeps_its_ai_original(ai_watch):
     refused_backup = backup_of[refused.name]
     assert refused.is_file()
     assert refused_backup.is_file()
-    assert (library / "Berserk" / "Berserk ch. 4 (2019).cbz").is_file()
+    assert (library / "Berserk" / "Berserk Ch. 4 (2019).cbz").is_file()
 
     offloaded_backups = [backup for backup, _series in offloaded]
     assert accepted_backup in offloaded_backups
@@ -923,7 +924,7 @@ def test_a_refused_loose_placeholder_keeps_its_ai_original(ai_watch):
 
     (parent_pairs, landed), = [c for c in calls if c[1] and c[1].name == "Berserk"]
     # Keyed by the renamed path, which is now inside the claim in processing.
-    assert [(p.name, b) for p, b in parent_pairs] == [("Berserk ch. 4 (2019).cbz", accepted_backup)]
+    assert [(p.name, b) for p, b in parent_pairs] == [("Berserk Ch. 4 (2019).cbz", accepted_backup)]
 
 
 def test_the_probe_layout_offloads_only_the_routed_original(ai_watch):
@@ -985,7 +986,7 @@ def test_an_all_success_directory_still_offloads_its_originals(ai_watch):
 
     watcher.process_and_move_directory(arrival)
 
-    assert (library / "Berserk" / "Berserk ch. 4 (2019).cbz").is_file()
+    assert (library / "Berserk" / "Berserk Ch. 4 (2019).cbz").is_file()
     assert offloaded == [(backup_of["volvox Chapter (2019).cbz"], "Berserk")]
 
 

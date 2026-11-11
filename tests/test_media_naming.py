@@ -163,8 +163,8 @@ def _watcher_name(tmp_path, filename, series="Usogui"):
 @pytest.mark.parametrize("filename, expected", [
     # Taken from the 2026-11-09 Usogui arrival, where all 54 such side
     # stories were refused and held the whole 710-file directory back.
-    ("Inglorious Vol.44 Ch.483.5 - Volume 44 Side Story.cbz", "Usogui v44 ch. 483.5.cbz"),
-    ("Team Duwang Vol.5 Ch.53.5 - Volume 5 Side Story.cbz", "Usogui v05 ch. 53.5.cbz"),
+    ("Inglorious Vol.44 Ch.483.5 - Volume 44 Side Story.cbz", "Usogui v44 Ch. 483.5.cbz"),
+    ("Team Duwang Vol.5 Ch.53.5 - Volume 5 Side Story.cbz", "Usogui v05 Ch. 53.5.cbz"),
 ])
 def test_a_volume_stated_twice_with_one_value_is_one_claim(tmp_path, filename, expected):
     assert _watcher_name(tmp_path, filename) == expected

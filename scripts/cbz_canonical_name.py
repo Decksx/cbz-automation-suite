@@ -9,7 +9,7 @@ fallback names come from :func:`format_canonical_name`.
 
 The grammar (§2.1), with the special word placed as described below::
 
-    <series> [<special>] [v<VV>] [#<III> | ch. <C>] [(<year>)] [(TPB)] [(<edition>)] [[v<N>]].cbz
+    <series> [<special>] [v<VV>] [#<III> | Ch. <C>] [(<year>)] [(TPB)] [(<edition>)] [[v<N>]].cbz
 
 This module **formats already-resolved fields**. It never resolves them: it
 does not decide whether a ``v`` token is a volume or a version (§3.2), and it
@@ -378,7 +378,7 @@ class CanonicalFields:
     * ``year`` and ``version`` become ``int``.
 
     ``issue`` and ``chapter`` are mutually exclusive. ``volume`` may combine
-    with either: the §2.1 grammar admits ``v<VV> ch. <C>`` even though its
+    with either: the §2.1 grammar admits ``v<VV> Ch. <C>`` even though its
     prose describes chapters as the volume-less form.
 
     ``series_year`` is reboot identity before primary numbering. The issue
@@ -450,10 +450,10 @@ _NUM = rf"{_ENDPOINT}(?:-{_ENDPOINT})?"
 _CANONICAL_RE = re.compile(
     r"(?P<series>.+?)"
     r"(?: \((?P<series_year>[0-9]{4})\)"
-    rf"(?= (?:(?:{_alternation(SPECIAL_WORDS)}) )?(?:v[0-9]|#[0-9]|ch\. [0-9])))?"
+    rf"(?= (?:(?:{_alternation(SPECIAL_WORDS)}) )?(?:v[0-9]|#[0-9]|[Cc]h\. [0-9])))?"
     rf"(?: (?P<special>{_alternation(SPECIAL_WORDS)}))?"
     rf"(?: v(?P<volume>{_NUM}))?"
-    rf"(?: (?:#(?P<issue>{_NUM})|ch\. (?P<chapter>{_NUM})))?"
+    rf"(?: (?:#(?P<issue>{_NUM})|[Cc]h\. (?P<chapter>{_NUM})))?"
     r"(?: \((?P<year>[0-9]{4})\))?"
     r"(?: \((?P<collection>TPB)\))?"
     rf"(?: \((?P<edition>{_alternation(EDITION_WORDS)})\))?"
@@ -474,7 +474,7 @@ def _is_reserved(name: str) -> bool:
     return base.upper() in RESERVED_DEVICE_NAMES
 
 
-def _assemble(fields: CanonicalFields) -> str:
+def _assemble(fields: CanonicalFields, chapter_token: str = "Ch.") -> str:
     parts = [fields.series + (f" ({fields.series_year})" if fields.series_year is not None else "")]
     if fields.special is not None:
         parts.append(fields.special)
@@ -483,7 +483,7 @@ def _assemble(fields: CanonicalFields) -> str:
     if fields.issue is not None:
         parts.append(f"#{_pad(fields.issue, ISSUE_WIDTH)}")
     if fields.chapter is not None:
-        parts.append(f"ch. {fields.chapter}")
+        parts.append(f"{chapter_token} {fields.chapter}")
     if fields.year is not None:
         parts.append(f"({fields.year})")
     if fields.collection is not None:
@@ -546,7 +546,8 @@ def format_canonical_name(
 
 
 def parse_canonical_name(
-    name: str, *, max_length: int = DEFAULT_MAX_NAME_LENGTH
+    name: str, *, max_length: int = DEFAULT_MAX_NAME_LENGTH,
+    lowercase_chapter: bool = False,
 ) -> CanonicalFields:
     """Parse a name produced by :func:`format_canonical_name` back to fields.
 
@@ -556,13 +557,19 @@ def parse_canonical_name(
     ``Batman.CBZ`` are refused with :class:`NotCanonicalNameError`. This is a
     recogniser for already-canonical names, never a parser of arbitrary
     library file names: it classifies nothing from name evidence (§3.2).
+
+    The chapter token is ``Ch.`` (David, 2026-11-10); until PR (C) the
+    formatter wrote ``ch.``. With *lowercase_chapter* that earlier image is
+    accepted too, and only it: the same name with ``ch.`` in the chapter
+    slot, byte for byte otherwise. Its fields are the same, so formatting
+    them gives the ``Ch.`` name, which is how a reader renames it once.
     """
     fields = _parse_unchecked(name)
     try:
         again = format_canonical_name(fields, max_length=max_length)
     except CanonicalNameError as exc:
         raise NotCanonicalNameError(f"{name!r} is not a valid canonical name: {exc}") from exc
-    if again != name:
+    if again != name and not (lowercase_chapter and _assemble(fields, "ch.") == name):
         raise NotCanonicalNameError(f"{name!r} is not canonical; canonical form is {again!r}")
     return fields
 

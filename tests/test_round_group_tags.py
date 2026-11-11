@@ -95,9 +95,9 @@ def _assert_fixpoint(filename: str, folder: str = "Solo Leveling") -> None:
 @pytest.mark.parametrize(
     ("template", "expected"),
     [
-        ("Solo Leveling ch. 5 {tag}.cbz", "Solo Leveling ch. 5.cbz"),
-        ("Solo Leveling {tag} ch. 5.cbz", "Solo Leveling ch. 5.cbz"),
-        ("{tag} Solo Leveling ch. 5.cbz", "Solo Leveling ch. 5.cbz"),
+        ("Solo Leveling Ch. 5 {tag}.cbz", "Solo Leveling Ch. 5.cbz"),
+        ("Solo Leveling {tag} Ch. 5.cbz", "Solo Leveling Ch. 5.cbz"),
+        ("{tag} Solo Leveling Ch. 5.cbz", "Solo Leveling Ch. 5.cbz"),
     ],
     ids=["trailing", "after-series", "leading"],
 )
@@ -115,7 +115,7 @@ def test_english_is_dropped_in_any_case(spelling):
     entry; it is now dropped in any case and spacing the edition match
     accepts."""
     assert cbz_core.sanitize_display(f"Book ch. 3 {spelling}") == "Book ch. 3"
-    assert _display(f"Book ch. 3 {spelling}.cbz", "Book") == "Book ch. 3.cbz"
+    assert _display(f"Book Ch. 3 {spelling}.cbz", "Book") == "Book Ch. 3.cbz"
     assert cbz_core.extract_display_tokens(f"Book {spelling}").editions == ()
 
 
@@ -195,9 +195,9 @@ def test_fallback_name_drops_english_and_keeps_colored():
     """Before hive #2646 (English) and (Colored) were two editions and the
     formatter refused the pair as conflicting; English is now no edition."""
     stem = watcher._fallback_display_stem("Berserk", "4", "Chapter (English) (Colored)")
-    assert stem == "Berserk ch. 4 (Colored)"
+    assert stem == "Berserk Ch. 4 (Colored)"
     stem = watcher._fallback_display_stem("Berserk", "4", "Chapter (ManhwaClub) (Ongoing)")
-    assert stem == "Berserk ch. 4"
+    assert stem == "Berserk Ch. 4"
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +312,10 @@ def test_a_tagged_arrival_resolves_to_the_existing_series(watch):
 def test_an_english_tagged_arrival_meets_the_existing_copy(watch):
     """Before hive #2646 the display name kept (English), an edition, so
     ``ch. 4 (English)`` was a different book from the existing ``ch. 4``
-    and landed beside it. It is now the same book: one file remains, under
-    the existing name, holding the larger incoming bytes."""
+    and landed beside it. It is now the same book: one file remains,
+    holding the larger incoming bytes. The arrival's name is re-formatted
+    without (English), so it is spelt "Ch." (PR (C)), and the replacement
+    lands under that spelling."""
     watch_root, library = watch
     existing = library / "Solo Leveling"
     _make_cbz(existing / "Solo Leveling ch. 4.cbz", 100)
@@ -324,5 +326,5 @@ def test_an_english_tagged_arrival_meets_the_existing_copy(watch):
 
     watcher.process_and_move_directory(arrival)
 
-    assert sorted(p.name for p in existing.iterdir()) == ["Solo Leveling ch. 4.cbz"]
-    assert _payload_size(existing / "Solo Leveling ch. 4.cbz") == incoming
+    assert sorted(p.name for p in existing.iterdir()) == ["Solo Leveling Ch. 4.cbz"]
+    assert _payload_size(existing / "Solo Leveling Ch. 4.cbz") == incoming
