@@ -113,10 +113,15 @@ library do not churn:
   unchanged. A lone book whose version label is from its file name only
   stays a no-op under its `ch.` name, since a rename could not certify the
   label.
-- The watcher never renames a library file for this. An arrival already
-  carrying a `ch.` canonical name keeps it (the watcher's naming is a no-op
-  on its own output), and an arrival meeting a `ch.` library copy of the same
-  book is the same collision as before.
+- The watcher never renames a library file for this. Since PR (D) it spells
+  every arrival's chapter token `Ch.`: the legacy display path respells a
+  standalone `ch.`/`ch`/`CH.` before a number (only the token; never a `ch`
+  ending a word such as `Beach`, never `Chapter`, never inside a kept
+  `{...}` group), and an arrival carrying the earlier `ch.` canonical name
+  is spelt `Ch.` too. Plain mode, which the library maintenance and
+  sanitizer CLIs use, is unchanged. An arrival meeting a `ch.` library copy
+  of the same book is the same collision as before; when the larger arrival
+  replaces it, the book carries the arrival's `Ch.` name.
 
 **Round-bracket tags in display names: three layers, three authorities.**
 They are kept apart here because only the first was decided on 2026-10-24.
