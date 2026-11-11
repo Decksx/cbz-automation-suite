@@ -121,7 +121,7 @@ def test_english_is_dropped_in_any_case(spelling):
 
 def test_several_tags_together_leave_only_the_name():
     name = "Solo Leveling ch. 5 (ManhwaClub) (Ongoing) (English) (Incognitymous).cbz"
-    assert _display(name) == "Solo Leveling ch. 5.cbz"
+    assert _display(name) == "Solo Leveling Ch. 5.cbz"
 
 
 # ---------------------------------------------------------------------------
@@ -133,14 +133,14 @@ def test_several_tags_together_leave_only_the_name():
 def test_non_language_edition_words_are_kept_among_stripped_tags(edition):
     name = f"Book ch. 3 (ManhwaClub) ({edition.lower()}) (English) (Ongoing).cbz"
     filename = _display(name, "Book")
-    assert filename == f"Book ch. 3 ({edition}).cbz"
+    assert filename == f"Book Ch. 3 ({edition}).cbz"
     _assert_fixpoint(filename, "Book")
 
 
 def test_year_colored_and_version_survive_the_tags_around_them():
     name = "[Group] Solo Leveling ch. 5 (2019) (ManhwaClub) [Colored] (English) [v2] (Ongoing).cbz"
     filename = _display(name)
-    assert filename == "Solo Leveling ch. 5 (2019) (Colored) [v2].cbz"
+    assert filename == "Solo Leveling Ch. 5 (2019) (Colored) [v2].cbz"
     _assert_fixpoint(filename)
 
 
@@ -222,7 +222,7 @@ def test_display_mode_still_changes_only_the_filename():
     path = Path("Solo Leveling (ManhwaClub)/Solo Leveling ch. 5 (English) (Colored).cbz")
     legacy = cbz_core.parse_comic_name(path, rules=NO_TRANSLATE)
     display = cbz_core.parse_comic_name(path, rules=NO_TRANSLATE, display_tokens=True)
-    assert display.filename == "Solo Leveling ch. 5 (Colored).cbz"
+    assert display.filename == "Solo Leveling Ch. 5 (Colored).cbz"
     assert (display.stem, display.series, display.chapter) == (
         legacy.stem, legacy.series, legacy.chapter,
     )
@@ -300,10 +300,11 @@ def test_a_tagged_arrival_resolves_to_the_existing_series(watch):
     watcher.process_and_move_directory(arrival)
 
     assert sorted(p.name for p in library.iterdir()) == ["Solo Leveling"]
-    landed = existing / "Solo Leveling ch. 5 (2019) (Colored).cbz"
+    landed = existing / "Solo Leveling Ch. 5 (2019) (Colored).cbz"
+    # The library's "ch. 4" is left as it is: the watcher names arrivals only.
     assert sorted(p.name for p in existing.iterdir()) == [
-        "Solo Leveling ch. 4.cbz",
         landed.name,
+        "Solo Leveling ch. 4.cbz",
     ]
     assert _payload_size(landed) == 200
     assert not list(watch_root.rglob("*.cbz"))
