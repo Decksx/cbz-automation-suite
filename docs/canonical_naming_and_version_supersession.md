@@ -22,12 +22,13 @@ All from David, 2026-10-22, in the terminal and recorded on #111 and #112:
 
 - **Every archive gets a name that identifies it at a glance.**
   - With volumes: `Series Name v01 #003 (2019).cbz`.
-  - Without volumes: `Series Name ch. 1 (2019).cbz`.
+  - Without volumes: `Series Name Ch. 1 (2019).cbz` (written `ch. 1` until
+    2026-11-10, when David chose `Ch.`; see §2.1).
 - **"v" is ambiguous today.** Many WIP books use `v` for **version**, not
   volume. A later version usually contains every earlier page with new pages
   appended, so earlier versions may be overwritten.
 - **The version designation is kept**, written **`[vN]`** (approved). For
-  example `Series Name ch. 1 (2019) [v3].cbz`. It can never be read as the
+  example `Series Name Ch. 1 (2019) [v3].cbz`. It can never be read as the
   `v01` volume token.
 - **Brackets.** Bracket stripping stays for identity matching, while the
   display name preserves the canonical tokens (§5.5). Confirmed by David on
@@ -85,7 +86,7 @@ strict xfails.
 ### 2.1 Grammar
 
 ```text
-<series> [v<VV>] [#<III> | ch. <C>] [(<year>)] [(<edition>)] [[v<N>]] .cbz
+<series> [v<VV>] [#<III> | Ch. <C>] [(<year>)] [(<edition>)] [[v<N>]] .cbz
 ```
 
 | Part | Rule |
@@ -93,10 +94,29 @@ strict xfails.
 | `<series>` | **Display name.** Human-cased and readable. It is never derived from `series_key`, which is a lossy identity key for matching, never for display. Comes from the decided identity (§3). |
 | `v<VV>` | **Volume**, at least two digits (`v01`). Present only when the volume is established (§3.2). |
 | `#<III>` | **Issue** within a volume, at least three digits (`#003`). |
-| `ch. <C>` | **Chapter**, for books without volumes. Written unpadded, in David's form `ch. 1`. |
+| `Ch. <C>` | **Chapter**, for books without volumes. Written unpadded, in David's form `Ch. 1` (David, 2026-11-10; it was `ch. 1` before, see below). |
 | `(<year>)` | Four-digit year, when established. |
 | `(<edition>)` | An edition variant from a closed list, for example `(Uncensored)` or `(Colored)`. An arrival's display name drops the language tag `(English)` (David, 2026-10-24, hive #2646; see below). |
 | `[v<N>]` | **Version**, for WIP books only, and only when it is verified (§4.6). |
+
+**The chapter token's case (PR (C), David, 2026-11-10).** The formatter wrote
+`ch.` until 2026-11-10 and writes `Ch.` since, everywhere the watcher names a
+file from it: fallback names, the chapter-1 backfill and media naming's
+chapter style. Every reader reads both. The `ch.` names already in the
+library do not churn:
+
+- `parse_canonical_name` accepts exactly the formatter's image, which is now
+  the `Ch.` name. With `lowercase_chapter=True` it also accepts the earlier
+  `ch.` image of the same fields, and nothing else.
+- The canonical planner reads such a name as the canonical name it was and
+  proposes one case-only rename to `Ch.`; the `Ch.` name then plans as
+  unchanged. A lone book whose version label is from its file name only
+  stays a no-op under its `ch.` name, since a rename could not certify the
+  label.
+- The watcher never renames a library file for this. An arrival already
+  carrying a `ch.` canonical name keeps it (the watcher's naming is a no-op
+  on its own output), and an arrival meeting a `ch.` library copy of the same
+  book is the same collision as before.
 
 **Round-bracket tags in display names: three layers, three authorities.**
 They are kept apart here because only the first was decided on 2026-10-24.
@@ -222,8 +242,8 @@ dropped at arrival only by layer 2. They stay unclassified for layer 3.
 
 ### 2.2 Numbers that are not plain integers
 
-- **Fractional numbers** keep their fraction: `#012.5` and `ch. 12.5`.
-- **Ranges** stay ranges: `ch. 1-3` and `v01-02`.
+- **Fractional numbers** keep their fraction: `#012.5` and `Ch. 12.5`.
+- **Ranges** stay ranges: `Ch. 1-3` and `v01-02`.
 - **Specials, extras, omake and one-shots** carry a word from a closed
   list, for example `Series Name Special (2019)`. Anything outside the list
   goes to review.
