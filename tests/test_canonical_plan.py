@@ -77,7 +77,7 @@ def test_ordinary_rename_uses_current_bytes_catalog_ids_and_resolved_fields(env)
     report = plan()
     (rename,) = report["renames"]
     assert rename["source"] == str(source)
-    assert rename["destination"] == str(source.with_name("Series ch. 7.cbz"))
+    assert rename["destination"] == str(source.with_name("Series Ch. 7.cbz"))
     assert rename["archive_id"] == rename["location_id"] == 1
     assert rename["sha256"] == hashlib.sha256(original).hexdigest()
     assert report["counts"] == dict(renames=1, families=0, quarantines=0, keeper_renames=0, review=0)
@@ -113,7 +113,7 @@ def test_a_strict_prefix_family_has_one_keeper_and_owned_quarantine_proposals(en
     (family,) = report["families"]
     assert family["basis"] == "sha256"
     assert family["keeper"]["path"] == str(newer)
-    assert family["keeper"]["rename_to"] == str(newer.with_name("Series ch. 1 [v2].cbz"))
+    assert family["keeper"]["rename_to"] == str(newer.with_name("Series Ch. 1 [v2].cbz"))
     (dep,) = family["dependants"]
     assert dep["path"] == str(older) and dep["index_map"] == [0]
     assert (dep["relation"], dep["outcome"]) == ("strict_prefix", "superseded")
@@ -160,7 +160,7 @@ def test_only_one_current_location_of_one_catalogued_archive_can_be_acted_on(env
 def test_unresolved_or_protected_identity_is_reviewed_instead_of_silently_dropped(env, kind):
     root, db, book, plan = env
     if kind == "directory_is_not_authority":
-        source = book("Series ch. 7.cbz", ci=b"")
+        source = book("Series Ch. 7.cbz", ci=b"")
     elif kind == "unknown_tag":
         source = book("old Ch. 7 [Unknown Edition].cbz")
     elif kind == "year":
@@ -175,7 +175,7 @@ def test_unresolved_or_protected_identity_is_reviewed_instead_of_silently_droppe
 def test_the_current_formatter_owns_edition_vocabulary(env):
     root, db, book, plan = env
     book("old Ch. 7 (English).cbz")
-    assert plan()["renames"][0]["destination"].endswith("Series ch. 7.cbz")
+    assert plan()["renames"][0]["destination"].endswith("Series Ch. 7.cbz")
 
 
 def test_originals_root_is_refused_before_any_archive_is_derived(env, monkeypatch):
@@ -292,7 +292,7 @@ def test_underscore_delimited_decensor_markers_still_require_pairing_evidence(en
 def test_an_occupied_canonical_destination_is_held_even_with_identical_bytes(env, occupant):
     root, db, book, plan = env
     source = book()
-    destination = source.with_name("Series ch. 7.cbz")
+    destination = source.with_name("Series Ch. 7.cbz")
     if occupant == "directory":
         destination.mkdir()
     elif occupant == "case_variant":
@@ -316,7 +316,7 @@ def test_a_keeper_collision_holds_the_entire_family(env):
     root, db, book, plan = env
     book("Series ch. 1 v1.cbz", number="1")
     newer = book("Series ch. 1 v2.cbz", number="1", pages=(b"a", b"b"))
-    newer.with_name("Series ch. 1 [v2].cbz").mkdir()
+    newer.with_name("Series Ch. 1 [v2].cbz").mkdir()
     report = plan()
     assert report["families"] == report["renames"] == []
     assert report["counts"]["quarantines"] == 0
@@ -384,7 +384,7 @@ def test_case_only_rename_remains_a_proposal_for_the_executor(env):
     book("SERIES CH. 7.cbz")
     report = plan()
     assert len(report["renames"]) == 1 and not report["review"]
-    assert report["renames"][0]["destination"].endswith("Series ch. 7.cbz")
+    assert report["renames"][0]["destination"].endswith("Series Ch. 7.cbz")
 
 
 def test_case_only_rename_uses_windows_semantics_when_host_normcase_is_identity(env, monkeypatch):
@@ -413,7 +413,7 @@ def test_conclusively_volume_classified_v_is_not_an_unresolved_version(env, numb
     source = book("Series v1.cbz" if number is None else "Series v1 Ch. 3.cbz", ci=ci)
     report = plan()
     assert not report["review"] and len(report["renames"]) == 1
-    expected = "Series v01.cbz" if number is None else "Series v01 ch. 3.cbz"
+    expected = "Series v01.cbz" if number is None else "Series v01 Ch. 3.cbz"
     assert report["renames"][0]["destination"] == str(source.with_name(expected))
 
 
@@ -446,7 +446,7 @@ def test_a_generated_volume_plan_applies_recovers_and_undoes_through_the_real_ex
     parsed = parse_plan(document)
     forward = executor.apply(parsed, library_root=root, database=db, quiescence=lambda _: None)
     assert forward.stopped is None and forward.units[0]["status"] == executor.UNIT_COMPLETED
-    assert plan()["unchanged"][0]["path"].endswith("Series v02 ch. 12.cbz")
+    assert plan()["unchanged"][0]["path"].endswith("Series v02 Ch. 12.cbz")
     recovered = executor.recover(parsed, library_root=root, database=db,
         attempt_id=forward.attempt_id, quiescence=lambda _: None)
     assert recovered.resolutions[0]["status"] == executor.RES_COMPLETE
@@ -470,7 +470,7 @@ def test_an_applied_family_keeper_is_unchanged_without_certifying_its_lone_versi
     second = plan()
     assert not second["families"] and not second["renames"] and not second["review"]
     (unchanged,) = second["unchanged"]
-    assert unchanged["path"].endswith("Series ch. 1 [v2].cbz")
+    assert unchanged["path"].endswith("Series Ch. 1 [v2].cbz")
     assert unchanged["diagnostic"] == "unverified_version_label"
     assert "version" not in unchanged and "family" not in unchanged
     assert second["diagnostics"] == {"unverified_version_labels": 1}
@@ -485,7 +485,7 @@ def test_an_applied_family_keeper_is_unchanged_without_certifying_its_lone_versi
 
 def test_a_lone_canonical_version_is_reviewed_when_a_resolved_field_would_change_it(env):
     root, db, book, plan = env
-    book("Series ch. 1 [v2].cbz", number="2")
+    book("Series Ch. 1 [v2].cbz", number="2")
     report = plan()
     assert report["review"] and not report["unchanged"] and not report["renames"]
 
@@ -493,7 +493,7 @@ def test_a_lone_canonical_version_is_reviewed_when_a_resolved_field_would_change
 def test_another_book_in_the_same_identity_group_restores_normal_version_evidence_rules(env):
     """A co-member still requires the full family proof, even for a no-op."""
     root, db, book, plan = env
-    source = book("Series ch. 1 [v2].cbz", number="1")
+    source = book("Series Ch. 1 [v2].cbz", number="1")
     book("old Ch. 1.cbz", number="1", pages=(b"different",))
     report = plan()
     assert report["diagnostics"]["unverified_version_labels"] == 0
@@ -503,7 +503,7 @@ def test_another_book_in_the_same_identity_group_restores_normal_version_evidenc
 
 def test_a_canonical_version_with_an_unverified_label_is_a_zero_exit_noop(env, capsys):
     root, db, book, plan = env
-    book("Series ch. 1 [v2].cbz", number="1")
+    book("Series Ch. 1 [v2].cbz", number="1")
     assert main(["--library-root", str(root), "--database", str(db),
                  "--quarantine-date", "2026-10-24", "--number-style", "chapter"]) == 0
     report = json.loads(capsys.readouterr().out)
@@ -513,7 +513,7 @@ def test_a_canonical_version_with_an_unverified_label_is_a_zero_exit_noop(env, c
 
 def test_an_already_canonical_archive_is_unchanged(env):
     root, db, book, plan = env
-    source = book("Series ch. 7.cbz")
+    source = book("Series Ch. 7.cbz")
     report = plan()
     assert report["renames"] == report["review"] == []
     assert report["unchanged"][0]["path"] == str(source)
@@ -705,8 +705,8 @@ def _junction(link: Path, target: Path) -> None:
 def test_lone_label_is_scoped_to_its_identity_group(env, series, number):
     """Other chapters or series in one folder do not certify or block a label."""
     root, db, book, plan = env
-    source = book("Series ch. 1 [v2].cbz", number="1")
-    book(f"{series} ch. {number}.cbz", series=series, number=number, folder=series)
+    source = book("Series Ch. 1 [v2].cbz", number="1")
+    book(f"{series} Ch. {number}.cbz", series=series, number=number, folder=series)
     report = plan()
     assert not report["review"] and not report["renames"] and not report["families"]
     assert report["diagnostics"] == {"unverified_version_labels": 1}
@@ -814,7 +814,7 @@ def test_output_alias_into_library_is_refused_before_planning(env, tmp_path, mon
 def test_saved_receipt_preserves_nonzero_diagnostics(env, tmp_path, capsys):
     """The receipt must expose the same unverified-label count as its file."""
     root, db, book, plan = env
-    book("Series ch. 1 [v2].cbz", number="1")
+    book("Series Ch. 1 [v2].cbz", number="1")
     output = tmp_path / "report.json"
     assert main(["--library-root", str(root), "--database", str(db),
                  "--quarantine-date", "2026-10-24", "--number-style", "chapter", "--output", str(output)]) == 0
@@ -1092,7 +1092,7 @@ def test_a_skipped_scope_drops_its_unchanged_rows(env, monkeypatch):
     """The unchanged-row filter had no direct witness either (#159 R2)."""
     root, db, book, plan = env
     alpha = book(series="Alpha", folder="Alpha")
-    book("Beta ch. 7.cbz", series="Beta", folder="Beta")
+    book("Beta Ch. 7.cbz", series="Beta", folder="Beta")
     baseline = plan(scoped=True)
     assert any(Path(u["path"]).parent.name == "Beta" for u in baseline["unchanged"])
     _mutate_once(monkeypatch, lambda: (root / "Beta" / "late.txt").write_text("x"))
@@ -1132,3 +1132,51 @@ def test_an_unrequested_series_folder_vanishing_is_not_this_plans_concern(env, m
     report = plan(scopes=["Alpha"])
     assert [r["source"] for r in report["renames"]] == [str(alpha)]
     assert report["skipped_scopes"] == []
+
+
+# PR (C): the canonical chapter token is "Ch." (David, 2026-11-10). A library
+# file the formatter named before, with "ch.", is renamed once; never back.
+
+
+def test_an_earlier_lowercase_chapter_name_is_renamed_once(env):
+    root, db, book, plan = env
+    source = book("Series ch. 7.cbz")
+    first = plan()
+    assert not first["review"] and len(first["renames"]) == 1
+    destination = Path(first["renames"][0]["destination"])
+    assert destination.name == "Series Ch. 7.cbz" and destination.parent == source.parent
+    source.rename(destination)
+    with database_connection(db) as connection:
+        connection.execute("UPDATE file_locations SET path=? WHERE path=?", (str(destination), str(source)))
+    second = plan()
+    assert not second["renames"] and not second["review"] and not second["families"]
+    assert second["unchanged"][0]["path"] == str(destination)
+    assert [p.name for p in destination.parent.iterdir()] == ["Series Ch. 7.cbz"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the executor rename protocol is Windows-only")
+def test_the_lowercase_rename_applies_through_the_real_executor_and_settles(env):
+    root, db, book, plan = env
+    source = book("Series ch. 7 (2019).cbz",
+                  ci=b"<ComicInfo><Series>Series</Series><Number>7</Number><Year>2019</Year></ComicInfo>")
+    markers.install_schema(db)
+    forward = executor.apply(parse_plan(plan()), library_root=root, database=db, quiescence=lambda _: None)
+    assert forward.stopped is None and forward.units[0]["status"] == executor.UNIT_COMPLETED
+    assert [p.name for p in source.parent.iterdir()] == ["Series Ch. 7 (2019).cbz"]
+    again = plan()
+    assert not again["renames"] and not again["review"]
+    assert again["unchanged"][0]["path"].endswith("Series Ch. 7 (2019).cbz")
+
+
+def test_a_lone_lowercase_name_with_an_unverified_version_label_keeps_its_name(env):
+    """A lone filename-only version label is a no-op in either spelling: a
+    rename could not certify the label, so the "ch." name is left as it is
+    (unchanged, with the diagnostic), neither renamed nor held for review."""
+    root, db, book, plan = env
+    source = book("Series ch. 1 [v2].cbz", number="1")
+    report = plan()
+    assert not report["renames"] and not report["families"] and not report["review"]
+    (unchanged,) = report["unchanged"]
+    assert unchanged["path"] == str(source)
+    assert unchanged["diagnostic"] == "unverified_version_label"
+    assert report["diagnostics"] == {"unverified_version_labels": 1}
