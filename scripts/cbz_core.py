@@ -172,6 +172,114 @@ GIBBERISH_RE = re.compile(
 )
 
 _BRACKET_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+# A bracket that holds only a number range ("(1-30)", "[01~12]"): a
+# compilation's chapter span, kept (unbracketed) when brackets are dropped.
+# The separators a number range is written with: hyphen, en dash, tilde, and
+# the CJK wave dash and fullwidth tilde ("1-30", "1\u201330", "1~30",
+# "1\u301c30", "1\uff5e30"), with or without spaces around them.
+_RANGE_SEP = r"[-\u2013~\u301c\uff5e]"
+BRACKETED_RANGE_RE = re.compile(
+    r"[\[(]\s*(\d+(?:\.\d+)?\s*" + _RANGE_SEP + r"\s*\d+(?:\.\d+)?)\s*[\])]")
+# What follows a number when it starts a range: "1-30", "1 - 30", "1–30",
+# "1~30".
+_RANGE_TAIL_RE = re.compile(r"\s*" + _RANGE_SEP + r"\s*(\d+(?:\.\d+)?)")
+# What precedes a number when it ends a range: "1-" of "1-30" (CJK markers and
+# trailing bare numbers come after the last number, "\u7b2c1-30\u8a71").
+_RANGE_HEAD_RE = re.compile(r"(\d+(?:\.\d+)?)\s*" + _RANGE_SEP + r"\s*$")
+# A number range anywhere in a text ("1-30", "1 ~ 30").
+_RANGE_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*" + _RANGE_SEP + r"\s*(\d+(?:\.\d+)?)")
+
+
+# A range with its marker, as a name spells it: "Ch. 1-30", "#1-30",
+# "Vol. 1-3", "v01-03", "第1-30話", "1-3巻".
+_MARKED_RANGE_RE = re.compile(
+    r"(?:(?P<vol>vol(?:ume)?s?\.?|v)|(?P<ch>ch(?:ap(?:ter)?)?s?\.?|#|issues?)|第)?\s*"
+    r"(?P<range>\d+(?:\.\d+)?\s*" + _RANGE_SEP + r"\s*\d+(?:\.\d+)?)"
+    r"(?P<cjk>\s*[話话章回巻卷])?",
+    re.IGNORECASE,
+)
+
+
+def _marked_range(text: str) -> tuple[str, str] | None:
+    """The first ascending range in *text* with its kind, or None.
+
+    The kind is ``"vol"`` (``Vol. 1-3``, ``v01-03``, ``1-3巻``), ``"ch"``
+    (``Ch. 1-30``, ``#1-30``, ``第1-30話``) or ``""`` for a bare range.
+    """
+    for match in _MARKED_RANGE_RE.finditer(text):
+        span = _ascending_range(match.group("range"), anchored=True)
+        if span is None or span.end() != len(match.group("range")):
+            continue
+        cjk = (match.group("cjk") or "").strip()
+        if match.group("vol") or cjk in ("\u5dfb", "\u5377"):
+            return "vol", match.group("range")
+        return ("ch" if match.group("ch") or cjk else ""), match.group("range")
+    return None
+
+
+# Where a name's numbering starts: the first volume, chapter, issue or episode
+# token, a CJK or Korean number marker, or a range ("Vol. 1-3", "Ch.30", "#5",
+# "第1-30話", "3巻", "1-30"). Everything from there to the end is the numbering
+# span a translated title keeps verbatim (``_split_numbering``).
+_NUMBERING_START_RE = re.compile(
+    r"(?<![^\W\d_])(?:"
+    r"vol(?:ume)?s?\.?\s*\d|v\d|ch(?:ap(?:ter)?)?s?p?\.?\s*\d|#\s*\d"
+    r"|issues?\.?\s*\d|ep(?:isode)?s?\.?\s*\d|\u7b2c\s*\d"
+    r"|\d+(?:\.\d+)?\s*[\u8a71\u8bdd\u7ae0\u56de\u5dfb\u5377\ud654\uad8c]"
+    r"|\d+(?:\.\d+)?\s*" + _RANGE_SEP + r"\s*\d)",
+    re.IGNORECASE,
+)
+
+
+def _split_numbering(stem: str) -> tuple[str, str] | None:
+    """Split *stem* into its title and its numbering span, or None.
+
+    The span runs from the first numbering token to the end, untouched
+    (``"漫画 Vol. 1-3 Ch. 31-60"`` -> ``("漫画", "Vol. 1-3 Ch. 31-60")``). A
+    stem with no numbering is all title (``("漫画", "")``). None when the two
+    cannot be told apart cleanly: no title before the numbering, or a digit
+    left in the title (a bare number the markers do not cover). A translated
+    title then keeps the arrival's name rather than lose its numbering
+    (PR #180 review round 4).
+    """
+    match = _NUMBERING_START_RE.search(stem)
+    title = (stem[:match.start()] if match else stem).strip(" .-_")
+    span = stem[match.start():].strip() if match else ""
+    if not title or any(char.isdigit() for char in title):
+        return None
+    return title, span
+
+
+def range_in(text: str) -> tuple[str, str] | None:
+    """The first ascending range in *text*, such as a folder name, or None.
+
+    For a name rebuilt from folder context (the watcher's fallback name for
+    a placeholder in ``Berserk Ch. 1-30``): the range labels the name, and
+    is never a chapter or volume field. Returns ``(kind, "N-M")``: the kind
+    is ``"vol"``, ``"ch"`` or ``""`` (bare), and the range is in the
+    canonical formatter's spelling (``1~30`` gives ``1-30``), the only
+    range form it accepts.
+    """
+    found = _marked_range(text)
+    if found is None:
+        return None
+    span = _ascending_range(found[1], anchored=True)
+    return found[0], f"{span.group(1)}-{span.group(2)}"
+
+
+def _ascending_range(text: str, at: int = 0, anchored: bool = False) -> re.Match | None:
+    """The first ascending number range in *text* from *at* (at *at* when
+    *anchored*), or None. A descending or equal pair is not a range."""
+    found = (_RANGE_RE.match(text, at),) if anchored else _RANGE_RE.finditer(text, at)
+    for match in found:
+        if match is None:
+            continue
+        try:
+            if float(match.group(2)) > float(match.group(1)):
+                return match
+        except ValueError:
+            pass
+    return None
 _DECENSOR_MARKER_RE = re.compile(r"\b(?:uncensored|decensored)\b", re.IGNORECASE)
 _STRAY_RE = re.compile(r"[\[\]()]")
 _SPACES_RE = re.compile(r" {2,}")
@@ -349,6 +457,9 @@ def _extract_num_suffix(parts: list[str], chosen: str) -> str:
     Prevents ``shorten_mixed_original_title`` from silently dropping chapter
     numbers that happen to sit in the non-Latin segment, e.g.
     ``"One Piece / ワンピース Ch.005"`` -> chosen ``"One Piece"``, suffix ``" Ch.005"``.
+    A token that starts an ascending range keeps both ends (``" Ch. 1-30"``),
+    so the range is never cut to its first number here, before
+    ``extract_chapter_number`` can see it (PR #180 review).
     """
     for part in parts:
         if part == chosen:
@@ -357,12 +468,20 @@ def _extract_num_suffix(parts: list[str], chosen: str) -> str:
         vol = _VOLUME_NUMBER_RE.search(part)
         ch  = _CHAPTER_NUMBER_RE.search(part)
         if vol:
-            tokens.append(part[vol.start():vol.end()])
+            tokens.append(part[vol.start():_token_end(part, vol)])
         if ch:
-            tokens.append(part[ch.start():ch.end()])
+            tokens.append(part[ch.start():_token_end(part, ch)])
         if tokens:
             return " " + " ".join(tokens)
     return ""
+
+
+def _token_end(text: str, match: re.Match) -> int:
+    """Where a number token ends: after its range's second end, if it starts one."""
+    value = next(group for group in match.groups() if group is not None)
+    if _starts_range(text, match, value):
+        return _RANGE_TAIL_RE.match(text, match.end()).end()
+    return match.end()
 
 
 def shorten_mixed_original_title(text: str, max_length: int = 120) -> str:
@@ -378,7 +497,23 @@ def shorten_mixed_original_title(text: str, max_length: int = 120) -> str:
     if not _CJK_RE.search(text):
         return text
 
-    parts = [p.strip() for p in _MIXED_TITLE_SPLIT_RE.split(text) if p.strip()]
+    # An ascending range ("1 ~ 30", "1 - 30") is one number, never two title
+    # segments; a descending pair ("5 - 3 Kittens") still splits as before.
+    spans: list[str] = []
+
+    def hold(match: re.Match) -> str:
+        try:
+            ascending = float(match.group(2)) > float(match.group(1))
+        except ValueError:
+            ascending = False
+        if not ascending:
+            return match.group(0)
+        spans.append(match.group(0))
+        return f"\ue000{len(spans) - 1}\ue001"
+
+    held = _RANGE_RE.sub(hold, text)
+    parts = [re.sub("\ue000(\\d+)\ue001", lambda m: spans[int(m.group(1))], p).strip()
+             for p in _MIXED_TITLE_SPLIT_RE.split(held) if p.strip()]
     if len(parts) < 2 and len(text) <= max_length:
         return text
 
@@ -694,6 +829,8 @@ def _sanitize_core(text: str, rules: set[str]) -> str:
     text = _GCODE_RE.sub("", text)
 
     if "brackets" in rules:
+        # A bracketed chapter range is the name's number, not a tag: kept.
+        text = BRACKETED_RANGE_RE.sub(r" \1 ", text)
         text = _BRACKET_RE.sub("", text)
         text = _STRAY_RE.sub("", text)
 
@@ -1154,7 +1291,9 @@ def extract_trailing_bare_number(name: str) -> str | None:
     which this function is meant to be paired with.
     """
     m = _TRAILING_BARE_NUMBER_RE.search(name)
-    return _num_field(m.group(1)) if m else None
+    if m is None or _ends_range(name, m.start(1), m.group(1)):
+        return None  # "Series 1-30": a range's last number is not a chapter
+    return _num_field(m.group(1))
 
 
 def is_generic(text: str) -> bool:
@@ -1238,7 +1377,14 @@ def normalize_stem(stem: str, dir_name: str) -> str:
     generic = GENERIC_CHAPTER_RE.match(stem)
     if generic:
         number = _fmt_num_text(generic.group(1))
-        suffix = generic.group(2).strip(" -_")
+        rest = generic.group(2)
+        span = _ascending_range(stem, generic.start(1), anchored=True)
+        if span is not None:
+            # "Chapter 1-30" is chapters 1 to 30: the range is the number,
+            # never "Ch. 1" followed by a stray "30" (PR #180 review).
+            number = span.group(0)
+            rest = stem[span.end():]
+        suffix = rest.strip(" -_")
         result = f"{dir_name} Ch. {number}"
         return result + (f" {suffix}" if suffix else "")
 
@@ -1252,9 +1398,44 @@ def normalize_stem(stem: str, dir_name: str) -> str:
         return f"{dir_name} Ch. {number}"
 
     if is_generic(stem):
+        span = _ascending_range(stem)
+        if span is not None:  # "Chapters 1-30": the range, never just the folder
+            return f"{dir_name} Ch. {span.group(0)}"
         return dir_name
 
     return stem
+
+
+def _starts_range(stem: str, match: re.Match, value: str) -> bool:
+    """Whether the number *match* read is the first end of an ascending range.
+
+    ``Ch. 1-30`` is chapters 1 to 30, not chapter 1: a range is never taken
+    for its first number (the field is then left unset). A descending or
+    equal second number (``Ch. 5 - 3 Kittens``) is not a range.
+    """
+    tail = _RANGE_TAIL_RE.match(stem, match.end())
+    if tail is None:
+        return False
+    try:
+        return float(tail.group(1)) > float(value.rstrip("."))
+    except ValueError:
+        return False
+
+
+def _ends_range(text: str, start: int, value: str) -> bool:
+    """Whether the number at *start* is the last end of an ascending range.
+
+    The counterpart of ``_starts_range`` for numbers read after the range:
+    the CJK markers (``\u7b2c1-30\u8a71`` reads ``30`` before ``\u8a71``) and a
+    trailing bare number (``Series 1-30``). Never a field (PR #180 review).
+    """
+    head = _RANGE_HEAD_RE.search(text[:start])
+    if head is None:
+        return False
+    try:
+        return float(head.group(1)) < float(value.rstrip("."))
+    except ValueError:
+        return False
 
 
 def extract_chapter_number(stem: str) -> str | None:
@@ -1262,6 +1443,8 @@ def extract_chapter_number(stem: str) -> str | None:
     if not match:
         return None
     value = next(group for group in match.groups() if group is not None)
+    if _starts_range(stem, match, value):
+        return None
     return _num_field(value)
 
 
@@ -1270,6 +1453,8 @@ def extract_volume_number(stem: str) -> str | None:
     if not match:
         return None
     value = match.group(1) or match.group(2)
+    if _starts_range(stem, match, value):
+        return None
     return _num_field(value)
 
 
@@ -1386,7 +1571,8 @@ def _without_group_prefix(name: str) -> str:
 
 def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
     """The stem normalisation that follows cleaning in :func:`parse_comic_name`."""
-    if "leading_nums" in rules:
+    if "leading_nums" in rules and _ascending_range(stem, anchored=True) is None:
+        # A leading index ("01 - Title") goes; a leading range ("1-30") stays.
         stem = NUMBER_PREFIX_RE.sub("", stem).strip()
     stem = _SCANLATION_HASH_RE.sub("", stem).strip()
     if "normalize_stem" in rules:
@@ -1531,13 +1717,14 @@ def parse_comic_name(
     # malformed one leaves the field unset instead of a guessed number.
     # The greedy run already starts at the leftmost digit; the lookbehind is
     # for a run that starts with a dot (".5話"), whose "5" is a fragment too.
+    # A range's last end ("第1-30話", "1~3巻") is not the field either.
     if chapter is None:
         m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[話话章]", raw_stem)
-        if m:
+        if m and not _ends_range(raw_stem, m.start(1), m.group(1)):
             chapter = _num_field(m.group(1))
     if volume is None:
         m = re.search(r"第?\s*(?<![\d.])(\d[\d.]*)\s*[巻卷]", raw_stem)
-        if m:
+        if m and not _ends_range(raw_stem, m.start(1), m.group(1)):
             volume = _num_field(m.group(1))
 
     # Translation handling: native CJK titles are always eligible; romanized
@@ -1554,6 +1741,9 @@ def parse_comic_name(
         if original is not None:
             # Translate only the title portion; strip chapter/volume tokens so the
             # translator sees just the name (e.g. "鬼滅の刃 Ch. 5" -> "鬼滅の刃").
+            # For the file's own name the title is split from its numbering
+            # first (_split_numbering): the numbering is kept, not rebuilt.
+            split = _split_numbering(source) if source == raw_stem else None
             title_part = _NUM_TOKEN_RE.sub("", source)
             title_part = re.sub(
                 r"\b(?:ch|chap|chapter|chp|vol|volume|v|ep|episode|issue|part)\b\.?",
@@ -1562,6 +1752,8 @@ def parse_comic_name(
             # CJK volume/chapter markers: 第N話 / 第N巻 / 第N章 and bare N話/N巻/N章.
             title_part = re.sub(r"第?\s*\d+\s*[話巻章话卷]", "", title_part).strip(" .-_#")
             title_part = title_part or source
+            if split is not None:
+                title_part = split[0]
             english, original = translate_metadata_text(title_part)
             if original is not None and english and english != title_part:
                 original_title = original
@@ -1570,19 +1762,28 @@ def parse_comic_name(
                 # non-Latin (empty, punctuation-only, or still CJK), so the file
                 # gets a human/Komga-readable name. The untouched original and the
                 # translation are preserved in ComicInfo metadata regardless.
-                if source == raw_stem and (
+                if source == raw_stem and split is not None and (
                     not stem
                     or not _LATIN_RE.search(stem)
                     or _CJK_RE.search(stem)
                     or _looks_romanized_cjk(title_part, None)
                 ):
+                    # The translated title, then the arrival's numbering. One
+                    # number that is a chapter or volume is written as before,
+                    # David's style ("漫画 第3話" -> "Story Ch. 3"). A range, or
+                    # more than one number, is kept as written, apart from the
+                    # usual cleaning ("漫画 Vol. 1-3 Ch. 31-60" -> "Story Vol.
+                    # 1-3 Ch. 31-60"): the parsed fields hold one number at most.
                     english_stem = sanitize(english, rules) or english
-                    rebuilt = english_stem
-                    if chapter:
-                        rebuilt = f"{english_stem} Ch. {chapter}"
-                    elif volume:
-                        rebuilt = f"{english_stem} Vol. {volume}"
-                    stem = rebuilt.strip() or stem
+                    span = sanitize(split[1], rules) if split[1] else ""
+                    # One number (a range always holds two).
+                    single = len(re.findall(r"\d+(?:\.\d+)?", span)) == 1
+                    if single and chapter:
+                        stem = f"{english_stem} Ch. {chapter}"
+                    elif single and volume:
+                        stem = f"{english_stem} Vol. {volume}"
+                    else:
+                        stem = f"{english_stem} {span}".strip() or stem
                     translated_stem = stem
 
     display = (
