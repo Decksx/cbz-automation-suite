@@ -8,7 +8,7 @@ approval. No old Tower plan is approved for this new naming policy.
 ## Shared grammar
 
 Western issues use `Series #003 (2019).cbz` when a year is resolved. Manga,
-manhwa and webtoon chapters use `Series ch. 3.cbz`. Manga volumes retain
+manhwa and webtoon chapters use `Series Ch. 3.cbz`. Manga volumes retain
 `v01` without a TPB marker. A collected Western edition uses
 `Series v01 (TPB).cbz`; the collection marker is separate from the existing
 edition slot, so `Series v01 (TPB) (Colored).cbz` preserves both facts.
