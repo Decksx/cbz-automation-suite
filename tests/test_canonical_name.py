@@ -69,7 +69,7 @@ def test_canonical_name_is_a_fixpoint():
 
 def test_version_marker_can_never_parse_as_a_volume():
     name = fmt(F("Series Name", chapter=1, year=2019, version=3))
-    assert name == "Series Name ch. 1 (2019) [v3].cbz"
+    assert name == "Series Name Ch. 1 (2019) [v3].cbz"
     parsed = parse(name)
     assert parsed.volume is None
     assert parsed.version == 3
@@ -84,12 +84,12 @@ def test_version_marker_can_never_parse_as_a_volume():
 def test_fractional_range_and_special_numbers_round_trip():
     expected = {
         F("S", issue="12.5"): "S #012.5.cbz",
-        F("S", chapter="12.5"): "S ch. 12.5.cbz",
-        F("S", chapter="1-3"): "S ch. 1-3.cbz",
+        F("S", chapter="12.5"): "S Ch. 12.5.cbz",
+        F("S", chapter="1-3"): "S Ch. 1-3.cbz",
         F("S", volume="01-02"): "S v01-02.cbz",
         F("S", volume=1, issue="1-3"): "S v01 #001-003.cbz",
         F("S", issue="0"): "S #000.cbz",
-        F("S", chapter="1.5-2"): "S ch. 1.5-2.cbz",
+        F("S", chapter="1.5-2"): "S Ch. 1.5-2.cbz",
         F("Series Name", special="Special", year=2019): "Series Name Special (2019).cbz",
         F("S", special="One-shot"): "S One-shot.cbz",
     }
@@ -100,7 +100,7 @@ def test_fractional_range_and_special_numbers_round_trip():
 
 def test_display_name_keeps_year_version_and_edition_tokens():
     name = fmt(F("Series Name", chapter=1, year=2019, edition="Colored", version=2))
-    assert name == "Series Name ch. 1 (2019) (Colored) [v2].cbz"
+    assert name == "Series Name Ch. 1 (2019) (Colored) [v2].cbz"
     for token in ("(2019)", "(Colored)", "[v2]"):
         assert token in name
 
@@ -112,8 +112,8 @@ def test_display_name_keeps_year_version_and_edition_tokens():
 
 def test_operator_examples_format_exactly():
     assert fmt(F("Series Name", volume=1, issue=3, year=2019)) == "Series Name v01 #003 (2019).cbz"
-    assert fmt(F("Series Name", chapter=1, year=2019)) == "Series Name ch. 1 (2019).cbz"
-    assert fmt(F("Series Name", chapter=1, year=2019, version=3)) == "Series Name ch. 1 (2019) [v3].cbz"
+    assert fmt(F("Series Name", chapter=1, year=2019)) == "Series Name Ch. 1 (2019).cbz"
+    assert fmt(F("Series Name", chapter=1, year=2019, version=3)) == "Series Name Ch. 1 (2019) [v3].cbz"
 
 
 def test_series_only_name():
@@ -136,7 +136,7 @@ def test_issue_is_padded_to_at_least_three_digits(issue, expected):
     assert fmt(F("S", issue=issue)) == f"S {expected}.cbz"
 
 
-@pytest.mark.parametrize(("chapter", "expected"), [(1, "ch. 1"), ("001", "ch. 1"), ("12.5", "ch. 12.5"), (100, "ch. 100")])
+@pytest.mark.parametrize(("chapter", "expected"), [(1, "Ch. 1"), ("001", "Ch. 1"), ("12.5", "Ch. 12.5"), (100, "Ch. 100")])
 def test_chapter_is_unpadded(chapter, expected):
     assert fmt(F("S", chapter=chapter)) == f"S {expected}.cbz"
 
@@ -144,7 +144,7 @@ def test_chapter_is_unpadded(chapter, expected):
 def test_fraction_digits_are_kept_verbatim():
     # "12.50" is not silently shortened to "12.5": whether the zero matters
     # is a resolution question.
-    assert fmt(F("S", chapter="12.50")) == "S ch. 12.50.cbz"
+    assert fmt(F("S", chapter="12.50")) == "S Ch. 12.50.cbz"
     assert F("S", chapter="12.50") != F("S", chapter="12.5")
 
 
@@ -157,7 +157,7 @@ def test_slot_order_is_fixed():
 
 def test_volume_combines_with_chapter():
     # The §2.1 grammar admits it; see the module docstring.
-    assert fmt(F("S", volume=3, chapter=20)) == "S v03 ch. 20.cbz"
+    assert fmt(F("S", volume=3, chapter=20)) == "S v03 Ch. 20.cbz"
 
 
 def test_equivalent_inputs_normalise_to_equal_fields():
@@ -464,11 +464,11 @@ def test_parse_accepts_only_the_formatters_image():
         "Batman v1.cbz",          # unpadded volume
         "Batman #3.cbz",          # unpadded issue
         "Batman #0003.cbz",       # over-padded issue
-        "Batman ch. 01.cbz",      # padded chapter
-        "Batman ch.1.cbz",        # missing space
+        "Batman Ch. 01.cbz",      # padded chapter
+        "Batman Ch.1.cbz",        # missing space
         "Batman.CBZ",             # extension case
         "Batman.cbr",
-        "Batman #001 ch. 1.cbz",  # issue and chapter
+        "Batman #001 Ch. 1.cbz",  # issue and chapter
         "Batman [v0].cbz",
         "CON.cbz",                # reserved
         " Batman.cbz",            # unsanitised series
