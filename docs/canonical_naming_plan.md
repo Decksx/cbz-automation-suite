@@ -222,7 +222,7 @@ syntax and does not bypass field, database, decensor, family or collision guards
 
 The registry SHA256, style, decision source, scope and matching root identity
 are sealed in provenance. Western issues use `#003`, collections use
-`v01 (TPB)`, Manga chapters use `ch. 3`, and Manga volumes omit TPB. A separate
+`v01 (TPB)`, Manga chapters use `Ch. 3`, and Manga volumes omit TPB. A separate
 collection field preserves independent edition variants. Unnumbered Full and
 substantively different folder/ComicInfo titles stay held; normalized-equal
 folder spelling wins display without becoming new series authority. The same
