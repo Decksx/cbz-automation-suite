@@ -598,3 +598,59 @@ run.
 
 Full suite: **5,322 passed / 10 skipped / 0 failed** (5,332 collected =
 5,278 on master + 54 new).
+
+### PR #179 review round 1 (Codex, at `1559d27`)
+
+Rebased onto master `b87b7c8` (#180 merged) after these fixes; only this
+log conflicted (both PRs append to it), and was resolved by keeping
+master's sections and appending this PR's.
+
+**1. A listed name can also be a title (blocking).** `Desire` and `Violet`
+are listed groups but can name books themselves: in a mixed drop,
+`Desire Ch. 1.cbz` and `Violet Ch. 1.cbz` became requests for `Mixed Drop
+Ch. 1.cbz`, one landed and the other was reviewed. Codex's
+`test_review179_identity.py` (SHA256 `fecb9ddd...e612`) fails 12/12 at
+`1559d27`. The list only says a text *can* name a group; the arrival's
+folder must now confirm it (`_drop_confirms_group`): the folder holds one
+series (no subfolders; not a mixed drop point's loose archives, which the
+watcher reports per arrival with `known_groups_mixed_drop`), and every
+archive in it carries that same listed prefix before a chapter token, or is
+already named after the folder's series (a batch is renamed one archive at
+a time). An unreadable or missing folder confirms nothing, so a bare path
+keeps its name. A prefix that is the folder's own series gives the same
+name either way, so no separate check is kept for it.
+
+**2. The structural veto missed normalised forms.** The list match ignores
+NFKC, spacing and punctuation, but the veto read only the raw prefix, so a
+listed `S2`/`V3`/`P2`/`Ep4` also stripped `S 2`, `V 3`, `P 2`, `E.p.4`,
+`Ｓ２`, `Ｖ３`. `_is_structural_prefix` now checks the raw, NFKC,
+separator-free and match-key forms.
+
+**3. An undecodable list raised.** A `known-groups.txt` that is not valid
+UTF-8 raised `UnicodeDecodeError`; it now means no known groups, with one
+warning per version of the file (a missing file stays silent).
+
+Tests: Codex's probe passes 12/12, unmodified. The earlier tests now build
+real arrival folders (parsing needs the folder to confirm). New: listed
+titles in a mixed folder and without a folder, a folder with subfolders, a
+mixed drop's loose archives, siblings already renamed, the six alias
+forms plus the literal ones, an undecodable list (warned once), and three
+watcher passes (two consecutive Mangakakalot chapters both renamed; the
+probe's mixed drop; a lone listed title in a mixed drop). At `1559d27` 26
+fail (five of them only because `_without_group_prefix` takes the folder
+now).
+
+Guards proven by bypass on the rebased tree (failing tests): the 9 new ones
+(folder confirmation 14, mixed drop 3, subfolders 2, every archive 4,
+already-renamed siblings 3, normalised veto 6, undecodable list 1, logged
+once 1, the watcher's report 1), and the 10 earlier ones re-run there
+(known group only 12, exact match 6, group-free display 9, missing list 1,
+re-read 1, hashed path 24, digit override 13, structural checks win 11,
+number markers structural 7, hashed digit rule 2). The sources were hashed
+before the bypass run and the full suite and were unchanged after each.
+
+Watcher edit byte-exact against `b87b7c8`: no unchanged line changed its
+ending; the 5 added lines are CRLF; bare LF stays 863.
+
+Full suite on the rebased tree: **6,412 passed / 10 skipped / 0 failed**
+(6,422 collected = 6,340 on `b87b7c8` + 82 in `test_known_group_prefixes.py`).
