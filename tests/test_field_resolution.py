@@ -1539,8 +1539,8 @@ def test_equal_valued_volume_and_chapter_keep_their_own_spellings():
         series_folder="S",
     )
     expected = {
-        names[0]: ("1", "1.00", "1", "1.0", "S v01.00 ch. 1.0.cbz"),
-        names[1]: ("2", "2", "2", "2.00", "S v02 ch. 2.00.cbz"),
+        names[0]: ("1", "1.00", "1", "1.0", "S v01.00 Ch. 1.0.cbz"),
+        names[1]: ("2", "2", "2", "2.00", "S v02 Ch. 2.00.cbz"),
     }
     for name, (vol, vol_raw, num, num_raw, formatted) in expected.items():
         result = results[name]
