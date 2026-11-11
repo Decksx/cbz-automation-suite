@@ -145,7 +145,7 @@ def test_a_hold_does_not_stop_the_rest_of_the_arrival_from_landing(env, caplog):
         watcher.process_and_move_directory(arrival)
 
     assert existing.read_bytes() == existing_bytes
-    assert _payload(library / "Solo Leveling" / "Solo Leveling ch. 5.cbz") == b"\3" * 80
+    assert _payload(library / "Solo Leveling" / "Solo Leveling Ch. 5.cbz") == b"\3" * 80
     held = _find(env, "Solo Leveling ch. 4 (s2).cbz")
     assert "_review" in held.parts and _payload(held) == b"" * BIG
     assert not arrival.exists()  # claimed whole; only the hold went to review
@@ -298,12 +298,14 @@ def test_noise_tag_higher_res_arrival_replaces(env, caplog, tag):
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    assert _payload(existing) == b"\1" * BIG
-    assert _files(library) == [str(Path("Solo Leveling") / "Solo Leveling ch. 4.cbz")]
+    assert _payload(existing.with_name("Solo Leveling Ch. 4.cbz")) == b"\1" * BIG
+    # The larger copy replaces the book under its own display name, "Ch."
+    # since PR (D) (David, 2026-11-10).
+    assert _files(library) == [str(Path("Solo Leveling") / "Solo Leveling Ch. 4.cbz")]
     assert "HELD FOR REVIEW" not in caplog.text
     assert not arrival.exists()
     if mode == "resolver":
-        loser = quarantine / "Solo Leveling" / "Solo Leveling ch. 4.cbz"
+        loser = quarantine / "Solo Leveling" / "Solo Leveling Ch. 4.cbz"
         assert _payload(loser) == b"\0" * SMALL
     else:
         assert _files(quarantine) == []
@@ -367,7 +369,7 @@ def test_normalised_name_without_a_stripped_tag_still_replaces(env, caplog):
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    assert _payload(existing) == b"\1" * BIG
+    assert _payload(existing.with_name("Solo Leveling Ch. 4.cbz")) == b"\1" * BIG
     assert "HELD FOR REVIEW" not in caplog.text
     assert not arrival.exists()
 
@@ -404,7 +406,7 @@ def test_square_bracket_group_tag_arrival_still_replaces(env, caplog):
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    assert _payload(existing) == b"\1" * BIG
+    assert _payload(existing.with_name("Solo Leveling Ch. 4.cbz")) == b"\1" * BIG
     assert "HELD FOR REVIEW" not in caplog.text
 
 
@@ -448,7 +450,7 @@ def test_stripped_tag_arrival_with_no_collision_still_lands(env, caplog, series_
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
 
-    landed = library / "Solo Leveling" / "Solo Leveling ch. 4.cbz"
+    landed = library / "Solo Leveling" / "Solo Leveling Ch. 4.cbz"
     assert _payload(landed) == b"\1" * BIG
     assert not arrival.exists()
     assert "HELD FOR REVIEW" not in caplog.text
@@ -663,7 +665,7 @@ def test_a_failed_sibling_move_keeps_the_held_tag_for_the_retry(env, monkeypatch
     caplog.clear()
     with caplog.at_level("INFO"):
         watcher.process_and_move_directory(arrival)
-    landed = existing.parent / "Solo Leveling ch. 5.cbz"
+    landed = existing.parent / "Solo Leveling Ch. 5.cbz"
     assert _payload(landed) == b"\3" * 80
     assert existing.read_bytes() == existing_bytes
     assert _payload(_find(env, S2_ARRIVAL)) == b"\1" * BIG
@@ -708,7 +710,7 @@ def test_display_names_on_a_whole_directory_move_never_overwrite(env, monkeypatc
         target = Path(target)
         if path.parent != series:
             return real_rename(path, target)
-        if target.name == "Solo Leveling ch. 6.cbz":
+        if target.name == "Solo Leveling Ch. 6.cbz":
             raise PermissionError("injected: landing rename failed")
         os.replace(path, target)
         return target
@@ -719,7 +721,7 @@ def test_display_names_on_a_whole_directory_move_never_overwrite(env, monkeypatc
 
     payloads = {p.name: _payload(p) for p in series.glob("*.cbz")}
     assert payloads == {
-        "Solo Leveling ch. 4.cbz": b"\1" * BIG,
+        "Solo Leveling Ch. 4.cbz": b"\1" * BIG,
         "Solo Leveling ch. 4 (s3).cbz": b"\2" * 90,
         "Solo Leveling ch. 6 (s2).cbz": b"\4" * 70,
     }
@@ -762,6 +764,6 @@ def test_a_held_archive_keeps_its_ai_original_while_a_routed_sibling_offloads(
     routed_original, = [b for b in backups if _payload(b) == b"\3" * 80]
     assert existing.read_bytes() == existing_bytes
     assert _payload(_find(env, S2_ARRIVAL)) == b"\1" * BIG
-    assert _payload(existing.parent / "Solo Leveling ch. 5.cbz") == b"\3" * 80
+    assert _payload(existing.parent / "Solo Leveling Ch. 5.cbz") == b"\3" * 80
     assert offloaded == [routed_original]
     assert held_original.is_file()

@@ -1767,6 +1767,29 @@ def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
     return stem
 
 
+# A standalone chapter token before a number, in any case and with or
+# without its dot ("ch. 3", "ch 3", "CH.3"). The display name spells it
+# "Ch." (David, 2026-11-10). Never the "ch" that ends a word ("Beach 3",
+# "Punch 3"; the 2026-03 sanitizer bug cut those off), never "Chapter", and
+# never inside a {...} group, which the cleaner keeps as text.
+_CHAPTER_TOKEN_RE = re.compile(r"(?<!\w)ch(?=\.?\s*\d)", re.IGNORECASE)
+
+
+def _display_chapter_token(stem: str) -> str:
+    """*stem* with each standalone chapter token spelt ``Ch.``.
+
+    Only the token changes: ``ch 3`` -> ``Ch. 3``, ``CH.3`` -> ``Ch.3``,
+    ``ch. 3`` -> ``Ch. 3``. Applying it again changes nothing.
+    """
+    def respell(match: re.Match[str]) -> str:
+        start = match.start()
+        if stem.count("{", 0, start) > stem.count("}", 0, start):
+            return match.group(0)
+        return "Ch" if stem.startswith(".", match.end()) else "Ch."
+
+    return _CHAPTER_TOKEN_RE.sub(respell, stem)
+
+
 def _display_stem(
     name: str,
     raw_stem: str,
@@ -1776,9 +1799,9 @@ def _display_stem(
 ) -> str | None:
     """The display stem for :func:`parse_comic_name`, or ``None`` for legacy.
 
-    * A name the canonical formatter already produced is kept verbatim,
-      including one it produced before PR (C) with ``ch.``, which an arrival
-      keeps as it was (the watcher's naming is a no-op on its own output):
+    * A name the canonical formatter already produced is kept, and one it
+      produced before PR (C) with ``ch.`` is spelt ``Ch.`` like every other
+      display name (``_display_chapter_token``):
       re-running the stem pipeline would undo its padding (``v01`` ->
       ``v1``), and keeping it classifies nothing. "Already produced" needs
       more than ``parse_canonical_name``, whose series slot accepts any text:
@@ -1819,7 +1842,9 @@ def _display_stem(
                 fields.edition is None
                 or fields.edition.casefold() not in _DISPLAY_LANGUAGE_WORDS
             ):
-                return raw_stem
+                # The formatter's spelling, so a "ch." name it wrote before
+                # PR (C) is spelt "Ch." like every other display name.
+                return _split_name(format_canonical_name(fields))[0]
             # A canonical name whose edition is a language word the display
             # name drops (hive #2646) loses only that token, and keeps the
             # formatter's spelling of everything else ("v01" stays "v01"):
@@ -1833,10 +1858,12 @@ def _display_stem(
             except CanonicalNameError:
                 pass
     if translated_stem is not None:
-        return append_display_tokens(translated_stem, raw_stem) or None
+        return append_display_tokens(_display_chapter_token(translated_stem), raw_stem) or None
 
     def step(current: str) -> str | None:
-        core = _stem_pipeline(sanitize_without_markers(current, rules), series, rules)
+        core = _display_chapter_token(
+            _stem_pipeline(sanitize_without_markers(current, rules), series, rules)
+        )
         return append_display_tokens(core, current) if core else None
 
     display = _display_fixpoint(step, raw_stem)

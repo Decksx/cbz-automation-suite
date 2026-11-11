@@ -353,7 +353,7 @@ def test_a_failed_move_stays_in_processing_and_lands_on_the_next_pass(watch, tmp
 
     monkeypatch.setattr(watcher, "_move_cbz_dir", real_move)
     watcher.process_and_move_directory(watch_root)
-    assert (library / "Solo Leveling" / "Solo Leveling ch. 4.cbz").is_file()
+    assert (library / "Solo Leveling" / "Solo Leveling Ch. 4.cbz").is_file()
     assert not list((tmp_path / "_processing").rglob("*.cbz"))
 
 

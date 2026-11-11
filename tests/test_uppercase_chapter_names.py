@@ -75,18 +75,23 @@ def test_both_spellings_read_as_the_same_chapter(tmp_path, token):
         assert parse_comic_name(path, display_tokens=display).chapter == "5"
 
 
-@pytest.mark.parametrize("name", [
-    "Berserk v03 Ch. 7.cbz",  # the canonical name now
-    "Berserk v03 ch. 7.cbz",  # the canonical name before PR (C)
-    "Berserk ch. 7.cbz",
+@pytest.mark.parametrize("name, expected", [
+    ("Berserk v03 Ch. 7.cbz", "Berserk v03 Ch. 7.cbz"),  # the canonical name now
+    ("Berserk v03 ch. 7.cbz", "Berserk v03 Ch. 7.cbz"),  # the canonical name before PR (C)
+    ("Berserk ch. 7.cbz", "Berserk Ch. 7.cbz"),
 ])
-def test_an_arrival_with_a_canonical_name_keeps_it(tmp_path, name):
-    """The watcher's naming is a no-op on its own output, either spelling:
-    a "ch." name is left as it is, never renamed back and forth."""
+def test_an_arrival_with_a_canonical_name_keeps_it(tmp_path, name, expected):
+    """A canonical name keeps its padding and tokens; one written before PR
+    (C) is spelt "Ch." like every display name since the legacy display path
+    does too (PR (D)). Either way the result is a fixpoint."""
     path = tmp_path / "Berserk" / name
     path.parent.mkdir()
     path.write_bytes(b"")
-    assert parse_comic_name(path, display_tokens=True).filename == name
+    assert parse_comic_name(path, display_tokens=True).filename == expected
+    again = tmp_path / "again" / expected
+    again.parent.mkdir()
+    again.write_bytes(b"")
+    assert parse_comic_name(again, display_tokens=True).filename == expected
 
 
 def test_a_canonical_name_with_a_dropped_language_edition_is_reformatted_with_Ch(tmp_path):
