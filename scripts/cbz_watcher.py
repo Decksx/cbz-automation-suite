@@ -1384,7 +1384,7 @@ def _apply_fallback_naming(
     resolved series name, with the chapter number implied by the enclosing
     directory (``dir_number``, from ``_resolve_series_dir_name``) when one was
     found. The name comes from the canonical formatter
-    (``_fallback_display_stem``): ``Series ch. 4 (2019) (Uncensored) [v2]``.
+    (``_fallback_display_stem``): ``Series Ch. 4 (2019) (Uncensored) [v2]``.
 
     Without this, files that arrive with an uninformative, group-generic name
     and no chapter number of their own (e.g. every release from a given
@@ -1493,7 +1493,8 @@ def _backfill_chapter_one(dest_dir: Path, series_name: str) -> None:
     (``_fallback_display_stem``), so a backfilled first chapter and the
     fallback-named second one share one spelling. Note this renames a file
     that is already in the library, as it did before design §5.5; only the
-    target spelling changed (``ch. 1``). It is not a bulk canonical rename.
+    target spelling changed (``ch. 1``, and ``Ch. 1`` again since PR (C)).
+    It is not a bulk canonical rename.
     When the formatter refuses, nothing is renamed and a review reason is
     logged: the sibling keeps its bare name, which still differs from the
     incoming numbered chapter's, so the merge cannot collide on it.
