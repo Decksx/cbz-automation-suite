@@ -922,3 +922,126 @@ byte (hashed before; `sha256sum -c` after):
 Full suite: **6,496 passed / 10 skipped / 0 failed** (6,506 collected =
 6,478 on `c996135` + 28 new). Under the case-exact plugin: 6,495 passed and
 the one baseline case-alias failure.
+
+## PR (D): the legacy display path spells the chapter token "Ch."
+
+David approved "uppercase Ch. everywhere" (2026-11-10). After #181 the
+canonical formatter wrote "Ch.", but the legacy display path still kept an
+arrival's own spelling: `Book ch. 3 (ManhwaClub).cbz` landed as
+`Book ch. 3.cbz`. Branch `fix/legacy-display-ch` off `27f4bf4` (#181 merged).
+
+### What changed
+
+All in `scripts/cbz_core.py`, display mode only (`display_tokens=True`, the
+watcher's arrivals):
+
+- `_CHAPTER_TOKEN_RE` / `_display_chapter_token`: a standalone chapter token
+  (`ch`, any case, with or without its dot) followed by a number becomes
+  `Ch.`. Only the token changes: `ch 3` -> `Ch. 3`, `CH.3` -> `Ch.3`,
+  `ch. 3` -> `Ch. 3`, `ch3` -> `Ch.3`. Standalone means no word character
+  before it (`(?<!\w)`), so a `ch` that ends a word (`Beach 3`, `Punch.3`,
+  `Witch3`) is never touched, nor a `ch` glued to CJK text. `Chapter`,
+  `ch. Three`, CJK and Korean markers (`第3話`, `3화`) do not match. A
+  `{...}` group, which the cleaner keeps as text, is left alone; `(...)` and
+  `[...]` groups never reach it (the cleaner drops them, and the display
+  tokens are appended after it runs).
+- Applied to the stem pipeline's output inside the display step, and to a
+  translated stem (`漫画 ch. 1-30` -> `Story Ch. 1-30`).
+- The canonical keep in `_display_stem` returns the formatter's spelling, so
+  an arrival carrying the `ch.` canonical name from before #181 is spelt
+  `Ch.` too. #181 kept it verbatim only because the legacy output kept
+  `ch.`; with the legacy output now `Ch.`, this stays idempotent.
+- Plain mode (`display_tokens=False`) is unchanged: the library maintenance
+  and sanitizer CLIs use it on files already in the library, so nothing in
+  the library is renamed by this.
+
+### The 2026-03 word-ending bug
+
+`tests/test_sanitizer_directory_names.py` records how a `[\s_\-]*` separator
+cut a bare `ch` off the end of words ("Beach" -> "Bea"). The new regex has no
+separator to get wrong: it needs a non-word character (or the start) before
+the `ch` and a number after it. Tested on Beach, Witch, Punch, Lunch and
+Sandwich, plain and display, as the series folder and in the name (bare,
+`3`, glued `3`, `.5 (Digital)`, `3 (ManhwaClub)` through the stem
+pipeline, `ch 3`, `Ch. 3`, `Out of <word> ch 12`), and on the respelling
+function directly. Removing the `(?<!\w)` guard fails 10 tests (5
+end-to-end, 5 direct).
+
+### Corpus: every diff, old (`27f4bf4`) vs new
+
+The suite's `.cbz` literals on `27f4bf4`: 914 names (888 before #181's
+tests), each in a "Series" folder and in a folder named after it, plain and
+display: 3,654 results. 257 differ. All 257 are display mode (no plain
+result changed), and in every one the new name is exactly the old name with
+the chapter token respelt (checked by applying `_display_chapter_token` to
+the old name). Old spellings respelt: `ch. ` 219, `Ch ` 10, `Ch` (glued) 10,
+`CH. ` 8, `ch` (glued) 6, `ch.` (glued) 2, `ch ` 2. The full list is in the
+PR body.
+
+Idempotence (each display result parsed again): 1 name changes on the second
+pass, the same one as on `27f4bf4` (`Manhwa18_Chapter 1_ab12cd`).
+
+### Case-exact witness
+
+The #181 plugin, extended so a `zipfile.ZipFile` read from a test also needs
+the exact case. On `27f4bf4` it flags 3 tests (the case-alias test, and
+`test_normalised_name_without_a_stripped_tag_still_replaces` twice, which
+read a library book that was already renamed `Ch. 4` through its old `ch. 4`
+path). With this PR's updates: only the case-alias test.
+
+### Pinned tests updated deliberately
+
+- `test_round_group_tags.py`: `test_several_tags_together_leave_only_the_name`,
+  `test_non_language_edition_words_are_kept_among_stripped_tags`,
+  `test_year_colored_and_version_survive_the_tags_around_them`,
+  `test_display_mode_still_changes_only_the_filename` (the display filename
+  is `Ch. 5`; the stem, series and chapter still equal plain mode's),
+  `test_a_tagged_arrival_resolves_to_the_existing_series` (the library's
+  `ch. 4` is left as it is; sort order changes).
+- `test_uppercase_chapter_names.py`: `test_an_arrival_with_a_canonical_name_keeps_it`
+  (a `ch.` canonical arrival is now spelt `Ch.`, and the result is a
+  fixpoint).
+- `test_watcher_stripped_collision.py`:
+  `test_noise_tag_higher_res_arrival_replaces` (the replaced book and the
+  quarantined loser carry the arrival's `Ch. 4`),
+  `test_display_names_on_a_whole_directory_move_never_overwrite` (its
+  injected rename failure keyed on `ch. 6`, now `Ch. 6`, so the test still
+  injects it); reads that passed only case-blind:
+  `test_a_hold_does_not_stop_the_rest_of_the_arrival_from_landing`,
+  `test_normalised_name_without_a_stripped_tag_still_replaces`,
+  `test_square_bracket_group_tag_arrival_still_replaces`,
+  `test_stripped_tag_arrival_with_no_collision_still_lands`,
+  `test_a_failed_sibling_move_keeps_the_held_tag_for_the_retry`,
+  `test_a_held_archive_keeps_its_ai_original_while_a_routed_sibling_offloads`.
+- `test_watcher_held_archives.py`:
+  `test_a_failed_move_stays_in_processing_and_lands_on_the_next_pass`
+  (case-blind `is_file`).
+
+### New tests (48)
+
+`tests/test_display_chapter_token.py`: the display spellings, each also a
+fixpoint (13); plain mode unchanged (3); the five word endings, plain and
+display (10); the respelling leaves everything else alone (13: word endings,
+CJK and Korean markers, `Chapter`, `ch. Three`, `{...}`); it changes only the
+token and is idempotent (8); a translated range (1). At `27f4bf4` (with the
+respelling function stood in by identity, since it does not exist there) 24
+fail and 24 pass: the passing ones are the cases that must not change.
+
+### Bypass proofs
+
+| Guard | Failing tests |
+| --- | --- |
+| D1 the display step respells the token | 30 |
+| D2 a translated stem is respelled | 1 |
+| D3 a `ch.` canonical arrival is spelt `Ch.` | 6 |
+| D4 never a `ch` ending a word (`(?<!\w)`) | 10 |
+| D5 only before a number | 2 |
+| D6 any case of the token | 5 |
+| D7 never inside a kept `{...}` group | 2 |
+| D8 an existing dot is not doubled | 145 |
+
+Sources hashed before; `sha256sum -c` OK after; restored byte for byte.
+`scripts/cbz_watcher.py` is untouched (bare LF 863).
+
+Full suite: **6,544 passed / 10 skipped / 0 failed** (6,554 collected =
+6,506 on `27f4bf4` + 48 new).
