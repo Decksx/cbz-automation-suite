@@ -694,3 +694,46 @@ unchanged after each.
 
 Full suite: **6,441 passed / 10 skipped / 0 failed** (6,451 collected =
 6,422 + 29 new).
+
+### PR #179 review round 3 (Codex, at `916278d`)
+
+**P2:** round 2's `_named_after_series` ran the sibling through #180's
+translation splitter, which splits at the first number. A series with a
+digit in its own title (`3XLOVE Uncensored`, `The Toy of 100 Baseball
+Players`, `20th Century Boys`) was split inside the title, so its canonical
+siblings never counted, and `Manhwa18 Chapter 6.cbz` next to `3XLOVE
+Uncensored Ch. 5.cbz` kept the group name. Codex's
+`test_review179_numeric_series.py` (SHA256 `3c601fe3...fcc0`) fails 7/7 at
+`916278d`, and its known-title control passes 7/7.
+
+Fix, per Codex: the folder's series is the anchor. The sibling is folded the
+way the key is (`_group_key`: NFKC, casefold, punctuation and spacing
+skipped) and must start with the whole series key, digits included; the
+next character must not be a letter or digit (so `City of Sins2` still
+fails); and only what follows is read as numbering, with the same
+`_NUMBERING_TOKEN_RE`, and must be numbering and nothing else, with at
+least some numbering. The title is never split. #180's splitter is
+unchanged.
+
+Tests: Codex's numeric probe passes 7/7 unmodified; the identity probe
+still 12/12 and the folder-evidence probe 7/7. New (27): Codex's three
+series plus `The Toy of 100 Baseball Players Uncensored`, plain and
+display (8); the named positives `3XLOVE Uncensored Ch. 5`, `The Toy of 100
+Baseball Players Uncensored Ch. 49` and `20th Century Boys v3 Ch. 12`, plain
+and display (6); the helper on twelve names, including a missing key word,
+a different leading digit, a glued suffix, a side story, no numbering and an
+empty series (12); and the batch landing case (1). At `916278d` 20 of them
+fail; the 7 that pass are negatives that held there too. The round-2 helper
+cases are unchanged and still pass.
+
+Guards proven by bypass (failing tests): already-named siblings confirm
+(R1) 30; an empty series key names nothing 1; the stem starts with the
+whole key, literally 1; a boundary follows the key 4; the rest is pure
+numbering 10; there is numbering 3. The sources were hashed before the
+bypass run and were unchanged after it.
+
+`docs/cbz_watcher.md`: the folder rule now says the whole series name is
+matched first, digits included, and only what follows is read as numbering.
+
+Full suite: **6,468 passed / 10 skipped / 0 failed** (6,478 collected =
+6,451 + 27 new).
