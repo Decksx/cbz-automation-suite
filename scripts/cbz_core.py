@@ -1653,19 +1653,34 @@ _NUMBERING_TOKEN_RE = re.compile(
 def _named_after_series(stem: str, series: str) -> bool:
     """Whether *stem* is the series itself followed by numbering and nothing else.
 
-    The name is split as a translated title is (``_split_numbering``): its
-    title must be exactly the folder's series (case, spacing and
-    punctuation aside), and the rest pure numbering (``Ch. 5``, ``v2 Ch.
-    3``, ``Ch. 1-30``). Another title that merely starts with the series
+    The folder's series is the anchor: *stem*, folded the same way
+    (``_group_key``: case, spacing and punctuation aside), must start with
+    the whole series key, digits in the title included (``3XLOVE
+    Uncensored``, ``20th Century Boys``), then a boundary (not a letter or
+    digit), and the rest must be numbering and nothing else (``Ch. 5``,
+    ``v2 Ch. 3``, ``Ch. 1-30``). Only that rest is read as numbering; the
+    title is never split, so a number in it is not taken for a chapter (PR
+    #179 review round 3). Another title that merely starts with the series
     (``City of Sins Side Story``, ``City of Sins Extra``), a glued digit
-    (``City of Sins2``), or any word after the numbering does not count;
-    neither does a name that cannot be split (PR #179 review round 2).
+    (``City of Sins2``), any word after the numbering, or no numbering at
+    all does not count (round 2).
     """
-    split = _split_numbering(stem)
-    if split is None or not split[1] or _group_key(split[0]) != _group_key(series):
+    key = _group_key(series)
+    if not key:
         return False
-    rest = _NUMBERING_TOKEN_RE.sub(" ", split[1])
-    return not rest.strip(" .-_,")
+    text = unicodedata.normalize("NFKC", stem).casefold()
+    i = 0
+    for ch in key:
+        while i < len(text) and not text[i].isalnum():
+            i += 1
+        if i >= len(text) or text[i] != ch:
+            return False
+        i += 1
+    rest = text[i:]
+    if rest[:1].isalnum():
+        return False
+    left = _NUMBERING_TOKEN_RE.sub(" ", rest)
+    return bool(rest.strip(" .-_,")) and not left.strip(" .-_,")
 
 
 def _drop_confirms_group(folder: Path | None, group_key: str, series: str) -> bool:
