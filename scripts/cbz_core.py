@@ -1640,6 +1640,34 @@ def known_groups_mixed_drop(mixed: bool) -> None:
     _known_groups_context.mixed = mixed
 
 
+# One numbering token: a marker (Vol./v/Ch./Chapter/#/Issue/Ep./第) and a
+# number or range, with an optional CJK or Korean marker after it.
+_NUMBERING_TOKEN_RE = re.compile(
+    r"(?:vol(?:ume)?s?\.?|v|ch(?:ap(?:ter)?)?s?p?\.?|#|issues?\.?|ep(?:isode)?s?\.?|\u7b2c)?"
+    r"\s*\d+(?:\.\d+)?(?:\s*" + _RANGE_SEP + r"\s*\d+(?:\.\d+)?)?"
+    r"\s*[\u8a71\u8bdd\u7ae0\u56de\u5dfb\u5377\ud654\uad8c]?",
+    re.IGNORECASE,
+)
+
+
+def _named_after_series(stem: str, series: str) -> bool:
+    """Whether *stem* is the series itself followed by numbering and nothing else.
+
+    The name is split as a translated title is (``_split_numbering``): its
+    title must be exactly the folder's series (case, spacing and
+    punctuation aside), and the rest pure numbering (``Ch. 5``, ``v2 Ch.
+    3``, ``Ch. 1-30``). Another title that merely starts with the series
+    (``City of Sins Side Story``, ``City of Sins Extra``), a glued digit
+    (``City of Sins2``), or any word after the numbering does not count;
+    neither does a name that cannot be split (PR #179 review round 2).
+    """
+    split = _split_numbering(stem)
+    if split is None or not split[1] or _group_key(split[0]) != _group_key(series):
+        return False
+    rest = _NUMBERING_TOKEN_RE.sub(" ", split[1])
+    return not rest.strip(" .-_,")
+
+
 def _drop_confirms_group(folder: Path | None, group_key: str, series: str) -> bool:
     """Whether the arrival folder confirms a listed prefix is the group's.
 
@@ -1647,10 +1675,11 @@ def _drop_confirms_group(folder: Path | None, group_key: str, series: str) -> bo
     "Violet" are titles too (PR #179 review). The structure must agree: the
     folder holds one series (no subfolders, and not a mixed drop point's
     loose archives), and every archive in it carries that same listed prefix
-    before a chapter token, or is already named after the folder's series.
-    (A prefix that is the folder's series names the chapter the same way
-    either way.) Anything else, an unreadable or missing folder included,
-    keeps the arrival's name.
+    before a chapter token, or is already named after the folder's series
+    and nothing else (``_named_after_series``; a batch is renamed one
+    archive at a time). (A prefix that is the folder's series names the
+    chapter the same way either way.) Anything else, an unreadable or
+    missing folder included, keeps the arrival's name.
     """
     if folder is None or getattr(_known_groups_context, "mixed", False):
         return False
@@ -1672,7 +1701,7 @@ def _drop_confirms_group(folder: Path | None, group_key: str, series: str) -> bo
         match = _KNOWN_GROUP_CHAPTER_RE.match(archive.name)
         if match is not None and _group_key(match.group("group")) == group_key:
             continue
-        if _group_key(archive.stem).startswith(series_key):
+        if _named_after_series(archive.stem, series):
             continue  # already named after the series (an earlier rename)
         return False
     return True
