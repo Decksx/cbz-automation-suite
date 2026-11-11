@@ -508,3 +508,232 @@ unchanged after each.
 
 Full suite: **6,330 passed / 10 skipped / 0 failed** (6,340 collected =
 6,155 + 185 new).
+
+## Watcher: known group prefixes without a downloader hash
+
+### Incident
+
+Live at `eb32d3e` (#178 merged), 2026-11-10 11:58: Comick (Unoriginal)
+delivered `Mangakakalot Ch. 53.cbz` into "City of Sins", and it kept that
+name. #178 drops a group prefix only with the downloader's trailing hex
+hash, because without it the prefix could be a real series. David approved
+dropping a prefix without the hash when it is a known group.
+
+### Changes
+
+- `config/known-groups.txt` (new, version-controlled; not the gitignored
+  `routing.json`): 212 known scanlation groups and source sites, one per
+  line, with the format and how to add a group at the top. 191 come from
+  the 2026-11-10 library audit's bucket 1 (`scratchpad/groupnames/
+  classify.py`, `GROUPS`) and 21 from the watcher log's hashed arrivals.
+- `scripts/cbz_core.py`: `_KNOWN_GROUP_CHAPTER_RE`, `known_groups()`,
+  `_group_key()`, `_is_structural_prefix()`. Without a hash,
+  `<Group> Ch. N`, `<Group> Chapter N`, `<Group> Episode N` and
+  `<Group>_Chapter N` (a title may follow) become `Chapter N`, named
+  `<Series> Ch. N` by the existing pipeline (uppercase `Ch.`, as David keeps
+  it), when the prefix is exactly a known group: case, spacing and
+  punctuation ignored, nothing else. The list is re-read when the file
+  changes; a missing file means no known groups. The display-name step now
+  receives the group-free name: with the original, `Mangakakalot Chapter 53`
+  came out as `Chapter 53.cbz` in display mode.
+- **David's decision (2026-11-10): an exact listed match overrides the digit
+  rule only.** `_is_structural_prefix` (`PART_MARKER_RE`, `SPECIAL_WORDS`,
+  `STRUCTURAL_PREFIX_WORDS`, and the volume, season, episode, part and
+  chapter number grammars, so `S2`, `V3`, `E5`, `P2`, `Ch 4`) always wins,
+  even over a listed line: `Part 2` or `S2` added to the file can never strip.
+  The hashed path keeps its digit rule unchanged.
+- `docs/cbz_watcher.md`: "Group prefixes in chapter names", including how to
+  add a known group.
+
+### Which candidates were shipped
+
+Of 222 candidates, 212 are listed. Of the 9 the digit rule had dropped, 8
+are shipped: `Manhwa18`, `Amin3`, `KM 42`, `1 2 Translations` and
+`that one guy 2123` (the digits are part of the group name), and
+`Gamma 2`, `Omega 2` and `Manhwa18 2`, which the morning's audit found are
+second copies from the same group with the same chapter numbering as the
+base group, not seasons; stripped, a copy collides with the primary one and
+goes to review, the intended handling for duplicates (noted in the file).
+Left out: `Official · sugerrrrr 2.5`, a credit string whose trailing `2.5`
+looks like a chapter or version number. Also left out: 5 duplicate
+spellings (`LOST_VEYL`, `The Blank`, `UToon`, `Utoon`, `Webtoon`), 3
+generic words from the log (`group`, `manga`, `doujinshi`) and one empty
+(zero-width) entry. No candidate matched a bucket-3 alternate title or any
+series folder in the audit, so none was dropped for that, and none is
+rejected by the structural checks.
+
+### Deliberately not done
+
+- A short group name that is also a real series (say `Desire`) would be
+  dropped where its files arrive outside their own folder. The audit found
+  no such overlap with library series folders.
+- Library files on Z: are not touched (another agent handles them).
+
+### Tests
+
+New `tests/test_known_group_prefixes.py` (54): the live Mangakakalot case
+and the other forms, plain and display; a prefix equal to the folder
+series; unknown, non-exact, unlisted-digit, structural and token-less
+prefixes without a hash (unchanged); the data file deciding (a temporary
+list; listed `Part A`, `Part 2`, `S2`, `V3`, `Ep4` still blocked; a missing
+file); every shipped entry passing the structural checks; the digit
+override (`Manhwa18 Chapter 1.cbz` -> `3XLOVE Uncensored Ch. 1.cbz`, and
+the other digit groups); the hashed path unchanged; `Manhwa18` and
+`Manhwa18 2` copies of one chapter (one lands, the other is reviewed, both
+kept); and an end-to-end watcher pass landing `City of Sins Ch. 53.cbz`. At
+`eb32d3e` 38 fail and the 16 "unchanged" ones pass.
+
+Guards proven by bypass (failing tests): without a hash only a known group
+is dropped 13; the match is exact 6; the display name uses the group-free
+name 9; a missing list means no known groups 1; the list is re-read when the
+file changes 1; a hashed name still uses the hash rule 4; a listed group
+overrides the digit rule 13; nothing overrides the structural checks 1;
+number markers are structural 1; the hashed path keeps its digit rule 2.
+The sources were hashed before the bypass run and the full suite and were
+unchanged after each.
+
+Process note: a failed helper script truncated the new test file once; it
+was rewritten in full and re-checked against `eb32d3e` before the bypass
+run.
+
+Full suite: **5,322 passed / 10 skipped / 0 failed** (5,332 collected =
+5,278 on master + 54 new).
+
+### PR #179 review round 1 (Codex, at `1559d27`)
+
+Rebased onto master `b87b7c8` (#180 merged) after these fixes; only this
+log conflicted (both PRs append to it), and was resolved by keeping
+master's sections and appending this PR's.
+
+**1. A listed name can also be a title (blocking).** `Desire` and `Violet`
+are listed groups but can name books themselves: in a mixed drop,
+`Desire Ch. 1.cbz` and `Violet Ch. 1.cbz` became requests for `Mixed Drop
+Ch. 1.cbz`, one landed and the other was reviewed. Codex's
+`test_review179_identity.py` (SHA256 `fecb9ddd...e612`) fails 12/12 at
+`1559d27`. The list only says a text *can* name a group; the arrival's
+folder must now confirm it (`_drop_confirms_group`): the folder holds one
+series (no subfolders; not a mixed drop point's loose archives, which the
+watcher reports per arrival with `known_groups_mixed_drop`), and every
+archive in it carries that same listed prefix before a chapter token, or is
+already named after the folder's series (a batch is renamed one archive at
+a time). An unreadable or missing folder confirms nothing, so a bare path
+keeps its name. A prefix that is the folder's own series gives the same
+name either way, so no separate check is kept for it.
+
+**2. The structural veto missed normalised forms.** The list match ignores
+NFKC, spacing and punctuation, but the veto read only the raw prefix, so a
+listed `S2`/`V3`/`P2`/`Ep4` also stripped `S 2`, `V 3`, `P 2`, `E.p.4`,
+`Ｓ２`, `Ｖ３`. `_is_structural_prefix` now checks the raw, NFKC,
+separator-free and match-key forms.
+
+**3. An undecodable list raised.** A `known-groups.txt` that is not valid
+UTF-8 raised `UnicodeDecodeError`; it now means no known groups, with one
+warning per version of the file (a missing file stays silent).
+
+Tests: Codex's probe passes 12/12, unmodified. The earlier tests now build
+real arrival folders (parsing needs the folder to confirm). New: listed
+titles in a mixed folder and without a folder, a folder with subfolders, a
+mixed drop's loose archives, siblings already renamed, the six alias
+forms plus the literal ones, an undecodable list (warned once), and three
+watcher passes (two consecutive Mangakakalot chapters both renamed; the
+probe's mixed drop; a lone listed title in a mixed drop). At `1559d27` 26
+fail (five of them only because `_without_group_prefix` takes the folder
+now).
+
+Guards proven by bypass on the rebased tree (failing tests): the 9 new ones
+(folder confirmation 14, mixed drop 3, subfolders 2, every archive 4,
+already-renamed siblings 3, normalised veto 6, undecodable list 1, logged
+once 1, the watcher's report 1), and the 10 earlier ones re-run there
+(known group only 12, exact match 6, group-free display 9, missing list 1,
+re-read 1, hashed path 24, digit override 13, structural checks win 11,
+number markers structural 7, hashed digit rule 2). The sources were hashed
+before the bypass run and the full suite and were unchanged after each.
+
+Watcher edit byte-exact against `b87b7c8`: no unchanged line changed its
+ending; the 5 added lines are CRLF; bare LF stays 863.
+
+Full suite on the rebased tree: **6,412 passed / 10 skipped / 0 failed**
+(6,422 collected = 6,340 on `b87b7c8` + 82 in `test_known_group_prefixes.py`).
+
+### PR #179 review round 2 (Codex, at `f6d18aa`)
+
+Codex accepted the normalised veto and the undecodable-list fallback. **P2:**
+the folder proof counted a sibling as "already named after the series" by a
+normalised prefix match, so `City of Sins Side Story Ch. 2`, `City of Sins
+Extra Ch. 2` and `City of Sins2 Ch. 2` counted as City of Sins; next to
+`Desire Ch. 1` that confirmed the folder, and Desire was renamed `City of
+Sins Ch. 1`. Codex's `test_review179_folder_evidence.py` (SHA256
+`2dd25232...ec61`) fails 7/7 at `f6d18aa`.
+
+Fix, without another heuristic: `_named_after_series` splits the sibling's
+name the way a translated title is split (`_split_numbering`, from #180).
+It counts only when the title is exactly the folder's series (case,
+spacing and punctuation aside) and everything after it is pure numbering
+(`Ch. 5`, `v2 Ch. 3`, `Ch. 1-30`, `#6`, `第7話`): numbering tokens and
+nothing else. A different title that starts with the series, a glued digit,
+any word after the number (`Ch. 5 Eclipse`) or a display token (`(2019)`)
+does not count, nor does a name that cannot be split. Such a sibling means
+the folder confirms nothing, and the arrival keeps its name.
+
+`docs/cbz_watcher.md` now states the folder-confirmation rule and the
+listed-group digit exception (`Manhwa18`, `Manhwa18 2`, `Gamma 2`, `KM 42`;
+David, 2026-11-10), and that an unreadable list counts as none.
+
+Tests: Codex's probe passes 7/7 unmodified, and the round-1 identity probe
+still 12/12. New: Codex's three siblings (plain and display) and its
+landing case, six positive siblings (`City of Sins Ch. 5`, `v2 Ch. 3`,
+`Ch. 1-30`, `ch. 4`, `#6`, `第7話`) still confirming, and the helper on ten
+names. At `f6d18aa` the 7 Codex cases fail (and the 10 helper cases, the
+helper being new); the positives pass there too.
+
+Guards proven by bypass (failing tests): already-named siblings confirm
+(P5, anchor moved) 15; the strict check, not a prefix match 7; the title is
+exactly the series 11; the rest is pure numbering 2; there is numbering 1.
+The sources were hashed before the bypass run and the full suite and were
+unchanged after each.
+
+Full suite: **6,441 passed / 10 skipped / 0 failed** (6,451 collected =
+6,422 + 29 new).
+
+### PR #179 review round 3 (Codex, at `916278d`)
+
+**P2:** round 2's `_named_after_series` ran the sibling through #180's
+translation splitter, which splits at the first number. A series with a
+digit in its own title (`3XLOVE Uncensored`, `The Toy of 100 Baseball
+Players`, `20th Century Boys`) was split inside the title, so its canonical
+siblings never counted, and `Manhwa18 Chapter 6.cbz` next to `3XLOVE
+Uncensored Ch. 5.cbz` kept the group name. Codex's
+`test_review179_numeric_series.py` (SHA256 `3c601fe3...fcc0`) fails 7/7 at
+`916278d`, and its known-title control passes 7/7.
+
+Fix, per Codex: the folder's series is the anchor. The sibling is folded the
+way the key is (`_group_key`: NFKC, casefold, punctuation and spacing
+skipped) and must start with the whole series key, digits included; the
+next character must not be a letter or digit (so `City of Sins2` still
+fails); and only what follows is read as numbering, with the same
+`_NUMBERING_TOKEN_RE`, and must be numbering and nothing else, with at
+least some numbering. The title is never split. #180's splitter is
+unchanged.
+
+Tests: Codex's numeric probe passes 7/7 unmodified; the identity probe
+still 12/12 and the folder-evidence probe 7/7. New (27): Codex's three
+series plus `The Toy of 100 Baseball Players Uncensored`, plain and
+display (8); the named positives `3XLOVE Uncensored Ch. 5`, `The Toy of 100
+Baseball Players Uncensored Ch. 49` and `20th Century Boys v3 Ch. 12`, plain
+and display (6); the helper on twelve names, including a missing key word,
+a different leading digit, a glued suffix, a side story, no numbering and an
+empty series (12); and the batch landing case (1). At `916278d` 20 of them
+fail; the 7 that pass are negatives that held there too. The round-2 helper
+cases are unchanged and still pass.
+
+Guards proven by bypass (failing tests): already-named siblings confirm
+(R1) 30; an empty series key names nothing 1; the stem starts with the
+whole key, literally 1; a boundary follows the key 4; the rest is pure
+numbering 10; there is numbering 3. The sources were hashed before the
+bypass run and were unchanged after it.
+
+`docs/cbz_watcher.md`: the folder rule now says the whole series name is
+matched first, digits included, and only what follows is read as numbering.
+
+Full suite: **6,468 passed / 10 skipped / 0 failed** (6,478 collected =
+6,451 + 27 new).

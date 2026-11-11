@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import html
 import inspect
+import logging
 import os
 import re
 import threading
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -165,6 +167,17 @@ _GROUP_CHAPTER_RE = re.compile(
     r"(?P<rest>\d[^_]*?)(?P<hash>(?:_[0-9a-f]{6})+)(?P<ext>\.[^.]+)$",
     re.IGNORECASE,
 )
+# The same layout without the hash: "<Group> Ch. 53.cbz", "<Group>_Chapter
+# 53.cbz". Without the downloader's hash the prefix could be a real series,
+# so it is dropped only when it is a known group (KNOWN_GROUPS_FILE).
+_KNOWN_GROUP_CHAPTER_RE = re.compile(
+    r"^(?P<group>.+?)[\s_]+(?:chapter|ch\.?|episode|ep\.?)\s*"
+    r"(?P<rest>\d.*?)(?P<ext>\.[^.]+)$",
+    re.IGNORECASE,
+)
+# Version-controlled list of known scanlation groups and source sites, one
+# per line; how to add one is written at the top of the file.
+KNOWN_GROUPS_FILE = Path(__file__).resolve().parents[1] / "config" / "known-groups.txt"
 GIBBERISH_RE = re.compile(
     r"^(?:TEMP[\s_-]*[0-9a-f]{8,}|[0-9a-f]{16,}"
     r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -1548,25 +1561,195 @@ def _is_group_prefix(prefix: str) -> bool:
     """
     if any(char.isdigit() for char in prefix):
         return False
+    return not _is_structural_prefix(prefix)
+
+
+def _is_structural_prefix(prefix: str) -> bool:
+    """Whether *prefix* says where a chapter sits in a work (never a group).
+
+    A part marker, a canonical special word, a structural word, or a volume,
+    season, episode, part or chapter number (``S2``, ``V3``, ``E5``, ``P2``,
+    ``Ch 4``). Unlike the digit rule in ``_is_group_prefix``, nothing
+    overrides this, not even a listed known group. It is checked on every
+    form the list matching can see (``_group_key``: NFKC, spacing and
+    punctuation gone), so ``S 2``, ``E.p.4`` and fullwidth ``Ｓ２`` are
+    structural too (PR #179 review).
+    """
+    folded = unicodedata.normalize("NFKC", prefix)
+    forms = {prefix, folded, re.sub(r"[\s._\-]+", "", folded), _group_key(prefix)}
+    return any(_is_structural_form(form) for form in forms)
+
+
+def _is_structural_form(prefix: str) -> bool:
     text = prefix.casefold()
-    return not (PART_MARKER_RE.search(text) or _SPECIAL_WORD_RE.search(text)
-                or _STRUCTURAL_WORD_RE.search(text))
+    return bool(
+        PART_MARKER_RE.search(text) or _SPECIAL_WORD_RE.search(text)
+        or _STRUCTURAL_WORD_RE.search(text)
+        or any(grammar.search(prefix) for grammar in (
+            _VOLUME_NUMBER_RE, _SEASON_NUMBER_RE, _EPISODE_NUMBER_RE,
+            _PART_NUMBER_RE, _CHAPTER_NUMBER_RE)))
 
 
-def _without_group_prefix(name: str) -> str:
+def _group_key(text: str) -> str:
+    """*text* for an exact group match: case, spacing and punctuation ignored."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold() if ch.isalnum())
+
+
+_known_groups_cache: tuple[tuple[str, float], frozenset[str]] | None = None
+_known_groups_warned: set[tuple[str, float]] = set()
+
+
+def known_groups() -> frozenset[str]:
+    """The match keys of ``KNOWN_GROUPS_FILE``, re-read when the file changes.
+
+    A missing or unreadable file, including one that is not valid UTF-8,
+    means no known groups: every arrival without a downloader hash keeps
+    today's name. An unreadable file is logged once per version of it.
+    """
+    global _known_groups_cache
+    stamp = (str(KNOWN_GROUPS_FILE), 0.0)
+    try:
+        stamp = (str(KNOWN_GROUPS_FILE), KNOWN_GROUPS_FILE.stat().st_mtime)
+        if _known_groups_cache is None or _known_groups_cache[0] != stamp:
+            lines = KNOWN_GROUPS_FILE.read_text(encoding="utf-8").splitlines()
+            keys = frozenset(
+                key for key in (_group_key(line) for line in lines
+                                if line.strip() and not line.lstrip().startswith("#"))
+                if key)
+            _known_groups_cache = (stamp, keys)
+        return _known_groups_cache[1]
+    except FileNotFoundError:
+        return frozenset()
+    except (OSError, UnicodeError) as exc:
+        if stamp not in _known_groups_warned:
+            _known_groups_warned.add(stamp)
+            logging.getLogger(__name__).warning(
+                "Known groups list %s is unreadable (%s); no prefix without a "
+                "downloader hash is dropped until it is fixed.", KNOWN_GROUPS_FILE, exc)
+        return frozenset()
+
+
+# Set by the watcher for each arrival it processes: True for a mixed drop
+# point's loose archives, whose folder is not one series, so its name
+# cannot confirm a known group (``known_groups_mixed_drop``).
+_known_groups_context = threading.local()
+
+
+def known_groups_mixed_drop(mixed: bool) -> None:
+    """Tell the group check whether this thread's arrival is a mixed drop."""
+    _known_groups_context.mixed = mixed
+
+
+# One numbering token: a marker (Vol./v/Ch./Chapter/#/Issue/Ep./第) and a
+# number or range, with an optional CJK or Korean marker after it.
+_NUMBERING_TOKEN_RE = re.compile(
+    r"(?:vol(?:ume)?s?\.?|v|ch(?:ap(?:ter)?)?s?p?\.?|#|issues?\.?|ep(?:isode)?s?\.?|\u7b2c)?"
+    r"\s*\d+(?:\.\d+)?(?:\s*" + _RANGE_SEP + r"\s*\d+(?:\.\d+)?)?"
+    r"\s*[\u8a71\u8bdd\u7ae0\u56de\u5dfb\u5377\ud654\uad8c]?",
+    re.IGNORECASE,
+)
+
+
+def _named_after_series(stem: str, series: str) -> bool:
+    """Whether *stem* is the series itself followed by numbering and nothing else.
+
+    The folder's series is the anchor: *stem*, folded the same way
+    (``_group_key``: case, spacing and punctuation aside), must start with
+    the whole series key, digits in the title included (``3XLOVE
+    Uncensored``, ``20th Century Boys``), then a boundary (not a letter or
+    digit), and the rest must be numbering and nothing else (``Ch. 5``,
+    ``v2 Ch. 3``, ``Ch. 1-30``). Only that rest is read as numbering; the
+    title is never split, so a number in it is not taken for a chapter (PR
+    #179 review round 3). Another title that merely starts with the series
+    (``City of Sins Side Story``, ``City of Sins Extra``), a glued digit
+    (``City of Sins2``), any word after the numbering, or no numbering at
+    all does not count (round 2).
+    """
+    key = _group_key(series)
+    if not key:
+        return False
+    text = unicodedata.normalize("NFKC", stem).casefold()
+    i = 0
+    for ch in key:
+        while i < len(text) and not text[i].isalnum():
+            i += 1
+        if i >= len(text) or text[i] != ch:
+            return False
+        i += 1
+    rest = text[i:]
+    if rest[:1].isalnum():
+        return False
+    left = _NUMBERING_TOKEN_RE.sub(" ", rest)
+    return bool(rest.strip(" .-_,")) and not left.strip(" .-_,")
+
+
+def _drop_confirms_group(folder: Path | None, group_key: str, series: str) -> bool:
+    """Whether the arrival folder confirms a listed prefix is the group's.
+
+    The list says only that the text *can* name a group; "Desire" and
+    "Violet" are titles too (PR #179 review). The structure must agree: the
+    folder holds one series (no subfolders, and not a mixed drop point's
+    loose archives), and every archive in it carries that same listed prefix
+    before a chapter token, or is already named after the folder's series
+    and nothing else (``_named_after_series``; a batch is renamed one
+    archive at a time). (A prefix that is the folder's series names the
+    chapter the same way either way.) Anything else, an unreadable or
+    missing folder included, keeps the arrival's name.
+    """
+    if folder is None or getattr(_known_groups_context, "mixed", False):
+        return False
+    series_key = _group_key(series)
+    if not series_key:
+        return False
+    try:
+        entries = list(folder.iterdir())
+        if any(entry.is_dir() for entry in entries):
+            return False
+        archives = [entry for entry in entries
+                    if entry.suffix.casefold() == ".cbz"
+                    and not entry.name.casefold().endswith((".tmp.cbz", ".bak.cbz"))]
+    except OSError:
+        return False
+    if not archives:
+        return False
+    for archive in archives:
+        match = _KNOWN_GROUP_CHAPTER_RE.match(archive.name)
+        if match is not None and _group_key(match.group("group")) == group_key:
+            continue
+        if _named_after_series(archive.stem, series):
+            continue  # already named after the series (an earlier rename)
+        return False
+    return True
+
+
+def _without_group_prefix(name: str, folder: Path | None = None, series: str = "") -> str:
     """*name* without a downloader's scanlation-group prefix (``_GROUP_CHAPTER_RE``).
 
     ``Alpha_Episode 42_2a8cb9.cbz`` becomes ``Chapter 42_2a8cb9.cbz``, which
     the stem pipeline names after the series folder (``<Series> Ch. 42``),
     exactly as a group-free ``Chapter 42_2a8cb9.cbz``. Episode and Ep. are
-    chapter tokens here. A prefix that is identity rather than a group
-    (``Vol. 3_``, ``Season 2_``, ``Part A_``, ``Side Story_``;
-    ``_is_group_prefix``) is kept, with the whole name.
+    chapter tokens here. Without the hash (``Mangakakalot Ch. 53.cbz``) the
+    prefix is dropped only when it is exactly a known group
+    (``known_groups``) and the arrival's *folder* confirms it
+    (``_drop_confirms_group``); without a folder it never is. Either way a
+    prefix that is identity rather than a
+    group (``Vol. 3_``, ``Season 2_``, ``Part A_``, ``Side Story_``) is kept,
+    with the whole name. The one exception: a listed group may hold a digit
+    (``Manhwa18``; David, 2026-11-10), since the list names it exactly; the
+    structural checks (``_is_structural_prefix``) still win over the list.
     """
     match = _GROUP_CHAPTER_RE.match(name)
-    if match is None or not _is_group_prefix(match.group("group")):
+    if match is not None:
+        if not _is_group_prefix(match.group("group")):
+            return name
+        return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
+    match = _KNOWN_GROUP_CHAPTER_RE.match(name)
+    # An exact listed group overrides the digit rule only.
+    if (match is None or _is_structural_prefix(match.group("group"))
+            or _group_key(match.group("group")) not in known_groups()
+            or not _drop_confirms_group(folder, _group_key(match.group("group")), series)):
         return name
-    return f"Chapter {match.group('rest')}{match.group('hash')}{match.group('ext')}"
+    return f"Chapter {match.group('rest')}{match.group('ext')}"
 
 
 def _stem_pipeline(stem: str, series: str, rules: set[str]) -> str:
@@ -1679,7 +1862,7 @@ def parse_comic_name(
 
     # A downloader's scanlation-group prefix names the group, not the series:
     # without it the folder's series names the chapter.
-    name = _without_group_prefix(path.name)
+    name = _without_group_prefix(path.name, path.parent, series)
     # Capture the raw title (filename stem before cleaning) so we can detect a
     # CJK-only name and translate it. clean_filename() strips most non-Latin
     # text, so this must happen on the raw stem.
@@ -1787,7 +1970,8 @@ def parse_comic_name(
                     translated_stem = stem
 
     display = (
-        _display_stem(path.name, raw_stem, series, rules, translated_stem)
+        # The group-free name: a known group's prefix must not decide it either.
+        _display_stem(name, raw_stem, series, rules, translated_stem)
         if display_tokens
         else None
     )
