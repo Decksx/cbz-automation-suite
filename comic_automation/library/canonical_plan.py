@@ -442,7 +442,12 @@ def _applied_full_default(filename: str) -> bool:
 
 
 def _lone_canonical_unchanged(resolution: fr.ArchiveResolution, *, number_style="chapter", folder=None) -> bool:
-    """Recognize a no-op without certifying its filename-only version label."""
+    """Recognize a no-op without certifying its filename-only version label.
+
+    A name the formatter wrote before PR (C), with ``ch.`` where it now
+    writes ``Ch.``, is the same no-op: a rename could not certify the label
+    either, so the book keeps its name rather than being held for review.
+    """
     fields = resolution.fields
     if fields["version"].resolved or fields["version"].reason != "filename_candidate_only":
         return False
@@ -451,10 +456,10 @@ def _lone_canonical_unchanged(resolution: fr.ArchiveResolution, *, number_style=
     if any(v.classification == fr.V_UNRESOLVED and not v.bracketed for v in resolution.v_tokens):
         return False
     try:
-        canonical = parse_canonical_name(resolution.filename)
+        canonical = parse_canonical_name(resolution.filename, lowercase_chapter=True)
         return canonical.version is not None and _destination(
             resolution, unchanged_version=canonical.version, number_style=number_style, folder=folder
-        ) == resolution.filename
+        ) == format_canonical_name(canonical)
     except (PlanningRefused, CanonicalNameError):
         return False
 
