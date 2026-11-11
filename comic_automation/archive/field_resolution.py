@@ -954,9 +954,13 @@ def _canonical_tokens(filename: str) -> NameTokens | None:
       valid name for the series "Series Special Edition"). That trailing run
       stays a candidate run like any other, ahead of the special slot, and
       `effective_markers` places it against the decided series.
+
+    A name the formatter wrote before PR (C), with ``ch.`` where it now
+    writes ``Ch.``, reads as the canonical name it was, so a planner renames
+    it once to the ``Ch.`` spelling rather than re-reading it as legacy.
     """
     try:
-        fields = parse_canonical_name(filename)
+        fields = parse_canonical_name(filename, lowercase_chapter=True)
     except CanonicalNameError:
         return None
     if any(_number_tokens(fields.series).values()) or _BRACKET_CHAR_RE.search(
