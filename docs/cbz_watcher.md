@@ -336,18 +336,37 @@ name. The watcher drops that prefix, so the series folder names the chapter
 - with the downloader's hash, any group: `Alpha_Episode 42_2a8cb9.cbz` in
   "Life of a Demon Hunter" becomes `Life of a Demon Hunter Ch. 42.cbz`;
 - without a hash, only a known group or site, listed in
-  `config/known-groups.txt`: `Mangakakalot Ch. 53.cbz` in "City of Sins"
-  becomes `City of Sins Ch. 53.cbz`. Any other prefix without a hash keeps
-  today's name, since it could be a real series.
+  `config/known-groups.txt`, **and** only when the arrival's folder confirms
+  it: `Mangakakalot Ch. 53.cbz` in "City of Sins" becomes `City of Sins Ch.
+  53.cbz`. Any other prefix without a hash keeps today's name, since it
+  could be a real series.
 
-A prefix is never taken for a group when it holds a digit, a part marker or
-a structural or special word (`Part A`, `Side B`, `Vol. 3`, `Extras`,
-`One-shot`): those tell chapters apart.
+The list only says a name *can* be a group; some listed names are titles
+too ("Desire", "Violet"). So the folder must back it up: it holds one series
+(no subfolders, and not the loose archives of a mixed drop point), and every
+archive in it either carries that same listed prefix before a chapter token,
+or is already named after the folder's series and nothing else: the series
+followed by pure numbering (`City of Sins Ch. 5`, `City of Sins v2 Ch. 3`,
+`City of Sins Ch. 1-30`). A different title that merely starts with the
+series (`City of Sins Side Story`, `City of Sins Extra`), a glued digit
+(`City of Sins2`) or words after the number do not count. Anything else, or
+a folder that cannot be read, keeps the arrival's name.
+
+A prefix is never taken for a group when it holds a part marker, a
+structural or special word, or a volume, season, episode or chapter marker
+(`Part A`, `Side B`, `Vol. 3`, `S2`, `Extras`, `One-shot`), in any spelling
+the list matching would accept (`S 2`, fullwidth `Ｓ２`): those tell chapters
+apart. A digit also rules a prefix out, with one exception (David,
+2026-11-10): an exact match on the list may hold a digit, such as
+`Manhwa18`, `Manhwa18 2`, `Gamma 2` or `KM 42`, since the list names it
+exactly. The structural markers still win over the list.
 
 To add a known group, add one line to `config/known-groups.txt` (the file's
 header explains the format). Matching is exact but ignores case, spacing and
 punctuation. The watcher re-reads the file when it changes; no restart is
-needed. Do not add a name that is also a series title.
+needed. A file that cannot be read or is not valid UTF-8 counts as no known
+groups, with one warning in the log. Do not add a name that is also a series
+title.
 
 ## ComicInfo behavior
 
