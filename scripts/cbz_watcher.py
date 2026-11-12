@@ -3750,7 +3750,7 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                         f"have their own .cbz files — moving only the loose files, not the whole "
                         f"directory, so unrelated series aren't swept along with it."
                     )
-                    # Held archives stay behind in the import folder; the
+                    # Held archives stay in the claim (processing root); the
                     # other loose files move as before. With none left there
                     # is nothing to move, and _move_loose_files would still create
                     # an empty series folder, so it is not called.
