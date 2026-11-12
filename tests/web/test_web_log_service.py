@@ -18,6 +18,7 @@ from comic_automation.web.jobs.log_service import JobLogs
 from comic_automation.web.jobs.store import JobStore, ProcessIdentity, LockBusy
 from test_web_job_store import fake_registry
 from web_support import private_dir
+from log_test_support import retry_log_index
 
 
 @pytest.fixture
@@ -231,7 +232,7 @@ def test_codec_verification_compares_supplied_ledger_command_digest(tmp_path):
         ar.verify_batch(target / receipt.file_name, receipt.sha256, jobs={job_id: other})
 
 
-def test_create_writer_streams_eight_mib_with_one_full_inspection(service, monkeypatch):
+def test_create_writer_streams_eight_mib_with_one_full_inspection(service, monkeypatch, retry_log_index):
     """Production adapter, real ACLs/fsyncs: no fixed scan per 64KiB chunk."""
     _, store, row, logs = service
     with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
