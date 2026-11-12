@@ -431,5 +431,6 @@ Use the watcher for incoming day-to-day processing. Use unified workflows for re
 Logs\cbz_watcher.log
 ```
 
-The rotating log is 5 MB with three backups. Held directories are recorded
-beside it in `Logs\cbz_watcher_held.json` (see Held archives).
+The rotating log is 5 MB with three backups. There is no separate held-state
+file: the folder an archive is in is its state, and each claim's
+`claim.json` records its decisions (see Claim-first processing).
