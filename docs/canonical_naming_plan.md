@@ -198,6 +198,57 @@ The CLI exits 1 when any folder was skipped. A strict plan carries neither
 key and is byte-identical to one made before this option existed. Apply
 is unchanged: it already revalidates each action on its own.
 
+### Changed-series selection (#158 B2)
+
+`--changed-in-batch N` and `--changed-since-batch N` pick the scopes from
+the catalog instead of by name (`comic_automation.library.changed_scopes`).
+Discovery batch N must be `completed`, for this library root, with
+persisted `start_event_id`/`end_event_id` bounds and a complete scan (no
+errors, not resumed, not limited). Any other batch, including every batch
+recorded before the bounds existed, is refused rather than defaulted, and
+the fix is a fresh complete discovery. Event ids, not timestamps, bound the
+selection, so a clock rollback or two batches in one second cannot hide or
+repeat an event. "In" takes the events in `(start, end]`; "since" takes
+`(start, newest]`. Only `discovered`, `changed`, `restored` and `missing`
+events count. The read is WAL-aware (`data_version` before and after one
+deferred transaction), and a concurrent catalog commit refuses it.
+
+The bounds cover changes **recorded in the catalog**. A change on disk
+reaches the selection only through a discovery that recorded it.
+
+Before the catalog is opened, the selection runs the planner's own
+preflight (`require_plannable_root`). It refuses a missing root, an
+`ai-decensor-originals` root, and a catalog inside the library, whether by
+path, resolved path or physical alias, so no read can create WAL/SHM files
+there. This holds even for a selection that turns out empty. The root's
+identity is bound before the read and rechecked after classification. A
+library that is unmounted or replaced mid-selection is refused (exit 2)
+rather than reported as every folder `gone`.
+
+**The selection and the plan are two snapshots.** `upper_event_id` is the
+cutoff the digest seals. An event appended after the selection was read
+is not covered by that plan, even when it falls inside a later plan read.
+It needs another selection, and "since" from the same batch picks it up.
+
+Each event path is resolved and grouped by the series folder directly under
+the root:
+
+- **planned**: the folder exists and can be read; these become `scopes`.
+- **gone**: the folder no longer exists, so there is nothing to plan.
+- **unavailable**: unreadable, or a file now stands where the folder was.
+- **excluded**: an internal folder or `ai-decensor-originals`.
+- **root_level**: a changed loose book, which only an unscoped plan covers.
+- **outside_root**: a count of events under other roots, or under a link
+  that resolves outside this root.
+
+The whole selection is sealed as `planning_scope.selection`, so the digest
+names the event range and everything left out. `build_plan` refuses a
+selection whose `planned` list differs from `scopes`. Unavailable folders
+and root-level books are omissions and make the CLI exit 1. If nothing
+needs planning, the CLI prints only `{"plan": null, "selection": ...}`,
+writes no `--output` file, and exits 0, or 1 when something was omitted.
+`--scope` cannot be combined with either flag.
+
 The SHA256 covers canonical UTF-8 JSON (sorted keys, compact separators,
 unescaped Unicode) of every field except `plan_digest`. Counts match the
 executor's five counts. Additional provenance, review and unchanged rows
