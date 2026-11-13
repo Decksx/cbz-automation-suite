@@ -1269,22 +1269,39 @@ _TRAILING_TOKEN_KW_RE = re.compile(
     rf"[\s_\-]*(?:{_TRAILING_TOKEN_BODY})[\s_\-.,]*$",
     re.IGNORECASE,
 )
+# A chapter token followed by a dash-separated suffix: per-chapter drops named
+# "<Series> Chapter 12 - <title> - <artist>" (hyphen, en or em dash). The same
+# keyword-plus-number rule as the trailing token applies, so the series is
+# everything before the token. The number must be followed by whitespace and
+# then the dash, so a range ("Ch. 1-30 - ...") never matches; a name that is
+# only "Chapter 1 - ..." has no series and is left alone.
+_CHAPTER_SUFFIX_RE = re.compile(
+    r"^(?P<base>.*?\S)[\s_]+ch(?:ap(?:ter)?)?\.?\s*\d+(?:\.\d+)?\s+[-\u2013\u2014]\s+\S",
+    re.IGNORECASE,
+)
 
 
 def series_base_name(name: str, bare_numbers: bool = True) -> str | None:
     """Strip a trailing chapter/volume/number token to recover the bare series title.
 
     Returns ``None`` if no trailing token was found (the name is already a base
-    title). When *bare_numbers* is False, a lone trailing number such as the
+    title). A chapter token followed by a dash-separated title/artist suffix
+    (``"Series Chapter 12 - Title - Artist"``) also ends the series title. When *bare_numbers* is False, a lone trailing number such as the
     ``88`` in ``"Area 88"`` is left intact and only keyword-qualified tokens
     (``Ch.``, ``Vol.``, ``Episode``, ``Issue``, ``v3``) are stripped — useful
     when the caller cannot afford to clobber a number that is part of the title.
     """
     pattern = _TRAILING_TOKEN_RE if bare_numbers else _TRAILING_TOKEN_KW_RE
     m = pattern.search(name)
-    if not m:
-        return None
-    base = name[: m.start()].strip()
+    if m:
+        base = name[: m.start()].strip()
+    else:
+        # "<Series> Chapter 12 - <title> - <artist>": the chapter token is not
+        # trailing, but it is still keyword-qualified, so it ends the title.
+        suffix = _CHAPTER_SUFFIX_RE.match(name)
+        if not suffix:
+            return None
+        base = suffix.group("base").strip()
     return clean_directory_name(base) if base else None
 
 
