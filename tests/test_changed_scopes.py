@@ -9,6 +9,7 @@ what was not planned, and that the planner seals the selection into its digest.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from comic_automation.library import changed_scopes as cs
 from comic_automation.library import canonical_plan as cp
 from comic_automation.library import scan_library
 from scripts.cbz_canonical_plan import main
-from test_canonical_plan import _two_series, env  # noqa: F401  (env is a fixture)
+from test_canonical_plan import _junction, _two_series, env  # noqa: F401  (env is a fixture)
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "comic_automation" / "database" / "migrations"
 COMPLETE = dict(errors=0, resumed=False, limited=False)
@@ -286,3 +287,112 @@ def test_cli_refuses_conflicting_or_untrustworthy_selections(env, capsys):
         with pytest.raises(SystemExit) as raised:
             main([*args, *extra])
         assert raised.value.code == 2
+
+
+# --- preflight and root availability (codex-lead review of #192, R1/R2) ----
+
+def cli_args(root, db, batch, flag="--changed-in-batch"):
+    return ["--library-root", str(root), "--database", str(db), "--quarantine-date", "2026-10-24",
+            "--number-style", "chapter", flag, str(batch)]
+
+
+def test_a_missing_library_is_refused_not_an_empty_selection(lib, capsys):
+    root, db = lib
+    batch = record(db, root, [root / "Alpha" / "Alpha 01.cbz"])
+    root.rename(root.with_name("offline-library"))
+    assert main(cli_args(root, db, batch)) == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_a_library_disappearing_during_the_read_is_refused(lib, monkeypatch, capsys):
+    """Unmounted inside the guarded window: every folder would look gone."""
+    root, db = lib
+    batch = record(db, root, [root / "Alpha" / "Alpha 01.cbz"])
+    real_check = cs.quick_check
+
+    def check_then_unmount(connection):
+        result = real_check(connection)
+        root.rename(root.with_name("offline-library"))
+        return result
+
+    monkeypatch.setattr(cs, "quick_check", check_then_unmount)
+    with pytest.raises(cs.ChangedScopesRefused, match="unavailable"):
+        cs.changed_scopes(db, root, batch_id=batch, since=False)
+
+
+def test_a_library_replaced_during_the_read_is_refused(lib, monkeypatch):
+    """Same path, different directory: the identity recheck, not existence, catches it."""
+    root, db = lib
+    batch = record(db, root, [root / "Alpha" / "Alpha 01.cbz"])
+    real_check = cs.quick_check
+
+    def check_then_swap(connection):
+        result = real_check(connection)
+        root.rename(root.with_name("old-library"))
+        root.mkdir()
+        return result
+
+    monkeypatch.setattr(cs, "quick_check", check_then_swap)
+    with pytest.raises(cs.ChangedScopesRefused, match="replaced"):
+        cs.changed_scopes(db, root, batch_id=batch, since=False)
+
+
+def test_a_removed_series_under_a_reachable_library_is_a_valid_noop(lib, capsys):
+    root, db = lib
+    batch = record(db, root, [root / "Alpha" / "Alpha 01.cbz"], event="missing")
+    shutil.rmtree(root / "Alpha")
+    assert main(cli_args(root, db, batch)) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["plan"] is None and report["selection"]["gone"] == ["Alpha"]
+
+
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("has_events", [False, True])
+def test_a_catalog_inside_the_library_is_refused_before_sqlite_opens(lib, tmp_path, monkeypatch, capsys,
+                                                                    alias, has_events):
+    """Empty and non-empty selections, direct and through a junction alias:
+    no open, so no WAL/SHM can appear in the library."""
+    root, db = lib
+    batch = record(db, root, [root / "Alpha" / "Alpha 01.cbz"] if has_events else [])
+    inside = root / "catalog.db"
+    shutil.copyfile(db, inside)
+    database = inside
+    if alias:
+        link = tmp_path / "db-alias"
+        _junction(link, root)
+        database = link / inside.name
+    before = set(root.iterdir())
+    monkeypatch.setattr(cs, "read_consistent_snapshot", lambda *a, **k: pytest.fail("opened SQLite"))
+    assert main(cli_args(root, database, batch)) == 2
+    assert "outside the library" in capsys.readouterr().err
+    assert set(root.iterdir()) == before
+
+
+def test_an_originals_root_is_refused_even_for_an_empty_selection(lib, capsys):
+    root, db = lib
+    originals = root / "ai-decensor-originals"
+    originals.mkdir()
+    batch = record(db, originals, [])
+    assert main(cli_args(originals, db, batch)) == 2
+    assert "ai-decensor-originals" in capsys.readouterr().err
+
+
+def test_a_later_append_stays_outside_the_recorded_cutoff(env, monkeypatch, capsys):
+    """Selection and plan are two snapshots. The selection's upper_event_id is
+    the cutoff; an event appended in between waits for the next selection."""
+    from scripts import cbz_canonical_plan as cli
+    root, db, book, plan = env
+    alpha, beta = _two_series(book)
+    batch = record(db, root, [alpha])
+    real = cli.changed_scopes
+
+    def select_then_append(*a, **k):
+        chosen = real(*a, **k)
+        record(db, root, [beta])
+        return chosen
+
+    monkeypatch.setattr(cli, "changed_scopes", select_then_append)
+    assert main(cli_args(root, db, batch, "--changed-since-batch")) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["planning_scope"]["selection"]["upper_event_id"] == 1
+    assert [r["source"] for r in report["renames"]] == [str(alpha)]
