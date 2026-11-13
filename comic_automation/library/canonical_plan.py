@@ -105,6 +105,24 @@ def _require_external_database(root: Path, database: str | Path) -> None:
                 raise PlanningRefused("database must be outside the library")
 
 
+def require_plannable_root(library_root: str | Path, database: str | Path) -> Path:
+    """The checks that must pass before anything opens the catalog.
+
+    Shared by `build_plan` and the changed-series selection
+    (`changed_scopes`), so neither can open SQLite against a catalog inside
+    the library or plan an originals root. Returns the absolute root.
+    """
+    root = Path(os.path.abspath(library_root))
+    if not root.is_dir():
+        raise PlanningRefused(f"library root is not a directory: {root}")
+    if any(part.casefold() == "ai-decensor-originals" for part in (*root.parts, *root.resolve().parts)):
+        raise PlanningRefused("ai-decensor-originals is preserved and outside planner scope")
+    # Even mode=ro SQLite may create WAL/SHM sidecars. Refuse before the
+    # first database open, including drive/UNC aliases into the library.
+    _require_external_database(root, database)
+    return root
+
+
 def _reparse(info: os.stat_result) -> bool:
     return stat.S_ISLNK(info.st_mode) or bool(
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
@@ -602,14 +620,7 @@ def build_plan(
         raise PlanningRefused("selection must list exactly the scopes being planned")
     if date.fromisoformat(quarantine_date).isoformat() != quarantine_date:
         raise PlanningRefused("quarantine_date must be YYYY-MM-DD")
-    root = Path(os.path.abspath(library_root))
-    if not root.is_dir():
-        raise PlanningRefused(f"library root is not a directory: {root}")
-    if any(part.casefold() == "ai-decensor-originals" for part in (*root.parts, *root.resolve().parts)):
-        raise PlanningRefused("ai-decensor-originals is preserved and outside planner scope")
-    # Even mode=ro SQLite may create WAL/SHM sidecars. Refuse before the
-    # first database open, including drive/UNC aliases into the library.
-    _require_external_database(root, database)
+    root = require_plannable_root(library_root, database)
     try:
         style_registry = NumberStyleRegistry.load(number_style_registry)
         style = style_registry.select(root, number_style)
