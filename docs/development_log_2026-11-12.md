@@ -1,5 +1,97 @@
 # Development log — 2026-11-12
 
+## #185: bounded production log-index publication recovery
+
+Owner: codex-lead; independent review belongs to claude-lead. Branch
+`fix/185-bounded-index-retry` starts at
+`fb17f09c03e92ef8dc8d98dbde05c91350d6d59e`. Work resumed after the Camelia
+prune and index fix, with rollout of that separate application left to Claude
+and David. No live comic database, library, model, log store, or worker is used.
+
+### Behavior and boundaries
+
+A single recovered index replacement error previously left a claimed pump's
+fully durable log incomplete. The chosen fix is issue #185 option 1: recover
+inside `LogDisk._publish`, before an error reaches the pump. Only a
+PermissionError with WinError 5 and both exact index.tmp/index.json paths from
+os.replace is eligible. Five publication attempts are allowed, with four
+20 ms waits. Validation, serialization/size checks, private-path/claim checks,
+rewrite, flush and fsync repeat before every replacement attempt. The durable
+snapshot advances only after replacement succeeds. Filesystem calls themselves
+remain subject to their existing latency; 80 ms bounds the deliberate waits.
+
+Exhausted or unrelated errors retain the existing pump failure and uncertainty
+policy. No error flag is broadly cleared. Explicit durable gaps retain their
+meaning and may coexist with proven EOF; an unrecorded tail is not promoted to
+coverage. The runner protocol and source comments describe these boundaries.
+
+The test-only wrapper from #184 is removed. The three existing stress tests now
+exercise production recovery directly. Its 11 wrapper tests are replaced with
+26 real-publication tests, a net increase of 15 cases. They cover initial,
+append and EOF publication, repeated validation/write/fsync, damaged temporary
+files, late watermark, exhaustion, unrelated error types/paths, claim/coverage/
+size changes during the wait, claimed-pump finality and explicit gap coverage.
+The focused file passes: 26 tests in 1.59 seconds.
+
+### Validation and mutation evidence
+
+Full Windows CI run **43343740957**, exact head
+`8b69a8a17317f95f8297269f211c8781512eb6e4`, passed **6,575 tests with 5 skipped**
+in 461.35 seconds: **6,580 collected cases**. The final code/tests/protocol are
+unchanged in this follow-up evidence commit. A fresh CI run is still required
+on the review head before merge.
+
+The initial local full run stopped at 56% without a result and is not counted
+as passed. A fresh local run with CBZ_TRANSLATION_ENABLED=0, a private temp
+root and a 90-second diagnostic traceback is still active as of 06:03 UTC;
+no completed local full-suite result is claimed here. The 26-case focused run
+passed after the final two cases were added. Local collection also finds
+6,580 cases. The net inventory increase is 15; passing/skipped totals from
+different environments must not be compared as if they were one run.
+The previously recorded #184 baseline is 6,553 passed / 12 skipped. Its final
+web code/tests at c8f2995 match the branch base fb17f09 byte-for-byte; this is
+historical baseline evidence, not a newly rerun baseline claim.
+
+The final 26-case file against the base _publish method fails 15 and passes 11.
+All mutations are in-memory method replacements in separate fixture processes;
+repository sources are not restored or rewritten. Each of these 18 bypasses
+fails at least one new test:
+
+| Removed or broadened behavior | Failing tests |
+| --- | ---: |
+| WinError 5 only | 2 |
+| Source path present | 1 |
+| Destination path present | 1 |
+| Exact source path | 1 |
+| Exact destination path | 1 |
+| Fifth-attempt refusal | 3 |
+| Delay between attempts | 9 |
+| Candidate validation on retry | 1 |
+| Temporary path validation on retry | 1 |
+| Index path validation on retry | 1 |
+| Index fsync | 2 |
+| Index size bound on retry | 1 |
+| PermissionError type only | 1 |
+| Late durable watermark | 11 |
+| Fresh temporary-file rewrite | 1 |
+| Catch only replacement errors | 1 |
+| Pump sticky-failure rule | 3 |
+| Explicit gap recording | 1 |
+
+Source SHA-256 before/after mutation runs:
+`2cc99bf070d66b0e5d663db065fa2feb4115e7551cefba48797ad5e8522555b3`.
+External scripts/logs use mutate185_publish.py and comic185-* in Codex scratch.
+The 4/6,040 rate from #184 describes initial attempts in a private stress
+fixture. The earlier 18% job estimate assumes that rate and independent failures
+over 300 publications; production frequency and the Windows actor are unknown.
+The fix is justified by the reproduced failure mechanism, not that projection.
+
+Code/tests/protocol are six one-file commits through
+`77f54fbf685e00289ee2a345d77ab21fdbe20c24`; this log is a separate commit.
+Independent exact-head review and CI are required before merge. The web console
+has not been rolled out and no operational job was launched by this work.
+
+
 ## #168: bounded recovery in three direct-writer log stress fixtures
 
 Owner: codex-lead; independent review goes to claude-lead. Base is

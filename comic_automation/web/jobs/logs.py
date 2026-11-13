@@ -161,20 +161,39 @@ class LogDisk:
         self._publish(self.snapshot)
 
     def _publish(self, candidate):
-        validate_index(candidate, self.snapshot["job_id"], self.snapshot["nonce"])
-        payload = json.dumps(candidate, separators=(",", ":"), allow_nan=False).encode()
-        if len(payload) > MAX_INDEX_BYTES:
-            raise LogRefused("LOG_INDEX_TOO_LARGE")
+        """Retry only a bounded Windows index-replace refusal before publication.
+
+        Recovery stays below the pump's sticky-failure boundary. Each attempt
+        revalidates and rewrites/fsyncs the index; only replacement success may
+        advance the durable snapshot. Other I/O and claim failures propagate.
+        """
         temporary = self.directory / "index.tmp"
-        self.validate(temporary)
-        self.validate(self.index_path)
-        with open(temporary, "wb") as stream:
-            if stream.write(payload) != len(payload):
-                raise OSError("Short log index write")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, self.index_path)
-        self.snapshot = candidate
+        for attempt in range(5):
+            validate_index(candidate, self.snapshot["job_id"], self.snapshot["nonce"])
+            payload = json.dumps(candidate, separators=(",", ":"), allow_nan=False).encode()
+            if len(payload) > MAX_INDEX_BYTES:
+                raise LogRefused("LOG_INDEX_TOO_LARGE")
+            self.validate(temporary)
+            self.validate(self.index_path)
+            with open(temporary, "wb") as stream:
+                if stream.write(payload) != len(payload):
+                    raise OSError("Short log index write")
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.replace(temporary, self.index_path)
+            except PermissionError as error:
+                if (getattr(error, "winerror", None) != 5
+                        or error.filename is None
+                        or getattr(error, "filename2", None) is None
+                        or Path(error.filename) != temporary
+                        or Path(error.filename2) != self.index_path
+                        or attempt == 4):
+                    raise
+                time.sleep(0.02)
+                continue
+            self.snapshot = candidate
+            return
 
     @staticmethod
     def _gap(candidate, start, end, reason):
@@ -279,8 +298,9 @@ class LogPump:
     This class owns neither the pipe handle nor the runner claim. M3c owns
     native cancellation/closure and maps unsettled cleanup to uncertainty.
     No worker callback may finalize a job or clear that uncertainty.
-    sticky_failure keeps EOF incomplete after any error even if retries recover;
-    the claimed runner enables it, while standalone capture keeps its old default.
+    sticky_failure keeps EOF incomplete after any error reaching the pump, even
+    if its retries recover. Bounded index publication recovery happens below
+    that boundary. The claimed runner enables the sticky policy.
     """
     def __init__(self, source, disk: LogDisk, *, capacity: int = QUEUE_CHUNKS, retry_seconds: float = 0.1,
                  sticky_failure: bool = False):
@@ -337,7 +357,7 @@ class LogPump:
             while not self.abort.is_set():
                 item = self.queue.take()
                 if item is None:
-                    # A runner's first storage failure permanently disqualifies
+                    # A runner's first escaped storage failure disqualifies
                     # EOF finality, even if this retry eventually becomes durable.
                     self._retry(lambda: self.disk.finish(self.queue.offset,
                         complete=self.queue.complete and not (self.sticky_failure and self.error is not None)))
