@@ -51,7 +51,8 @@ literal prefixes and built-in exclusion policy into its digest.
 4. Check the opened file's identity/size/timestamps against the inventory before
    reading, check byte count and handle observations afterward, then check the
    pathname and its components again. A failed observation supplies a problem
-   and a null hash. Reads stop after the observed size plus one byte, so a
+   and a null hash/byte count, since its payload-read count is uncertified.
+   Reads stop after the observed size plus one byte, so a
    continuously growing source cannot make the read unbounded.
 5. Re-establish each root and repeat the tree walk after hashing. An observed
    addition, removal, replacement, metadata change or coverage error makes
