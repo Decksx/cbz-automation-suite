@@ -11,8 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
-import re
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
 import unicodedata
 
@@ -22,7 +21,6 @@ from comic_automation.library.exclusions import DEFAULT_EXCLUDED_DIRECTORIES
 CONTRACT = "sync-filesystem-observation-v1"
 _PROTECTED = frozenset({"ai-decensor-originals", "ai_decensor_originals"})
 _EXCLUDED = DEFAULT_EXCLUDED_DIRECTORIES | _PROTECTED | {".stignore"}
-_RESERVED = re.compile(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?\Z", re.I)
 _BLOCK = 1024 * 1024
 
 
@@ -50,7 +48,7 @@ def _portable(relative: str) -> None:
     # collapse two different source entries into one receiver path.
     for part in relative.split("/"):
         if (not part or part in {".", ".."} or part.endswith((".", " "))
-                or _RESERVED.fullmatch(part)
+                or PureWindowsPath(part).is_reserved()
                 or any(c in '<>:"\\|?*' or ord(c) < 32 or 0xD800 <= ord(c) <= 0xDFFF for c in part)):
             raise ValueError("path cannot be represented on Windows")
 
