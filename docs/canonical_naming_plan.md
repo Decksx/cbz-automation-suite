@@ -216,6 +216,20 @@ deferred transaction), and a concurrent catalog commit refuses it.
 The bounds cover changes **recorded in the catalog**. A change on disk
 reaches the selection only through a discovery that recorded it.
 
+Before the catalog is opened, the selection runs the planner's own
+preflight (`require_plannable_root`). It refuses a missing root, an
+`ai-decensor-originals` root, and a catalog inside the library, whether by
+path, resolved path or physical alias, so no read can create WAL/SHM files
+there. This holds even for a selection that turns out empty. The root's
+identity is bound before the read and rechecked after classification. A
+library that is unmounted or replaced mid-selection is refused (exit 2)
+rather than reported as every folder `gone`.
+
+**The selection and the plan are two snapshots.** `upper_event_id` is the
+cutoff the digest seals. An event appended after the selection was read
+is not covered by that plan, even when it falls inside a later plan read.
+It needs another selection, and "since" from the same batch picks it up.
+
 Each event path is resolved and grouped by the series folder directly under
 the root:
 
