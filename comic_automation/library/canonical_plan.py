@@ -568,6 +568,7 @@ def build_plan(
     number_style: str = "auto", number_style_registry: str | Path = DEFAULT_REGISTRY,
     series_folder_root: bool = False,
     scoped: bool = False, scopes: Sequence[str] | None = None,
+    selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Produce a sealed executor-compatible plan; read only, no live locks.
 
@@ -586,8 +587,19 @@ def build_plan(
     (exact spellings) and implies ``scoped``; without it every series folder
     and the root's loose books are planned. A change at the root level,
     outside every series folder, still refuses (see `_skipped_scopes`).
+
+    ``selection`` (#158 B2) is the catalog-event selection that chose
+    ``scopes`` (`changed_scopes.ChangedScopes.as_dict`). Its ``planned``
+    list must equal ``scopes``; it is sealed into ``planning_scope`` so an
+    approved digest names the event range the plan covers and every
+    changed folder it left out.
     """
     scoped = scoped or scopes is not None
+    if selection is not None and (scopes is None
+            or sorted(selection.get("planned") or ()) != sorted(scopes)):
+        # A selection describing other folders than the ones planned would
+        # seal a false account of what the plan covers.
+        raise PlanningRefused("selection must list exactly the scopes being planned")
     if date.fromisoformat(quarantine_date).isoformat() != quarantine_date:
         raise PlanningRefused("quarantine_date must be YYYY-MM-DD")
     root = Path(os.path.abspath(library_root))
@@ -806,6 +818,10 @@ def build_plan(
             # approved digest also approves exactly what was left unplanned.
             doc["planning_scope"] = {"mode": "series",
                 "requested": None if requested is None else sorted(requested)}
+            if selection is not None:
+                # A JSON round trip copies it and refuses anything the
+                # digest's canonical bytes could not carry.
+                doc["planning_scope"]["selection"] = json.loads(json.dumps(selection, allow_nan=False))
             doc["skipped_scopes"] = skipped
         doc["provenance"] = {
             "planner_version": PLANNER_VERSION, "inventory": before,
