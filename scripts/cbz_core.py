@@ -1269,22 +1269,61 @@ _TRAILING_TOKEN_KW_RE = re.compile(
     rf"[\s_\-]*(?:{_TRAILING_TOKEN_BODY})[\s_\-.,]*$",
     re.IGNORECASE,
 )
+# A chapter token followed by a dash-separated suffix: per-chapter drops named
+# "<Series> Chapter 12 - <title> - <artist>" (hyphen, en or em dash). The same
+# keyword-plus-number rule as the trailing token applies, so the series is
+# everything before the token. ``_chapter_suffix_base`` refuses the shapes where
+# the suffix is not just title/artist text (PR #186 review).
+_CHAPTER_SUFFIX_RE = re.compile(
+    r"^(?P<base>.*?\S)[\s_]+ch(?:ap(?:ter)?)?\.?\s*(?P<num>\d+(?:\.\d+)?)"
+    r"\s+[-\u2013\u2014]\s+(?P<suffix>\S.*)$",
+    re.IGNORECASE,
+)
+
+
+def _chapter_suffix_base(name: str) -> str | None:
+    """The series before a ``Chapter N - <suffix>`` token, or ``None``.
+
+    Conservative: the name keeps today's meaning (no series is split off) when
+    the suffix starts with a number, which is every spaced range the range
+    grammar accepts (``Chapter 1 - 30``, ``1 \u2013 30``) plus an em-dash one
+    (``1 \u2014 30``, outside ``_RANGE_SEP``), or when the suffix is structural
+    by the same test that guards group prefixes (``_is_structural_prefix``:
+    ``Part A``, ``Side B``, ``Extras``, ``Specials``, ``Vol. 2``...). Titles
+    that merely contain such a word (``Book Club``) or start with a number
+    (``1000 Years Later``) are refused too, which is today's behaviour. Those suffixes are identity: collapsing
+    ``Book Chapter 12 - Part A`` and ``- Part B`` into one series gave both the
+    same chapter filename and sent a distinct book to duplicate quarantine.
+    """
+    m = _CHAPTER_SUFFIX_RE.match(name)
+    if not m:
+        return None
+    suffix = m.group("suffix")
+    if suffix[:1].isdigit() or _is_structural_prefix(suffix):
+        return None
+    return m.group("base").strip()
 
 
 def series_base_name(name: str, bare_numbers: bool = True) -> str | None:
     """Strip a trailing chapter/volume/number token to recover the bare series title.
 
     Returns ``None`` if no trailing token was found (the name is already a base
-    title). When *bare_numbers* is False, a lone trailing number such as the
+    title). A chapter token followed by a dash-separated title/artist suffix
+    (``"Series Chapter 12 - Title - Artist"``) also ends the series title. When *bare_numbers* is False, a lone trailing number such as the
     ``88`` in ``"Area 88"`` is left intact and only keyword-qualified tokens
     (``Ch.``, ``Vol.``, ``Episode``, ``Issue``, ``v3``) are stripped — useful
     when the caller cannot afford to clobber a number that is part of the title.
     """
     pattern = _TRAILING_TOKEN_RE if bare_numbers else _TRAILING_TOKEN_KW_RE
     m = pattern.search(name)
-    if not m:
-        return None
-    base = name[: m.start()].strip()
+    if m:
+        base = name[: m.start()].strip()
+    else:
+        # "<Series> Chapter 12 - <title> - <artist>": the chapter token is not
+        # trailing, but it is still keyword-qualified, so it ends the title.
+        base = _chapter_suffix_base(name)
+        if base is None:
+            return None
     return clean_directory_name(base) if base else None
 
 

@@ -2564,12 +2564,18 @@ def _resolve_series_dir_name(
     generic name.
     """
     cleaned = clean_directory_name(comic_dir.name) or comic_dir.name
+    reboot_year = None
     if _media_naming_enabled():
         base, reboot_year = split_series_year(comic_dir.name)
         if reboot_year is not None:
             cleaned = f"{clean_directory_name(base) or base} ({reboot_year})"
 
     kw_base = series_base_name(cleaned, bare_numbers=False)
+    if kw_base and reboot_year is not None and split_series_year(kw_base)[1] != reboot_year:
+        # "Book Chapter 12 - Title (2019)" ends its title at the chapter
+        # token, before the year. The year is series identity (a reboot),
+        # so it stays with the series, not the dropped suffix (PR #186).
+        kw_base = f"{kw_base} ({reboot_year})"
     if kw_base:
         dir_number = extract_chapter_number(cleaned) or extract_volume_number(cleaned)
         return kw_base, dir_number
