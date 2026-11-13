@@ -160,7 +160,7 @@ def test_required_hash_failures_never_supply_a_trusted_hash(pair, monkeypatch, p
     monkeypatch.setattr(Path, "open", controlled)
     report = sync.observe_pairs((pair,))
     row = next(row for row in report["files"] if row["side"] == "tower")
-    assert row["sha256"] is None and row["bytes_read"] == 0
+    assert row["sha256"] is None and row["bytes_read"] is None
     assert not report["complete"] and report["problems"]
     if phase == "before":
         assert reads == []  # reject the changed handle before reading its bytes
