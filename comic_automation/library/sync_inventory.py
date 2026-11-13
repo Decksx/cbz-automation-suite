@@ -236,6 +236,7 @@ def observe_pairs(pairs: tuple[RootPair, ...]) -> dict:
             try:
                 row["sha256"], row["bytes_read"] = _hash(root["path"], row)
             except (OSError, ValueError) as error:
+                row["bytes_read"] = None
                 problems.append(dict(folder_id=row["folder_id"], side=row["side"], path=row["relative_path"], reason=str(error)))
         for root, before in observations:
             try:
