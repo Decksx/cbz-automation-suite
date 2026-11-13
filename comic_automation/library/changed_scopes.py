@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from comic_automation.database.read_guards import DatabaseChangedError, quick_check, read_consistent_snapshot
+from comic_automation.library.canonical_plan import require_plannable_root
 from comic_automation.library.discovery import normalize_library_path
 
 EVENT_TYPES = ("discovered", "changed", "restored", "missing")
@@ -118,17 +119,34 @@ def _classify(root: Path, name: str, internal) -> str:
     return "planned"
 
 
+def _root_identity(root: Path) -> tuple:
+    try:
+        info = root.stat()
+        return info.st_dev, info.st_ino, str(root.resolve(strict=True))
+    except OSError as exc:
+        raise ChangedScopesRefused(f"library root is unavailable: {exc}") from exc
+
+
 def changed_scopes(database: str | Path, library_root: str | Path, *, batch_id: int,
                    since: bool, internal=frozenset()) -> ChangedScopes:
     """Select the series folders with catalog events inside the batch bounds.
 
-    One WAL-aware read through `read_consistent_snapshot` (strictly
+    The planner's own preflight (`require_plannable_root`) runs first, so a
+    catalog inside the library, an originals root or a missing root is
+    refused before SQLite is opened (it raises ``PlanningRefused``). Then
+    one WAL-aware read through `read_consistent_snapshot` (strictly
     read-only, ``quick_check``, ``data_version`` around one deferred
     transaction); a concurrent catalog commit refuses the selection.
     ``internal`` names folders the planner never plans (its ``_INTERNAL``).
+
+    The root's identity is bound before the read and rechecked after
+    classification: an unmounted or replaced library would otherwise turn
+    every changed folder into ``gone`` and pass as an empty selection.
     """
     if type(batch_id) is not int or batch_id < 1:
         raise ChangedScopesRefused("batch id must be a positive integer")
+    bound = require_plannable_root(library_root, database)
+    identity = _root_identity(bound)
     root = normalize_library_path(library_root)
 
     def read(connection) -> tuple[int, int, list[str]]:
@@ -188,6 +206,8 @@ def changed_scopes(database: str | Path, library_root: str | Path, *, batch_id: 
     internal = {name.casefold() for name in internal}
     for name in sorted(scopes.values(), key=str.casefold):
         groups[_classify(root, name, internal)].append(name)
+    if _root_identity(bound) != identity:
+        raise ChangedScopesRefused("library root was replaced during the selection")
     return ChangedScopes(batch_id=batch_id, root=str(root), mode="since" if since else "batch",
                          start_event_id=start, upper_event_id=upper, events=len(paths),
                          root_level=sorted(root_level, key=str.casefold), outside_root=outside, **groups)
