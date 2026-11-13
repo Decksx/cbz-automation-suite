@@ -3,8 +3,9 @@
 Issue #108 implements the Tower-to-X preview and post-sync verification on
 explicit root pairs. The first implementation PR supplies their shared
 filesystem observation API in `comic_automation.library.sync_inventory`.
-Report classification, the CLI and sanitized Syncthing configuration evidence
-follow in the next slice. Issue #108 remains open through those deliveries.
+The estimate/observation CLI below exposes that API. Preview/verifier report
+classification and sanitized Syncthing configuration evidence follow in the next
+slice. Issue #108 remains open through those deliveries.
 
 ## API and scope
 
@@ -46,7 +47,9 @@ literal prefixes and built-in exclusion policy into its digest.
    Record explicit exclusions and errors. Hard-linked payloads, reparse points,
    unsupported entry types and Windows path collisions make coverage incomplete.
 3. Intersect the file-size sets across both sides and all declared folder IDs.
-   Fully SHA-256 each file in that intersection once. Files of other sizes
+   Report the candidate file count and summed logical bytes before opening any
+   payload. Fully SHA-256 each file in that intersection once, provided initial
+   inventory coverage is complete. Files of other sizes
    carry a null hash and zero payload bytes read.
 4. Check the opened file's identity/size/timestamps against the inventory before
    reading, check byte count and handle observations afterward, then check the
@@ -84,6 +87,57 @@ non-atomic scan limitation. A file can change after its final observation.
 Timestamp/file-ID checks alone cannot establish immutable bytes. The preview
 and verifier must bind fresh observations and report later drift.
 
-The API reads directories and files and returns its document in memory. A
-later CLI will place generated artifacts outside the compared roots. Actual
-sync and cutover remain the separately reviewed operator procedure in #108.
+## Estimates and progress
+
+`observe_pairs(pairs, hash_content=False)` inventories and rechecks both trees
+without opening payload files. Its `hash_mode` is `estimate`; all file hashes
+remain null and payload bytes read remain zero. `hash_plan` gives candidate
+files and bytes, including separate `tower` and `target` totals. The default
+`hash_content=True` uses mode `content`. Mode and plan are digest-bound.
+
+Candidate bytes count the logical file content that a complete content pass
+would read across both sides. They are neither predicted SMB traffic nor an ETA:
+cache hits, storage throughput, metadata operations and failures affect elapsed
+time. Nearly identical trees can share almost every file size and therefore
+require hashing almost everything. An estimate supplies no content-equality
+evidence, even when `complete` is true.
+
+An optional `progress=callback` receives independent dictionaries for inventory,
+directory counts, the hash plan, file starts/results, bytes read within a file,
+the final tree recheck and completion. Progress timing is outside the document
+and digest. Attempted read bytes can include reads later rejected by drift
+checks; file-row `bytes_read` remains the certified value or null. A consumer
+exception aborts with `ProgressError`; it is not turned into a filesystem gap.
+
+## Read-only CLI
+
+Keep the manifest and redirected artifacts outside the compared trees. A
+manifest declares filesystem scope only; it does not accept raw Syncthing
+configuration or credentials. Relative paths resolve against its directory:
+
+```json
+{
+  "contract": "sync-root-pairs-v1",
+  "pairs": [
+    {"folder_id": "manga", "tower": "fixture/tower",
+     "target": "fixture/receiver", "exclude_prefixes": ["private"]}
+  ]
+}
+```
+
+```powershell
+python -m comic_automation.library.sync_observe_cli estimate --pairs pairs.json
+python -m comic_automation.library.sync_observe_cli observe --pairs pairs.json
+```
+
+Both commands print JSON to stdout and throttled JSON progress to stderr.
+`--quiet` suppresses progress. Exit 0 means complete observation, 2 means invalid
+input or incomplete coverage, and 1 means an output/progress consumer failed.
+An incomplete observation still prints its document. A complete estimate remains
+an estimate, not a successful sync verification.
+
+The CLI reads directories and files and prints its document; it has no sync,
+apply, rename or configuration-control mode. It does not resume a prior hash
+pass or promote cached stat-matching hashes to fresh evidence. Reuse needs an
+explicit evidence-age contract first. Actual sync and cutover remain the
+separately reviewed operator procedure in #108.

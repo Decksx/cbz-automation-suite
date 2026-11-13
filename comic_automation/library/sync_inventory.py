@@ -7,6 +7,7 @@ These observations are non-atomic and carry no Syncthing configuration claim.
 from __future__ import annotations
 
 from collections import Counter
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -22,6 +23,21 @@ CONTRACT = "sync-filesystem-observation-v1"
 _PROTECTED = frozenset({"ai-decensor-originals", "ai_decensor_originals"})
 _EXCLUDED = DEFAULT_EXCLUDED_DIRECTORIES | _PROTECTED | {".stignore"}
 _BLOCK = 1024 * 1024
+
+
+class ProgressError(RuntimeError):
+    """A progress consumer failed and observation must stop."""
+
+
+def _emit(callback, **event) -> None:
+    if callback is None:
+        return
+    try:
+        callback(copy.deepcopy(event))
+    except Exception as error:
+        # A failed renderer must escape the filesystem-error handlers, including
+        # when its own exception is OSError or ValueError.
+        raise ProgressError("progress consumer failed") from error
 
 
 @dataclass(frozen=True)
@@ -108,9 +124,10 @@ def _excluded(relative: str, prefixes: tuple[str, ...]) -> str | None:
     return None
 
 
-def _walk(root: Path, prefixes: tuple[str, ...]) -> tuple[list[dict], list[dict], list[dict]]:
+def _walk(root: Path, prefixes: tuple[str, ...], *, on_progress=None) -> tuple[list[dict], list[dict], list[dict]]:
     rows, excluded, problems = [], [], []
     names = {}
+    files_seen = 0
     pending = [root]
     while pending:
         folder = pending.pop()
@@ -148,10 +165,14 @@ def _walk(root: Path, prefixes: tuple[str, ...]) -> tuple[list[dict], list[dict]
                     if info.st_nlink > 1:
                         raise ValueError("hard-linked file is unsupported")
                     rows.append(dict(relative_path=relative, kind="file", **_stamp(info)))
+                    files_seen += 1
                 else:
                     raise ValueError("unsupported filesystem entry type")
             except (OSError, ValueError) as error:
                 problems.append(dict(path=relative, reason=str(error)))
+        if on_progress is not None:
+            on_progress(dict(path=folder.relative_to(root).as_posix(), entries=len(rows),
+                             files=files_seen, excluded=len(excluded), problems=len(problems)))
     order = lambda row: row.get("relative_path", row.get("path", ""))
     return sorted(rows, key=order), sorted(excluded, key=order), sorted(problems, key=order)
 
@@ -164,7 +185,7 @@ def _plain_chain(root: Path, path: Path) -> None:
             raise ValueError("path became a link or reparse point")
 
 
-def _hash(root: Path, row: dict) -> tuple[str, int]:
+def _hash(root: Path, row: dict, *, on_bytes=None) -> tuple[str, int]:
     path = root / row["relative_path"]
     expected = {key: row[key] for key in ("device", "inode", "size", "mtime_ns", "ctime_ns")}
     _plain_chain(root, path)
@@ -181,6 +202,8 @@ def _hash(root: Path, row: dict) -> tuple[str, int]:
                 break
             digest.update(chunk)
             total += len(chunk)
+            if on_bytes is not None:
+                on_bytes(len(chunk))
         if total != row["size"] or _stamp(os.fstat(source.fileno())) != expected:
             raise ValueError("file changed during hashing")
     _plain_chain(root, path)
@@ -189,14 +212,24 @@ def _hash(root: Path, row: dict) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def observe_pairs(pairs: tuple[RootPair, ...]) -> dict:
+def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True, progress=None) -> dict:
     """Inventory explicit roots and hash each cross-side size candidate once.
 
     Returns a deterministic JSON-compatible observation with a content digest.
     Operational failures are retained in ``problems`` and make ``complete``
     false. Invalid pair declarations raise ValueError. Consumers must require
     complete coverage before making negative content or absence assertions.
+
+    ``hash_content=False`` returns a sizes-only estimate with null hashes.
+    ``hash_plan`` records candidate file counts and logical payload bytes before
+    hashing. The optional progress consumer receives metadata stages and hash
+    read events, including intermediate reads within large files. Its failures
+    raise ProgressError. Progress is excluded from the observation digest.
     """
+    if type(hash_content) is not bool:
+        raise ValueError("hash_content must be a boolean")
+    if progress is not None and not callable(progress):
+        raise ValueError("progress must be callable")
     if not pairs or any(not isinstance(pair, RootPair) or not isinstance(pair.folder_id, str)
                         or not pair.folder_id.strip() for pair in pairs):
         raise ValueError("pairs need non-empty string folder IDs")
@@ -221,33 +254,68 @@ def observe_pairs(pairs: tuple[RootPair, ...]) -> dict:
     if not problems:
         for root in roots:
             label = {key: root[key] for key in ("folder_id", "side")}
-            before = _walk(root["path"], root["prefixes"])
+            _emit(progress, phase="inventory", **label)
+            if progress is None:
+                before = _walk(root["path"], root["prefixes"])
+            else:
+                before = _walk(root["path"], root["prefixes"],
+                               on_progress=lambda event: _emit(progress, phase="inventory_read", **label, **event))
             observations.append((root, before))
             files.extend(dict(**label, **row, sha256=None, bytes_read=0) for row in before[0] if row["kind"] == "file")
             excluded.extend(dict(**label, **row) for row in before[1])
             problems.extend(dict(**label, **row) for row in before[2])
-        sizes = {side: {f["size"] for f in files if f["side"] == side} for side in ("tower", "target")}
-        common_sizes = sizes["tower"] & sizes["target"]
-        by_root = {(root["folder_id"], root["side"]): root for root in roots}
-        for row in files:
-            if row["size"] not in common_sizes:
-                continue
+    sizes = {side: {f["size"] for f in files if f["side"] == side} for side in ("tower", "target")}
+    common_sizes = sizes["tower"] & sizes["target"]
+    candidates = [row for row in files if row["size"] in common_sizes]
+    hash_plan = dict(candidate_files=len(candidates), candidate_bytes=sum(row["size"] for row in candidates),
+                     inventory_complete=not problems,
+                     by_side={side: dict(files=sum(row["side"] == side for row in candidates),
+                                         bytes=sum(row["size"] for row in candidates if row["side"] == side))
+                              for side in ("tower", "target")})
+    _emit(progress, phase="hash_plan", hash_content=hash_content, **hash_plan)
+    by_root = {(root["folder_id"], root["side"]): root for root in roots}
+    bytes_attempted = 0
+    files_hashed = 0
+    if hash_content and not problems:
+        for number, row in enumerate(candidates, 1):
             root = by_root[row["folder_id"], row["side"]]
+            label = dict(folder_id=row["folder_id"], side=row["side"], path=row["relative_path"])
+            _emit(progress, phase="hash_start", files_processed=number - 1, **label, **hash_plan)
+
+            def read_progress(count):
+                nonlocal bytes_attempted
+                bytes_attempted += count
+                _emit(progress, phase="hash_read", bytes_read=bytes_attempted,
+                      candidate_bytes=hash_plan["candidate_bytes"], files_hashed=files_hashed, **label)
+
             try:
-                row["sha256"], row["bytes_read"] = _hash(root["path"], row)
+                if progress is None:
+                    row["sha256"], row["bytes_read"] = _hash(root["path"], row)
+                else:
+                    row["sha256"], row["bytes_read"] = _hash(root["path"], row, on_bytes=read_progress)
+                files_hashed += 1
             except (OSError, ValueError) as error:
                 row["bytes_read"] = None
                 problems.append(dict(folder_id=row["folder_id"], side=row["side"], path=row["relative_path"], reason=str(error)))
-        for root, before in observations:
-            try:
-                _, identity, _ = _bind(root["path"])
+            _emit(progress, phase="hash_result", files_processed=number, files_hashed=files_hashed,
+                  successful=row["sha256"] is not None, **label)
+    for root, before in observations:
+        _emit(progress, phase="recheck", folder_id=root["folder_id"], side=root["side"])
+        try:
+            _, identity, _ = _bind(root["path"])
+            if progress is None:
                 after = _walk(root["path"], root["prefixes"])
-                if identity != root["identity"] or before != after:
-                    raise ValueError("tree changed across observation")
-            except (OSError, ValueError) as error:
-                problems.append(dict(folder_id=root["folder_id"], side=root["side"], path=".", reason=str(error)))
+            else:
+                after = _walk(root["path"], root["prefixes"],
+                              on_progress=lambda event: _emit(progress, phase="recheck_read", folder_id=root["folder_id"], side=root["side"], **event))
+            if identity != root["identity"] or before != after:
+                raise ValueError("tree changed across observation")
+        except (OSError, ValueError) as error:
+            problems.append(dict(folder_id=root["folder_id"], side=root["side"], path=".", reason=str(error)))
+    _emit(progress, phase="complete", complete=not problems, files_hashed=files_hashed)
     order = lambda row: (row["folder_id"], row["side"], row.get("relative_path", row.get("path", "")), row.get("reason", ""))
     result = dict(contract=CONTRACT, scope="filesystem-only", complete=not problems,
+                  hash_mode="content" if hash_content else "estimate", hash_plan=hash_plan,
                   exclusion_policy=dict(component_names=sorted(_EXCLUDED), temporary_name=".syncthing.*.tmp"),
                   roots=sorted(bindings, key=order), files=sorted(files, key=order),
                   excluded=sorted(excluded, key=order), problems=sorted(problems, key=order),
