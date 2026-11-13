@@ -212,6 +212,30 @@ def test_descendant_grace_starts_at_root_exit_independent_of_eof(fixture, monkey
     assert store.get(row["job_id"])["state"] == "succeeded"
 
 
+def _stalled_commit_evidence(owner, store, final):
+    """Retain failure evidence without polling native handles or changing budgets.
+
+    Only the failing assertion calls this, after the witness has started its
+    pump and settled the owner. An unavailable event page must not mask the
+    original unexpected state. Milestones and log counters are cached values.
+    """
+    try:
+        events = store.events(final["job_id"], limit=100)
+    except Exception as exc:
+        events = {"read_error": type(exc).__name__ + ": " + str(exc)}
+    return dict(reason=owner.reason, phase=owner.phase,
+        budgets=dataclasses.asdict(owner.limits), row=final, events=events,
+        milestones={key: getattr(owner, key) for key in
+                    ("root_exit", "terminate_at", "zero_at", "cleanup_at")},
+        ownership=dict(done=owner.done, claim_closed=owner.claim._closed,
+                       running_saved=owner.running_saved, uncertain_saved=owner.uncertain_saved,
+                       published=owner.published, terminal=owner.terminal),
+        log=dict(error=owner.pump.error, read_offset=owner.pump.queue.offset,
+                 durable_offset=owner.pump.disk.snapshot["offset"],
+                 complete=owner.pump.disk.snapshot["complete"],
+                 reader_alive=owner.pump.reader.is_alive(), writer_alive=owner.pump.writer.is_alive()))
+
+
 def test_stalled_running_commit_cannot_block_descendant_supervision(fixture, monkeypatch, tmp_path):
     ready = tmp_path / "ready"
     child = f"import pathlib,time;pathlib.Path({str(ready)!r}).touch();time.sleep(60)"
@@ -233,7 +257,9 @@ def test_stalled_running_commit_cannot_block_descendant_supervision(fixture, mon
     finally:
         release.set()
     until(owner, lambda: owner.done)
-    assert store.get(row["job_id"])["state"] == "succeeded"
+    final = store.get(row["job_id"])
+    assert final["state"] == "succeeded", json.dumps(
+        _stalled_commit_evidence(owner, store, final), indent=2, default=str)
 
 
 def test_slow_receipt_publication_retains_owner_and_waits_for_actual_proof(fixture, monkeypatch):
