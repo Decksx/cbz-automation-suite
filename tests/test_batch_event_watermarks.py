@@ -135,6 +135,80 @@ def test_a_fault_while_completing_leaves_the_batch_unusable(catalog):
     assert not connection.in_transaction
 
 
+def _deny_one_commit(connection):
+    """A real SQLite authorizer refusing the next COMMIT (ROLLBACK allowed)."""
+    state = {"denied": False}
+
+    def authorizer(action, arg1, arg2, database, trigger):
+        if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT" and not state["denied"]:
+            state["denied"] = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorizer)
+    return state
+
+
+@pytest.mark.parametrize("step", ["start", "complete"])
+def test_a_rejected_commit_rolls_back_and_releases_the_lock(catalog, step):
+    """PR #189 review R1: a refused COMMIT must not leave the owned write
+    transaction open with a reported-failed mutation still pending."""
+    connection, library = catalog
+    library.mkdir(parents=True)
+    repository = LibraryRepository(connection)
+    batch = repository.start_batch(library) if step == "complete" else None
+    state = _deny_one_commit(connection)
+    with pytest.raises(sqlite3.DatabaseError):
+        if step == "start":
+            repository.start_batch(library)
+        else:
+            repository.complete_batch(batch, {"scanned": 0})
+    connection.set_authorizer(None)
+    assert state["denied"] and not connection.in_transaction
+    rows = connection.execute("SELECT id, status FROM source_batches ORDER BY id").fetchall()
+    if step == "start":
+        assert rows == []
+    else:
+        assert [(r["id"], r["status"]) for r in rows] == [(batch, "running")]
+        assert "end_event_id" not in details(connection, batch)
+
+
+def test_a_failed_cleanup_rollback_keeps_the_original_error(catalog):
+    """If COMMIT is refused and the cleanup ROLLBACK is refused too, the error
+    raised is still the original COMMIT failure, not a ROLLBACK error chained
+    on top of it. The transaction is then left for the connection owner."""
+    connection, library = catalog
+    library.mkdir(parents=True)
+    denied = []
+
+    def authorizer(action, arg1, arg2, database, trigger):
+        if action == sqlite3.SQLITE_TRANSACTION and arg1 in ("COMMIT", "ROLLBACK") and arg1 not in denied:
+            denied.append(arg1)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorizer)
+    with pytest.raises(sqlite3.DatabaseError) as raised:
+        LibraryRepository(connection).start_batch(library)
+    connection.set_authorizer(None)
+    assert denied == ["COMMIT", "ROLLBACK"]
+    assert raised.value.__context__ is None  # the COMMIT failure itself, not a cleanup error
+    connection.execute("ROLLBACK")
+
+
+def test_sqlite_automatic_rollback_keeps_the_original_error(catalog):
+    """PR #189 review R1: when SQLite itself ends the transaction, cleanup must
+    not replace the real failure with 'no transaction is active'."""
+    connection, library = catalog
+    library.mkdir(parents=True)
+    connection.execute("""CREATE TRIGGER rollback_checkpoint BEFORE INSERT ON discovery_checkpoints
+                          BEGIN SELECT RAISE(ROLLBACK, 'checkpoint rollback witness'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="checkpoint rollback witness"):
+        LibraryRepository(connection).start_batch(library)
+    assert not connection.in_transaction
+    assert connection.execute("SELECT COUNT(*) FROM source_batches").fetchone()[0] == 0
+
+
 def test_bookkeeping_joins_a_transaction_the_caller_holds(catalog):
     connection, library = catalog
     library.mkdir(parents=True)
