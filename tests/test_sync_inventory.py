@@ -299,3 +299,18 @@ def test_exclusion_scope_is_bound_even_when_the_trees_are_empty(pair):
     assert plain["observation_digest"] != scoped["observation_digest"]
     assert all(root["exclude_prefixes"] == ["private"] for root in scoped["roots"])
     assert "ai-decensor-originals" in scoped["exclusion_policy"]["component_names"]
+
+
+def test_a_root_replaced_between_binding_and_first_walk_is_unresolved(pair, monkeypatch):
+    original = sync._walk
+    replaced = []
+    def replacement(root, prefixes):
+        if root == pair.tower and not replaced:
+            root.rename(root.with_name("former-tower"))
+            root.mkdir()
+            replaced.append(True)
+        return original(root, prefixes)
+    monkeypatch.setattr(sync, "_walk", replacement)
+    report = sync.observe_pairs((pair,))
+    assert replaced and not report["complete"]
+    assert any("tree changed" in row["reason"] for row in report["problems"])
