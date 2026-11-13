@@ -35,9 +35,19 @@ The focused file passes: 26 tests in 1.59 seconds.
 
 ### Validation and mutation evidence
 
-FULL_SUITE_PENDING: the full Windows suite is running. Two final test cases
-were added after its collection; their focused run passed. Final full-suite
-coverage and exact inventory will be recorded before the review handoff.
+Full Windows CI run **43343740957**, exact head
+`8b69a8a17317f95f8297269f211c8781512eb6e4`, passed **6,575 tests with 5 skipped**
+in 461.35 seconds: **6,580 collected cases**. The final code/tests/protocol are
+unchanged in this follow-up evidence commit. A fresh CI run is still required
+on the review head before merge.
+
+The initial local full run stopped at 56% without a result and is not counted
+as passed. A fresh local run with CBZ_TRANSLATION_ENABLED=0, a private temp
+root and a 90-second diagnostic traceback is still active as of 06:03 UTC;
+no completed local full-suite result is claimed here. The 26-case focused run
+passed after the final two cases were added. Local collection also finds
+6,580 cases. The net inventory increase is 15; passing/skipped totals from
+different environments must not be compared as if they were one run.
 The previously recorded #184 baseline is 6,553 passed / 12 skipped. Its final
 web code/tests at c8f2995 match the branch base fb17f09 byte-for-byte; this is
 historical baseline evidence, not a newly rerun baseline claim.
