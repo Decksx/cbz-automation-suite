@@ -8,6 +8,14 @@ otherwise JSON goes to stdout. Exit 0: complete plan with no review holds;
 By default any change under the library root during planning refuses the
 whole plan. --scoped (or one or more --scope NAME) compares each series
 folder on its own and lists a changed folder under skipped_scopes instead.
+
+--changed-in-batch N / --changed-since-batch N (#158 B2) choose the scopes
+from catalog events inside a completed discovery batch's bounds (that
+batch only, or that batch through the newest event). The selection is
+sealed into planning_scope. A changed folder the selection could not plan
+(unreadable, or changed root-level books) also makes the exit 1. If no
+folder needs planning, only the selection report is printed (no plan and
+no --output file): exit 0, or 1 when something was omitted.
 """
 
 from __future__ import annotations
@@ -18,7 +26,8 @@ import os
 import sys
 from pathlib import Path
 
-from comic_automation.library.canonical_plan import build_plan
+from comic_automation.library.canonical_plan import _INTERNAL, build_plan
+from comic_automation.library.changed_scopes import changed_scopes
 from comic_automation.library.number_style import DEFAULT_REGISTRY
 
 
@@ -53,17 +62,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scope", action="append", metavar="NAME",
         help="Plan only this series folder directly under the root (exact spelling); "
              "repeatable; implies --scoped.")
+    changed = parser.add_mutually_exclusive_group()
+    changed.add_argument("--changed-in-batch", type=int, metavar="N",
+        help="Plan the series folders with catalog events inside discovery batch N.")
+    changed.add_argument("--changed-since-batch", type=int, metavar="N",
+        help="Plan the series folders with catalog events from batch N's start to now.")
     args = parser.parse_args(argv)
+    batch = args.changed_in_batch if args.changed_in_batch is not None else args.changed_since_batch
+    if batch is not None and args.scope:
+        parser.error("--scope cannot be combined with a changed-series selection")
+    chosen = None
     try:
         if args.output is not None:
             _output_target(args.output, args.library_root)
+        if batch is not None:
+            chosen = changed_scopes(args.database, args.library_root, batch_id=batch,
+                                    since=args.changed_since_batch is not None, internal=_INTERNAL)
+            if not chosen.planned:
+                # Nothing to plan; build_plan would refuse an empty scope list.
+                report = {"plan": None, "selection": chosen.as_dict()}
+                print(json.dumps(report, sort_keys=True, indent=2, ensure_ascii=True))
+                return 1 if chosen.omitted else 0
         doc = build_plan(args.library_root, database=args.database,
             quarantine_date=args.quarantine_date,
             accept_comicinfo_drop=args.accept_comicinfo_drop,
             temp_dir=args.temp_dir, max_held_bytes=args.max_held_bytes,
             max_copy_bytes=args.max_copy_bytes, number_style=args.number_style,
             number_style_registry=args.number_style_registry, series_folder_root=args.series_folder_root,
-            scoped=args.scoped, scopes=args.scope)
+            scoped=args.scoped, scopes=chosen.planned if chosen else args.scope,
+            selection=chosen.as_dict() if chosen else None)
         payload = json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
         if args.output is not None:
             target = _output_target(args.output, args.library_root)
@@ -83,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"output": str(target), "plan_digest": doc["plan_digest"],
                           "counts": doc["counts"], "diagnostics": doc["diagnostics"]}))
     # A skipped folder was not planned at all, so the plan is not complete.
-    return 1 if doc["counts"]["review"] or doc.get("skipped_scopes") else 0
+    return 1 if doc["counts"]["review"] or doc.get("skipped_scopes") or (chosen and chosen.omitted) else 0
 
 
 if __name__ == "__main__":
