@@ -53,9 +53,17 @@ class LibraryRepository:
     def _write_transaction(self) -> Iterator[None]:
         """Hold the write lock across a read-then-write of batch bookkeeping.
 
-        Joins a transaction the caller already holds; otherwise takes one with
+        Joins a transaction the caller already holds, and leaves its outcome
+        (commit or rollback) to the caller; otherwise takes one with
         BEGIN IMMEDIATE, so no other writer can append a file event between
         reading the event-ID watermark and storing it (issue #158, B2).
+
+        An owned transaction is committed inside the protected block, so a
+        rejected COMMIT is rolled back instead of leaving the write lock and a
+        reported-failed mutation pending. A failing cleanup ROLLBACK never
+        replaces the original error: SQLite may already have rolled back
+        (``RAISE(ROLLBACK)``, some I/O errors), and a second ROLLBACK would
+        then report "no transaction is active" instead (PR #189).
         """
         if self.connection.in_transaction:
             yield
@@ -63,10 +71,16 @@ class LibraryRepository:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             yield
+            self.connection.execute("COMMIT")
         except BaseException:
-            self.connection.execute("ROLLBACK")
+            # SQLite may already have ended the transaction itself; then this
+            # ROLLBACK fails with "no transaction is active". Either way the
+            # original failure is the one to report, never the cleanup error.
+            try:
+                self.connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise
-        self.connection.execute("COMMIT")
 
     def _max_event_id(self) -> int:
         row = self.connection.execute(
@@ -128,8 +142,9 @@ class LibraryRepository:
             # Its paired discovery_checkpoints row starts at zero progress;
             # update_checkpoint() advances it as the scan proceeds so a
             # crash mid-scan can be resumed from the last checkpoint. It is
-            # written in the same transaction, so a batch never exists
-            # without its checkpoint.
+            # written in the same transaction: when this method owns that
+            # transaction, a batch never exists without its checkpoint; inside
+            # a caller's transaction, the caller must roll back on failure.
             self.connection.execute(
                 """
                 INSERT INTO discovery_checkpoints (
