@@ -106,7 +106,7 @@ def test_invalid_exclusion_declarations_are_refused(pair, prefix):
         sync.observe_pairs((sync.RootPair("manga", pair.tower, pair.target, (prefix,)),))
 
 
-@pytest.mark.parametrize("name", ["CON", "aux.cbz", "COM1.txt", "dir/bad.", "dir/bad ", "a:b", "a\\b", "a?b", "a\x01b"])
+@pytest.mark.parametrize("name", ["CON", "aux.cbz", "COM1.txt", "dir/bad.", "dir/bad ", "a:b", "a\\b", "a?b", "a\x01b", "COM\u00b9.cbz", "LPT\u00b2.txt", "CON .cbz"])
 def test_windows_unrepresentable_paths_are_rejected(name):
     with pytest.raises(ValueError):
         sync._portable(name)
