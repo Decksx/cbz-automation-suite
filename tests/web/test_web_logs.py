@@ -13,7 +13,6 @@ import pytest
 
 from comic_automation.web.jobs import logs as lg
 from comic_automation.web.jobs.log_io import shared_read, cancel_thread_io
-from log_test_support import retry_log_index
 
 JOB = "00000000000000000000000001"
 NONCE = "0" * 32
@@ -109,7 +108,7 @@ def test_retention_gap_is_durable_before_closed_file_deletion(tmp_path, monkeypa
     assert "".join(r.get("text", "") for r in result["records"]) == "bbbbcccc"
 
 
-def test_alternating_overflow_compacts_map_and_physical_files(tmp_path, retry_log_index):
+def test_alternating_overflow_compacts_map_and_physical_files(tmp_path):
     disk = lg.LogDisk(tmp_path / "log", JOB, NONCE, keep=4, segment_bytes=8)
     for n in range(300):
         disk.append(n * 4, b"a\n")
@@ -143,7 +142,7 @@ def test_partial_write_preserves_prefix_and_accounts_remaining_bytes(disk, monke
     assert (disk.directory / "seg-0000000000000000.log").read_bytes() == b"abc"
 
 
-def test_zero_writes_do_not_leak_empty_segments(tmp_path, monkeypatch, retry_log_index):
+def test_zero_writes_do_not_leak_empty_segments(tmp_path, monkeypatch):
     disk = lg.LogDisk(tmp_path / "log", JOB, NONCE)
     class Zero:
         def __init__(self, stream): self.stream = stream
