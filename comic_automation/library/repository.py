@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,43 +49,112 @@ class LibraryRepository:
         self.connection = connection
         self.queue = JobQueue(connection)
 
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        """Hold the write lock across a read-then-write of batch bookkeeping.
+
+        Joins a transaction the caller already holds, and leaves its outcome
+        (commit or rollback) to the caller; otherwise takes one with
+        BEGIN IMMEDIATE, so no other writer can append a file event between
+        reading the event-ID watermark and storing it (issue #158, B2).
+
+        An owned transaction is committed inside the protected block, so a
+        rejected COMMIT is rolled back instead of leaving the write lock and a
+        reported-failed mutation pending. A failing cleanup ROLLBACK never
+        replaces the original error: SQLite may already have rolled back
+        (``RAISE(ROLLBACK)``, some I/O errors), and a second ROLLBACK would
+        then report "no transaction is active" instead (PR #189).
+        """
+        if self.connection.in_transaction:
+            yield
+            return
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self.connection.execute("COMMIT")
+        except BaseException:
+            # SQLite may already have ended the transaction itself; then this
+            # ROLLBACK fails with "no transaction is active". Either way the
+            # original failure is the one to report, never the cleanup error.
+            try:
+                self.connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _max_event_id(self) -> int:
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM file_events"
+        ).fetchone()
+        return int(row[0])
+
+    def _start_event_id(self, batch_id: int) -> int | None:
+        """The batch's persisted lower watermark, or None if it has none.
+
+        Batches recorded before watermarks existed, and malformed details,
+        give None. Nothing is invented from timestamps: a batch without a
+        trustworthy marker cannot bound "what changed" (issue #158, B2).
+        """
+        row = self.connection.execute(
+            "SELECT details_json FROM source_batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        try:
+            value = json.loads(row[0]).get("start_event_id")
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return value if type(value) is int and value >= 0 else None
+
     def start_batch(self, source_path: str | Path) -> int:
         normalized = str(normalize_library_path(source_path))
 
-        # A source_batches row represents this scan run as a whole.
-        cursor = self.connection.execute(
-            """
-            INSERT INTO source_batches (
-                source_path,
-                status,
-                details_json
-            )
-            VALUES (?, 'running', ?)
-            """,
-            (
-                normalized,
-                json.dumps(
-                    {"mode": "read-only-discovery"},
-                    sort_keys=True,
+        with self._write_transaction():
+            # The highest file_events id before any discovery work: every
+            # event this scan records gets a larger id (the log is
+            # append-only), so "id > start_event_id" bounds what this scan
+            # and later scans saw, independent of clocks (issue #158, B2).
+            start_event_id = self._max_event_id()
+
+            # A source_batches row represents this scan run as a whole.
+            cursor = self.connection.execute(
+                """
+                INSERT INTO source_batches (
+                    source_path,
+                    status,
+                    details_json
+                )
+                VALUES (?, 'running', ?)
+                """,
+                (
+                    normalized,
+                    json.dumps(
+                        {
+                            "mode": "read-only-discovery",
+                            "start_event_id": start_event_id,
+                        },
+                        sort_keys=True,
+                    ),
                 ),
-            ),
-        )
-
-        batch_id = int(cursor.lastrowid)
-
-        # Its paired discovery_checkpoints row starts at zero progress;
-        # update_checkpoint() advances it as the scan proceeds so a
-        # crash mid-scan can be resumed from the last checkpoint.
-        self.connection.execute(
-            """
-            INSERT INTO discovery_checkpoints (
-                batch_id,
-                source_path
             )
-            VALUES (?, ?)
-            """,
-            (batch_id, normalized),
-        )
+
+            batch_id = int(cursor.lastrowid)
+
+            # Its paired discovery_checkpoints row starts at zero progress;
+            # update_checkpoint() advances it as the scan proceeds so a
+            # crash mid-scan can be resumed from the last checkpoint. It is
+            # written in the same transaction: when this method owns that
+            # transaction, a batch never exists without its checkpoint; inside
+            # a caller's transaction, the caller must roll back on failure.
+            self.connection.execute(
+                """
+                INSERT INTO discovery_checkpoints (
+                    batch_id,
+                    source_path
+                )
+                VALUES (?, ?)
+                """,
+                (batch_id, normalized),
+            )
 
         return batch_id
 
@@ -167,41 +237,56 @@ class LibraryRepository:
         batch_id: int,
         summary: dict,
     ) -> None:
-        self.connection.execute(
-            """
-            UPDATE source_batches
-            SET
-                status = 'completed',
-                details_json = ?
-            WHERE id = ?
-            """,
-            (json.dumps(summary, sort_keys=True), batch_id),
-        )
+        # The summary replaces details_json, so the batch's start marker is
+        # carried over, and the upper marker is stored with the 'completed'
+        # status in one statement: a completed batch always has both, or
+        # start_event_id null for a batch that never had one (never a
+        # fabricated bound).
+        with self._write_transaction():
+            details = dict(
+                summary,
+                start_event_id=self._start_event_id(batch_id),
+                end_event_id=self._max_event_id(),
+            )
+            self.connection.execute(
+                """
+                UPDATE source_batches
+                SET
+                    status = 'completed',
+                    details_json = ?
+                WHERE id = ?
+                """,
+                (json.dumps(details, sort_keys=True), batch_id),
+            )
 
     def fail_batch(
         self,
         batch_id: int,
         error_message: str,
     ) -> None:
-        self.connection.execute(
-            """
-            UPDATE source_batches
-            SET
-                status = 'failed',
-                details_json = ?
-            WHERE id = ?
-            """,
-            (
-                json.dumps(
-                    {
-                        "mode": "read-only-discovery",
-                        "error": error_message,
-                    },
-                    sort_keys=True,
+        # A failed batch can be resumed; it keeps its original start marker
+        # so the resumed scan still bounds everything it recorded.
+        with self._write_transaction():
+            self.connection.execute(
+                """
+                UPDATE source_batches
+                SET
+                    status = 'failed',
+                    details_json = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "mode": "read-only-discovery",
+                            "error": error_message,
+                            "start_event_id": self._start_event_id(batch_id),
+                        },
+                        sort_keys=True,
+                    ),
+                    batch_id,
                 ),
-                batch_id,
-            ),
-        )
+            )
 
     def record_archive(
         self,
