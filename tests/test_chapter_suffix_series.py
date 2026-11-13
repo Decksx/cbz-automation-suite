@@ -77,6 +77,22 @@ def test_watcher_lands_every_chapter_drop_in_one_series_folder(tmp_path):
     assert resolved == {"Hypnotist Security Guard"}
 
 
+@pytest.mark.parametrize("suffix", ["Night Shift", "Artist"])
+def test_media_mode_keeps_the_series_year_of_a_chapter_suffix_drop(tmp_path, monkeypatch, suffix):
+    """Registered media mode reattaches the folder's series year before the
+    keyword rule runs; the suffix rule must not drop it, or 2019 and 2020
+    reboots land in one series as the same chapter (PR #186 review round 2)."""
+    monkeypatch.setattr(watcher, "_media_naming_enabled", lambda: True)
+    dest = tmp_path / "Comix"
+    dest.mkdir()
+    resolved = []
+    for year in (2019, 2020):
+        folder = tmp_path / "claims" / f"Book Chapter 12 - {suffix} ({year})"
+        folder.mkdir(parents=True)
+        resolved.append(watcher._resolve_series_dir_name(folder, [], str(dest)))
+    assert resolved == [("Book (2019)", "12"), ("Book (2020)", "12")]
+
+
 @pytest.mark.parametrize("pair", [("Part A", "Part B"), ("Side A", "Side B")])
 def test_watcher_keeps_part_and_side_folders_distinct(tmp_path, pair):
     """Two halves of one chapter must not collapse into one series and one
