@@ -89,9 +89,24 @@ policy. The reader continues draining/offering (and dropping when the bounded
 queue is full) until actual EOF or final cleanup after verified job zero. It
 does not wait for writer recovery. The runner selects `sticky_failure=True`
 on its log pump: even recovered I/O cannot publish a complete EOF index after
-an error. The last durable coverage remains truthful, with `unknown_tail` and
-no ordinary terminal receipt. Standalone M3b pumps retain their previous
+an error escapes the disk writer. The last durable coverage remains truthful,
+with `unknown_tail` and no ordinary terminal receipt. Standalone M3b pumps retain their previous
 retry/coverage behavior by default.
+
+The disk writer handles a narrowly bounded publication retry before that sticky
+boundary: only a `PermissionError` with `winerror == 5` from replacing its exact
+`index.tmp` with `index.json`, with both paths present on the error, is retried.
+It makes at most five attempts, separated by four 20 ms waits (80 ms of waiting
+in total; filesystem calls can take longer). Every attempt revalidates the
+candidate and claim/path boundary, rewrites and fsyncs the temporary index, and
+advances the in-memory durable watermark only after a successful atomic replace.
+This applies to initial publication, appended coverage, and EOF publication.
+Recovered refusals do not reach the pump. Exhaustion, other replacement errors,
+and write/fsync/validation failures retain the existing error and uncertainty
+policy. This does not add any authority to stop or finalize a writing job.
+An explicit, durable dropped/retention gap keeps its existing coverage meaning;
+proven pipe EOF can coexist with such a gap. Recovery does not erase the gap or
+turn an unrecorded tail into proven coverage.
 
 Only `wait` stop policy is accepted in this slice. A stop intent observed while
 the root runs records uncertainty and retains admission; it is **not** authority
