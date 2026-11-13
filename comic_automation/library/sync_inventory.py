@@ -241,9 +241,9 @@ def observe_pairs(pairs: tuple[RootPair, ...]) -> dict:
                 problems.append(dict(folder_id=row["folder_id"], side=row["side"], path=row["relative_path"], reason=str(error)))
         for root, before in observations:
             try:
-                _bind(root["path"])
+                _, identity, _ = _bind(root["path"])
                 after = _walk(root["path"], root["prefixes"])
-                if before != after:
+                if identity != root["identity"] or before != after:
                     raise ValueError("tree changed across observation")
             except (OSError, ValueError) as error:
                 problems.append(dict(folder_id=root["folder_id"], side=root["side"], path=".", reason=str(error)))
