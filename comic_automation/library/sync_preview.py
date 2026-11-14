@@ -37,6 +37,33 @@ def _ref(row):
     return {key: row[key] for key in ("folder_id", "relative_path", "size", "sha256")}
 
 
+def _directory_holds(rows):
+    """Find spelling conflicts on every parent component, scoped by folder ID.
+
+    Different child filenames do not make a case/NFC-conflicted parent safe.
+    Hold the whole affected subtree, including otherwise identical keeps.
+    Prefix components prevent `Series` from also holding `SeriesExtra`.
+    """
+    def prefixes(row):
+        parts = row["relative_path"].split("/")
+        for length in range(1, len(parts)):
+            spelling = "/".join(parts[:length])
+            yield (row["folder_id"], unicodedata.normalize("NFC", spelling).casefold()), spelling
+
+    spellings = defaultdict(set)
+    for row in rows:
+        for key, spelling in prefixes(row):
+            spellings[key].add(spelling)
+    conflicts = {key: tuple(sorted(names)) for key, names in spellings.items() if len(names) > 1}
+    holds = {}
+    for row in rows:
+        for key, _ in prefixes(row):
+            if key in conflicts:
+                holds[row["side"], _key(row)] = "directory spelling conflict: " + ", ".join(conflicts[key])
+                break
+    return holds
+
+
 def _validated(observation):
     """Validate the producer contract and digest before deriving assertions.
 
@@ -110,6 +137,7 @@ def build_preview(observation: dict) -> dict:
     """
     doc = _validated(observation)
     rows = sorted(doc["files"], key=lambda row: (row["folder_id"], row["side"], row["relative_path"]))
+    directory_holds = _directory_holds(rows)
     sides = {side: {_key(row): row for row in rows if row["side"] == side}
              for side in ("tower", "target")}
     routes = {side: {} for side in sides}
@@ -128,7 +156,11 @@ def build_preview(observation: dict) -> dict:
     else:
         for key, tower in sides["tower"].items():
             target = sides["target"].get(key)
-            if target is None:
+            if (reason := directory_holds.get(("tower", key))) is not None:
+                hold("tower", key, reason)
+                if target is not None:
+                    hold("target", key, reason)
+            elif target is None:
                 writes.append(dict(kind="new_path", tower=_ref(tower), old_target=None))
                 routes["tower"][key] = "write"
             elif tower["relative_path"] != target["relative_path"]:
@@ -147,8 +179,11 @@ def build_preview(observation: dict) -> dict:
                 routes["tower"][key], routes["target"][key] = "write", "replaced"
         for key, target in sides["target"].items():
             if key not in sides["tower"]:
-                removes.append(dict(target=_ref(target)))
-                routes["target"][key] = "remove"
+                if (reason := directory_holds.get(("target", key))) is not None:
+                    hold("target", key, reason)
+                else:
+                    removes.append(dict(target=_ref(target)))
+                    routes["target"][key] = "remove"
 
     # Groups keep many-to-many mappings linear in files, avoiding a quadratic
     # list of Cartesian pairs. Group membership never changes path accounting.
@@ -179,6 +214,8 @@ def build_preview(observation: dict) -> dict:
                   to_remove=removes, unresolved=unresolved, metadata_differences=metadata,
                   exact_matches_elsewhere=matches, counts=counts, reconciled=reconciled,
                   limits=["Logical file delta, not predicted network/disk I/O or Syncthing actions.",
+                          "Empty directories are not classified; complete refers to observed files only.",
+                          "File/directory type transitions are logical file deltas; directory operations and their ordering are not modeled.",
                           "No bound Syncthing configuration evidence; sync readiness is not established.",
                           "Non-atomic observation; later changes require a fresh comparison."])
     result["preview_digest"] = _digest(result, "preview_digest")
