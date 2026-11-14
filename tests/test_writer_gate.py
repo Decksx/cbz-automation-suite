@@ -217,3 +217,94 @@ def test_sync_observations_never_carry_or_count_control_files(tmp_path):
     excluded = {row["path"] for row in report["excluded"]}
     assert excluded == {name for name in wg.CONTROL_FILENAMES} | {f"Series/{name}" for name in wg.CONTROL_FILENAMES}
     assert set(wg.CONTROL_FILENAMES) <= set(report["exclusion_policy"]["component_names"])
+
+
+# --- physical binding and acquisition window (codex-lead review of #195) ----
+
+def test_an_interior_alias_gets_the_physical_series_key_and_cannot_double_admit(library, tmp_path):
+    root, registry, coordination = library
+    _junction(root / "Alias", root / "Series")
+    normal, below = wg.coordination_root((coordination,), root / "Series" / "book.cbz")
+    alias, alias_below = wg.coordination_root((coordination,), root / "Alias" / "book.cbz")
+    assert alias is normal and alias_below == below == ("Series", "book.cbz")
+    results = []
+    with wg.ordinary_unit(normal, wg.series_key(normal, below, folder=False)):
+        thread = threading.Thread(target=lambda: results.append(
+            attempt(wg.ordinary_unit(alias, wg.series_key(alias, alias_below, folder=False)))))
+        thread.start()
+        thread.join(timeout=10)
+    assert results == ["busy"]
+
+
+def test_a_junction_escaping_into_another_root_uses_that_roots_gate(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    (second / "Series").mkdir(parents=True)
+    _junction(first / "Escape", second / "Series")
+    roots = wg.load_registry(write_registry(tmp_path / "r.json", [(first, 1), (second, 1)]))
+    chosen, below = wg.coordination_root(roots, first / "Escape" / "new.cbz")
+    assert chosen.path == second and below == ("Series", "new.cbz")
+
+
+def test_an_external_alias_straight_to_a_series_resolves_to_the_enclosing_root(library, tmp_path):
+    root, registry, coordination = library
+    _junction(tmp_path / "Shortcut", root / "Series")
+    chosen, below = wg.coordination_root((coordination,), tmp_path / "Shortcut" / "Missing Dir" / "new.cbz")
+    assert chosen is coordination and below == ("Series", "Missing Dir", "new.cbz")
+    assert wg.series_key(chosen, below, folder=False) == "series"
+
+
+def test_a_retargeted_alias_is_caught_by_still_bound(library, tmp_path):
+    root, registry, coordination = library
+    (root / "Other").mkdir()
+    _junction(root / "Alias", root / "Series")
+    chosen, below = wg.coordination_root((coordination,), root / "Alias" / "book.cbz")
+    assert wg.still_bound((coordination,), root / "Alias" / "book.cbz", chosen, below)
+    (root / "Alias").rmdir()                      # removes the junction, not its target
+    _junction(root / "Alias", root / "Other")
+    assert not wg.still_bound((coordination,), root / "Alias" / "book.cbz", chosen, below)
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "maintenance"])
+def test_a_root_swapped_during_the_gate_open_is_refused_and_released(library, tmp_path, monkeypatch, kind):
+    root, registry, coordination = library
+    real_open = os.open
+    swapped = []
+
+    def open_after_swap(path, *args, **kwargs):
+        if Path(path) == root / wg.GATE_LOCK and not swapped:
+            swapped.append(True)
+            root.rename(tmp_path / "old-library")
+            root.mkdir()
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(wg.os, "open", open_after_swap)
+    manager = wg.ordinary_unit(coordination, "series") if kind == "ordinary" else wg.maintenance_run(coordination, {"who": "t"})
+    with pytest.raises(wg.GateRefused, match="changed during acquisition"):
+        with manager:
+            pytest.fail("ownership was granted on a replacement root")
+    monkeypatch.setattr(wg.os, "open", real_open)
+    replacement = wg.load_registry(write_registry(tmp_path / "again.json", [(root, 1)]))[0]
+    assert attempt(wg.maintenance_run(replacement, {"who": "t"})) == "granted"   # nothing left locked
+
+
+def test_a_link_still_on_the_physical_chain_is_refused(library, monkeypatch):
+    """Simulates an alias created or retargeted after resolution: the chain is
+    walked again with lstat, and a remaining reparse point is refused."""
+    root, registry, coordination = library
+    _junction(root / "Alias", root / "Series")
+    monkeypatch.setattr(wg.os.path, "realpath", lambda path: path)
+    with pytest.raises(wg.GateRefused, match="remains on the physical path"):
+        wg.coordination_root((coordination,), root / "Alias" / "book.cbz")
+
+
+def test_a_held_lock_file_cannot_be_renamed_or_deleted(library):
+    """The property that makes swapping the lock file under a holder impossible:
+    Python's os.open grants no delete sharing, so Windows refuses both."""
+    root, registry, coordination = library
+    with wg.ordinary_unit(coordination, "series"):
+        with pytest.raises(PermissionError):
+            os.replace(root / wg.GATE_LOCK, root / "orphaned.lock")
+        with pytest.raises(PermissionError):
+            (root / wg.GATE_LOCK).unlink()
+    os.replace(root / wg.GATE_LOCK, root / "after.lock")   # free once released
