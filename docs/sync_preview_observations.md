@@ -3,9 +3,9 @@
 Issue #108 implements the Tower-to-X preview and post-sync verification on
 explicit root pairs. The first implementation PR supplies their shared
 filesystem observation API in `comic_automation.library.sync_inventory`.
-The estimate/observation CLI below exposes that API. Preview/verifier report
-classification and sanitized Syncthing configuration evidence follow in the next
-slice. Issue #108 remains open through those deliveries.
+The CLI exposes estimates, observations and the filesystem preview described
+below. The fresh post-sync verifier and sanitized Syncthing configuration
+evidence remain subsequent deliveries. Issue #108 stays open.
 
 ## API and scope
 
@@ -128,9 +128,10 @@ configuration or credentials. Relative paths resolve against its directory:
 ```powershell
 python -m comic_automation.library.sync_observe_cli estimate --pairs pairs.json
 python -m comic_automation.library.sync_observe_cli observe --pairs pairs.json
+python -m comic_automation.library.sync_observe_cli preview --pairs pairs.json
 ```
 
-Both commands print JSON to stdout and throttled JSON progress to stderr.
+All commands print JSON to stdout and throttled JSON progress to stderr.
 `--quiet` suppresses progress. Exit 0 means complete observation, 2 means invalid
 input or incomplete coverage, and 1 means an output/progress consumer failed.
 An incomplete observation still prints its document. A complete estimate remains
@@ -141,3 +142,68 @@ apply, rename or configuration-control mode. It does not resume a prior hash
 pass or promote cached stat-matching hashes to fresh evidence. Reuse needs an
 explicit evidence-age contract first. Actual sync and cutover remain the
 separately reviewed operator procedure in #108.
+
+## Logical filesystem preview
+
+`comic_automation.library.sync_preview.build_preview(observation)` derives a
+`sync-filesystem-preview-v1` document. It accepts content observations and
+checks their digest, file/root bindings, portable path collisions, certified
+hash read lengths and observed file counts. A supposedly complete artifact
+missing a shared-size candidate's hash is refused, including when the match
+would be at another path. An estimate is refused. The
+preview embeds an independent copy of the full observation and binds it and
+every derived field into `preview_digest`, using the same canonical JSON
+encoding as the observation digest. Digests bind artifacts; the producer's
+filesystem stability and coverage checks remain prerequisites.
+
+| Set | Meaning |
+| --- | --- |
+| `keep_in_place` | Exact corresponding folder ID/path, equal size and verified SHA-256. |
+| `to_write`, `new_path` | Desired Tower path absent from the complete target inventory. |
+| `to_write`, `replacement` | Corresponding path has unequal size or unequal verified bytes; retains `old_target`. |
+| `to_remove` | In-scope target path absent from the desired Tower layout; replacements are not counted here. |
+| `unresolved` | Coverage/stability is incomplete, needed full hashes are absent, or cross-side Windows path spellings conflict. |
+
+Different sizes prove inequality without payload reads. Equal sizes need full
+hashes before a keep or replacement is asserted. Incomplete coverage makes
+every observed file unresolved, since absence cannot be inferred from gaps.
+An incomplete observation with zero files is still incomplete. Case-only or
+NFC-equivalent spelling differences across sides are held as unresolved.
+Every directory prefix represented by the files is checked within each
+folder ID, including conflicting spellings within one side. All files under
+a conflicting prefix are held, even when their child names differ or a child
+would otherwise be a same-path keep. Reasons name the conflicting folder
+spellings. Prefix components keep `Series` separate from `SeriesExtra`.
+Proposing writes and removals under spelling variants could address the same
+Windows directory or file; the report does not resolve that policy itself.
+
+`counts.tower` partitions observed files/bytes into keep, write and unresolved;
+`counts.target` partitions them into keep, replaced, remove and unresolved.
+`reconciled` checks every observed file has a disposition. Excluded boundaries
+remain in the embedded observation; their unknown descendant populations are
+not counted as observed library files. `metadata_differences` records mtime
+differences for equal-content keeps. Neither keeps nor logical byte totals
+predict Syncthing block transfers, metadata updates or physical disk writes.
+
+`exact_matches_elsewhere` contains advisory groups keyed by `(size, sha256)`
+with the full Tower and target path lists, including matches across folder
+IDs. It includes only groups with a cross-path alternative. A row's size/hash
+joins it to the matching group. The lists represent many-to-many alternatives
+without expanding a Cartesian product or inflating file counts. An identical
+file at another target path remains a new-path write at the desired location
+and a removal at the obsolete location; this is not an automatic rename or a
+semantic loss/supersession judgment.
+
+`complete` means the filesystem classification is complete and reconciled.
+`sync_ready` remains **false**: this slice has no bound Syncthing configuration
+or effective-ignore evidence. CLI exit 0 is a complete filesystem comparison,
+not permission or readiness to sync; exit 2 includes unresolved comparisons.
+The preview command has no control/apply operation. The post-sync verifier
+must still use fresh path-and-content evidence and detect source drift; it
+is not implemented by this preview slice.
+
+Directories themselves are not classified: empty-directory creation/removal
+is outside this file accounting. A file-to-directory or directory-to-file
+transition is a logical file delta, not an ordered execution plan; required
+directory operations and their ordering are not modeled. These limits also
+appear in each preview document. `complete` refers to observed files.
