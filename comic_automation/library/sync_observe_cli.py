@@ -1,4 +1,4 @@
-"""Read-only estimates, content observations and logical sync previews.
+"""Read-only estimates, observations, previews, baselines and fresh verification.
 
 JSON goes to stdout. Throttled progress goes to stderr. The manifest and
 generated observation are operator-supplied artifacts outside the library.
@@ -13,6 +13,7 @@ import time
 
 from comic_automation.library.sync_inventory import ProgressError, RootPair, observe_pairs
 from comic_automation.library.sync_preview import build_preview
+from comic_automation.library.sync_verify import verify_pairs
 
 
 def read_pairs(path: Path) -> tuple[RootPair, ...]:
@@ -66,21 +67,30 @@ def _error(message):
 def main(argv=None) -> int:
     """Estimate, observe or classify declared roots without sync controls.
 
-    Exit 0 means complete filesystem observation/classification, not Syncthing
-    readiness. Exit 2 means invalid input or incomplete coverage; 1 means a
-    progress/output consumer failed.
+    Exit 0 means complete observation/classification, or verified file equality
+    in verify mode, not Syncthing readiness. Exit 2 includes invalid input,
+    incomplete evidence and verification differences; 1 means output failed.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("estimate", "observe", "preview"))
+    parser.add_argument("mode", choices=("estimate", "observe", "preview", "baseline", "verify"))
     parser.add_argument("--pairs", required=True, type=Path, help="sync-root-pairs-v1 JSON manifest")
     parser.add_argument("--quiet", action="store_true", help="suppress progress on stderr")
+    parser.add_argument("--all-tower", action="store_true", help="include every Tower file; implicit for baseline/verify")
+    parser.add_argument("--expected", type=Path, help="complete full-Tower baseline JSON; verify only")
     args = parser.parse_args(argv)
+    if (args.mode == "verify") != (args.expected is not None):
+        parser.error("verify requires --expected; other modes do not accept it")
     try:
         pairs = read_pairs(args.pairs)
-        report = observe_pairs(pairs, hash_content=args.mode != "estimate",
-                               progress=None if args.quiet else _renderer(sys.stderr))
-        if args.mode == "preview":
-            report = build_preview(report)
+        progress = None if args.quiet else _renderer(sys.stderr)
+        if args.mode == "verify":
+            expected = json.loads(args.expected.read_text(encoding="utf-8"))
+            report = verify_pairs(expected, pairs, progress=progress)
+        else:
+            report = observe_pairs(pairs, hash_content=args.mode != "estimate",
+                                   hash_all_tower=args.all_tower or args.mode == "baseline", progress=progress)
+            if args.mode == "preview":
+                report = build_preview(report)
     except ProgressError:
         _error("progress output failed")
         return 1
@@ -92,7 +102,7 @@ def main(argv=None) -> int:
     except (OSError, ValueError):
         _error("observation output failed")
         return 1
-    return 0 if report["complete"] else 2
+    return 0 if (report["verified"] if args.mode == "verify" else report["complete"]) else 2
 
 
 if __name__ == "__main__":
