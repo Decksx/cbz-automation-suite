@@ -391,3 +391,85 @@ def test_control_files_never_enter_an_all_tower_baseline_or_block_its_verificati
         (roots["target"] / name).write_bytes(b"")
     result = verify_pairs(baseline, pair)
     assert result["verified"] and result["extra"] == [] and len(result["matched"]) == 1
+
+
+# --- identity/physical consistency and the opened handle (#195 R4/R5) -------
+
+def _aliased_root(tmp_path):
+    first, second, alias = tmp_path / "first", tmp_path / "second", tmp_path / "registered"
+    for root in (first, second):
+        (root / "Series").mkdir(parents=True)
+    _junction(alias, first)
+    return first, second, alias, write_registry(tmp_path / "r.json", [(alias, 1)])
+
+
+def test_an_alias_flipped_during_registry_load_is_refused(tmp_path, monkeypatch):
+    """Alias A->B->A around the realpath call would store identity A with path B."""
+    first, second, alias, config = _aliased_root(tmp_path)
+    real = os.path.realpath
+    flipped = []
+
+    def resolve_during_flip(path, *args, **kwargs):
+        if Path(path) == alias and not flipped:
+            flipped.append(True)
+            alias.rmdir()
+            _junction(alias, second)
+            try:
+                return real(path, *args, **kwargs)
+            finally:
+                alias.rmdir()
+                _junction(alias, first)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(wg.os.path, "realpath", resolve_during_flip)
+    with pytest.raises(wg.GateRefused, match="changed while the registry was loaded"):
+        wg.load_registry(config)
+
+
+def test_a_replaced_physical_root_behind_an_unchanged_alias_identity_is_refused(tmp_path):
+    """Move the original tree, recreate its name, repoint the alias at the moved tree:
+    the alias keeps the stored identity but root.physical now names the replacement."""
+    first, second, alias, config = _aliased_root(tmp_path)
+    registry = wg.load_registry(config)
+    root = registry[0]
+    moved = tmp_path / "moved-original"
+    first.rename(moved)
+    (first / "Series").mkdir(parents=True)
+    alias.rmdir()
+    _junction(alias, moved)
+    assert (alias.stat().st_dev, alias.stat().st_ino) == root.identity
+    below = ("Series", "new.cbz")
+    assert not wg.still_bound(registry, moved / "Series" / "new.cbz", root, below)
+    with pytest.raises(wg.GateRefused, match="changed identity"):
+        with wg.ordinary_unit(root, "series"):
+            pass
+
+
+def test_a_transient_junction_around_the_open_cannot_hand_out_another_trees_gate(tmp_path, monkeypatch):
+    """Swap the physical root for a junction to B only around os.open, then restore it.
+    Every later stat of the root is correct; only the opened handle betrays B."""
+    first, second, alias, config = _aliased_root(tmp_path)
+    (first / wg.GATE_LOCK).touch()
+    root = wg.load_registry(config)[0]
+    moved = tmp_path / "temporarily-moved"
+    real_open = os.open
+    flipped = []
+
+    def open_through_transient_junction(path, *args, **kwargs):
+        if Path(path) == first / wg.GATE_LOCK and not flipped:
+            flipped.append(True)
+            first.rename(moved)
+            _junction(first, second)
+            try:
+                return real_open(path, *args, **kwargs)
+            finally:
+                first.rmdir()
+                moved.rename(first)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(wg.os, "open", open_through_transient_junction)
+    with pytest.raises(wg.GateRefused, match="gate handle is not"):
+        with wg.ordinary_unit(root, "series"):
+            pytest.fail("ownership was granted on another tree's gate file")
+    monkeypatch.setattr(wg.os, "open", real_open)
+    assert attempt(wg.maintenance_run(root, {"who": "t"})) == "granted"   # nothing left locked
