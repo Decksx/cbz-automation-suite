@@ -112,8 +112,16 @@ def load_registry(path: str | Path) -> tuple[CoordinationRoot, ...]:
             identity = _identity(root)
         except OSError as exc:
             raise GateRefused(f"registered root is unavailable: {root}: {exc}") from exc
-        roots.append(CoordinationRoot(root, item["series_depth"], item["enforced"], identity,
-                                      Path(os.path.realpath(root))))
+        physical = Path(os.path.realpath(root))
+        try:
+            # The alias can be retargeted between the stat and the resolve, so
+            # the bound path must be shown to name the identity just stored.
+            consistent = _identity(physical) == identity and _identity(root) == identity
+        except OSError as exc:
+            raise GateRefused(f"registered root is unavailable: {root}: {exc}") from exc
+        if not consistent:
+            raise GateRefused(f"registered root changed while the registry was loaded: {root}")
+        roots.append(CoordinationRoot(root, item["series_depth"], item["enforced"], identity, physical))
     for root in roots:
         lineage = _lineage(root.path)
         for other in roots:
@@ -191,14 +199,15 @@ def destination(root: CoordinationRoot, below: tuple[str, ...]) -> Path:
 
 
 def _root_bound(root: CoordinationRoot) -> bool:
-    """The registered spelling still names the directory bound at load.
+    """The registered spelling **and** the bound physical path still name ``identity``.
 
-    Checking ``root.physical`` as well would add nothing: a registered alias
-    follows its target by path, so replacing the physical directory changes
-    what ``root.path`` resolves to as well.
+    Both are needed. Moving the original tree and repointing the alias at it
+    keeps ``root.path``'s identity while ``root.physical`` names a replacement
+    directory; retargeting the alias keeps ``root.physical`` while changing
+    ``root.path`` (codex-lead's #195 R3/R4 witnesses).
     """
     try:
-        return _identity(root.path) == root.identity
+        return _identity(root.physical) == root.identity and _identity(root.path) == root.identity
     except (OSError, GateRefused):
         return False
 
@@ -287,13 +296,25 @@ class _GateFile:
 
         Checked after the locks are taken and before the caller proceeds: a
         root swapped aside during or after ``os.open`` would otherwise leave
-        this handle locking a file in a different directory. The lock file
-        itself cannot be swapped while held: ``os.open`` does not grant
-        delete sharing, so Windows refuses any rename or delete of it until
-        this handle closes (pinned by a test).
+        this handle locking a file in a different directory. The held lock
+        file itself cannot be renamed or deleted (``os.open`` grants no delete
+        sharing), but its *directory* can be swapped around the open, which is
+        why the handle is compared with the file at the bound path.
         """
         if not _root_bound(root):
             raise GateRefused(f"registered root changed during acquisition: {root.path}")
+        # A root-identity check alone is not enough: the physical name can be
+        # swapped for a transient junction only around os.open and restored,
+        # leaving this handle on another tree's gate while every later stat of
+        # the root looks right (#195 R5). The handle must be the file now at
+        # the bound gate path. (A hard link to the same file would share the
+        # same lock object, so a matching id is sufficient.)
+        try:
+            held, there = os.fstat(self._fd), os.stat(root.physical / GATE_LOCK)
+        except OSError as exc:
+            raise GateRefused(f"cannot confirm the gate file for {root.path}: {exc}") from exc
+        if not held.st_ino or (held.st_dev, held.st_ino) != (there.st_dev, there.st_ino):
+            raise GateRefused(f"registered root changed during acquisition: the gate handle is not {root.physical / GATE_LOCK}")
 
     def close(self) -> None:
         # Unlock in reverse; closing the handle would release them anyway.
