@@ -90,6 +90,11 @@ def _validated(observation):
                        for side in ("tower", "target")}
     if doc.get("file_counts") != {side: count for side, count in observed_counts.items() if count}:
         raise PreviewRefused("observation file counts disagree")
+    sizes = {side: {row["size"] for row in doc["files"] if row["side"] == side}
+             for side in ("tower", "target")}
+    common = sizes["tower"] & sizes["target"]
+    if doc["complete"] and any(row["size"] in common and not row["sha256"] for row in doc["files"]):
+        raise PreviewRefused("complete observation lacks required content evidence")
     return doc
 
 
@@ -132,9 +137,6 @@ def build_preview(observation: dict) -> dict:
             elif tower["size"] != target["size"]:
                 writes.append(dict(kind="replacement", tower=_ref(tower), old_target=_ref(target)))
                 routes["tower"][key], routes["target"][key] = "write", "replaced"
-            elif not tower["sha256"] or not target["sha256"]:
-                for side in sides:
-                    hold(side, key, "corresponding equal-size files lack full-content evidence")
             elif tower["sha256"] == target["sha256"]:
                 kept.append(dict(tower=_ref(tower), target=_ref(target)))
                 routes["tower"][key] = routes["target"][key] = "keep"
