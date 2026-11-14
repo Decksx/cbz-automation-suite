@@ -168,9 +168,14 @@ Different sizes prove inequality without payload reads. Equal sizes need full
 hashes before a keep or replacement is asserted. Incomplete coverage makes
 every observed file unresolved, since absence cannot be inferred from gaps.
 An incomplete observation with zero files is still incomplete. Case-only or
-NFC-equivalent spelling differences across sides are held as unresolved:
-proposing a new write and an obsolete removal could address the same Windows
-file. The report does not resolve that policy automatically.
+NFC-equivalent spelling differences across sides are held as unresolved.
+Every directory prefix represented by the files is checked within each
+folder ID, including conflicting spellings within one side. All files under
+a conflicting prefix are held, even when their child names differ or a child
+would otherwise be a same-path keep. Reasons name the conflicting folder
+spellings. Prefix components keep `Series` separate from `SeriesExtra`.
+Proposing writes and removals under spelling variants could address the same
+Windows directory or file; the report does not resolve that policy itself.
 
 `counts.tower` partitions observed files/bytes into keep, write and unresolved;
 `counts.target` partitions them into keep, replaced, remove and unresolved.
@@ -196,3 +201,9 @@ not permission or readiness to sync; exit 2 includes unresolved comparisons.
 The preview command has no control/apply operation. The post-sync verifier
 must still use fresh path-and-content evidence and detect source drift; it
 is not implemented by this preview slice.
+
+Directories themselves are not classified: empty-directory creation/removal
+is outside this file accounting. A file-to-directory or directory-to-file
+transition is a logical file delta, not an ordered execution plan; required
+directory operations and their ordering are not modeled. These limits also
+appear in each preview document. `complete` refers to observed files.
