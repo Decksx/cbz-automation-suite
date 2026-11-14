@@ -88,8 +88,10 @@ def test_exact_group_can_cross_folder_ids_without_changing_path_counts(tmp_path)
         tower, target = tmp_path / (name+'-tower'), tmp_path / (name+'-target')
         tower.mkdir(); target.mkdir()
         pairs.append(inv.RootPair(name, tower, target))
-    (pairs[0].tower / 'a.cbz').write_bytes(b'x')
-    (pairs[1].target / 'a.cbz').write_bytes(b'x')
+    (pairs[0].tower / 'Series').mkdir()
+    (pairs[1].target / 'series').mkdir()
+    (pairs[0].tower / 'Series/a.cbz').write_bytes(b'x')
+    (pairs[1].target / 'series/a.cbz').write_bytes(b'x')
     report = build_preview(inv.observe_pairs(tuple(pairs)))
     assert report['complete'] and not report['keep_in_place']
     assert report['to_write'][0]['tower']['folder_id'] == 'manga'
@@ -105,6 +107,53 @@ def test_cross_side_windows_spelling_conflicts_are_unresolved(trees, source, tar
     assert len(report['unresolved']) == 2
     assert not report['keep_in_place'] and not report['to_write'] and not report['to_remove']
     assert report['counts']['tower']['unresolved']['files'] == report['counts']['target']['unresolved']['files'] == 1
+
+
+@pytest.mark.parametrize('source,target', [('Series', 'series'), ('Book/Part', 'Book/part'), ('Café', 'Cafe\u0301')])
+def test_directory_prefix_spelling_conflicts_hold_different_child_files(trees, source, target):
+    pair = trees({source+'/new.cbz': b'x'}, {target+'/old.cbz': b'y'})
+    report = build_preview(inv.observe_pairs((pair,)))
+    assert not report['complete'] and report['reconciled']
+    assert len(report['unresolved']) == 2
+    assert all('directory' in r['reason'] for r in report['unresolved'])
+    assert not report['to_write'] and not report['to_remove'] and not report['keep_in_place']
+    assert report['counts']['tower']['unresolved'] == report['counts']['target']['unresolved'] == {'files': 1, 'bytes': 1}
+
+
+def test_directory_spelling_conflict_holds_the_whole_subtree_but_not_sibling_prefixes(trees):
+    pair = trees({'Series/new.cbz': b'x', 'Series/kept.cbz': b's', 'SeriesExtra/ok.cbz': b'o'},
+                 {'series/old.cbz': b'y', 'series/kept.cbz': b's', 'SeriesExtra/ok.cbz': b'o'})
+    report = build_preview(inv.observe_pairs((pair,)))
+    assert not report['complete'] and report['reconciled'] and len(report['unresolved']) == 4
+    assert len(report['keep_in_place']) == 1
+    assert report['keep_in_place'][0]['tower']['relative_path'] == 'SeriesExtra/ok.cbz'
+    assert not report['to_write'] and not report['to_remove']
+    assert report['counts']['tower']['unresolved'] == report['counts']['target']['unresolved'] == {'files': 2, 'bytes': 2}
+
+
+def test_within_side_directory_spellings_are_held_even_with_distinct_file_keys(trees):
+    pair = trees({'Series/a.cbz': b'x', 'Other/b.cbz': b'yyy'}, {})
+    doc = inv.observe_pairs((pair,))
+    for row in doc['files']:
+        if row['relative_path'] == 'Other/b.cbz': row['relative_path'] = 'series/b.cbz'
+    report = build_preview(reseal(doc))
+    assert not report['complete'] and len(report['unresolved']) == 2
+    assert report['counts']['tower']['unresolved'] == {'files': 2, 'bytes': 4}
+    assert not report['to_write']
+
+
+def test_identical_directory_spellings_still_allow_different_child_deltas(trees):
+    pair = trees({'Series/new.cbz': b'x'}, {'Series/old.cbz': b'y'})
+    report = build_preview(inv.observe_pairs((pair,)))
+    assert report['complete'] and not report['unresolved']
+    assert len(report['to_write']) == len(report['to_remove']) == 1
+
+
+def test_a_keep_without_other_paths_has_no_elsewhere_group(trees):
+    pair = trees({'a.cbz': b'x'}, {'a.cbz': b'x'})
+    report = build_preview(inv.observe_pairs((pair,)))
+    assert report['complete'] and len(report['keep_in_place']) == 1
+    assert report['exact_matches_elsewhere'] == []
 
 
 def test_incomplete_hash_coverage_never_becomes_path_certainty(trees, monkeypatch):
