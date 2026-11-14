@@ -146,7 +146,7 @@ def test_scope_changes_are_unresolved_never_missing_or_extra_certainty(trees, ch
     assert len(result['unresolved'])==3 and not result['missing'] and not result['extra'] and not result['source_drift']
 
 
-@pytest.mark.parametrize('change',['no_hash','estimate','incomplete','tamper','bad_root','bad_policy'])
+@pytest.mark.parametrize('change',['no_hash','estimate','incomplete','tamper','bad_root','bad_policy','directory_spellings'])
 def test_unusable_expected_baselines_refuse_before_fresh_payload_reads(trees, monkeypatch, change):
     pair=trees({'a.cbz':b'abc'}, {})
     expected=inv.observe_pairs((pair,)) if change=='no_hash' else baseline(pair)
@@ -155,6 +155,13 @@ def test_unusable_expected_baselines_refuse_before_fresh_payload_reads(trees, mo
     elif change=='tamper': expected['files'][0]['mtime_ns']+=1
     elif change=='bad_root': expected['roots'][0].pop('identity'); reseal(expected)
     elif change=='bad_policy': expected['exclusion_policy']={}; reseal(expected)
+    elif change=='directory_spellings':
+        row=expected['files'][0]; row['relative_path']='Series/a.cbz'
+        extra=copy.deepcopy(row); extra['relative_path']='series/b.cbz'; extra['inode']+=1
+        expected['files'].append(extra); expected['file_counts']['tower']=2
+        expected['hash_plan']['candidate_files']=2; expected['hash_plan']['candidate_bytes']=6
+        expected['hash_plan']['by_side']['tower']={'files':2,'bytes':6}
+        reseal(expected)
     monkeypatch.setattr(inv,'observe_pairs',lambda *a,**k:pytest.fail('invalid baseline reached actual scan'))
     with pytest.raises(verify.VerificationRefused): verify.verify_pairs(expected,(pair,))
 
