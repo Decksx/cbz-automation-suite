@@ -228,6 +228,8 @@ def test_cli_preview_emits_a_complete_filesystem_delta_not_sync_readiness(trees,
     report = json.loads(capsys.readouterr().out)
     assert report['contract'] == 'sync-filesystem-preview-v1'
     assert report['complete'] and not report['sync_ready'] and not report['keep_in_place']
+    assert (pair.tower/'new.cbz').read_bytes() == (pair.target/'old.cbz').read_bytes() == b'x'
+    assert not (pair.target/'new.cbz').exists()
 
 
 def test_cli_incomplete_preview_is_failure(trees, tmp_path, capsys):
@@ -237,13 +239,15 @@ def test_cli_incomplete_preview_is_failure(trees, tmp_path, capsys):
 
 
 @pytest.mark.parametrize('change', ['pair_secret', 'root_relative', 'forward_root_relative'])
-def test_manifest_followups_refuse_unknown_pair_fields_and_ambiguous_roots(trees, tmp_path, capsys, change):
+def test_manifest_followups_refuse_unknown_pair_fields_and_ambiguous_roots(trees, tmp_path, capsys, monkeypatch, change):
     pair = trees({}, {})
     path = manifest(pair, tmp_path)
     doc = json.loads(path.read_text())
     if change == 'pair_secret': doc['pairs'][0]['api_key'] = 'NEVER_ECHO_PAIR_SECRET'
     else: doc['pairs'][0]['tower'] = '\\comics' if change == 'root_relative' else '/comics'
     path.write_text(json.dumps(doc))
+    # Even a guard-removal proof must never reach a host-dependent root.
+    monkeypatch.setattr(cli, 'observe_pairs', lambda *a, **k: pytest.fail('invalid manifest reached observation'))
     assert cli.main(['preview','--pairs',str(path),'--quiet']) == 2
     captured = capsys.readouterr()
     assert not captured.out and 'NEVER_ECHO_PAIR_SECRET' not in captured.err
