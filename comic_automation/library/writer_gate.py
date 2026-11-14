@@ -72,6 +72,10 @@ class CoordinationRoot:
     series_depth: int
     enforced: bool
     identity: tuple[int, int]
+    # The directory ``path`` resolved to when the registry was loaded. Locks
+    # and writes use it, so retargeting a registered alias cannot move a
+    # held transaction into another tree (see `still_bound`).
+    physical: Path
 
 
 def _identity(path: Path) -> tuple[int, int]:
@@ -108,7 +112,8 @@ def load_registry(path: str | Path) -> tuple[CoordinationRoot, ...]:
             identity = _identity(root)
         except OSError as exc:
             raise GateRefused(f"registered root is unavailable: {root}: {exc}") from exc
-        roots.append(CoordinationRoot(root, item["series_depth"], item["enforced"], identity))
+        roots.append(CoordinationRoot(root, item["series_depth"], item["enforced"], identity,
+                                      Path(os.path.realpath(root))))
     for root in roots:
         lineage = _lineage(root.path)
         for other in roots:
@@ -156,7 +161,7 @@ def coordination_root(registry: tuple[CoordinationRoot, ...], path: str | Path) 
     """Map ``path`` to the one registered root physically containing it.
 
     Returns the root and the **physical** components below it. Writers act on
-    ``root.path.joinpath(*below)``, never on the supplied spelling, and recheck
+    `destination(root, below)`, never on the supplied spelling, and recheck
     the binding under ownership with `still_bound`. A caller rooted inside a
     registered root (an apply at a series folder) resolves to the enclosing
     root; one above or outside every root is refused. A reparse point still
@@ -167,7 +172,7 @@ def coordination_root(registry: tuple[CoordinationRoot, ...], path: str | Path) 
     for identity, below in _lineage(Path(path)):
         if identity in by_identity:
             root = by_identity[identity]
-            current = root.path
+            current = root.physical
             for part in below:
                 current = current / part
                 try:
@@ -180,13 +185,35 @@ def coordination_root(registry: tuple[CoordinationRoot, ...], path: str | Path) 
     raise GateRefused(f"path is under no registered library root: {path}")
 
 
+def destination(root: CoordinationRoot, below: tuple[str, ...]) -> Path:
+    """The physical path a writer may mutate: the root as bound at load, plus ``below``."""
+    return root.physical.joinpath(*below)
+
+
+def _root_bound(root: CoordinationRoot) -> bool:
+    """The registered spelling still names the directory bound at load.
+
+    Checking ``root.physical`` as well would add nothing: a registered alias
+    follows its target by path, so replacing the physical directory changes
+    what ``root.path`` resolves to as well.
+    """
+    try:
+        return _identity(root.path) == root.identity
+    except (OSError, GateRefused):
+        return False
+
+
 def still_bound(registry: tuple[CoordinationRoot, ...], path: str | Path,
                 root: CoordinationRoot, below: tuple[str, ...]) -> bool:
     """Whether ``path`` still resolves to the same root and physical components.
 
     Call under ownership before mutating: an alias retargeted after the key
-    was chosen means the lock held is not the series being written.
+    was chosen means the lock held is not the series being written. A
+    registered root that is itself an alias and was retargeted is refused
+    too, since the registry no longer names the tree whose gate is held.
     """
+    if not _root_bound(root):
+        return False
     try:
         again = coordination_root(registry, path)
     except GateRefused:
@@ -236,9 +263,12 @@ class _GateFile:
 
     def __init__(self, root: CoordinationRoot):
         self._api, self._overlapped, self._ctypes = _kernel32()
-        if _identity(root.path) != root.identity:
+        if not _root_bound(root):
             raise GateRefused(f"registered root changed identity: {root.path}")
-        self._fd = os.open(root.path / GATE_LOCK, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+        # Open through the bound physical path, never the registered spelling:
+        # an alias flipped away and back around this open would otherwise
+        # leave the lock in another tree while verify() still passes.
+        self._fd = os.open(root.physical / GATE_LOCK, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
         import msvcrt
         self._handle = msvcrt.get_osfhandle(self._fd)
         self._held: list[int] = []
@@ -262,11 +292,7 @@ class _GateFile:
         delete sharing, so Windows refuses any rename or delete of it until
         this handle closes (pinned by a test).
         """
-        try:
-            same_root = _identity(root.path) == root.identity
-        except OSError as exc:
-            raise GateRefused(f"cannot confirm the gate binding for {root.path}: {exc}") from exc
-        if not same_root:
+        if not _root_bound(root):
             raise GateRefused(f"registered root changed during acquisition: {root.path}")
 
     def close(self) -> None:
@@ -327,7 +353,7 @@ def maintenance_run(root: CoordinationRoot, owner: dict):
             record = dict(owner, pid=os.getpid(), protocol_version=PROTOCOL_VERSION,
                           started_at=datetime.now(timezone.utc).isoformat())
             try:
-                (root.path / GATE_OWNER).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+                (root.physical / GATE_OWNER).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
             except OSError as exc:  # informational: never fail the run over it
                 log.warning("writer gate: owner record not written: %s", exc)
             yield
