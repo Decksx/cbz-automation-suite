@@ -1,4 +1,4 @@
-"""Read-only estimates and content observations for explicit sync root pairs.
+"""Read-only estimates, content observations and logical sync previews.
 
 JSON goes to stdout. Throttled progress goes to stderr. The manifest and
 generated observation are operator-supplied artifacts outside the library.
@@ -12,6 +12,7 @@ import sys
 import time
 
 from comic_automation.library.sync_inventory import ProgressError, RootPair, observe_pairs
+from comic_automation.library.sync_preview import build_preview
 
 
 def read_pairs(path: Path) -> tuple[RootPair, ...]:
@@ -35,9 +36,10 @@ def read_pairs(path: Path) -> tuple[RootPair, ...]:
         if not isinstance(prefixes, list) or not all(isinstance(value, str) for value in prefixes):
             raise ValueError("exclude_prefixes must be a string array")
         base = path.resolve().parent
-        if any(PureWindowsPath(item[key]).drive and not PureWindowsPath(item[key]).is_absolute()
+        if any((PureWindowsPath(item[key]).drive and not PureWindowsPath(item[key]).is_absolute())
+               or (PureWindowsPath(item[key]).root and not PureWindowsPath(item[key]).drive)
                for key in ("tower", "target")):
-            raise ValueError("drive-relative roots are ambiguous; use absolute or manifest-relative paths")
+            raise ValueError("root/drive-relative paths are ambiguous; use absolute or manifest-relative paths")
         pairs.append(RootPair(item["folder_id"], base / item["tower"], base / item["target"], tuple(prefixes)))
     return tuple(pairs)
 
@@ -62,20 +64,23 @@ def _error(message):
 
 
 def main(argv=None) -> int:
-    """Estimate candidate bytes or collect full evidence from declared roots.
+    """Estimate, observe or classify declared roots without sync controls.
 
-    Exit 0 means complete observation, 2 means invalid input or incomplete
-    coverage, and 1 means a progress/output consumer failed.
+    Exit 0 means complete filesystem observation/classification, not Syncthing
+    readiness. Exit 2 means invalid input or incomplete coverage; 1 means a
+    progress/output consumer failed.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("estimate", "observe"))
+    parser.add_argument("mode", choices=("estimate", "observe", "preview"))
     parser.add_argument("--pairs", required=True, type=Path, help="sync-root-pairs-v1 JSON manifest")
     parser.add_argument("--quiet", action="store_true", help="suppress progress on stderr")
     args = parser.parse_args(argv)
     try:
         pairs = read_pairs(args.pairs)
-        report = observe_pairs(pairs, hash_content=args.mode == "observe",
+        report = observe_pairs(pairs, hash_content=args.mode != "estimate",
                                progress=None if args.quiet else _renderer(sys.stderr))
+        if args.mode == "preview":
+            report = build_preview(report)
     except ProgressError:
         _error("progress output failed")
         return 1
