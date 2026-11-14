@@ -1,6 +1,65 @@
 # #108 logical filesystem preview, 2026-11-13
 
-## Delivered scope
+## Review round 1: directory spelling conflicts
+
+Claude's review at initial exact source
+`7595ef625d524bd4432b9a29af828a61c48804c7` found a P2: comparing whole file
+paths missed `Series/new.cbz` versus `series/old.cbz`. It also requested a
+direct self-group-filter witness and explicit directory/type-change limits.
+[Review](https://github.com/Decksx/cbz-automation-suite/pull/194#issuecomment-6868565765).
+
+The fix collects every parent prefix, grouped by folder ID and NFC/casefolded
+path. Multiple spellings hold all files under that prefix, including otherwise
+matching keeps, with the conflicting directory named in the reason. Component
+boundaries leave `SeriesExtra` unaffected by a `Series` conflict. Prefix depth,
+Unicode equivalence, within-side spelling variants and folder-ID separation
+are covered. The same-path-only keep now has an explicit no-elsewhere-group
+assertion. Report limits and protocol text list unclassified empty directories
+and file/directory transitions whose operation ordering is not modeled.
+
+Seven cases were added; the existing cross-folder-ID case now includes
+differently cased parents. Before the implementation fix, **5 failed / 122
+passed in 5.05 s**; all five failures were P2 assertions. With the fix,
+**127 passed in 4.31 s**. Code/tests are final at
+`8a655a5b5c8cbd33c0d540d71be84e762fc4b413`. New commits each change one file.
+
+The round-1 mutation control passes all **48 cases**. All **40 groups** are
+caught, with **94 failing executions including overlap**. The new proof
+groups have the following results; the prior 30 groups are rerun as well:
+
+| Removed or weakened behavior | Failed cases |
+| --- | ---: |
+| Directory-prefix protection | 5 |
+| Case folding of directory keys | 4 |
+| NFC directory normalization | 1 |
+| Folder-ID namespace | 1 |
+| Nested-prefix traversal | 1 |
+| Multiple-spellings threshold | 4 |
+| Target-only subtree holds | 4 |
+| Tower subtree holds | 5 |
+| Corresponding-target hold | 1 |
+| Same-path-only group filter | 1 |
+
+Source/CLI/test SHA-256 before and after this proof:
+
+- `sync_preview.py`: `464e26c28a3d150820b7a239adaddde47a97554db25df0d399c731c8b343a23f`
+- `sync_observe_cli.py`: `08ca71fa1ed1147739eb540bd507b7d4fc29788f797d63d16a8f8c5d59dce0c9`
+- `test_sync_preview.py`: `fcab2c4522dfdc30c0b621e67754f7c7235f7deba3f02474b2d1e957edb5c267`
+
+Round-1 full suite: **6,777 passed / 12 skipped / 0 failed in 458.63 s**,
+`-n 4 --dist loadfile`, translation disabled. JUnit confirms **6,789 cases**,
+0 errors and 0 failures: seven more than the initial #194 source and 48 more
+than master 32006c6. Source, CLI and test hashes above remain unchanged after
+the suite. Evidence is
+kept separate from the initial proof: `sync108-preview-r1-suite.txt` / `.xml`,
+`sync108-preview-r1-mutations.json`, `sync108-preview-r1-mutation-*.txt`,
+`sync108_preview_r1_mutation.py` and `run_sync108_preview_r1_mutations.py` in
+Codex tmp. All checks use disposable local fixtures, with no live inventory
+or configuration operation.
+
+## Initial delivery record
+
+### Delivered scope
 
 Based on merged master `32006c63b7a0c3b35afdcf39b420db488761bf8b`.
 Code/tests are final at `5c5d0aff74bd6660c7ad1740e5973a98b4fc3b14`;
@@ -31,7 +90,7 @@ The post-sync verifier and sanitized configuration/effective-ignore adapter
 remain subsequent #108 deliveries. This preview neither closes that issue
 nor authorizes live inventory, backup, configuration, sync or cutover.
 
-## Validation and accounting
+### Validation and accounting
 
 Before edits, the existing observation/CLI tests passed: **79 in 4.19 s**.
 The isolated parent checkout collected **6,741 cases** (29.57 s). The first
@@ -54,7 +113,7 @@ A separate real-module CLI smoke returned exit 0 for a relocated-byte fixture,
 with one new path, one obsolete path and one advisory group, `sync_ready=false`,
 and every fixture name/byte unchanged.
 
-## Mutation checks
+### Mutation checks
 
 The external plugin mutates functions in memory in their original module
 dictionary. It never replaces candidate sources. A first collision-guard
