@@ -6,7 +6,7 @@ if Tower changed after the baseline. It does not control Syncthing or authorize
 a migration, configuration change, or cutover.
 
 Use the existing `sync-root-pairs-v1` manifest described in
-[sync observation](sync_observation.md). Keep manifests and output artifacts
+[sync observation](sync_preview_observations.md). Keep manifests and output artifacts
 outside the compared roots. For example:
 
 ```powershell
