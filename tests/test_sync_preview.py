@@ -148,14 +148,15 @@ def test_estimates_and_tampered_artifacts_are_refused(trees):
     with pytest.raises(PreviewRefused, match='content-mode'):
         build_preview(inv.observe_pairs((pair,), hash_content=False))
     doc = inv.observe_pairs((pair,))
-    doc['files'][0]['size'] += 1
+    doc['files'][0]['mtime_ns'] += 1
     with pytest.raises(PreviewRefused, match='digest'):
         build_preview(doc)
 
 
 @pytest.mark.parametrize('bad', ['negative', 'boolean', 'absolute', 'parent', 'backslash', 'duplicate',
                                 'unbound', 'short_hash', 'file_type', 'root_type', 'collection', 'scope',
-                                'read_count', 'read_boolean', 'counts', 'duplicate_root', 'unpaired_root', 'missing_hash'])
+                                'read_count', 'read_boolean', 'counts', 'duplicate_root', 'unpaired_root',
+                                'missing_hash', 'case_collision'])
 def test_resealed_malformed_documents_cannot_supply_assertions(trees, bad):
     pair = trees({'a.cbz': b'x'}, {'a.cbz': b'x'})
     doc = inv.observe_pairs((pair,))
@@ -164,7 +165,12 @@ def test_resealed_malformed_documents_cannot_supply_assertions(trees, bad):
     elif bad == 'absolute': doc['files'][0]['relative_path'] = '/a.cbz'
     elif bad == 'parent': doc['files'][0]['relative_path'] = '../a.cbz'
     elif bad == 'backslash': doc['files'][0]['relative_path'] = 'a\\b.cbz'
-    elif bad == 'duplicate': doc['files'].append(copy.deepcopy(doc['files'][0]))
+    elif bad in ('duplicate', 'case_collision'):
+        extra = copy.deepcopy(doc['files'][0])
+        if bad == 'case_collision': extra['relative_path'] = extra['relative_path'].upper()
+        doc['files'].append(extra)
+        # Keep counts valid so only the collision guard can refuse the rows.
+        doc['file_counts'][extra['side']] += 1
     elif bad == 'unbound': doc['files'][0]['folder_id'] = 'other'
     elif bad == 'short_hash': doc['files'][0]['sha256'] = '1234'
     elif bad == 'file_type': doc['files'][0] = None
@@ -196,6 +202,7 @@ def test_output_binds_evidence_and_is_deterministic_without_mutating_input(trees
         {k:v for k,v in first.items() if k != 'preview_digest'}, sort_keys=True,
         separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
     doc['files'][0]['mtime_ns'] += 1
+    assert first['observation'] == original
     assert first['preview_digest'] != build_preview(reseal(doc))['preview_digest']
 
 
