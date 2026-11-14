@@ -125,13 +125,13 @@ def test_missing_root_is_unresolved_even_when_no_files_were_observed(trees):
     assert report['counts']['tower']['observed']['files'] == 0
 
 
-def test_equal_size_without_hash_evidence_is_not_a_keep(trees):
-    pair = trees({'a.cbz': b'x'}, {'a.cbz': b'x'})
+@pytest.mark.parametrize('target_name', ['a.cbz', 'elsewhere.cbz'])
+def test_a_complete_artifact_cannot_omit_required_candidate_hashes(trees, target_name):
+    pair = trees({'a.cbz': b'x'}, {target_name: b'x'})
     doc = inv.observe_pairs((pair,))
     doc['files'][0]['sha256'] = None
-    report = build_preview(reseal(doc))
-    assert not report['complete'] and len(report['unresolved']) == 2
-    assert not report['keep_in_place'] and not report['to_write']
+    with pytest.raises(PreviewRefused, match='required content evidence'):
+        build_preview(reseal(doc))
 
 
 @pytest.mark.parametrize('flag,problems', [(False, []), (True, [{'reason': 'reported gap'}])])
