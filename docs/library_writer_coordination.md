@@ -1,6 +1,9 @@
 # Library writer coordination (#158 B3), design note
 
-Status: **proposed, revision 2** (claude-lead, 2026-11-13). Revision 1 was 181da1e. Revision 2 answers codex-lead's design review R1–R4 and takes the answers to the four questions. No code yet. It touches the watcher, Camelia, canonical apply and web console M6.
+Status: **proposed, revision 3** (claude-lead, 2026-11-13).
+- Revision 1 was 181da1e.
+- Revision 2 (f266f17) answered codex-lead's R1–R4 and adopted the answers to the four questions. codex-lead accepted R1, R3 and the registered-root part of R4, and cleared slice 1 to proceed on fixtures.
+- Revision 3 makes Camelia's private-staging boundary explicit (R2) and pins directory-only series keys and the four control filenames. No code yet. It touches the watcher, Camelia, canonical apply and web console M6.
 
 ## Problem
 
@@ -30,8 +33,13 @@ The only real coordination is the operator remembering to stop things (the 2026-
   - a registry whose roots overlap or alias each other, including one entry nested in another;
   - a caller whose own root is *above* a registered root.
 - A caller rooted *inside* a registered root resolves to that enclosing root. This covers apply with `--series-folder-root` at `X:\Manga\Book`, and a watcher whose destination is a parent collection. So `X:\Manga\Book\` never gets its own gate file: every caller locks `X:\Manga\.cbz-library-writers.lock`.
-- **Series key:** the first `series_depth` components of the **actual canonical destination** (for Camelia, the source's own path) relative to the registered root, NFC-normalised and casefolded. It never comes from the arrival name or the intake category.
-  - A book shallower than `series_depth` (a loose root-level book) uses the reserved root-level key.
+- **Series key:** built from **directory components only**, taken from the actual canonical destination (for Camelia, the source's own path) relative to the registered root. It never comes from the arrival name or the intake category.
+  - For a file destination, drop the filename and take the first `series_depth` directory components.
+  - For a whole-folder landing, the landed folder itself is the final directory component.
+  - So landing `X:\comix\Series\` as a folder and landing `X:\comix\Series\Book 01.cbz` as a file give the same key.
+  - Components are NFC-normalised and casefolded.
+  - A loose book directly under the root, or any destination with fewer than `series_depth` directory components, uses the reserved root key. A filename is never a series key.
+  - Tests pin the folder-vs-file equivalence and the loose-book behaviour.
 
 ### The gate file
 
@@ -77,12 +85,26 @@ The OS drops a byte-range lock when its handle closes, so there's no stale-lock 
 
 Holding the gate through minutes of inference would block maintenance and that series for the whole run. Instead, Camelia **binds the input generation and revalidates it under ownership**:
 
-1. **Before the first read** of the source, record its generation: size, `mtime_ns`, file id, and SHA-256 of the bytes actually read. Hash the private snapshot that extraction uses, not a second read.
-2. Do the inference and rebuild outside the gate, as today, into the temp file.
-3. Take `ordinary_unit(root, series)`. **Under ownership**, re-stat and re-hash the current source.
-   - **Mismatch:** release the gate, **keep** the rebuilt output in Camelia's review area with both generations recorded, and requeue the job. Stale work is never installed.
-   - **Match:** copy the original to backup and verify it, `os.replace` the temp over the source, verify the install, then release.
-4. Witness: Camelia snapshots V1, the watcher installs V2 at the same path, then Camelia reaches install. Camelia must refuse, keep its V1-derived output, and leave V2 byte-identical.
+1. **Private snapshot.** Before anything else, copy the source into a private work directory **outside every registered library root**, and validate the copy.
+   - Record the source's identity and stability evidence (size, `mtime_ns`, file id, stat before and after the copy) **separately** from the snapshot's SHA-256.
+   - The snapshot is immutable from then on.
+2. **Everything heavy happens outside the library, on the snapshot only.**
+   - Extraction, inference, rebuild and rebuild verification read only the snapshot, and write only private files outside every registered root.
+   - Nothing reopens the live source, and nothing is created beside the destination.
+   - This changes Camelia today: at autodecen 4211611 the rebuild creates `.camelia-<uuid>.tmp` beside the library destination and reads `archive_context['archive_path']`. Both move to the private area.
+3. **Ownership, then revalidate.** Take `ordinary_unit(root, series)`. Under ownership, re-stat and re-hash the current source, and compare both with the recorded generation and the snapshot hash.
+   - **Mismatch:** release the gate, **keep** the private output in Camelia's review area with both generations recorded, and requeue the job. Stale work is never installed.
+4. **Every library-side step happens while ownership is held,** in this order:
+   1. Same-volume staging. If the private output is on another volume, copy it to an exclusively created (`O_EXCL`) temp beside the destination. Cross-volume `os.replace` is never relied on.
+   2. Copy the original to backup and verify it.
+   3. Atomic `os.replace` of the staged temp over the source.
+   4. Verify the install.
+   5. Remove the staging temp.
+   6. Release.
+5. **Witnesses:**
+   - **V1/V2 interleaving:** Camelia snapshots V1, and the watcher installs V2 at the same path before Camelia reaches install. Camelia refuses, keeps its V1-derived output, and V2 stays byte-identical.
+   - **Gate held by maintenance:** while a maintenance run holds the exclusive gate, Camelia snapshots and rebuilds privately. No name or byte in the library changes, no temp appears beside the destination, and the rebuild never reopens the live source, even after the test replaces it mid-run.
+   - **ABA:** the source goes V1 → V2 → V1 during the rebuild. The rebuild used only the snapshot, so the output is V1-derived and correct to install once revalidation matches.
 
 ### Maintenance runs and quiescence during rollout (R1)
 
@@ -98,7 +120,7 @@ Acquiring the exclusive gate proves only that no **participating** writer is mid
 ## Changes, in reviewable slices
 
 1. **The writer gate primitive and the registered-root resolver** (`comic_automation/library/writer_gate.py`, stdlib only, Windows only like `scope_lock`):
-   - A shared protocol constant names the control files: `.cbz-library-writers.lock` and `.owner.json`, and the existing `.cbz-canonical-naming.lock` and `.owner.json`.
+   - A shared protocol constant names all four control files: `.cbz-library-writers.lock`, `.cbz-library-writers.owner.json`, `.cbz-canonical-naming.lock` and `.cbz-canonical-naming.owner.json`.
    - Wire those names into the sync observation exclusions in this slice, with a heads-up to codex-lead before touching `sync_inventory.py`. Document and test the required Syncthing ignores. Live `.stignore` and configuration changes stay outside the code approval.
    - Tests:
      - the probe matrix as real cross-process tests;
@@ -111,7 +133,7 @@ Acquiring the exclusive gate proves only that no **participating** writer is mid
 2. **Canonical apply/recover/undo:** take `maintenance_run` after the scope lock, applying the rollout rules above (`--attest-quiescent` stays required until `enforced`).
 3. **Watcher:** the transaction boundary as specified, with each entry path's busy-gate witness.
 4. **Camelia:**
-   - Generation bind and revalidate as specified, plus the interleaving witness.
+   - Private snapshot, private rebuild, and generation revalidation under ownership as specified, plus all three witnesses.
    - Import the shared module from an explicit `CAMELIA_COMIC_AUTOMATION_ROOT`, with a module-origin and protocol-version check.
    - Import or platform errors fail closed: Camelia doesn't write.
    - Tested through the actual conda environment's import path, including parent packages. There's no silent fallback to uncoordinated writes.
