@@ -118,12 +118,16 @@ def load_registry(path: str | Path) -> tuple[CoordinationRoot, ...]:
 
 
 def _lineage(path: Path) -> list[tuple[tuple[int, int], tuple[str, ...]]]:
-    """(identity, components below it) for ``path``'s existing ancestors, nearest first.
+    """(identity, components below it) for ``path``'s **physical** ancestors, nearest first.
 
+    The path is resolved first (``os.path.realpath`` follows junctions and
+    symlinks in every existing component), so an interior alias such as
+    ``library/Alias -> library/Series`` yields the physical ``Series``
+    components and a junction escaping into another tree yields that tree.
     Missing tail components (a destination not created yet) are carried as
     relative parts of the nearest existing ancestor.
     """
-    path = Path(os.path.abspath(path))
+    path = Path(os.path.realpath(os.path.abspath(path)))
     tail: list[str] = []
     current = path
     while not current.exists():
@@ -143,18 +147,51 @@ def _lineage(path: Path) -> list[tuple[tuple[int, int], tuple[str, ...]]]:
         current = current.parent
 
 
+def _reparse(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
 def coordination_root(registry: tuple[CoordinationRoot, ...], path: str | Path) -> tuple[CoordinationRoot, tuple[str, ...]]:
     """Map ``path`` to the one registered root physically containing it.
 
-    Returns the root and ``path``'s components below it. A caller rooted
-    inside a registered root (an apply at a series folder) resolves to the
-    enclosing root; one above or outside every root is refused.
+    Returns the root and the **physical** components below it. Writers act on
+    ``root.path.joinpath(*below)``, never on the supplied spelling, and recheck
+    the binding under ownership with `still_bound`. A caller rooted inside a
+    registered root (an apply at a series folder) resolves to the enclosing
+    root; one above or outside every root is refused. A reparse point still
+    present on the physical chain (an alias retargeted mid-resolution) is
+    refused rather than guessed.
     """
     by_identity = {root.identity: root for root in registry}
     for identity, below in _lineage(Path(path)):
         if identity in by_identity:
-            return by_identity[identity], below
+            root = by_identity[identity]
+            current = root.path
+            for part in below:
+                current = current / part
+                try:
+                    info = current.lstat()
+                except FileNotFoundError:
+                    break  # the rest is a destination not created yet
+                if _reparse(info):
+                    raise GateRefused(f"a link or junction remains on the physical path: {current}")
+            return root, below
     raise GateRefused(f"path is under no registered library root: {path}")
+
+
+def still_bound(registry: tuple[CoordinationRoot, ...], path: str | Path,
+                root: CoordinationRoot, below: tuple[str, ...]) -> bool:
+    """Whether ``path`` still resolves to the same root and physical components.
+
+    Call under ownership before mutating: an alias retargeted after the key
+    was chosen means the lock held is not the series being written.
+    """
+    try:
+        again = coordination_root(registry, path)
+    except GateRefused:
+        return False
+    return again[0] is root and tuple(unicodedata.normalize("NFC", p).casefold() for p in again[1]) ==         tuple(unicodedata.normalize("NFC", p).casefold() for p in below)
 
 
 def series_key(root: CoordinationRoot, below: tuple[str, ...], *, folder: bool) -> str:
@@ -215,6 +252,23 @@ class _GateFile:
             raise GateBusy(busy)
         self._held.append(offset)
 
+    def verify(self, root: CoordinationRoot) -> None:
+        """Refuse ownership unless the registered root is still the bound directory.
+
+        Checked after the locks are taken and before the caller proceeds: a
+        root swapped aside during or after ``os.open`` would otherwise leave
+        this handle locking a file in a different directory. The lock file
+        itself cannot be swapped while held: ``os.open`` does not grant
+        delete sharing, so Windows refuses any rename or delete of it until
+        this handle closes (pinned by a test).
+        """
+        try:
+            same_root = _identity(root.path) == root.identity
+        except OSError as exc:
+            raise GateRefused(f"cannot confirm the gate binding for {root.path}: {exc}") from exc
+        if not same_root:
+            raise GateRefused(f"registered root changed during acquisition: {root.path}")
+
     def close(self) -> None:
         # Unlock in reverse; closing the handle would release them anyway.
         try:
@@ -251,6 +305,7 @@ def ordinary_unit(root: CoordinationRoot, key: str):
         try:
             gate.lock(0, False, f"maintenance in progress on {root.path}")
             gate.lock(_offset(key), True, f"series busy under {root.path}")
+            gate.verify(root)
             yield
         finally:
             gate.close()
@@ -268,6 +323,7 @@ def maintenance_run(root: CoordinationRoot, owner: dict):
         gate = _GateFile(root)
         try:
             gate.lock(0, True, f"writers active on {root.path}; retry")
+            gate.verify(root)
             record = dict(owner, pid=os.getpid(), protocol_version=PROTOCOL_VERSION,
                           started_at=datetime.now(timezone.utc).isoformat())
             try:
