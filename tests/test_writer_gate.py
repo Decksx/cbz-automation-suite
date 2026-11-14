@@ -371,3 +371,23 @@ def test_an_alias_flipped_away_and_back_around_the_open_cannot_misplace_the_lock
     monkeypatch.setattr(wg.os, "open", flip_around_open)
     with wg.ordinary_unit(root, "series"):
         assert (first / wg.GATE_LOCK).exists() and not (second / wg.GATE_LOCK).exists()
+
+
+def test_control_files_never_enter_an_all_tower_baseline_or_block_its_verification(tmp_path):
+    """Combined observation policy (#195 exclusions with #196's all-Tower baseline):
+    gate files created on the receiver after the baseline neither appear in
+    the evidence nor turn into verifier differences."""
+    from comic_automation.library.sync_inventory import RootPair, observe_pairs
+    from comic_automation.library.sync_verify import verify_pairs
+    roots = {side: tmp_path / side for side in ("tower", "target")}
+    for root in roots.values():
+        (root / "Series").mkdir(parents=True)
+        (root / "Series" / "a.cbz").write_bytes(b"book")
+    (roots["tower"] / wg.GATE_LOCK).write_bytes(b"")
+    pair = (RootPair("m", roots["tower"], roots["target"]),)
+    baseline = observe_pairs(pair, hash_all_tower=True)
+    assert baseline["complete"] and [row["relative_path"] for row in baseline["files"]] == ["Series/a.cbz"] * 2
+    for name in wg.CONTROL_FILENAMES:          # a writer gate starts being used on the receiver
+        (roots["target"] / name).write_bytes(b"")
+    result = verify_pairs(baseline, pair)
+    assert result["verified"] and result["extra"] == [] and len(result["matched"]) == 1
