@@ -15,6 +15,13 @@ python -m comic_automation.library.sync_observe_cli baseline --pairs pairs.json 
 python -m comic_automation.library.sync_observe_cli verify --pairs pairs.json --expected baseline.json > verification.json
 ```
 
+Pin the same code version for baseline collection and verification. In
+particular, #195 adds four control filenames to the built-in exclusions; a
+baseline from before that policy change will fail scope matching afterward.
+Collect a new baseline with the intended version and policy. Keep old artifacts
+unchanged for their original evidence; editing and resealing them is not a
+replacement for fresh collection.
+
 `baseline` hashes every Tower file, including sizes absent from the receiver.
 It also hashes receiver files whose sizes occur on Tower. The same selection is
 budgeted by `estimate --all-tower`, without reading payloads. `observe` and
@@ -42,6 +49,12 @@ Observed file and logical-byte partitions are reconciled separately for the
 expected source, current source and receiver. Both observations and the result
 are digest-bound; an unkeyed digest detects accidental modification, not a
 maliciously resealed document.
+
+An empty desired baseline can verify successfully when the fresh source and
+receiver are both empty within the same scope. The report's expected/current/
+receiver observed file and byte counts are then zero. Inspect those counts when
+reviewing the baseline: empty-set equality is not evidence of a populated
+library or migration readiness, and `sync_ready` remains false.
 
 Exit 0 in `verify` means `verified=true`. Exit 2 means invalid input, incomplete
 evidence or differences; exit 1 means output/progress delivery failed. Other
