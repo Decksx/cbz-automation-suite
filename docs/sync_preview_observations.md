@@ -4,8 +4,9 @@ Issue #108 implements the Tower-to-X preview and post-sync verification on
 explicit root pairs. The first implementation PR supplies their shared
 filesystem observation API in `comic_automation.library.sync_inventory`.
 The CLI exposes estimates, observations and the filesystem preview described
-below. The fresh post-sync verifier and sanitized Syncthing configuration
-evidence remain subsequent deliveries. Issue #108 stays open.
+below. [Fresh verification](sync_verifier.md) adds full-Tower baselines and
+fresh comparisons. Sanitized Syncthing configuration evidence remains a
+subsequent delivery. Issue #108 stays open.
 
 ## API and scope
 

@@ -215,7 +215,8 @@ def _hash(root: Path, row: dict, *, on_bytes=None) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True, progress=None) -> dict:
+def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True,
+                  hash_all_tower: bool = False, progress=None) -> dict:
     """Inventory explicit roots and hash each cross-side size candidate once.
 
     Returns a deterministic JSON-compatible observation with a content digest.
@@ -224,6 +225,9 @@ def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True, pro
     complete coverage before making negative content or absence assertions.
 
     ``hash_content=False`` returns a sizes-only estimate with null hashes.
+    ``hash_all_tower=True`` includes every Tower file, even when its size is
+    absent from the receiver. This provides full desired-byte evidence for a
+    verifier baseline; estimate mode budgets the same selection without reads.
     ``hash_plan`` records candidate file counts and logical payload bytes before
     hashing. The optional progress consumer receives metadata stages and hash
     read events, including intermediate reads within large files. Its failures
@@ -231,6 +235,8 @@ def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True, pro
     """
     if type(hash_content) is not bool:
         raise ValueError("hash_content must be a boolean")
+    if type(hash_all_tower) is not bool:
+        raise ValueError("hash_all_tower must be a boolean")
     if progress is not None and not callable(progress):
         raise ValueError("progress must be callable")
     if not pairs or any(not isinstance(pair, RootPair) or not isinstance(pair.folder_id, str)
@@ -269,7 +275,8 @@ def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True, pro
             problems.extend(dict(**label, **row) for row in before[2])
     sizes = {side: {f["size"] for f in files if f["side"] == side} for side in ("tower", "target")}
     common_sizes = sizes["tower"] & sizes["target"]
-    candidates = [row for row in files if row["size"] in common_sizes]
+    candidates = [row for row in files if row["size"] in common_sizes
+                  or (hash_all_tower and row["side"] == "tower")]
     hash_plan = dict(candidate_files=len(candidates), candidate_bytes=sum(row["size"] for row in candidates),
                      inventory_complete=not problems,
                      by_side={side: dict(files=sum(row["side"] == side for row in candidates),
@@ -318,7 +325,8 @@ def observe_pairs(pairs: tuple[RootPair, ...], *, hash_content: bool = True, pro
     _emit(progress, phase="complete", complete=not problems, files_hashed=files_hashed)
     order = lambda row: (row["folder_id"], row["side"], row.get("relative_path", row.get("path", "")), row.get("reason", ""))
     result = dict(contract=CONTRACT, scope="filesystem-only", complete=not problems,
-                  hash_mode="content" if hash_content else "estimate", hash_plan=hash_plan,
+                  hash_mode="content" if hash_content else "estimate", hash_all_tower=hash_all_tower,
+                  hash_plan=hash_plan,
                   exclusion_policy=dict(component_names=sorted(_EXCLUDED), temporary_name=".syncthing.*.tmp"),
                   roots=sorted(bindings, key=order), files=sorted(files, key=order),
                   excluded=sorted(excluded, key=order), problems=sorted(problems, key=order),
