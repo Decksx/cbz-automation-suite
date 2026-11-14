@@ -180,6 +180,43 @@ def test_incomplete_actual_coverage_supplies_no_negative_facts(trees, monkeypatc
     assert not result['missing'] and not result['mismatched'] and not result['extra'] and not result['source_drift']
 
 
+@pytest.mark.parametrize('denied_side', ['tower', 'target'])
+def test_partial_listing_with_visible_differences_holds_every_row(trees, monkeypatch, denied_side):
+    """A stable root binding cannot make an incomplete listing prove absence.
+
+    Keep an extra receiver file visible while denying a nested directory, so
+    bypassing only the coverage branch would falsely classify extra/missing
+    files even though the final verified flag still stays false.
+    """
+    pair = trees({'blocked/a.cbz': b'abc', 'visible.cbz': b'visible'},
+                 {'blocked/a.cbz': b'abc', 'visible.cbz': b'visible', 'extra.cbz': b'extra'})
+    expected = baseline(pair)
+    denied = getattr(pair, denied_side) / 'blocked'
+    real_scandir = os.scandir
+    def partial_listing(path):
+        if Path(path) == denied:
+            raise PermissionError('fixture nested listing denied')
+        return real_scandir(path)
+    monkeypatch.setattr(inv.os, 'scandir', partial_listing)
+    result = verify.verify_pairs(expected, (pair,))
+    assert result['scope_matches'] and not result['coverage']['actual']
+    assert not result['verified'] and result['reconciled']
+    assert result['missing'] == result['extra'] == result['mismatched'] == []
+    assert result['matched'] == result['source_drift'] == []
+    expected_rows = {('expected_tower', row['folder_id'], row['relative_path'])
+                     for row in expected['files'] if row['side'] == 'tower'}
+    actual_rows = {('current_tower' if row['side'] == 'tower' else 'target',
+                    row['folder_id'], row['relative_path']) for row in result['actual']['files']}
+    held_rows = {(row['side'], row['file']['folder_id'], row['file']['relative_path'])
+                 for row in result['unresolved']}
+    assert held_rows == expected_rows | actual_rows
+    assert len(result['unresolved']) == len(held_rows) == 6
+    for counts in result['counts'].values():
+        assert counts['unresolved'] == counts['observed']
+        assert all(value == {'files': 0, 'bytes': 0} for slot, value in counts.items()
+                   if slot not in ('unresolved', 'observed'))
+
+
 def test_excluded_originals_and_empty_directories_stay_outside_file_assertions(trees):
     pair=trees({'a.cbz':b'abc','ai-decensor-originals/x.cbz':b'original'},{'a.cbz':b'abc'})
     expected=baseline(pair)
