@@ -195,7 +195,7 @@ def test_series_keys_use_directory_components_only(tmp_path):
     assert wg.series_key(flat, file_below, folder=False) == wg.series_key(flat, folder_below, folder=True) == "berserk"
     _, loose = wg.coordination_root((flat,), root / "Manga" / "Loose 01.cbz")
     assert wg.series_key(flat, loose, folder=False) == wg.ROOT_KEY      # a filename is never a series
-    deep = wg.CoordinationRoot(root, 2, False, flat.identity)
+    deep = wg.CoordinationRoot(root, 2, False, flat.identity, root)
     assert wg.series_key(deep, ("Manga", "Berserk", "Berserk 01.cbz"), folder=False) == "manga/berserk"
     assert wg.series_key(deep, ("Manga", "Loose.cbz"), folder=False) == wg.ROOT_KEY
     # Case and Unicode composition never split one Windows folder into two keys.
@@ -308,3 +308,66 @@ def test_a_held_lock_file_cannot_be_renamed_or_deleted(library):
         with pytest.raises(PermissionError):
             (root / wg.GATE_LOCK).unlink()
     os.replace(root / wg.GATE_LOCK, root / "after.lock")   # free once released
+
+
+def test_a_retargeted_registered_root_alias_cannot_move_a_held_transaction(tmp_path):
+    """The registered root is itself a junction, repointed while a unit is held.
+
+    Writes still go to the bound physical tree (where the gate is held), and
+    the binding is reported broken, so the writer refuses before mutating.
+    """
+    first, second, alias = tmp_path / "first", tmp_path / "second", tmp_path / "registered"
+    for root in (first, second):
+        (root / "Series").mkdir(parents=True)
+    _junction(alias, first)
+    registry = wg.load_registry(write_registry(tmp_path / "r.json", [(alias, 1)]))
+    original = first / "Series" / "new.cbz"
+    root, below = wg.coordination_root(registry, original)
+    with wg.ordinary_unit(root, wg.series_key(root, below, folder=False)):
+        assert wg.still_bound(registry, original, root, below)
+        alias.rmdir()
+        _junction(alias, second)
+        assert not wg.still_bound(registry, original, root, below)
+        assert wg.destination(root, below).parent.stat().st_ino == (first / "Series").stat().st_ino
+        assert (first / wg.GATE_LOCK).exists() and not (second / wg.GATE_LOCK).exists()
+    with pytest.raises(wg.GateRefused, match="changed identity"):
+        with wg.ordinary_unit(root, "series"):
+            pass
+
+
+def test_a_registered_alias_root_locks_and_writes_in_its_physical_tree(tmp_path):
+    target = tmp_path / "physical"
+    (target / "Series").mkdir(parents=True)
+    _junction(tmp_path / "registered", target)
+    registry = wg.load_registry(write_registry(tmp_path / "r.json", [(tmp_path / "registered", 1)]))
+    root, below = wg.coordination_root(registry, tmp_path / "registered" / "Series" / "a.cbz")
+    assert Path(os.path.realpath(wg.destination(root, below))) == wg.destination(root, below)
+    with wg.maintenance_run(root, {"who": "t"}):
+        pass
+    assert (target / wg.GATE_OWNER).exists()
+
+
+def test_an_alias_flipped_away_and_back_around_the_open_cannot_misplace_the_lock(tmp_path, monkeypatch):
+    """ABA on a registered root alias: point it at another tree only for the
+    instant of the gate open, then back. The lock must still land in the bound tree."""
+    first, second, alias = tmp_path / "first", tmp_path / "second", tmp_path / "registered"
+    first.mkdir()
+    second.mkdir()
+    _junction(alias, first)
+    root = wg.load_registry(write_registry(tmp_path / "r.json", [(alias, 1)]))[0]
+    real_open = os.open
+
+    def flip_around_open(path, *args, **kwargs):
+        if Path(path).name == wg.GATE_LOCK:
+            alias.rmdir()
+            _junction(alias, second)
+            try:
+                return real_open(path, *args, **kwargs)
+            finally:
+                alias.rmdir()
+                _junction(alias, first)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(wg.os, "open", flip_around_open)
+    with wg.ordinary_unit(root, "series"):
+        assert (first / wg.GATE_LOCK).exists() and not (second / wg.GATE_LOCK).exists()
