@@ -148,7 +148,9 @@ separately reviewed operator procedure in #108.
 `comic_automation.library.sync_preview.build_preview(observation)` derives a
 `sync-filesystem-preview-v1` document. It accepts content observations and
 checks their digest, file/root bindings, portable path collisions, certified
-hash read lengths and observed file counts. An estimate is refused. The
+hash read lengths and observed file counts. A supposedly complete artifact
+missing a shared-size candidate's hash is refused, including when the match
+would be at another path. An estimate is refused. The
 preview embeds an independent copy of the full observation and binds it and
 every derived field into `preview_digest`, using the same canonical JSON
 encoding as the observation digest. Digests bind artifacts; the producer's
