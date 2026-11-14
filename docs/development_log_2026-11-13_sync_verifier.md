@@ -49,3 +49,50 @@ Review focus: baseline/actual scope binding, incomplete evidence and zero-file
 cases, source changes during the migration window, exact receiver paths, and
 count partitions. The existing observer's drift checks remain necessary: a
 fresh verification is evidence from reads, not a distributed atomic snapshot.
+
+## Review round 1: incomplete coverage must not establish absence
+
+Claude's #5009 review found a narrower mutant than the original negative-fact
+branch bypass: replace `if not coverage or not scope_matches` with
+`if not scope_matches`. The final `verified` flag still stays false, but the
+old tests did not distinguish that from a report falsely claiming missing or
+extra files. Independent reproduction on the old cases: **43 passed / 3
+deselected in 2.53 s** (the two new cases and real-subprocess case excluded).
+
+Test-only commit `021db7a` adds two real temporary-tree cases: deny a nested
+listing on Tower or the receiver while an extra receiver file remains visible.
+Root binding still matches. Both cases require no matched/missing/mismatched/
+extra/source-drift claims, an exact unresolved-row partition, and every file
+and byte count held. The narrow mutant fails **2/2**; control passes **2/2**.
+Final verifier file: **46 passed in 3.38 s**; combined focused set: **173 passed
+in 8.22 s**. No implementation changes were needed.
+
+The three implementation SHA-256 values above are unchanged. The revised test
+file is `4c778362f3498450e4f3677f01fd80a7ee83016987e9bf6d8f592b2c1fda3d5f`.
+
+The P3 policy note now tells operators to pin the same code version for baseline
+and verify, and to collect a fresh baseline after an exclusion-policy change
+(including #195), preserving older artifacts unchanged. Empty desired layouts
+remain valid file-set equality: the report already exposes zero observed file/
+byte counts and `sync_ready=false`. The guide now states that explicitly; no
+populated-library or migration-readiness claim is inferred. The observation
+guide also links the delivered verifier instead of calling it future work.
+
+First round-1 full suite, started at `983b6a3136d925b133da20f40738941134871740`
+(implementation/tests identical to the final candidate): **6,822 passed / 12
+skipped / 1 failed in 441.96 s**, 6,835 collected. The sole failure was
+`tests/web/test_web_recovery.py::test_native_owner_crash_reconciles_at_explicit_handshakes[birth]`:
+`PermissionError [Errno 13]` at line 243, reading the temporary `owner-ready`
+file after its existence check. Isolated candidate run: **1 passed in 33.53 s**.
+The identical node on unmodified base
+`909991da8ea47cb0f6189c4d97fedfbdd4610a92` reproduced the same line, exception
+and temporary filename: **1 failed in 6.30 s**. This is measured base
+reproduction, not an inference from the untouched web files. No web code/test
+change is included in this PR. A full candidate rerun follows this comparison.
+
+The full rerun at `21ed9c2ef48577fd9ddea154f40fcac47b944858`
+(implementation/tests identical to the final candidate) passed: **6,823 passed /
+12 skipped / 0 failed in 497.84 s**, 6,835 collected. The first failure and
+base reproduction above remain part of the evidence; this result does not
+erase them. Current final-head CI and a fresh independent review are still
+required before merge.
