@@ -1,0 +1,382 @@
+"""Library writer gate and registered coordination roots (#158 B3, slice 1).
+
+Design: ``docs/library_writer_coordination.md``. This slice supplies the
+primitive and the root resolver only; no writer uses them yet, so nothing
+here changes how the watcher, Camelia or an apply behaves.
+
+One zero-byte file per registered root, ``<root>\\.cbz-library-writers.lock``,
+carries Windows byte-range locks (``LockFileEx``):
+
+* **byte 0, the root gate**: shared for an ordinary write transaction,
+  exclusive for a maintenance run;
+* **byte 1 + (h mod 2**62)**, one per series key, exclusive for an
+  ordinary transaction. A hash collision only causes false contention.
+
+Every request fails immediately rather than waiting, the gate is taken
+before the series byte, and a thread may not take the gate twice for one
+root (byte-range locks are not reentrant). The OS drops a lock when its
+handle closes, including on kill, so nothing ever removes the lock file and
+the owner file is informational only: it never proves quiescence.
+
+Acquiring the exclusive gate proves only that no *participating* writer is
+mid-transaction. Callers keep today's operator attestation until a root is
+marked ``enforced`` (design, "rollout").
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import stat
+import threading
+import unicodedata
+
+PROTOCOL_VERSION = 1
+REGISTRY_CONTRACT = "library-writer-roots-v1"
+GATE_LOCK = ".cbz-library-writers.lock"
+GATE_OWNER = ".cbz-library-writers.owner.json"
+CANONICAL_LOCK = ".cbz-canonical-naming.lock"
+CANONICAL_OWNER = ".cbz-canonical-naming.owner.json"
+# Every control file a sync or inventory must never carry or count.
+CONTROL_FILENAMES = frozenset({GATE_LOCK, GATE_OWNER, CANONICAL_LOCK, CANONICAL_OWNER})
+# Casefolded paths cannot contain NUL, so no real series can produce this key.
+ROOT_KEY = "\x00root"
+
+_SHARED, _EXCLUSIVE, _FAIL_NOW = 0x0, 0x2, 0x1
+_held = threading.local()
+log = logging.getLogger(__name__)
+
+
+class GateError(RuntimeError):
+    """Base class for writer-gate refusals."""
+
+
+class GateBusy(GateError):
+    """Another writer holds a conflicting lock; defer (ordinary) or retry (maintenance)."""
+
+
+class GateRefused(GateError):
+    """The request is invalid: unregistered or ambiguous root, reentry, platform."""
+
+
+@dataclass(frozen=True)
+class CoordinationRoot:
+    """One registered library root: every writer under it shares its gate."""
+
+    path: Path
+    series_depth: int
+    enforced: bool
+    identity: tuple[int, int]
+    # The directory ``path`` resolved to when the registry was loaded. Locks
+    # and writes use it, so retargeting a registered alias cannot move a
+    # held transaction into another tree (see `still_bound`).
+    physical: Path
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_dev <= 0 or info.st_ino <= 0:
+        raise GateRefused(f"unusable directory identity: {path}")
+    return info.st_dev, info.st_ino
+
+
+def load_registry(path: str | Path) -> tuple[CoordinationRoot, ...]:
+    """Read and validate the registry; refuse overlapping or aliased roots.
+
+    Overlap is judged by physical directory identity of every ancestor, so a
+    drive letter, UNC spelling or junction naming the same tree is caught.
+    """
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateRefused(f"writer-root registry is unreadable: {exc}") from exc
+    if (not isinstance(document, dict) or set(document) != {"contract", "roots"}
+            or document["contract"] != REGISTRY_CONTRACT or not isinstance(document["roots"], list)
+            or not document["roots"]):
+        raise GateRefused(f"expected {REGISTRY_CONTRACT} with a non-empty roots array")
+    roots = []
+    for item in document["roots"]:
+        if (not isinstance(item, dict) or set(item) != {"path", "series_depth", "enforced"}
+                or not isinstance(item["path"], str) or type(item["series_depth"]) is not int
+                or item["series_depth"] < 1 or type(item["enforced"]) is not bool):
+            raise GateRefused("each root needs path, a positive series_depth and boolean enforced")
+        root = Path(item["path"])
+        if not root.is_absolute():
+            raise GateRefused(f"registered root must be absolute: {root}")
+        try:
+            identity = _identity(root)
+        except OSError as exc:
+            raise GateRefused(f"registered root is unavailable: {root}: {exc}") from exc
+        physical = Path(os.path.realpath(root))
+        try:
+            # The alias can be retargeted between the stat and the resolve, so
+            # the bound path must be shown to name the identity just stored.
+            consistent = _identity(physical) == identity and _identity(root) == identity
+        except OSError as exc:
+            raise GateRefused(f"registered root is unavailable: {root}: {exc}") from exc
+        if not consistent:
+            raise GateRefused(f"registered root changed while the registry was loaded: {root}")
+        roots.append(CoordinationRoot(root, item["series_depth"], item["enforced"], identity, physical))
+    for root in roots:
+        lineage = _lineage(root.path)
+        for other in roots:
+            if other is not root and other.identity in {identity for identity, _ in lineage}:
+                raise GateRefused(f"registered roots overlap or alias: {other.path} and {root.path}")
+    return tuple(roots)
+
+
+def _lineage(path: Path) -> list[tuple[tuple[int, int], tuple[str, ...]]]:
+    """(identity, components below it) for ``path``'s **physical** ancestors, nearest first.
+
+    The path is resolved first (``os.path.realpath`` follows junctions and
+    symlinks in every existing component), so an interior alias such as
+    ``library/Alias -> library/Series`` yields the physical ``Series``
+    components and a junction escaping into another tree yields that tree.
+    Missing tail components (a destination not created yet) are carried as
+    relative parts of the nearest existing ancestor.
+    """
+    path = Path(os.path.realpath(os.path.abspath(path)))
+    tail: list[str] = []
+    current = path
+    while not current.exists():
+        if current.parent == current:
+            raise GateRefused(f"no existing ancestor for {path}")
+        tail.insert(0, current.name)
+        current = current.parent
+    lineage = []
+    below = list(tail)
+    while True:
+        info = current.stat()
+        if stat.S_ISDIR(info.st_mode) and info.st_dev > 0 and info.st_ino > 0:
+            lineage.append(((info.st_dev, info.st_ino), tuple(below)))
+        if current.parent == current:
+            return lineage
+        below.insert(0, current.name)
+        current = current.parent
+
+
+def _reparse(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def coordination_root(registry: tuple[CoordinationRoot, ...], path: str | Path) -> tuple[CoordinationRoot, tuple[str, ...]]:
+    """Map ``path`` to the one registered root physically containing it.
+
+    Returns the root and the **physical** components below it. Writers act on
+    `destination(root, below)`, never on the supplied spelling, and recheck
+    the binding under ownership with `still_bound`. A caller rooted inside a
+    registered root (an apply at a series folder) resolves to the enclosing
+    root; one above or outside every root is refused. A reparse point still
+    present on the physical chain (an alias retargeted mid-resolution) is
+    refused rather than guessed.
+    """
+    by_identity = {root.identity: root for root in registry}
+    for identity, below in _lineage(Path(path)):
+        if identity in by_identity:
+            root = by_identity[identity]
+            current = root.physical
+            for part in below:
+                current = current / part
+                try:
+                    info = current.lstat()
+                except FileNotFoundError:
+                    break  # the rest is a destination not created yet
+                if _reparse(info):
+                    raise GateRefused(f"a link or junction remains on the physical path: {current}")
+            return root, below
+    raise GateRefused(f"path is under no registered library root: {path}")
+
+
+def destination(root: CoordinationRoot, below: tuple[str, ...]) -> Path:
+    """The physical path a writer may mutate: the root as bound at load, plus ``below``."""
+    return root.physical.joinpath(*below)
+
+
+def _root_bound(root: CoordinationRoot) -> bool:
+    """The registered spelling **and** the bound physical path still name ``identity``.
+
+    Both are needed. Moving the original tree and repointing the alias at it
+    keeps ``root.path``'s identity while ``root.physical`` names a replacement
+    directory; retargeting the alias keeps ``root.physical`` while changing
+    ``root.path`` (codex-lead's #195 R3/R4 witnesses).
+    """
+    try:
+        return _identity(root.physical) == root.identity and _identity(root.path) == root.identity
+    except (OSError, GateRefused):
+        return False
+
+
+def still_bound(registry: tuple[CoordinationRoot, ...], path: str | Path,
+                root: CoordinationRoot, below: tuple[str, ...]) -> bool:
+    """Whether ``path`` still resolves to the same root and physical components.
+
+    Call under ownership before mutating: an alias retargeted after the key
+    was chosen means the lock held is not the series being written. A
+    registered root that is itself an alias and was retargeted is refused
+    too, since the registry no longer names the tree whose gate is held.
+    """
+    if not _root_bound(root):
+        return False
+    try:
+        again = coordination_root(registry, path)
+    except GateRefused:
+        return False
+    return again[0] is root and tuple(unicodedata.normalize("NFC", p).casefold() for p in again[1]) ==         tuple(unicodedata.normalize("NFC", p).casefold() for p in below)
+
+
+def series_key(root: CoordinationRoot, below: tuple[str, ...], *, folder: bool) -> str:
+    """Directory components only: a file drops its name, a folder landing keeps itself.
+
+    ``below`` is the destination relative to ``root`` (from `coordination_root`).
+    Fewer directory components than ``series_depth`` gives the reserved root key.
+    """
+    directories = list(below) if folder else list(below[:-1])
+    if len(directories) < root.series_depth:
+        return ROOT_KEY
+    return "/".join(unicodedata.normalize("NFC", part).casefold() for part in directories[:root.series_depth])
+
+
+def _offset(key: str) -> int:
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return 1 + (int.from_bytes(digest[:8], "big") % (1 << 62))
+
+
+def _kernel32():
+    if os.name != "nt":
+        raise GateRefused("the writer gate requires Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class OVERLAPPED(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.LockFileEx.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.DWORD, ctypes.POINTER(OVERLAPPED))
+    api.LockFileEx.restype = wintypes.BOOL
+    api.UnlockFileEx.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                 ctypes.POINTER(OVERLAPPED))
+    api.UnlockFileEx.restype = wintypes.BOOL
+    return api, OVERLAPPED, ctypes
+
+
+class _GateFile:
+    """One handle on the root's lock file; every lock it takes dies with it."""
+
+    def __init__(self, root: CoordinationRoot):
+        self._api, self._overlapped, self._ctypes = _kernel32()
+        if not _root_bound(root):
+            raise GateRefused(f"registered root changed identity: {root.path}")
+        # Open through the bound physical path, never the registered spelling:
+        # an alias flipped away and back around this open would otherwise
+        # leave the lock in another tree while verify() still passes.
+        self._fd = os.open(root.physical / GATE_LOCK, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+        import msvcrt
+        self._handle = msvcrt.get_osfhandle(self._fd)
+        self._held: list[int] = []
+
+    def _range(self, offset: int):
+        return self._overlapped(Offset=offset & 0xFFFFFFFF, OffsetHigh=offset >> 32)
+
+    def lock(self, offset: int, exclusive: bool, busy: str) -> None:
+        flags = _FAIL_NOW | (_EXCLUSIVE if exclusive else _SHARED)
+        if not self._api.LockFileEx(self._handle, flags, 0, 1, 0, self._ctypes.byref(self._range(offset))):
+            raise GateBusy(busy)
+        self._held.append(offset)
+
+    def verify(self, root: CoordinationRoot) -> None:
+        """Refuse ownership unless the registered root is still the bound directory.
+
+        Checked after the locks are taken and before the caller proceeds: a
+        root swapped aside during or after ``os.open`` would otherwise leave
+        this handle locking a file in a different directory. The held lock
+        file itself cannot be renamed or deleted (``os.open`` grants no delete
+        sharing), but its *directory* can be swapped around the open, which is
+        why the handle is compared with the file at the bound path.
+        """
+        if not _root_bound(root):
+            raise GateRefused(f"registered root changed during acquisition: {root.path}")
+        # A root-identity check alone is not enough: the physical name can be
+        # swapped for a transient junction only around os.open and restored,
+        # leaving this handle on another tree's gate while every later stat of
+        # the root looks right (#195 R5). The handle must be the file now at
+        # the bound gate path. (A hard link to the same file would share the
+        # same lock object, so a matching id is sufficient.)
+        try:
+            held, there = os.fstat(self._fd), os.stat(root.physical / GATE_LOCK)
+        except OSError as exc:
+            raise GateRefused(f"cannot confirm the gate file for {root.path}: {exc}") from exc
+        if not held.st_ino or (held.st_dev, held.st_ino) != (there.st_dev, there.st_ino):
+            raise GateRefused(f"registered root changed during acquisition: the gate handle is not {root.physical / GATE_LOCK}")
+
+    def close(self) -> None:
+        # Unlock in reverse; closing the handle would release them anyway.
+        try:
+            for offset in reversed(self._held):
+                self._api.UnlockFileEx(self._handle, 0, 1, 0, self._ctypes.byref(self._range(offset)))
+        finally:
+            self._held.clear()
+            os.close(self._fd)
+
+
+@contextmanager
+def _once_per_thread(root: CoordinationRoot):
+    held = getattr(_held, "roots", None)
+    if held is None:
+        held = _held.roots = set()
+    if root.identity in held:
+        raise GateRefused(f"this thread already holds the writer gate for {root.path}")
+    held.add(root.identity)
+    try:
+        yield
+    finally:
+        held.discard(root.identity)
+
+
+@contextmanager
+def ordinary_unit(root: CoordinationRoot, key: str):
+    """Hold the shared gate plus this series' byte for one write transaction.
+
+    Raises `GateBusy` without waiting when maintenance holds the gate or
+    another transaction holds this series; the caller defers its unit.
+    """
+    with _once_per_thread(root):
+        gate = _GateFile(root)
+        try:
+            gate.lock(0, False, f"maintenance in progress on {root.path}")
+            gate.lock(_offset(key), True, f"series busy under {root.path}")
+            gate.verify(root)
+            yield
+        finally:
+            gate.close()
+
+
+@contextmanager
+def maintenance_run(root: CoordinationRoot, owner: dict):
+    """Hold the exclusive gate for a whole maintenance run.
+
+    Raises `GateBusy` without waiting while any ordinary transaction or
+    other maintenance run holds the gate. The owner record is written after
+    the lock is held, for diagnostics only.
+    """
+    with _once_per_thread(root):
+        gate = _GateFile(root)
+        try:
+            gate.lock(0, True, f"writers active on {root.path}; retry")
+            gate.verify(root)
+            record = dict(owner, pid=os.getpid(), protocol_version=PROTOCOL_VERSION,
+                          started_at=datetime.now(timezone.utc).isoformat())
+            try:
+                (root.physical / GATE_OWNER).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            except OSError as exc:  # informational: never fail the run over it
+                log.warning("writer gate: owner record not written: %s", exc)
+            yield
+        finally:
+            gate.close()

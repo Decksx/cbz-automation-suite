@@ -18,10 +18,13 @@ import unicodedata
 
 from comic_automation.library.canonical_apply.containment import is_reparse
 from comic_automation.library.exclusions import DEFAULT_EXCLUDED_DIRECTORIES
+from comic_automation.library.writer_gate import CONTROL_FILENAMES
 
 CONTRACT = "sync-filesystem-observation-v1"
 _PROTECTED = frozenset({"ai-decensor-originals", "ai_decensor_originals"})
-_EXCLUDED = DEFAULT_EXCLUDED_DIRECTORIES | _PROTECTED | {".stignore"}
+# Writer-gate and canonical-naming control files are per-library state, never
+# library content: a sync must not carry them and an inventory must not count them.
+_EXCLUDED = DEFAULT_EXCLUDED_DIRECTORIES | _PROTECTED | {".stignore"} | CONTROL_FILENAMES
 _BLOCK = 1024 * 1024
 
 
