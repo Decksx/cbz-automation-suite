@@ -54,7 +54,7 @@ def _filesystem(report):
     contract = report.get("contract")
     if contract == inventory.CONTRACT:
         obs = _validated(report)
-        _require(obs["hash_mode"] == "content", "content observation")
+        # _validated already requires content mode (including empty trees).
         complete = obs["complete"] and not obs["problems"]
     else:
         kind = {"sync-filesystem-preview-v1": "preview", "sync-filesystem-verification-v1": "verification"}.get(contract)
