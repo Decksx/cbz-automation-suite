@@ -202,7 +202,7 @@ def test_known_but_unsupported_configuration_is_not_scoped(evidence, change):
     assert not result['scope_bound'] and 'SECRET' not in json.dumps(result)
 
 
-@pytest.mark.parametrize('change', ['folder_missing', 'duplicate_folder', 'duplicate_device', 'paused_type', 'mapping_missing', 'mapping_duplicate', 'same_device', 'relative_path', 'version_number', 'missing_expanded'])
+@pytest.mark.parametrize('change', ['folder_missing', 'duplicate_folder', 'duplicate_device', 'paused_type', 'mapping_missing', 'mapping_duplicate', 'same_device', 'relative_path', 'version_number', 'missing_expanded', 'contract', 'node', 'encryption_type'])
 def test_malformed_exports_refuse_without_raw_values(evidence, change):
     _, obs, capture = evidence
     node = capture['nodes']['tower']['after']
@@ -216,6 +216,9 @@ def test_malformed_exports_refuse_without_raw_values(evidence, change):
         for phase in capture['nodes']['target'].values(): phase['status']['myID'] = 'TOWER-ID'
     elif change == 'relative_path': node['config']['folders'][0]['path'] = 'SECRET'
     elif change == 'version_number': node['config']['folders'][0]['versioning']['params']['maxAge'] = 'SECRET'
+    elif change == 'contract': capture['contract'] = 'SECRET'
+    elif change == 'node': del capture['nodes']['target']
+    elif change == 'encryption_type': node['config']['folders'][0]['devices'][0]['encryptionPassword'] = 0
     else: del node['ignores']['manga']['expanded']
     with pytest.raises(cfg.ConfigurationRefused) as error: cfg.bind_configuration(obs, capture)
     assert 'SECRET' not in str(error.value)
@@ -237,7 +240,7 @@ def test_configuration_bound_baseline_and_fresh_verification(evidence):
     assert not cfg.bind_configuration(report, changed, expected=expected)['scoped_verified']
 
 
-@pytest.mark.parametrize('change', ['digest', 'baseline_digest', 'baseline_flag', 'baseline_observation', 'scope_fingerprint'])
+@pytest.mark.parametrize('change', ['digest', 'baseline_digest', 'baseline_flag', 'baseline_observation', 'scope_fingerprint', 'baseline_root'])
 def test_digest_and_baseline_bindings_are_checked(evidence, change):
     pair, obs, capture = evidence
     expected = cfg.bind_configuration(obs, capture); report = verify_pairs(obs, (pair,))
@@ -246,6 +249,10 @@ def test_digest_and_baseline_bindings_are_checked(evidence, change):
     elif change == 'baseline_flag': expected['scope_bound'] = False; expected['binding_digest'] = _digest(expected, 'binding_digest')
     elif change == 'baseline_observation':
         expected['filesystem_report']['observation_digest'] = '0'*64
+        expected['binding_digest'] = _digest(expected, 'binding_digest')
+    elif change == 'baseline_root':
+        expected['configuration']['scope']['roots'][0]['path'] = 'C:\\other'
+        expected['scope_fingerprint'] = cfg._fingerprint(expected['configuration']['scope'])
         expected['binding_digest'] = _digest(expected, 'binding_digest')
     else:
         expected['scope_fingerprint'] = '0'*64; expected['binding_digest'] = _digest(expected, 'binding_digest')
