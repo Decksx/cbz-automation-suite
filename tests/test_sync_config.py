@@ -124,6 +124,15 @@ def test_unicode_policy_equivalence_is_not_claimed(trees, name):
     assert not result['scope_bound'] and not result['complete']
 
 
+@pytest.mark.parametrize('name', ['~syncthing~a.tmp', '.syncthing.a.cbz', '~syncthing~dir/a.cbz'])
+def test_native_temporary_names_not_excluded_by_observer_prevent_binding(trees, name):
+    pair = trees({name: b'book'}, {name: b'book'})
+    obs = inv.observe_pairs((pair,), hash_all_tower=True)
+    assert obs['files']
+    result = cfg.bind_configuration(obs, capture_for(obs))
+    assert not result['scope_bound'] and not result['scoped_verified']
+
+
 def test_local_device_can_be_implicit_in_global_device_list(evidence):
     _, obs, capture = evidence
     for side, node in capture['nodes'].items():
