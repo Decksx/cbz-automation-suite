@@ -100,7 +100,8 @@ def _ignores(response, required, windows):
                 or value.casefold() not in required):
             supported = False
         normalized.add(value.casefold())
-    # Missing or extra ignores mean the filesystem report's scope differs.
+    # Extras are rejected individually above; equality also rejects omissions.
+    # Consequently changing == to <= here alone is an equivalent mutation.
     supported = supported and normalized == required
     return dict(source_digest=_fingerprint(raw), expanded_digest=_fingerprint(expanded),
                 matches_observer_policy=bool(supported))
@@ -284,6 +285,8 @@ def bind_configuration(report: dict, capture: dict, *, expected: dict | None = N
             _require(expected is None, "unexpected baseline configuration")
         # Duplicate before/after problems are one semantic unresolved condition.
         problems = sorted({str(sorted(p.items())): p for p in problems}.values(), key=lambda p: str(sorted(p.items())))
+        # Drift also adds a problem above. These two checks deliberately overlap:
+        # removing either alone is redundant; bypassing both must fail tests.
         bound = stable and not problems
         result = dict(contract=CONTRACT, scope="configuration-evidence-bound" if bound else "filesystem-only",
             scope_bound=bool(bound), complete=bool(bound and complete), sync_ready=False,
