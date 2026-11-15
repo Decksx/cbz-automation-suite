@@ -70,6 +70,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,7 @@ from comic_automation.library.canonical_apply.scope_lock import (
     owner_path,
     require_windows,
 )
+from comic_automation.library import writer_gate as wg
 
 Fault = Callable[[str, Mapping[str, Any]], None]
 Quiescence = Callable[[Path], "str | None"]
@@ -655,6 +657,26 @@ def _recover_actions(run: _Run, actions: Sequence[Action], *, single_round: bool
 # --- sessions --------------------------------------------------------------------
 
 
+@contextmanager
+def _maintenance(gate: "wg.CoordinationRoot | None", root: Path, attempt: str, mode: str):
+    """Hold the library writer gate exclusively for a whole run (#158 B3).
+
+    Taken after the canonical scope lock and before quiescence is checked,
+    so participating writers (watcher, Camelia) defer for the whole run.
+    ``gate`` must be the registered root enclosing ``root``; a gate for
+    another tree would exclude nobody here. ``None`` keeps the pre-gate
+    behaviour. The gate never replaces the quiescence probe: until a root
+    is ``enforced`` that probe is still the operator's attestation.
+    """
+    if gate is None:
+        yield
+        return
+    # Raises GateRefused unless ``gate`` physically encloses the library root.
+    wg.coordination_root((gate,), root)
+    with wg.maintenance_run(gate, {"tool": "canonical_apply", "mode": mode, "attempt": attempt}):
+        yield
+
+
 def _check_quiescent(quiescence: Quiescence, root: Path) -> None:
     reason = quiescence(root)
     if reason:
@@ -1061,6 +1083,7 @@ def apply(
     max_drift_fraction: float = DEFAULT_MAX_DRIFT_FRACTION,
     fault: Fault = _no_fault,
     attempt_id: str | None = None,
+    writer_gate: "wg.CoordinationRoot | None" = None,
 ) -> RunReport:
     """Apply an approved plan (already checked by `plan.load_plan`).
 
@@ -1080,7 +1103,7 @@ def apply(
     attempt = resume_attempt or attempt_id or _new_attempt_id()
     _check_state_paths(root, plan, [attempt])
     _check_chains(root, {a.action_id: a.steps(attempt) for a in plan.actions.values()})
-    with ScopeLock(root, attempt, "apply"):
+    with ScopeLock(root, attempt, "apply"), _maintenance(writer_gate, root, attempt, "apply"):
         _check_quiescent(quiescence, root)
         # Re-checked after the quiescence wait, not only at entry.
         _check_state_paths(root, plan, [attempt])
@@ -1188,6 +1211,7 @@ def recover(
     pairing_columns: Mapping[str, PairingColumn] | None = None,
     single_round: bool = False,
     fault: Fault = _no_fault,
+    writer_gate: "wg.CoordinationRoot | None" = None,
 ) -> RunReport:
     """Resolve every action's frontier for ``attempt_id`` (apply or undo).
 
@@ -1203,7 +1227,7 @@ def recover(
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
     _check_state_paths(root, plan, [attempt_id])
-    with ScopeLock(root, attempt_id, "recover"):
+    with ScopeLock(root, attempt_id, "recover"), _maintenance(writer_gate, root, attempt_id, "recover"):
         _check_quiescent(quiescence, root)
         _check_state_paths(root, plan, [attempt_id])
         run, header = _attempt_run(plan, root, Path(database), attempt_id, registry, fault)
@@ -1229,6 +1253,7 @@ def undo(
     pairing_columns: Mapping[str, PairingColumn] | None = None,
     fault: Fault = _no_fault,
     attempt_id: str | None = None,
+    writer_gate: "wg.CoordinationRoot | None" = None,
 ) -> RunReport:
     """Reverse fully confirmed forward actions as a new attempt (§5.4 Undo).
 
@@ -1245,7 +1270,7 @@ def undo(
     _check_pairings(plan, registry)
     attempt = resume_attempt or attempt_id or _new_attempt_id()
     _check_state_paths(root, plan, [attempt, forward_attempt])
-    with ScopeLock(root, attempt, "undo"):
+    with ScopeLock(root, attempt, "undo"), _maintenance(writer_gate, root, attempt, "undo"):
         _check_quiescent(quiescence, root)
         _check_state_paths(root, plan, [attempt, forward_attempt])
         forward_run, forward_header = _attempt_run(plan, root, Path(database), forward_attempt, registry, fault)
