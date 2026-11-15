@@ -1,6 +1,6 @@
 # X: migration cutover runbook (#108, #158)
 
-Status: **draft for review, revision 3**, claude-lead, 2026-11-15.
+Status: **draft for review, revision 4**, claude-lead, 2026-11-15. codex-lead accepted Phases 0–2 at revision 3 (39e7de3). Revision 4 closes the Phase 3 Camelia retry gap and adds the requested check details.
 - **Authority:** David's #5120 ("migrate back to X: today") and #5191 (explicit permission for X:, Z:\media\comics, G:, C:\git, C:\temp and the Tower/PiNAS container configs).
 - **Path:** option B (sync, then one full comparison pass).
 - **No backup of X: (David #5278/#5281):** X:'s content isn't needed, so anything only X: holds is discarded by design. There is no restore-from-backup rollback.
@@ -34,7 +34,8 @@ Status: **draft for review, revision 3**, claude-lead, 2026-11-15.
    - Camelia and the watcher stay stopped, with no autostart, until Phase 3 step 4.
 2. **Both Syncthing instances paused,** with roles as listed above. Record each instance's running version.
 3. **Tools pinned to merged master b9cfa58** (#197, #198 and #200).
-   - The observer's exclusion policy then includes both maintenance folders. The operator commands' pin (codex-lead's `OPERATOR_COMMANDS.md`, currently 2e82a32) must be refreshed to b9cfa58 before Phase 2.
+   - The observer's exclusion policy then includes both maintenance folders.
+   - codex-lead re-pinned the operator tools checkout to `b9cfa58dc0e741dae6596f0496137e415f4bdf5f`. `OPERATOR_COMMANDS.md` SHA-256 is `38d03b2a7afad7e3d0ef7e27a0625c2b984e6198beda0257b1ac38e038ada240`, and the old c32c538f copy is archived as `OPERATOR_COMMANDS.pre-b9cfa58.md`. `pairs.json` is still `2e44e52a…`.
    - The `.stignore` below must equal that policy.
 
 ## Phase 0b: give Syncthing the same scope as the comparison
@@ -86,7 +87,7 @@ Tower is the source of truth throughout this phase.
 4. **Fresh scans and index exchange on both sides.**
    - Trigger a full scan of each folder on each device (GUI "Rescan", or `POST /rest/db/scan?folder=<id>`).
    - Wait until each folder's state is idle, with no scan or pull errors.
-   - Save the `GET /rest/db/status` output for every folder on both devices as witnesses: `globalFiles`, `localFiles`, `needFiles`, `errors`.
+   - Save the `GET /rest/db/status` output for every folder on both devices as witnesses: `globalFiles`, `localFiles`, `needFiles`, `needTotalItems`, `needDeletes`, `errors`, `pullErrors`.
    - Both devices must report each other as connected and up to date on index exchange.
 5. **Publish Tower's state as global.**
    - On **Tower only**, if a folder shows "Override Changes", click it. Override enforces Tower's *local index* (just refreshed by step 4) over the cluster's.
@@ -94,7 +95,9 @@ Tower is the source of truth throughout this phase.
    - **Never** Override or Revert on X: in this step.
 6. **Confirm the global state matches Tower.**
    - Compare Tower's global counts with the read-only estimate (77,931 files, minus anything excluded by the `.stignore`), allowing for any differences the scan surfaced, and record them.
-   - Spot-check a few known Tower-only additions and a few known X:-only paths. The former must be in the global index; the latter must not be in Tower's local state.
+   - Spot-check a few known Tower-only additions and a few known X:-only paths with `GET /rest/db/file?folder=<id>&file=<path>` on Tower.
+     - Tower-only additions must be present in the **global** index.
+     - X:-only paths must be **absent from the global** index after the Override. Absence from Tower's local files proves nothing here, because it is already true before the Override.
 7. **X: → receive-only.** Change OfficePC's two folders to receive-only. X: now pulls everything it needs from the global (Tower) state. Watch free space per step 2. Wait until both X: folders say "Up to Date", with no errors.
 8. **Revert on X: only.**
    - X:'s remaining differences are local additions only it has: pre-consolidation duplicates, not needed (David #5278).
@@ -125,12 +128,19 @@ Tower is the source of truth throughout this phase.
    - Tower: Manga and Comix → **receive-only**, with Tower Comix keeping its staggered versioning.
 2. **Unpause.** Scan both sides. Check: `needFiles` is 0 everywhere, Tower shows **no local changes**, and nothing transfers.
 3. **File the 100 staged books** from `X:\_staging` into the library. This is the watcher's normal hand-off, done as an explicit, logged move that refuses occupied destinations. They then reach Tower through Syncthing.
-4. **Camelia's old-root queue, before Camelia runs again.**
-   - With autostart disabled, identify the runtime backlog DB that Camelia will actually use, read-only and WAL-aware.
-   - List its queued rows whose `root_path` or `source_path` is on `Z:`. Codex's snapshot found 13,621.
-   - **Hold** them via the supported `BacklogStore.edit_queue_books(ids, "hold")`, in batches of ≤100. Read back each batch's status.
-   - Only then start Camelia, with its library root set to `X:\Comix`.
-   - Confirm a newly claimed job's input and output are under `X:`, never `Z:`. Writing on Tower would now create receive-only local changes there.
+4. **Camelia's old-root work, before Camelia runs again.**
+   - The GUI/API **Resume** calls `resume_queue(retry_failed=True)`, which requeues failed jobs across roots. A failed Z: job (codex-lead's snapshot at 22:54:15Z: id 23456, attempt 1 of 2) would then be claimed after a correct X: smoke claim. So holding only queued rows, and checking one first claim, is not enough.
+   - All of this runs while Camelia's workers are stopped and autostart is disabled:
+     1. **Bind the runtime DB:** identify the backlog DB Camelia will actually use, and read it WAL-aware.
+     2. **Report the population:** count Z: rows by state (queued, processing/interrupted, failed with retries left).
+     3. **Make startup's requeues happen now, with no worker running:**
+        - Recover interrupted processing rows the way startup does.
+        - Call `retry_failed()` while still stopped, so every retry-eligible failed row becomes queued now.
+     4. **Hold** every resulting Z: queued row via `BacklogStore.edit_queue_books(ids, "hold")`, in batches of ≤100, reading back each batch.
+     5. **Immediately before restart, prove nothing old-root is runnable:** zero Z: rows that are queued, processing, or failed with retries remaining.
+        - Z: scans and requeue stay disabled, and nothing releases the old holds.
+   - **Then start Camelia,** with its library root set to `X:\Comix`. Check the actual source and destination paths of the first claims: all under `X:`, never `Z:`. Writing on Tower would now create receive-only local changes there.
+   - Alternative, if supported: an explicitly X:-only processing scope that cannot claim old roots.
    - Migrating the held jobs to X: paths is follow-up work, not part of this cutover.
 5. **Watcher:**
    - It already routes to `X:\_staging`. Restart it.
