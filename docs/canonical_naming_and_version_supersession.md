@@ -911,6 +911,16 @@ review.
    - The probe is checked right after the lock is taken, and again at
      every batch boundary.
    - A `unit_gate` seam is where a future series-lock wait goes.
+   - **Update 2026-11-15 (#158 B3 slice 2):** a cross-process mechanism now
+     exists for writers that take part in it. With `--writer-roots`, apply,
+     recover and undo hold the registered root's library writer gate
+     exclusively, right after the scope lock and for the whole run, so a
+     participating watcher or Camelia defers and a busy gate refuses at
+     once. `--attest-quiescent` is still required until that root is
+     `enforced`; on an enforced root, `--attest-no-external-writers`
+     covers the non-participants. No writer takes the gate yet (slices
+     3-5), so today the attestation remains the operative guarantee. See
+     `docs/library_writer_coordination.md`.
 7. **Lock waits.** Validation of a unit always runs after its gate
    returns. The SQLite write lock is the other wait: inside
    `BEGIN IMMEDIATE`, the destination is re-hashed before the conditional

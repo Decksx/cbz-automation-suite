@@ -38,12 +38,16 @@ from scripts.cbz_core import extract_display_tokens
 from comic_automation.library.media_naming import media_fields, display_key, unnumbered_full
 from comic_automation.library.number_style import NumberStyleRegistry, NumberStyleRefused, DEFAULT_REGISTRY
 from scripts.cbz_routing import NON_SERIES_DIRECTORIES
+from comic_automation.library.writer_gate import CONTROL_FILENAMES
 
 CONTRACT = "canonical-naming-plan-v1"
 PLANNER_VERSION = 2
+# The writer-gate and canonical-naming control files sit at the library
+# root; they are coordination state, never library content, and one being
+# created or rewritten must not read as a root-level change (#158 B3).
 _INTERNAL = NON_SERIES_DIRECTORIES | {
     ".cbz-canonical-naming", ".cbz-canonical-quarantine",
-}
+} | CONTROL_FILENAMES
 _DECENSOR = re.compile(r"\b(?:uncen|uncensor(?:ed|ing)?|decensor(?:ed|ing)?)\b", re.I)
 
 

@@ -131,6 +131,7 @@ Acquiring the exclusive gate proves only that no **participating** writer is mid
      - refusal off Windows;
      - resolver witnesses: parent vs series root, drive/UNC/junction aliases, overlapping registrations refused, unregistered refused, a nested apply root mapped to its enclosing gate.
 2. **Canonical apply/recover/undo:** take `maintenance_run` after the scope lock, applying the rollout rules above (`--attest-quiescent` stays required until `enforced`).
+   - *Implemented 2026-11-15:* `executor.apply/recover/undo(writer_gate=...)` and the CLI's `--writer-roots` / `--attest-no-external-writers`. The planner also ignores the four control files, so a gate file appearing during planning isn't a root-level change.
 3. **Watcher:** the transaction boundary as specified, with each entry path's busy-gate witness.
 4. **Camelia:**
    - Private snapshot, private rebuild, and generation revalidation under ownership as specified, plus all three witnesses.
