@@ -389,6 +389,8 @@ class _Run:
     chains: dict[str, tuple[Step, ...]]
     actions: dict[str, Action]
     writer: jn.JournalWriter | None = None
+    # The physical tree the run's locks were taken in (see `_root_binding`).
+    root_binding: "tuple[int, int] | None" = None
 
     def records(self) -> tuple[jn.JournalRecord, ...]:
         self.check_state()
@@ -403,6 +405,10 @@ class _Run:
         than `Refused`, for checks between units.
         """
         try:
+            # The journal and state live under the root too: a retargeted
+            # root alias would move them into another tree.
+            if self.root_binding is not None:
+                _check_binding(self.library_root, self.root_binding)
             _check_state_paths(self.library_root, self.plan, [self.attempt_id])
         except Refused as exc:
             if stop:
@@ -454,6 +460,13 @@ class _Run:
 
     def containment_problem(self, step: Step) -> str | None:
         """Why either end of ``step`` is not physically under the root."""
+        # Containment is judged against the root's *current* resolution, so a
+        # root alias retargeted mid-run would move root and target together
+        # and still look contained. The bound tree must be unchanged first.
+        if self.root_binding is not None:
+            problem = _binding_problem(self.library_root, self.root_binding)
+            if problem is not None:
+                return problem
         for path in (step.source, step.destination):
             try:
                 require_contained(str(self.library_root), path)
@@ -655,6 +668,36 @@ def _recover_actions(run: _Run, actions: Sequence[Action], *, single_round: bool
 
 
 # --- sessions --------------------------------------------------------------------
+
+
+def _root_binding(root: Path) -> tuple[int, int]:
+    """The identity of the physical directory ``root`` resolves to now.
+
+    Captured before the scope lock and writer gate are taken, and required
+    to be unchanged after quiescence and before every rename: if the plan's
+    root is an alias, retargeting it would otherwise send renames into a
+    tree whose locks this run does not hold (#197 review). ``os.stat``
+    follows the alias, and a different tree always has a different identity,
+    so the resolved path adds nothing (a mutant comparing it alone survived).
+    """
+    info = os.stat(root)
+    return info.st_dev, info.st_ino
+
+
+def _binding_problem(root: Path, binding: tuple[int, int]) -> str | None:
+    try:
+        current = _root_binding(root)
+    except OSError as exc:
+        return f"library root {root} cannot be re-resolved: {exc}"
+    if current != binding:
+        return f"library root {root} no longer resolves to the tree this run locked"
+    return None
+
+
+def _check_binding(root: Path, binding: tuple[int, int]) -> None:
+    problem = _binding_problem(root, binding)
+    if problem is not None:
+        raise Refused(problem)
 
 
 @contextmanager
@@ -1103,8 +1146,10 @@ def apply(
     attempt = resume_attempt or attempt_id or _new_attempt_id()
     _check_state_paths(root, plan, [attempt])
     _check_chains(root, {a.action_id: a.steps(attempt) for a in plan.actions.values()})
+    binding = _root_binding(root)
     with ScopeLock(root, attempt, "apply"), _maintenance(writer_gate, root, attempt, "apply"):
         _check_quiescent(quiescence, root)
+        _check_binding(root, binding)
         # Re-checked after the quiescence wait, not only at entry.
         _check_state_paths(root, plan, [attempt])
         run = _Run(
@@ -1112,6 +1157,7 @@ def apply(
             {a.action_id: a.steps(attempt) for a in plan.actions.values()},
             plan.actions,
         )
+        run.root_binding = binding
         report = RunReport(attempt, jn.MODE_APPLY, str(jn.journal_path(root, attempt)))
         if resume_attempt is None:
             _refuse_new_attempt(root, plan)
@@ -1227,10 +1273,13 @@ def recover(
     registry = dict(pairing_columns or {})
     _check_pairings(plan, registry)
     _check_state_paths(root, plan, [attempt_id])
+    binding = _root_binding(root)
     with ScopeLock(root, attempt_id, "recover"), _maintenance(writer_gate, root, attempt_id, "recover"):
         _check_quiescent(quiescence, root)
+        _check_binding(root, binding)
         _check_state_paths(root, plan, [attempt_id])
         run, header = _attempt_run(plan, root, Path(database), attempt_id, registry, fault)
+        run.root_binding = binding
         report = RunReport(attempt_id, f"recover:{header.get('mode')}", str(jn.journal_path(root, attempt_id)))
         run.writer = _open_journal(root, plan, attempt_id)
         try:
@@ -1270,10 +1319,13 @@ def undo(
     _check_pairings(plan, registry)
     attempt = resume_attempt or attempt_id or _new_attempt_id()
     _check_state_paths(root, plan, [attempt, forward_attempt])
+    binding = _root_binding(root)
     with ScopeLock(root, attempt, "undo"), _maintenance(writer_gate, root, attempt, "undo"):
         _check_quiescent(quiescence, root)
+        _check_binding(root, binding)
         _check_state_paths(root, plan, [attempt, forward_attempt])
         forward_run, forward_header = _attempt_run(plan, root, Path(database), forward_attempt, registry, fault)
+        forward_run.root_binding = binding
         if forward_header.get("mode") != jn.MODE_APPLY:
             raise Refused(f"attempt {forward_attempt} is not a forward apply; an undo is not undone")
         if resume_attempt is None:
@@ -1317,6 +1369,7 @@ def undo(
             )
             writer.close()
         run, header = _attempt_run(plan, root, Path(database), attempt, registry, fault)
+        run.root_binding = binding
         if header.get("mode") != jn.MODE_UNDO or header.get("forward_attempt_id") != forward_attempt:
             raise Refused(f"attempt {attempt} is not an undo of {forward_attempt}")
         report = RunReport(attempt, jn.MODE_UNDO, str(jn.journal_path(root, attempt)))
