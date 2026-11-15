@@ -16,8 +16,12 @@ python -m comic_automation.library.sync_observe_cli verify --pairs pairs.json --
 ```
 
 Pin the same code version for baseline collection and verification. In
-particular, #195 adds four control filenames to the built-in exclusions; a
-baseline from before that policy change will fail scope matching afterward.
+particular, #195 adds four control filenames, and the maintenance-folder
+follow-up adds `.cbz-canonical-naming` and `.cbz-canonical-quarantine` at every
+depth. A baseline from before either policy change will fail scope matching
+afterward, even when the book payloads are identical. Configuration binding
+also requires the expanded ignore rules for both maintenance components on
+both sides; the observer itself does not install Syncthing rules.
 Collect a new baseline with the intended version and policy. Keep old artifacts
 unchanged for their original evidence; editing and resealing them is not a
 replacement for fresh collection.
