@@ -36,6 +36,35 @@ Status: **draft for review**, claude-lead, 2026-11-15. David's go: hive #5120 ("
    - **Check:** per-root file count and bytes on F: equal X: (the estimate's per-side counts), and every log's "FAILED" column is 0.
    - It must not touch `F:\comics` or `F:\ai-decensor-originals`.
 
+## Phase 0b: give Syncthing the same scope as the comparison
+
+All four roots (`X:\Manga`, `X:\Comix`, `/mnt/user/media/comics/Manga`, `/mnt/user/media/comics/Comix`) get the **same** `.stignore`, written while everything is paused.
+- It lists exactly the observer's 13 built-in exclusions (`sync_inventory._EXCLUDED` at 2e82a32) plus the temporary-name rule.
+- Syncthing then skips what the comparison skips. In particular, the four writer-gate and canonical-naming control files can never be carried between the copies.
+- `.stignore` itself is never synced.
+
+```
+// Same on all four roots: the #108 observer's built-in exclusions (2e82a32)
+(?i).stversion
+(?i).stversions
+(?i).stfolder
+(?i).stignore
+(?i)@eadir
+(?i)$recycle.bin
+(?i)system volume information
+(?i)ai-decensor-originals
+(?i)ai_decensor_originals
+(?i).cbz-library-writers.lock
+(?i).cbz-library-writers.owner.json
+(?i).cbz-canonical-naming.lock
+(?i).cbz-canonical-naming.owner.json
+(?i).syncthing.*.tmp
+```
+
+- **Check:** after Syncthing starts, each folder's "Ignore Patterns" shows these lines on both devices.
+- The comparison stays **filesystem-only** evidence: an XML/`.stignore` read is not a two-boundary API capture (#198), and nothing here claims Syncthing's effective scope.
+- Undo: delete the four `.stignore` files.
+
 ## Phase 1: merge Tower into X: (temporary direction Tower → X:)
 
 Tower is send-only throughout this phase, so **nothing on Tower can change**. Only X: is written, and X: is backed up.
@@ -68,15 +97,10 @@ Tower was never written.
 ## Phase 2: prove X: equals Tower (option B's one full pass)
 
 1. **Pause** both folders, so nothing moves during the comparison.
-2. **Comparison pass** (David runs it; about a day at the ~37 MB/s measured over SMB for Tower, plus the X: side). Run it from a master checkout that includes #195/#196:
-   ```
-   python -m comic_automation.library.sync_observe_cli observe --pairs C:\git\.claude-tools\sync_live\pairs-live.json > F:\x-backup-2026-11-15-observe.json
-   ```
-   Then derive the preview **from that saved observation** (no second hashing pass):
-   ```
-   python -c "import json,sys; from comic_automation.library.sync_preview import build_preview; print(json.dumps(build_preview(json.load(open(sys.argv[1],encoding='utf-8'))),indent=2,sort_keys=True))" F:\x-backup-2026-11-15-observe.json > F:\x-backup-2026-11-15-preview.json
-   ```
-   - The manifest uses the real folder IDs `wcv4q-z7oqx` and `wwrge-mushw`, `tower` = the `\\TOWER\media\comics\...` paths, and `target` = the `X:\...` paths. codex-lead confirms it against the configuration evidence (#198) before use.
+2. **Comparison pass** (David runs it in his own PowerShell; about a day at the ~37 MB/s measured over SMB for Tower, plus the X: side). Use codex-lead's prepared, fixture-tested commands: `C:\Users\david\.codex\tmp\sync108-live-20261115\OPERATOR_COMMANDS.md`, SHA-256 c32c538f1e53…, section "One full baseline; derive preview without another hash pass".
+   - They pin the reviewed observer at 2e82a32 in a clean checkout, and check the manifest's SHA (`pairs.json`, 2e44e52a1f08…: folder IDs `wcv4q-z7oqx`/`wwrge-mushw`, Tower UNC roots, X: roots, no prefixes).
+   - They refuse to overwrite earlier output, redirect bytes through `cmd` (PowerShell 5 would write UTF-16), and derive `preview.json` from the saved baseline with no second hash pass.
+   - In option B this "baseline" is taken **after** the sync, as the acceptance comparison. It can't prove what X: held before the sync; the F: backup covers that. The same artifact later serves as the expected baseline for a `verify` in the restored X:→Tower direction.
 3. **Pass criteria** (all required):
    - `complete=true`.
    - Every Tower file is in `keep_in_place`. `to_write`, `to_remove` and `unresolved` are all empty.
@@ -98,6 +122,8 @@ Tower was never written.
 5. **Standing rule until the writer-gate rollout:** stop the watcher and Camelia before any rename/cleanup apply (#197 keeps `--attest-quiescent` required).
 
 ## What this does not cover
+
+- **Canonical-naming state folders:** `.cbz-canonical-naming\` (journals) and `.cbz-canonical-quarantine\` sit inside a library root once an apply runs. They are **not** in the observer's exclusions, so they'd be compared and synced like books. Follow-up for #108 before any apply on X:. Neither exists in today's roots.
 
 - `F:\ai-decensor-originals` and other backups: untouched.
 - The canonical-naming apply on X:, and the writer-gate adapters for the watcher and Camelia: later work, unaffected.
