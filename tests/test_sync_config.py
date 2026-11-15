@@ -1,6 +1,7 @@
 """Configuration captures are sanitized evidence, never control authority."""
 import copy
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -240,6 +241,24 @@ def test_configuration_bound_baseline_and_fresh_verification(evidence):
     assert not cfg.bind_configuration(report, changed, expected=expected)['scoped_verified']
 
 
+def test_configuration_baseline_must_match_the_verifications_own_baseline(evidence):
+    pair, first, capture = evidence
+    first_bound = cfg.bind_configuration(first, capture)
+    # A real second observation keeps roots, policy and bytes while changing
+    # its generation. Scope equality alone must not authorize substituting it.
+    os.utime(pair.tower/'Book/a.cbz', ns=(1_000_000_000, 1_000_000_000))
+    second = inv.observe_pairs((pair,), hash_all_tower=True)
+    second_bound = cfg.bind_configuration(second, capture)
+    assert first['complete'] and second['complete']
+    assert first['observation_digest'] != second['observation_digest']
+    assert first_bound['scope_fingerprint'] == second_bound['scope_fingerprint']
+    verification = verify_pairs(second, (pair,))
+    assert verification['verified']
+    assert cfg.bind_configuration(verification, capture, expected=second_bound)['scoped_verified']
+    with pytest.raises(cfg.ConfigurationRefused, match='baseline observation binding'):
+        cfg.bind_configuration(verification, capture, expected=first_bound)
+
+
 @pytest.mark.parametrize('change', ['digest', 'baseline_digest', 'baseline_flag', 'baseline_observation', 'scope_fingerprint', 'baseline_root'])
 def test_digest_and_baseline_bindings_are_checked(evidence, change):
     pair, obs, capture = evidence
@@ -303,3 +322,24 @@ def test_cli_round_trip_and_secret_safe_errors(evidence, tmp_path, capsys):
     capture_path.write_text('{"apikey":"SECRET", broken')
     assert cli.main(args) == 2
     assert 'SECRET' not in str(capsys.readouterr())
+
+
+@pytest.mark.parametrize('state', ['complete', 'fallback', 'incomplete'])
+def test_cli_success_requires_a_complete_bound_report(evidence, tmp_path, capsys, state):
+    _, obs, capture = evidence
+    if state == 'fallback':
+        mutate_both(capture, 'tower', lambda p: p['ignores']['manga']['expanded'].append('!keep'))
+    elif state == 'incomplete':
+        obs['complete'] = False
+        obs['problems'].append(dict(reason='fixture coverage gap'))
+        obs['observation_digest'] = _digest(obs, 'observation_digest')
+    report_path, capture_path = tmp_path/'report.json', tmp_path/'capture.json'
+    report_path.write_text(json.dumps(obs), encoding='utf-8')
+    capture_path.write_text(json.dumps(capture), encoding='utf-8')
+    code = cli.main(['--report', str(report_path), '--capture', str(capture_path)])
+    output = capsys.readouterr()
+    assert not output.err
+    result = json.loads(output.out)
+    assert result['complete'] is (state == 'complete')
+    assert result['scope_bound'] is (state != 'fallback')
+    assert code == (0 if state == 'complete' else 2)
