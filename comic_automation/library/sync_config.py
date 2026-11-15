@@ -232,6 +232,12 @@ def bind_configuration(report: dict, capture: dict, *, expected: dict | None = N
         if any(not row["relative_path"].isascii() for row in obs["files"]) or any(
                 not row["path"].isascii() for row in obs["excluded"]):
             problems.append(dict(reason="Unicode ignore semantics are not modeled"))
+        # Syncthing reserves either temporary prefix even without .tmp. The
+        # observer has a narrower suffix rule, so any such counted file makes
+        # a scoped Syncthing assertion unsupported rather than disappearing.
+        if any(any(part.casefold().startswith((".syncthing.", "~syncthing~"))
+                   for part in row["relative_path"].split("/")) for row in obs["files"]):
+            problems.append(dict(reason="native temporary-file scope differs"))
         for phase in ("before", "after"):
             snapshots[phase] = {}
             for side in SIDES:
