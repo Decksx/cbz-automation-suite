@@ -10,6 +10,8 @@ not ``enforced``: an old watcher that never takes the gate is invisible to it.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -21,6 +23,7 @@ from comic_automation.library import writer_gate as wg
 from comic_automation.library.canonical_apply import cli, executor
 from tests.canonical_apply_fixtures import env  # noqa: F401  (fixture)
 from tests.test_canonical_apply_components import _rename_doc
+from tests.test_writer_gate import _junction
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="the step protocol and gate are Windows-only")
 
@@ -184,3 +187,125 @@ def test_the_planner_never_inventories_control_files(tmp_path):
     rows, books, excluded = cp._inventory(root)
     assert not any(Path(row["path"]).name in wg.CONTROL_FILENAMES for row in rows)
     assert {row["path"] for row in excluded} == set(wg.CONTROL_FILENAMES)
+
+
+# --- the run is bound to the physical tree it locked (#197 review R1) -------------
+
+def _aliased_env(env):
+    """Re-point the fixture at a junction to its library, plus an unlocked copy."""
+    physical, alias, other = env.root, env.tmp / "library-alias", env.tmp / "unlocked-copy"
+    _junction(alias, physical)
+    env.root, env.series = alias, alias / "Series"
+    return physical, alias, other
+
+
+def _retarget(alias, target):
+    os.rmdir(alias)                       # removes the junction only
+    _junction(alias, target)
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_a_root_alias_retargeted_before_the_run_is_refused(env, gated):
+    physical, alias, other = _aliased_env(env)
+    document, source, destination = _rename_doc(env)
+    shutil.copytree(physical, other)
+    gate = wg.load_registry(registry(env.tmp / "roots.json", alias))[0] if gated else None
+
+    def quiet_then_retarget(root):
+        _retarget(alias, other)
+        return None
+
+    with pytest.raises(executor.Refused, match="no longer resolves to the tree this run locked"):
+        env.apply(document, writer_gate=gate, quiescence=quiet_then_retarget)
+    for tree in (physical, other):
+        assert (tree / "Series" / "a.cbz").exists() and not (tree / "Series" / destination.name).exists()
+
+
+def test_a_root_alias_retargeted_between_units_stops_before_the_next_rename(env):
+    from tests.canonical_apply_fixtures import P1, P2, book
+    physical, alias, other = _aliased_env(env)
+    first, second = book(env.series, "a.cbz", [P1]), book(env.series, "b.cbz", [P2])
+    document = env.plan(renames=[
+        env.rename_spec(first, env.series / "A ch. 1.cbz", "ren1"),
+        env.rename_spec(second, env.series / "B ch. 2.cbz", "ren2"),
+    ])
+    shutil.copytree(physical, other)
+    calls = []
+
+    def retarget_before_second(unit):
+        calls.append(unit)
+        if len(calls) == 2:
+            _retarget(alias, other)
+
+    report = env.apply(document, unit_gate=retarget_before_second)
+    assert len(calls) == 2
+    detail = json.dumps(report.as_dict())
+    assert "no longer resolves to the tree this run locked" in detail, detail
+    assert [u["status"] for u in report.units][0] == executor.UNIT_COMPLETED
+    assert report.units[1]["status"] != executor.UNIT_COMPLETED
+    # Nothing landed in the unlocked tree; the second book was never moved anywhere.
+    assert not (other / "Series" / "B ch. 2.cbz").exists() and (other / "Series" / "b.cbz").exists()
+    assert (physical / "Series" / "b.cbz").exists() and not (physical / "Series" / "B ch. 2.cbz").exists()
+
+
+@pytest.mark.parametrize("mode", ["recover", "undo"])
+def test_recover_and_undo_refuse_a_retargeted_root_alias(env, mode):
+    physical, alias, other = _aliased_env(env)
+    document, source, destination = _rename_doc(env)
+    attempt = env.apply(document).attempt_id
+    shutil.copytree(physical, other)
+    # Without the up-front binding check the run would read the other tree's
+    # journal; give that tree none, so only the binding refusal matches.
+    shutil.rmtree(other / ".cbz-canonical-naming")
+
+    def quiet_then_retarget(root):
+        _retarget(alias, other)
+        return None
+
+    with pytest.raises(executor.Refused, match="no longer resolves"):
+        if mode == "recover":
+            env.recover(document, attempt, quiescence=quiet_then_retarget)
+        else:
+            env.undo(document, attempt, quiescence=quiet_then_retarget)
+
+
+def test_a_root_alias_retargeted_inside_a_step_stops_before_the_rename(env):
+    """Retarget after the intent is durable, the last wait before os.rename: only
+    the per-rename binding check stands between the step and the unlocked tree."""
+    physical, alias, other = _aliased_env(env)
+    document, source, destination = _rename_doc(env)
+    shutil.copytree(physical, other)
+
+    def retarget_after_intent(point, context):
+        if point == "after_intent":
+            _retarget(alias, other)
+
+    report = env.apply(document, fault=retarget_after_intent)
+    detail = json.dumps(report.as_dict())
+    assert "no longer resolves to the tree this run locked" in detail, detail
+    assert (other / "Series" / "a.cbz").exists() and not (other / "Series" / destination.name).exists()
+    assert (physical / "Series" / "a.cbz").exists() and not (physical / "Series" / destination.name).exists()
+
+
+def test_a_root_replaced_at_the_same_physical_path_is_refused(env, monkeypatch):
+    """Same resolved path, different directory: only the identity half catches it.
+
+    Windows refuses to rename the root while the run's lock files are open in
+    it, so the swap is injected in the one window it can happen: after the
+    binding is captured and before the scope lock is taken.
+    """
+    physical, alias, other = _aliased_env(env)
+    document, source, destination = _rename_doc(env)
+    moved = env.tmp / "moved-original"
+    real_lock = executor.ScopeLock
+
+    def swap_then_lock(root, attempt, mode):
+        physical.rename(moved)
+        shutil.copytree(moved, physical)
+        return real_lock(root, attempt, mode)
+
+    monkeypatch.setattr(executor, "ScopeLock", swap_then_lock)
+    with pytest.raises(executor.Refused, match="no longer resolves"):
+        env.apply(document)
+    assert not (physical / "Series" / destination.name).exists()
+    assert not (moved / "Series" / destination.name).exists()
