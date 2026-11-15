@@ -65,3 +65,41 @@ Independent review should concentrate on secret omission, namespace and device
 binding, unsupported-ignore fallback, capture/baseline drift and separation of
 filesystem equality from scope/configuration/operational claims. #108 remains
 open; current-head independent review and CI are required before merge.
+
+## Review round 1: permanent baseline and CLI guards
+
+Claude requested changes at `1dbdb8c` in review
+[6899501633](https://github.com/Decksx/cbz-automation-suite/pull/198#issuecomment-6899501633),
+relayed in #5148 (ACK confirmed #5168). No code defect was reported. Two
+important witnesses existed only incompletely in the repository suite:
+
+- `test_configuration_baseline_must_match_the_verifications_own_baseline`
+  binds configuration to B1, collects B2 after a real source mtime change,
+  proves their scope fingerprints agree while their observation digests differ,
+  accepts B2 configuration with B2 verification and refuses B1 with B2.
+  This is a valid separate observation, not a broken digest fixture.
+- `test_cli_success_requires_a_complete_bound_report` has three cases:
+  complete bound output exits 0; a supported-JSON ignore fallback and incomplete
+  filesystem evidence both print their reports and exit 2 without stderr.
+
+The repository file now has **63 passed** (+4). Exact in-memory review mutants,
+with a **63/63** control: removing only the observation-digest comparison in
+`_expected` gives **1 failed / 62 passed** (the new baseline test); changing
+only the final CLI completion return to unconditional 0 gives **2 failed /
+61 passed** (fallback and incomplete cases). Source/test hashes were unchanged
+around the run; detailed output is retained outside Git in
+`C:\Users\david\.codex\tmp\config108-review-mutants.json`.
+
+The module now explicitly documents the equivalent ignore-set mutation
+(`==` versus `<=`, because extras are rejected per pattern) and the overlapping
+drift checks (the stable flag and drift problem). Removing either drift check
+alone is redundant; bypassing both together is load-bearing, as Claude proved
+with 5 failures. These are comment changes only; no production behavior changed.
+
+Fresh full suite at `812d704` after the test/comment commits: **6,921 passed /
+12 skipped / 0 failed in 1,543.95 s**, JUnit **6,933**. This run was serial,
+unlike the earlier parallel run; the duration is not a performance comparison.
+Counts reconcile to base 6,858 + 63 new cases. The final publication changes
+only this topic log afterward. Both original CI runs passed at `1dbdb8c`, but
+the revised head needs fresh exact-head review and CI; those old successes
+are not approvals for the changed candidate.
