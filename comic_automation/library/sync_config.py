@@ -166,6 +166,7 @@ def _phase(value, side, selected, mappings, observation):
         _require(isinstance(shares, list) and all(isinstance(d, dict) for d in shares), "folder devices")
         peers = [_text(d.get("deviceID"), "folder device ID") for d in shares]
         _require(len(peers) == len(set(peers)) and all(p == device or p in devices for p in peers), "folder peer binding")
+        _require(all(isinstance(d.get("encryptionPassword", ""), str) for d in shares), "folder encryption state")
         encrypted = any(bool(d.get("encryptionPassword")) for d in shares)
         required = required_expanded_patterns(observation)
         for prefix in root["exclude_prefixes"]:
@@ -199,6 +200,10 @@ def _expected(value, expected_observation):
     old, complete = _filesystem(report)
     _require(complete and old["observation_digest"] == expected_observation["observation_digest"],
              "baseline observation binding")
+    _require(value["configuration"]["capture_stable"] is True
+             and value["configuration"]["scope"]["roots"] == old["roots"]
+             and value["configuration"]["scope"]["exclusion_policy"] == old["exclusion_policy"],
+             "baseline configuration root binding")
     _require(value.get("scope_fingerprint") == _fingerprint(value["configuration"]["scope"]), "baseline scope fingerprint")
     return value
 
