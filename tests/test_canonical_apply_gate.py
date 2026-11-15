@@ -309,3 +309,14 @@ def test_a_root_replaced_at_the_same_physical_path_is_refused(env, monkeypatch):
         env.apply(document)
     assert not (physical / "Series" / destination.name).exists()
     assert not (moved / "Series" / destination.name).exists()
+
+
+def test_a_library_root_gone_before_the_run_is_a_clean_cli_refusal(env, capsys):
+    """The root vanishes after the plan is written: the CLI reports a structured
+    refusal (exit 1) from the binding capture, never a raw traceback (#197 review)."""
+    document, source, destination = _rename_doc(env)
+    path = env.write_plan(document)
+    shutil.rmtree(env.root)
+    assert cli.main(_argv(env, document, path, "--attest-quiescent")) == 1
+    err = capsys.readouterr().err
+    assert "refused" in err and "Traceback" not in err
