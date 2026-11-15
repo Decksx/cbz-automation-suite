@@ -33,7 +33,11 @@ adapter to establish effective configuration scope.
 
 The policy includes the existing shared directory exclusions, `.stignore`,
 `.syncthing.*.tmp` temporary names and protected original-directory names
-`ai-decensor-originals` / `ai_decensor_originals`, at any depth. An excluded
+`ai-decensor-originals` / `ai_decensor_originals`, at any depth. Local canonical
+maintenance journals (`.cbz-canonical-naming`) and quarantine originals
+(`.cbz-canonical-quarantine`) are also excluded at any depth, including inside
+series folders. These reserved components are local recovery state, not books;
+similarly prefixed names remain ordinary content. An excluded
 subtree is recorded at its boundary and is never descended or hashed. A root
 inside a protected original-directory path is refused. The output binds the
 literal prefixes and built-in exclusion policy into its digest.
