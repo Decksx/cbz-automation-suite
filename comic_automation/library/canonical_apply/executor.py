@@ -680,14 +680,18 @@ def _root_binding(root: Path) -> tuple[int, int]:
     follows the alias, and a different tree always has a different identity,
     so the resolved path adds nothing (a mutant comparing it alone survived).
     """
-    info = os.stat(root)
+    try:
+        info = os.stat(root)
+    except OSError as exc:
+        # A refusal like any other precondition, so the CLI reports it cleanly.
+        raise Refused(f"library root {root} cannot be resolved: {exc}") from exc
     return info.st_dev, info.st_ino
 
 
 def _binding_problem(root: Path, binding: tuple[int, int]) -> str | None:
     try:
         current = _root_binding(root)
-    except OSError as exc:
+    except Refused as exc:
         return f"library root {root} cannot be re-resolved: {exc}"
     if current != binding:
         return f"library root {root} no longer resolves to the tree this run locked"
