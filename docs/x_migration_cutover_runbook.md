@@ -9,7 +9,8 @@ Status: **draft for review, revision 4**, claude-lead, 2026-11-15. codex-lead ac
 ## Facts this runbook relies on (measured 2026-11-15)
 
 **Library:**
-- Pairs: Manga `wcv4q-z7oqx` (`X:\Manga` and Tower `/mnt/user/media/comics/Manga`, `\\TOWER\media\comics\Manga`), and Comix `wwrge-mushw` (`X:\Comix` and `.../comics/Comix`).
+- Pairs: Manga `wcv4q-z7oqx` (`X:\Manga` and Tower `/mnt/user/media/comics/Manga`, `\\TOWER\media\comics\Manga`), Comix `wwrge-mushw` (`X:\Comix` and `.../comics/Comix`), and, **added 2026-11-16** after David #5423, Graphic Novels `comics-graphic-novels` (`X:\Graphic Novels` and `.../comics/Graphic Novels`: Tower 706 cbz / 26.5 GiB, X: 824 files / 39.6 GiB).
+- David #5423: every file in X:'s root book directories (Comix, Manga, Graphic Novels, etc.) is a duplicate or deprecated version of a file in `\\TOWER\media\comics`. X:'s copies are disposable; Tower is authoritative.
 - Read-only estimate: Tower has 77,931 files / 2,783 GiB, and X: has 67,205 / 2,489 GiB. X: has 0.99 TiB free.
 - codex-lead's space budget: 26,017 Tower paths absent on X: (0.552 TiB), and an illustrative peak of 0.671 TiB with replacement temporaries.
 
@@ -35,17 +36,22 @@ Status: **draft for review, revision 4**, claude-lead, 2026-11-15. codex-lead ac
 2. **Both Syncthing instances paused,** with roles as listed above. Record each instance's running version.
 3. **Tools pinned to merged master b9cfa58** (#197, #198 and #200).
    - The observer's exclusion policy then includes both maintenance folders.
-   - codex-lead re-pinned the operator tools checkout to `b9cfa58dc0e741dae6596f0496137e415f4bdf5f`. `OPERATOR_COMMANDS.md` SHA-256 is `38d03b2a7afad7e3d0ef7e27a0625c2b984e6198beda0257b1ac38e038ada240`, and the old c32c538f copy is archived as `OPERATOR_COMMANDS.pre-b9cfa58.md`. `pairs.json` is still `2e44e52a…`.
+   - codex-lead re-pinned the operator tools checkout to `b9cfa58dc0e741dae6596f0496137e415f4bdf5f`.
+   - **Three-pair artifacts (2026-11-16):**
+     - `pairs.json` SHA-256 `a9ead940ab66fa4368f68e87c2bb13445902bf7468878c1b446c2486bba787e8`: Manga, Comix and Graphic Novels, Tower UNC roots, X: roots, no prefixes.
+     - `OPERATOR_COMMANDS.md` SHA-256 `c590e681d201d78f0741f89f0cce25beae944baba5543167f55a1e022f883f95`, which references that manifest hash and pin b9cfa58.
+     - `pairs.provenance.json` SHA-256 `c37e6a4811589770bee503e436f331f9b4ca02e32b4c40493820b3a5759ab92c`.
+     - The earlier two-pair artifacts (`pairs.json` 2e44e52a…, commands 38d03b2a…) are preserved, not reused.
    - The `.stignore` below must equal that policy.
 
 ## Phase 0b: give Syncthing the same scope as the comparison
 
-All four roots get the **same** `.stignore`, written while everything is paused.
+All Syncthing roots get the **same** `.stignore`, written while everything is paused: the four Manga and Comix roots in Phase 0b, and both Graphic Novels roots before that folder was created (2026-11-16).
 - It lists exactly the observer's built-in exclusions at b9cfa58 (`sync_inventory._EXCLUDED`: 15 names) plus the temporary-name rule.
 - Syncthing then skips what the comparison skips. The writer-gate and canonical-naming control files and the apply journal and quarantine folders can never be carried between the copies.
 
 ```
-// Same on all four roots: the #108 observer's built-in exclusions (b9cfa58)
+// Same on every root: the #108 observer's built-in exclusions (b9cfa58)
 (?i).stversion
 (?i).stversions
 (?i).stfolder
@@ -120,6 +126,14 @@ Tower is the source of truth throughout this phase.
    - Every Tower file is in `keep_in_place`. `to_write`, `to_remove` and `unresolved` are empty.
    - `counts.tower.keep.files` equals Tower's observed files, and the same for target.
    - Any failure means stay paused, investigate, and do not proceed.
+
+## Graphic Novels (third pair, added during Phase 1)
+
+Graphic Novels was never a Syncthing folder. It was added as `comics-graphic-novels` with **Tower send-only and X: receive-only from creation**. X:'s existing files are therefore never announced to the global index (they show as `receiveOnlyChangedFiles`), and Tower's copy is the global state from the start.
+- Steps 4 and 6 apply as for the other folders: Tower idle with local = global, and the global-index spot checks.
+- Step 5 (Override) is not needed: X: never published.
+- Step 8 (Revert on X:) removes X:'s extras once X: is up to date.
+- Phase 2 covers it through the three-pair manifest. Phase 3 restores the folder to X: send-only and Tower receive-only like the others.
 
 ## Phase 3: restore the original direction and the writers
 
