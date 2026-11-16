@@ -1,6 +1,6 @@
 # X: migration cutover runbook (#108, #158)
 
-Status: **draft for review, revision 4**, claude-lead, 2026-11-15. codex-lead accepted Phases 0–2 at revision 3 (39e7de3). Revision 4 closes the Phase 3 Camelia retry gap and adds the requested check details.
+Status: **draft for review, revision 4**, claude-lead, 2026-11-15. codex-lead accepted Phases 0–2 at revision 3 (39e7de3). Revision 4 closes the Phase 3 Camelia retry gap and adds the requested check details. The 2026-11-16 amendment (#201) adds Graphic Novels as the third pair.
 - **Authority:** David's #5120 ("migrate back to X: today") and #5191 (explicit permission for X:, Z:\media\comics, G:, C:\git, C:\temp and the Tower/PiNAS container configs).
 - **Path:** option B (sync, then one full comparison pass).
 - **No backup of X: (David #5278/#5281):** X:'s content isn't needed, so anything only X: holds is discarded by design. There is no restore-from-backup rollback.
@@ -11,14 +11,16 @@ Status: **draft for review, revision 4**, claude-lead, 2026-11-15. codex-lead ac
 **Library:**
 - Pairs: Manga `wcv4q-z7oqx` (`X:\Manga` and Tower `/mnt/user/media/comics/Manga`, `\\TOWER\media\comics\Manga`), Comix `wwrge-mushw` (`X:\Comix` and `.../comics/Comix`), and, **added 2026-11-16** after David #5423, Graphic Novels `comics-graphic-novels` (`X:\Graphic Novels` and `.../comics/Graphic Novels`: Tower 706 cbz / 26.5 GiB, X: 824 files / 39.6 GiB).
 - David #5423: every file in X:'s root book directories (Comix, Manga, Graphic Novels, etc.) is a duplicate or deprecated version of a file in `\\TOWER\media\comics`. X:'s copies are disposable; Tower is authoritative.
-- Read-only estimate: Tower has 77,931 files / 2,783 GiB, and X: has 67,205 / 2,489 GiB. X: has 0.99 TiB free.
-- codex-lead's space budget: 26,017 Tower paths absent on X: (0.552 TiB), and an illustrative peak of 0.671 TiB with replacement temporaries.
+- **Two-pair history (Manga and Comix only, 2026-11-15; Graphic Novels not included):**
+  - Read-only estimate: Tower has 77,931 files / 2,783 GiB, and X: has 67,205 / 2,489 GiB. X: had 0.99 TiB free.
+  - codex-lead's space budget: 26,017 Tower paths absent on X: (0.552 TiB), and an illustrative peak of 0.671 TiB with replacement temporaries.
+  - These totals and the estimate JSON do not describe Graphic Novels. Its figures come from fresh metadata (see the Graphic Novels section).
 
-**Syncthing (current state):**
-- OfficePC: both folders send-only, paused. Comix has staggered versioning; Manga has none.
-- Tower `binhex-syncthing` (container state Created, not running): both folders receive-only, paused.
+**Syncthing (state before Phase 1, 2026-11-15; Graphic Novels was not yet a Syncthing folder):**
+- OfficePC: Manga and Comix send-only, paused. Comix has staggered versioning; Manga has none.
+- Tower `binhex-syncthing` (container state Created, not running): Manga and Comix receive-only, paused.
 - No `.stignore` anywhere. **Tower Comix has no `.stfolder` marker.**
-- None of the control files or maintenance folders exist in the four roots.
+- None of the control files or maintenance folders exist in the four Manga and Comix roots.
 
 **Komga and writers:**
 - Komga runs on Tower and reads `/mnt/user/media/comics`. It needs no change.
@@ -72,7 +74,7 @@ All Syncthing roots get the **same** `.stignore`, written while everything is pa
 
 - **Check:** each folder's "Ignore Patterns" shows these lines on both devices.
 - The evidence stays **filesystem-only**: no two-boundary API capture (#198) has been made, so nothing here claims Syncthing's effective scope.
-- Undo: delete the four `.stignore` files.
+- Undo: delete all six `.stignore` files: the four Manga and Comix roots and both Graphic Novels roots (`X:\Graphic Novels` and Tower `/mnt/user/media/comics/Graphic Novels`).
 
 ## Phase 1: make Tower authoritative, then let X: receive
 
@@ -100,7 +102,7 @@ Tower is the source of truth throughout this phase.
    - Don't infer anything from a missing button. Re-read `db/status` and confirm Tower's `localFiles`/`localBytes` equal its `globalFiles`/`globalBytes`, and that Tower `needFiles` is 0.
    - **Never** Override or Revert on X: in this step.
 6. **Confirm the global state matches Tower.**
-   - Compare Tower's global counts with the read-only estimate (77,931 files, minus anything excluded by the `.stignore`), allowing for any differences the scan surfaced, and record them.
+   - For Manga and Comix, compare Tower's global counts with the two-pair read-only estimate (77,931 files, minus anything excluded by the `.stignore`), allowing for any differences the scan surfaced, and record them.
    - Spot-check a few known Tower-only additions and a few known X:-only paths with `GET /rest/db/file?folder=<id>&file=<path>` on Tower.
      - Tower-only additions must be present in the **global** index.
      - X:-only paths must be **absent from the global** index after the Override. Absence from Tower's local files proves nothing here, because it is already true before the Override.
@@ -116,7 +118,7 @@ Tower is the source of truth throughout this phase.
 
 ## Phase 2: prove X: equals Tower (option B's one full pass)
 
-1. **Pause** both folders, so nothing moves during the comparison. Re-run the Phase 0 writer check.
+1. **Pause** all three folders (Manga `wcv4q-z7oqx`, Comix `wwrge-mushw` and Graphic Novels `comics-graphic-novels`) on **both devices**, so nothing moves during the comparison. Re-run the Phase 0 writer check.
 2. **Comparison pass.** David runs it in his own PowerShell; it takes about a day at the ~37 MB/s measured over SMB for Tower, plus the X: side.
    - Use codex-lead's prepared commands, `C:\Users\david\.codex\tmp\sync108-live-20261115\OPERATOR_COMMANDS.md`, section "One full baseline; derive preview without another hash pass", **re-pinned to b9cfa58** (Phase 0 step 3), with the actual-ID `pairs.json`.
    - They check the code pin and the manifest SHA, refuse to overwrite earlier output, redirect bytes through `cmd`, and derive `preview.json` from the saved baseline without a second hash pass.
@@ -131,6 +133,7 @@ Tower is the source of truth throughout this phase.
 
 Graphic Novels was never a Syncthing folder. It was added as `comics-graphic-novels` with **Tower send-only and X: receive-only from creation**. X:'s existing files are therefore never announced to the global index (they show as `receiveOnlyChangedFiles`), and Tower's copy is the global state from the start.
 - Steps 4 and 6 apply as for the other folders: Tower idle with local = global, and the global-index spot checks.
+  - Its expected counts and spot-check samples come from **fresh metadata**: a current Tower listing of `/mnt/user/media/comics/Graphic Novels` and a current X: listing, taken at the time of the check. Not the two-pair estimate JSON, and not the Manga/Comix spot-check helper's estimate-based sampling.
 - Step 5 (Override) is not needed: X: never published.
 - Step 8 (Revert on X:) removes X:'s extras once X: is up to date.
 - Phase 2 covers it through the three-pair manifest. Phase 3 restores the folder to X: send-only and Tower receive-only like the others.
@@ -138,9 +141,10 @@ Graphic Novels was never a Syncthing folder. It was added as `comics-graphic-nov
 ## Phase 3: restore the original direction and the writers
 
 1. **Roles back to the original:**
-   - OfficePC: Manga and Comix → **send-only**. Restore X: Comix's staggered versioning from the run log.
-   - Tower: Manga and Comix → **receive-only**, with Tower Comix keeping its staggered versioning.
-2. **Unpause.** Scan both sides. Check: `needFiles` is 0 everywhere, Tower shows **no local changes**, and nothing transfers.
+   - Applies to all three folders: Manga `wcv4q-z7oqx`, Comix `wwrge-mushw` and Graphic Novels `comics-graphic-novels`.
+   - OfficePC: Manga, Comix and Graphic Novels → **send-only**. Restore X: Comix's staggered versioning from the run log. X: Graphic Novels keeps versioning none, as created.
+   - Tower: Manga, Comix and Graphic Novels → **receive-only**, with Tower Comix keeping its staggered versioning and Tower Graphic Novels keeping versioning none, as created.
+2. **Unpause** all three folders on both devices. Scan both sides. Check: `needFiles` is 0 everywhere, Tower shows **no local changes**, and nothing transfers.
 3. **File the 100 staged books** from `X:\_staging` into the library. This is the watcher's normal hand-off, done as an explicit, logged move that refuses occupied destinations. They then reach Tower through Syncthing.
 4. **Camelia's old-root work, before Camelia runs again.**
    - The GUI/API **Resume** calls `resume_queue(retry_failed=True)`, which requeues failed jobs across roots. A failed Z: job (codex-lead's snapshot at 22:54:15Z: id 23456, attempt 1 of 2) would then be claimed after a correct X: smoke claim. So holding only queued rows, and checking one first claim, is not enough.
