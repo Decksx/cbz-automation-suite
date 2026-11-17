@@ -221,14 +221,16 @@ def test_live_registry_aliases_include_original_and_translated_titles() -> None:
     }
 
 
-def test_watcher_cli_defaults_to_z_but_requires_explicit_enable() -> None:
+def test_watcher_cli_defaults_to_x_but_requires_explicit_enable() -> None:
+    """An empty GUI root field omits its flag, so these parser defaults are what such a launch
+    uses. They must be the X: library (#108), never Tower's receive-only Z: copy."""
     args = watcher.build_argument_parser().parse_args([])
 
     assert args.series_resolver is False
-    assert args.resolver_comix_root == Path(r"Z:\comics\Comix")
-    assert args.resolver_manga_root == Path(r"Z:\comics\Manga")
+    assert args.resolver_comix_root == Path(r"X:\Comix")
+    assert args.resolver_manga_root == Path(r"X:\Manga")
     assert args.resolver_quarantine_root == Path(
-        r"Z:\comics\_resolver_quarantine"
+        r"X:\_resolver_quarantine"
     )
     assert args.resolver_threshold == 0.95
     assert args.resolver_normalize_apostrophes is False

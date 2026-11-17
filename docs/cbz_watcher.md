@@ -166,7 +166,8 @@ rather than deleting them.
 
 ## Canonical series resolver
 
-The GUI enables **Resolve series names and import directly to Z:** by default.
+The GUI enables **Resolve series names and import directly to the X: library**
+by default.
 The source/category rules in `routing.json` provide the fallback category only
 for a genuinely new series. Existing series aliases are checked in both Comix
 and Manga first, so a mixed download source cannot override an established
@@ -174,13 +175,19 @@ library location. The current `X:\_staging` paths remain review fallbacks.
 Confirmed imports go to:
 
 ```text
-Z:\comics\Comix\<canonical series>
-Z:\comics\Manga\<canonical series>
+X:\Comix\<canonical series>
+X:\Manga\<canonical series>
 ```
 
 The trailing `\<canonical series>` is a placeholder, not a literal `$`
-directory. The roots can be changed in the GUI or with CLI arguments when the
-future X: migration is ready; no X: final-library destination is hard-coded.
+directory. The roots can be changed in the GUI or with CLI arguments.
+
+**Why X:, not Z: (#108, 2026-11-17).** The libraries moved back to X:, and
+Syncthing carries X: to Tower. Tower's folders are receive-only, so a writer
+aimed at `Z:\comics` (Tower over SMB) would change Tower behind Syncthing's back
+and show up as receive-only local changes there. The GUI defaults and the CLI
+parser defaults are both X:. This matters for the CLI too: a blank root field in
+the GUI omits its flag, and the parser default then decides.
 
 Each root stores `_series_registry.json` and `_series_aliases.json`. A missing
 registry is built automatically at resolver-enabled startup. Enable **Rebuild
@@ -228,9 +235,13 @@ conflicts the larger file is retained and the smaller file is moved outside
 Komga to:
 
 ```text
-Z:\comics\_resolver_quarantine\Comix\<series>\...
-Z:\comics\_resolver_quarantine\Manga\<series>\...
+X:\_resolver_quarantine\Comix\<series>\...
+X:\_resolver_quarantine\Manga\<series>\...
 ```
+
+That folder is outside both the Komga and the Syncthing roots, so a quarantined
+file is neither indexed nor copied to Tower. Nothing moves files quarantined under
+the old `Z:\comics\_resolver_quarantine` default; reviewing them is separate.
 
 Plain CLI launches retain the legacy staging behavior. Enable direct resolving
 explicitly with:
@@ -241,7 +252,7 @@ python -m scripts.cbz_watcher --series-resolver
 
 Relevant overrides are `--resolver-comix-root`, `--resolver-manga-root`,
 `--resolver-quarantine-root`, `--resolver-threshold`, and
-`--resolver-refresh`. Resolver-enabled startup fails if a configured Z: root is
+`--resolver-refresh`. Resolver-enabled startup fails if a configured library root is
 unavailable, rather than silently accumulating imports in the old staging
 workflow.
 

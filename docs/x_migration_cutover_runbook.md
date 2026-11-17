@@ -145,7 +145,10 @@ Graphic Novels was never a Syncthing folder. It was added as `comics-graphic-nov
    - OfficePC: Manga, Comix and Graphic Novels → **send-only**. Restore X: Comix's staggered versioning from the run log. X: Graphic Novels keeps versioning none, as created.
    - Tower: Manga, Comix and Graphic Novels → **receive-only**, with Tower Comix keeping its staggered versioning and Tower Graphic Novels keeping versioning none, as created.
 2. **Unpause** all three folders on both devices. Scan both sides. Check: `needFiles` is 0 everywhere, Tower shows **no local changes**, and nothing transfers.
-3. **File the 100 staged books** from `X:\_staging` into the library. This is the watcher's normal hand-off, done as an explicit, logged move that refuses occupied destinations. They then reach Tower through Syncthing.
+3. **Leave the 100 staged books in `X:\_staging` for review** (amended 2026-11-17, #108). The earlier step said to file them into the library as "the watcher's normal hand-off". That was wrong:
+   - In resolver mode, which the GUI enables by default, the watcher imports **confirmed** series straight into the library. Only **ambiguous** matches stay in `X:\_staging`, logged with their candidates, for a person to decide (`docs/cbz_watcher.md`, "Canonical series resolver").
+   - The 100 books match that: raw names, near-duplicates (one series has both `68.cbz` and `Ch. 68.cbz`), and 2 whose library destination is already occupied. Filing them blind would add duplicates and bypass the resolver's checks.
+   - `X:\_staging` is outside the watch roots and the Syncthing roots, so leaving them there neither re-imports them nor copies them to Tower. Reviewing them is separate work.
 4. **Camelia's old-root work, before Camelia runs again.**
    - The GUI/API **Resume** calls `resume_queue(retry_failed=True)`, which requeues failed jobs across roots. A failed Z: job (codex-lead's snapshot at 22:54:15Z: id 23456, attempt 1 of 2) would then be claimed after a correct X: smoke claim. So holding only queued rows, and checking one first claim, is not enough.
    - All of this runs while Camelia's workers are stopped and autostart is disabled:
@@ -160,14 +163,21 @@ Graphic Novels was never a Syncthing folder. It was added as `comics-graphic-nov
    - **Then start Camelia,** with its library root set to `X:\Comix`. Check the actual source and destination paths of the first claims: all under `X:`, never `Z:`. Writing on Tower would now create receive-only local changes there.
    - Alternative, if supported: an explicitly X:-only processing scope that cannot claim old roots.
    - Migrating the held jobs to X: paths is follow-up work, not part of this cutover.
-5. **Watcher:**
-   - It already routes to `X:\_staging`. Restart it.
-   - **Smoke check:** drop one known test CBZ into the intake. It lands in `X:\_staging\...`, nothing errors, and Tower is untouched until Syncthing carries it.
+5. **Watcher** (amended 2026-11-17, #108):
+   - The earlier step said "it already routes to `X:\_staging`, restart it". That was wrong. The live watcher runs resolver mode, which imports confirmed series to its resolver roots, and those defaulted to `Z:\comics\{Comix,Manga}`: Tower, which is now receive-only.
+   - **Deploy the X: defaults first.** The resolver roots become `X:\Comix` and `X:\Manga`, with the conflict quarantine at `X:\_resolver_quarantine`, in both the GUI defaults and the CLI parser defaults. The parser defaults matter because a blank GUI root field omits its flag.
+   - Before starting anything, build the launch command from the GUI's defaults, without launching, and confirm every root in it is on `X:`.
+   - **Start once with Rebuild series registries before watching** (`--resolver-refresh`), so the resolver loads registries for the X: roots. Check the startup log: the roots it reports are `X:\Comix` and `X:\Manga`, and the quarantine is on `X:`.
+   - **Smoke check:** drop one known test CBZ into the intake.
+     - It lands under `X:\Comix` or `X:\Manga` if its series is confirmed, or in `X:\_staging\...` if ambiguous.
+     - Nothing errors, and nothing is written under `Z:\comics`.
+     - Tower shows no receive-only local changes, and receives the book only through Syncthing.
 6. **Standing rule until the writer-gate adapters ship:** stop the watcher and Camelia before any rename/cleanup apply (#197 keeps `--attest-quiescent` required).
 
 ## What this does not cover
 
 - **Writer gate:** the gate adapters for the watcher and Camelia (B3 slices 3-5).
 - **Held Camelia jobs:** migrating them to X: paths.
+- **The 100 ambiguous staged books** in `X:\_staging`, and files the resolver quarantined under the old `Z:\comics\_resolver_quarantine`: reviewing them is separate work.
 - **`F:\ai-decensor-originals`** and other backups: untouched.
 - **Syncthing's own status** is a progress indicator. Phase 2's independent byte comparison is the acceptance evidence.
