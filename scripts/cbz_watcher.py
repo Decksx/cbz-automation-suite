@@ -160,11 +160,15 @@ AI_DECENSOR_ARCHIVE_DIR = Path(os.environ.get("CBZ_AI_DECENSOR_ARCHIVE_DIR", str
 # Optional canonical-series routing. The GUI enables it explicitly; plain CLI
 # launches remain on the legacy staging flow unless --series-resolver is used.
 SERIES_RESOLVER_ENABLED = False
+# The libraries live on X: and Syncthing carries them to Tower (#108). Tower's
+# folders are receive-only, so a writer aimed at Z:\comics (Tower over SMB)
+# would change Tower behind Syncthing's back. The quarantine is on X: but
+# outside the Syncthing and Komga roots.
 SERIES_RESOLVER_ROOTS = {
-    "comix": Path(r"Z:\comics\Comix"),
-    "manga": Path(r"Z:\comics\Manga"),
+    "comix": Path(r"X:\Comix"),
+    "manga": Path(r"X:\Manga"),
 }
-SERIES_RESOLVER_QUARANTINE_ROOT = Path(r"Z:\comics\_resolver_quarantine")
+SERIES_RESOLVER_QUARANTINE_ROOT = Path(r"X:\_resolver_quarantine")
 SERIES_RESOLVER_THRESHOLD = 0.95
 SERIES_RESOLVER_REFRESH = False
 SERIES_RESOLVER_NORMALIZE_APOSTROPHES = False
@@ -4393,19 +4397,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--resolver-comix-root",
         type=Path,
         default=SERIES_RESOLVER_ROOTS["comix"],
-        help=r"Canonical Comix library (default: Z:\comics\Comix).",
+        help=r"Canonical Comix library (default: X:\Comix).",
     )
     parser.add_argument(
         "--resolver-manga-root",
         type=Path,
         default=SERIES_RESOLVER_ROOTS["manga"],
-        help=r"Canonical Manga library (default: Z:\comics\Manga).",
+        help=r"Canonical Manga library (default: X:\Manga).",
     )
     parser.add_argument(
         "--resolver-quarantine-root",
         type=Path,
         default=SERIES_RESOLVER_QUARANTINE_ROOT,
-        help=r"Conflict quarantine outside Komga roots (default: Z:\comics\_resolver_quarantine).",
+        help=r"Conflict quarantine outside Komga and Syncthing roots (default: X:\_resolver_quarantine).",
     )
     parser.add_argument(
         "--resolver-threshold",
@@ -4598,6 +4602,12 @@ def _watch_session(args: argparse.Namespace, watch_path: Path, tracker: Director
         log.info(
             f"  Resolver : enabled at {SERIES_RESOLVER_THRESHOLD:.1%}; "
             f"quarantine {SERIES_RESOLVER_QUARANTINE_ROOT}"
+        )
+        # The roots are where confirmed imports are written. Logged so a launch can be
+        # checked for X: (#108) from the log alone; Tower's Z: copy is receive-only.
+        log.info(
+            f"  Resolver roots: Comix {SERIES_RESOLVER_ROOTS['comix']}; "
+            f"Manga {SERIES_RESOLVER_ROOTS['manga']}"
         )
     if AI_DECENSOR_ENABLED:
         log.info(
