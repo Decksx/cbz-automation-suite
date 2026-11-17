@@ -2076,10 +2076,10 @@ def _load_routing() -> None:
 
 
 def _load_series_resolvers() -> None:
-    """Load or build the enabled Z-library registries.
+    """Load or build the registries for the enabled resolver library roots.
 
     Initialization is intentionally fatal when enabled. Silently falling back
-    to X staging because Z is disconnected would make an apparently successful
+    to X staging because a library root is unavailable would make an apparently successful
     watcher run accumulate exactly the manual cleanup this mode replaces.
     """
     global _series_resolvers
@@ -4389,7 +4389,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--series-resolver",
         action="store_true",
         help=(
-            "Resolve canonical series names and import directly into the Z libraries; "
+            "Resolve canonical series names and import directly into the resolver library roots; "
             "ambiguous matches remain in legacy staging."
         ),
     )
