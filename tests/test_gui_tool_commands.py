@@ -228,15 +228,15 @@ def test_watcher_ai_decensor_option_builds_ordered_cli_flags():
     ]
 
 
-def test_watcher_resolver_builds_z_library_cli_flags():
+def test_watcher_resolver_builds_x_library_cli_flags():
     """The GUI's canonical resolver settings must reach the watcher unchanged."""
     launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
     launcher._option_vars = {
         "series_resolver": _OptionValue(True),
-        "resolver_comix_root": _OptionValue(r"Z:\comics\Comix"),
-        "resolver_manga_root": _OptionValue(r"Z:\comics\Manga"),
+        "resolver_comix_root": _OptionValue(r"X:\Comix"),
+        "resolver_manga_root": _OptionValue(r"X:\Manga"),
         "resolver_quarantine_root": _OptionValue(
-            r"Z:\comics\_resolver_quarantine"
+            r"X:\_resolver_quarantine"
         ),
         "resolver_threshold": _OptionValue("0.95"),
         "resolver_refresh": _OptionValue(True),
@@ -248,23 +248,53 @@ def test_watcher_resolver_builds_z_library_cli_flags():
 
     assert command[-11:] == [
         "--series-resolver",
-        "--resolver-comix-root", r"Z:\comics\Comix",
-        "--resolver-manga-root", r"Z:\comics\Manga",
-        "--resolver-quarantine-root", r"Z:\comics\_resolver_quarantine",
+        "--resolver-comix-root", r"X:\Comix",
+        "--resolver-manga-root", r"X:\Manga",
+        "--resolver-quarantine-root", r"X:\_resolver_quarantine",
         "--resolver-threshold", "0.95",
         "--resolver-refresh",
         "--resolver-normalize-apostrophes",
     ]
 
 
-def test_watcher_gui_enables_z_resolver_by_default() -> None:
+def test_watcher_gui_enables_x_resolver_by_default() -> None:
+    """The libraries moved to X: (#108); Tower is receive-only and a Z: default would write behind Syncthing."""
     watcher = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
     options = {option["key"]: option for option in watcher["options"]}
 
     assert options["series_resolver"]["default"] is True
-    assert options["resolver_comix_root"]["default"] == r"Z:\comics\Comix"
-    assert options["resolver_manga_root"]["default"] == r"Z:\comics\Manga"
+    assert options["resolver_comix_root"]["default"] == r"X:\Comix"
+    assert options["resolver_manga_root"]["default"] == r"X:\Manga"
+    assert options["resolver_quarantine_root"]["default"] == r"X:\_resolver_quarantine"
     assert options["resolver_normalize_apostrophes"]["default"] is False
+
+
+def test_watcher_empty_resolver_roots_fall_back_to_the_x_library():
+    """A blank GUI root field omits its flag, so the watcher's own parser default
+    decides where imports go. Both halves are checked together: the GUI must omit
+    the flags, and parsing that exact command must land on X:, never on Tower's
+    receive-only Z: copy (#108)."""
+    from scripts import cbz_watcher
+
+    launcher = cbz_gui.CBZLauncherApp.__new__(cbz_gui.CBZLauncherApp)
+    launcher._option_vars = {
+        "series_resolver": _OptionValue(True),
+        "resolver_comix_root": _OptionValue("  "),
+        "resolver_manga_root": _OptionValue(""),
+        "resolver_quarantine_root": _OptionValue(""),
+    }
+    watcher_tool = next(tool for tool in cbz_gui.TOOLS if tool["id"] == "watcher")
+
+    command = launcher._build_command(watcher_tool)
+
+    assert "--series-resolver" in command
+    for flag in ("--resolver-comix-root", "--resolver-manga-root", "--resolver-quarantine-root"):
+        assert flag not in command
+    args = cbz_watcher.build_argument_parser().parse_args(command[command.index("--series-resolver"):])
+    assert args.series_resolver is True
+    assert args.resolver_comix_root == Path(r"X:\Comix")
+    assert args.resolver_manga_root == Path(r"X:\Manga")
+    assert args.resolver_quarantine_root == Path(r"X:\_resolver_quarantine")
 
 
 def test_watcher_gui_can_append_mosaic_as_fourth_stage():
