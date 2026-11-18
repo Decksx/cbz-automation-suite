@@ -143,7 +143,7 @@ def test_routes_have_auth_host_method_and_no_write_side_effects(ledger,tmp_path)
         assert head.status == 200 and head.body == b''
         assert head.headers['content-length'] == response.headers['content-length']
     assert before == (store.get(row['job_id']),store.events(row['job_id']))
-    assert call(app,'GET',f"/api/jobs/{row['job_id']}/stop",headers=auth).status == 404
+    assert call(app,'GET',f"/api/jobs/{row['job_id']}/stop",headers=auth).status == 405
 
 
 @pytest.mark.parametrize('query',['limit=0','limit=101','limit=','limit=01','limit=-1','limit=true',
