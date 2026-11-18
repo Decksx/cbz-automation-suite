@@ -56,7 +56,14 @@ def resolve_params(tool: Tool, supplied: Mapping[str, Any],
             value = None
         else:
             raise ArgvError(f"{where}: a value is required")
-        if value is not None:
+        if value is None:
+            # None means "omit this argument", which is only safe for a
+            # parameter declared optional. Anywhere else omission hands the
+            # tool its own default instead of the checked value: a supplied
+            # dry_run: null would drop --dry-run and run for real.
+            if not param.get("optional"):
+                raise ArgvError(f"{where}: a value is required; null is not accepted")
+        else:
             try:
                 check_value(param, value, where)
             except SchemaError as exc:
