@@ -58,7 +58,12 @@ def test_pipe_evidence_counts_bytes_and_split_errors_without_retaining_output():
     assert len(pipe._tail) <= 64
 
 
-def test_owned_server_pipes_are_drained_without_publishing_their_contents():
+def test_owned_server_pipes_are_drained_without_publishing_their_contents(monkeypatch):
+    # This child only exercises pipes; it does not own an HTTP listener.
+    def unreachable(*args, **kwargs):
+        raise ConnectionRefusedError()
+    monkeypatch.setattr('browser_evidence.http.client.HTTPConnection',
+        lambda *args, **kwargs: SimpleNamespace(request=unreachable, close=lambda: None))
     process = subprocess.Popen([sys.executable, '-c',
         "import sys; sys.stdout.write('SECRET'*20000); sys.stdout.flush(); "
         "sys.stderr.write('SECRET [WinError 10055] BrokenPipeError'); sys.stderr.flush()"],
