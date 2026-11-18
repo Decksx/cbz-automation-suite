@@ -122,6 +122,24 @@ def test_ordering_does_not_change_the_argv_for_an_unordered_list():
         build_argv(TOOL, {"root": ROOT, "rules": ["brackets", "url"]})
 
 
+@pytest.mark.parametrize("key", [p.key for p in TOOL.params])
+def test_null_is_refused_for_every_maintenance_parameter(key):
+    # codex-lead's #205 P1: dry_run: null skipped validation, dropped --dry-run,
+    # and the real parser then read dry_run=False, i.e. a real run. No
+    # maintenance parameter is optional, so null must be refused for all.
+    params = {"root": ROOT, key: None}
+    with pytest.raises(ArgvError, match="null is not accepted"):
+        build_argv(TOOL, params)
+
+
+def test_without_the_null_guard_the_parser_would_run_for_real():
+    # Parser witness for the P1: the argv with --dry-run omitted parses as a
+    # real run. This is what the guard above prevents; it never runs the tool.
+    argv = build_argv(TOOL, {"root": ROOT})
+    argv.remove("--dry-run")
+    assert _parser().parse_args(argv[2:]).dry_run is False
+
+
 @pytest.mark.parametrize("params,message", [
     ({}, "a value is required"),
     ({"root": ROOT, "dry_runn": True}, "unknown parameters"),
