@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import urllib.parse
 import urllib.request
 
 import pytest
+from browser_evidence import evidence_for, launch_summary
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
@@ -26,24 +28,51 @@ from web_support import private_dir  # noqa: E402
 
 
 @pytest.fixture
-def console(tmp_path):
+def console(tmp_path, request):
     state = private_dir(tmp_path / "web-console")
     proc = _start(state)
     try:
-        yield _wait_for_session(state, proc)
+        session = _wait_for_session(state, proc)
+        evidence_for(request).watch_server(proc, session['port'])
+        yield session
     finally:
         _reap(proc)
 
 
 @pytest.fixture
-def browser():
+def browser(request, monkeypatch):
     with sync_api.sync_playwright() as p:
         try:
-            b = p.chromium.launch(channel="msedge", headless=True)
+            # Explicit automation enables the read-only CDP switch inspection.
+            # This was already a default in the earlier pinned driver.
+            b = p.chromium.launch(channel="msedge", headless=True, args=['--enable-automation'])
         except Exception as exc:  # Edge missing on this machine
             pytest.skip(f"Edge not available: {exc}")
-        yield b
-        b.close()
+        try:
+            evidence = evidence_for(request)
+            inspector = b.new_browser_cdp_session()
+            evidence.browser = {'version': b.version, **launch_summary(
+                inspector.send('Browser.getBrowserCommandLine')['arguments'])}
+            inspector.detach()
+            new_context = b.new_context
+            def observed_context(*args, **kwargs):
+                context = new_context(*args, **kwargs)
+                evidence.attach(context)
+                return context
+            monkeypatch.setattr(b, 'new_context', observed_context)
+            yield b
+        finally:
+            b.close()
+
+
+def test_installed_browser_keeps_upstream_network_and_security_defaults(browser, request):
+    """Inspect the real launch, so an obsolete CI pin fails before more retries."""
+    summary = evidence_for(request).browser
+    assert summary['feature_arguments'] == 1  # a second flag would replace upstream's list
+    assert summary['https_upgrades_disabled']
+    assert not summary['web_security_disabled']
+    if os.name == 'nt':
+        assert summary['tcp_randomization_disabled']
 
 
 _SW_PAGE = b"""<!doctype html><script>
@@ -89,7 +118,7 @@ def _register_worker_on_fresh_port(context) -> int:
     return port
 
 
-def test_a_service_worker_left_on_a_reused_port_cannot_reach_the_console(browser, tmp_path):
+def test_a_service_worker_left_on_a_reused_port_cannot_reach_the_console(browser, tmp_path, request):
     """codex-lead's R3 on #151, the strong form: even on the *same* port an
     earlier program used, its service worker cannot touch the console. Browser
     pages use <random label>.localhost:<port>, an origin new each run; the old
@@ -101,6 +130,7 @@ def test_a_service_worker_left_on_a_reused_port_cannot_reach_the_console(browser
     proc = _start(state, "--port", str(old_port))  # the later --port wins over _start's 0
     try:
         session = _wait_for_session(state, proc)
+        evidence_for(request).watch_server(proc, session['port'])
         assert session["port"] == old_port
 
         control = context.new_page()  # the worker still answers on the old spelling
