@@ -63,6 +63,7 @@ _STATUS_TEXT = {
     405: "Method Not Allowed", 409: "Conflict", 411: "Length Required", 413: "Payload Too Large",
     415: "Unsupported Media Type", 421: "Misdirected Request", 422: "Unprocessable Entity",
     500: "Internal Server Error",
+    503: "Service Unavailable",
 }
 
 
@@ -158,7 +159,7 @@ class ConsoleApp:
     def handle(self, environ: Mapping[str, Any]) -> Response:
         method = environ.get("REQUEST_METHOD", "GET").upper()
         path = environ.get("PATH_INFO", "/") or "/"
-        req = Request(method, path, parse_qs(environ.get("QUERY_STRING", "")), environ)
+        req = Request(method, path, parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True), environ)
 
         if not security.host_ok(environ, self.allowed_hosts(method, path)):
             return error_response(421, "HOST_REFUSED", "Unexpected Host header.")
@@ -175,6 +176,12 @@ class ConsoleApp:
         except RequestRefused as refused:
             return error_response(refused.status, refused.code, refused.message)
 
+        # Dynamic job IDs must never bypass the same Host/session/CSRF gates
+        # used by the exact-path routes above.
+        from .job_routes import dispatch
+        job_response = dispatch(self, req)
+        if job_response is not None:
+            return job_response
         handler = self.routes.get(("GET" if method == "HEAD" else method, path))
         if handler is None:
             if any(p == path for (_, p) in self.routes):

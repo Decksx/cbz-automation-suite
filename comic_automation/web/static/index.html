@@ -14,8 +14,9 @@
       <p class="brand">CBZ Console</p>
       <ul>
         <li><a href="/" aria-current="page">Dashboard</a></li>
+        <li><a href="#jobs-heading">Jobs</a></li>
       </ul>
-      <p class="nav-note">Jobs, tools and plan review arrive in later milestones.</p>
+      <p class="nav-note">Tool controls and plan review are coming next.</p>
     </nav>
     <main id="main" tabindex="-1">
       <header class="topbar">
@@ -23,6 +24,29 @@
         <span id="who" class="pill">Connecting…</span>
       </header>
       <p id="notice" class="notice" role="alert" hidden></p>
+      <section id="jobs" class="card" aria-labelledby="jobs-heading" aria-busy="false">
+        <div class="jobs-toolbar">
+          <h2 id="jobs-heading">Jobs</h2>
+          <div><button id="jobs-refresh" type="button">Refresh latest</button>
+          <button id="jobs-older" type="button" disabled>Older jobs</button></div>
+        </div>
+        <p id="jobs-status" class="hint" role="status">Sign in to load job history.</p>
+        <p id="jobs-notice" class="notice" role="alert" hidden></p>
+        <p id="jobs-empty" hidden>No jobs on this page. New jobs will appear here when you run a tool.</p>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Job history table">
+          <table class="grid"><caption class="visually-hidden">Job history</caption>
+            <thead><tr><th scope="col">Tool and job</th><th scope="col">Status</th><th scope="col">Mode</th><th scope="col">Updated</th></tr></thead>
+            <tbody id="job-rows"></tbody>
+          </table>
+        </div>
+        <section id="job-detail" aria-labelledby="job-detail-heading" hidden>
+          <h3 id="job-detail-heading" tabindex="-1">Job details</h3>
+          <dl id="job-facts" class="facts"></dl>
+          <h3>Events</h3><ol id="job-events"></ol>
+          <p id="job-events-empty" hidden>No events on this page.</p>
+          <button id="job-events-more" type="button" disabled>Later events</button>
+        </section>
+      </section>
       <section class="card" aria-labelledby="server-heading">
         <h2 id="server-heading">Server</h2>
         <dl id="server" class="facts"></dl>
@@ -30,10 +54,12 @@
       <section class="card" aria-labelledby="config-heading">
         <h2 id="config-heading">Effective configuration</h2>
         <p class="hint">Read from console.toml at startup. Edit that file and restart the console to change a value.</p>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Configuration table">
         <table class="grid">
           <thead><tr><th scope="col">Setting</th><th scope="col">Value</th><th scope="col">Source</th></tr></thead>
           <tbody id="config"></tbody>
         </table>
+        </div>
       </section>
     </main>
   </div>

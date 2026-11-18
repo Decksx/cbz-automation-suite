@@ -156,6 +156,18 @@ class Supervisor:
         finally:
             self._pass_guard.release()
 
+    def read_jobs(self, *, before=None, limit=50):
+        """Read one bounded page while retaining console ownership."""
+        from .views import JobViews
+        with self._operation():
+            return JobViews(self.store).list(before=before, limit=limit)
+
+    def read_job(self, job_id, *, after=0, limit=100):
+        """Read a redacted job/event snapshot without lifecycle mutation."""
+        from .views import JobViews
+        with self._operation():
+            return JobViews(self.store).detail(job_id, after=after, limit=limit)
+
     def start(self):
         """Reconcile synchronously before readiness, then start the sole scheduler."""
         with self._condition:

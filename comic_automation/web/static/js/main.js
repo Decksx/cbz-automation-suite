@@ -2,6 +2,7 @@
 // configuration. Real dashboard cards arrive with M6 and M7.
 import { api, loadSession } from "./api.js";
 import { h } from "./h.js";
+import { startJobs } from "./jobs.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -39,6 +40,7 @@ async function start() {
     who.classList.add("ok");
     renderServer(session);
     renderConfig((await api("GET", "/api/config")).values);
+    await startJobs();
     announce("Console ready");
   } catch (err) {
     $("who").textContent = "Not signed in";
