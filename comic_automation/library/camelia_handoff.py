@@ -31,6 +31,14 @@ class HandoffRefused(RuntimeError):
     """The event cannot safely update the currently tracked library book."""
 
 
+class SourceLocationRefused(HandoffRefused):
+    """One source has stale catalog identity; no registration was written."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(f"Source location is recorded as non-current: {path}")
+
+
 @dataclass(frozen=True)
 class HandoffResult:
     event_id: int
@@ -221,7 +229,7 @@ def _prepare_one(comic, path, archive, measured, *, apply: bool) -> PreparationR
     ).fetchone()
     new_location = location is None
     if location is not None and not location["is_current"]:
-        raise HandoffRefused(f"Source location is recorded as non-current: {path}")
+        raise SourceLocationRefused(path)
     changed = (location is None or location["file_size"] != archive.file_size
                or location["modified_time_ns"] != archive.modified_time_ns)
     digest_row = None
@@ -331,6 +339,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             camelia_database=args.camelia_database, comic_database=args.database,
             root=args.root, limit=args.limit, apply=args.apply,
         )
+    except SourceLocationRefused as exc:
+        # A consumer may continue past this one book, but must never infer
+        # that permission from arbitrary stderr or other handoff failures.
+        print(json.dumps({"schema": "camelia-source-refusal-v1",
+                          "code": "non_current_location", "path": str(exc.path)}))
+        parser.exit(3, f"Camelia handoff refused: {exc}\n")
     except (HandoffRefused, OSError, sqlite3.Error, ValueError) as exc:
         parser.exit(1, f"Camelia handoff refused: {exc}\n")
     print(json.dumps({"applied": args.apply, "count": len(results),
