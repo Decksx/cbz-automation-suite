@@ -331,6 +331,13 @@ def validate_tool(raw: Any, *, origin: str = "<schema>") -> Tool:
         if dry_run["default"] is not True or by_key[dry_run_param].get("default") is not True:
             # A writing tool's first preview must be a dry run (design §8.1).
             _fail(tool_id, "dry_run must default to true, in the tool and in its parameter")
+        dry = by_key[dry_run_param]
+        if dry.get("when") is not None or dry.emit.style != "flag":
+            # A true default only means a dry run if --dry-run is then actually
+            # emitted. A `when` can switch it off, and flag_false emits the flag
+            # for *false*, so either would let a validated schema whose default
+            # argv the tool parses as a real run (codex-lead #205 P2).
+            _fail(tool_id, "the dry-run parameter must be unconditional and emitted as a positive flag")
     else:
         _fail(tool_id, "dry_run must be 'unsupported' or {param, default}")
     if raw["effects"] == "writes_files" and dry_run_param is None:
