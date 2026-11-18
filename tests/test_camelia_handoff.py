@@ -219,3 +219,44 @@ def test_cli_preview_then_apply_uses_the_same_safe_handoff(tmp_path: Path) -> No
     applied = subprocess.run([*command, "--apply"], cwd=MIGRATIONS.parents[2],
                              capture_output=True, text=True, check=True)
     assert json.loads(applied.stdout)["results"][0]["archive_id"] == archive_id
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_cli_non_current_source_reports_only_that_book_without_writes(tmp_path: Path, apply: bool) -> None:
+    root, archive, comic_db, _camelia_db, _archive_id = setup_databases(tmp_path)
+    with database_connection(comic_db) as comic:
+        comic.execute("UPDATE file_locations SET is_current=0")
+        comic.commit()
+    before_db = comic_db.read_bytes()
+    before_book = archive.read_bytes()
+    command = [sys.executable, "-m", "comic_automation.library.camelia_handoff",
+               "--database", str(comic_db), "--root", str(root), "--prepare-source", str(archive)]
+    run = subprocess.run(command + (["--apply"] if apply else []), cwd=MIGRATIONS.parents[2],
+                         capture_output=True, text=True)
+    assert run.returncode == 3
+    assert json.loads(run.stdout) == {"schema": "camelia-source-refusal-v1",
+                                    "code": "non_current_location", "path": str(archive.resolve())}
+    assert "Source location is recorded as non-current" in run.stderr
+    assert archive.read_bytes() == before_book
+    assert comic_db.read_bytes() == before_db
+
+
+@pytest.mark.parametrize("fault", ["root", "database", "hash"])
+def test_cli_other_preparation_failures_never_claim_book_local_refusal(tmp_path: Path, fault: str) -> None:
+    root, archive, comic_db, _camelia_db, _archive_id = setup_databases(tmp_path)
+    prepare_source(comic_database=comic_db, root=root, source=archive, apply=True)
+    if fault == "root":
+        root = root / "absent"
+    elif fault == "database":
+        comic_db = tmp_path / "absent.db"
+    else:
+        before = archive.stat()
+        archive.write_bytes(b"new archive content")
+        os.utime(archive, ns=(before.st_atime_ns, before.st_mtime_ns))
+    run = subprocess.run([sys.executable, "-m", "comic_automation.library.camelia_handoff",
+                          "--database", str(comic_db), "--root", str(root),
+                          "--prepare-source", str(archive), "--apply"], cwd=MIGRATIONS.parents[2],
+                         capture_output=True, text=True)
+    assert run.returncode == 1
+    assert run.stdout == ""
+    assert "Camelia handoff refused:" in run.stderr
