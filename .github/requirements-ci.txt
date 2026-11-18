@@ -1,4 +1,6 @@
 pytest
 pytest-xdist>=3.8,<4
 # Web console browser smoke test only (tests/web); drives the runner's Edge, no browser download.
-playwright==1.48.0
+# Includes the Windows TCP-port-randomization mitigation (microsoft/playwright#43605).
+# Keep upstream's complete default feature list; do not replace it with a custom flag.
+playwright==1.65.1
