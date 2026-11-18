@@ -52,6 +52,16 @@ def test_an_optional_path_is_emitted_only_when_given():
     assert argv[argv.index("--hold") + 1] == r"D:\hold"
 
 
+def test_null_omits_only_an_optional_parameter():
+    assert "--hold" not in build_argv(TOOL, {"hold": None}, FIXED)
+    for key in ("enabled", "minutes", "count", "tag", "models"):
+        with pytest.raises(ArgvError, match="null is not accepted"):
+            build_argv(TOOL, {key: None}, FIXED)
+    # A fixed value that configuration resolves to null is refused too, not omitted.
+    with pytest.raises(ArgvError, match="null is not accepted"):
+        build_argv(TOOL, {}, {"naming.registry": None})
+
+
 def test_a_fixed_value_comes_from_configuration_and_cannot_be_supplied():
     with pytest.raises(ArgvError, match="fixed by configuration"):
         build_argv(TOOL, {"registry": r"C:\evil.json"}, FIXED)
