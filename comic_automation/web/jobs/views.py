@@ -14,9 +14,12 @@ from .store import JobRefused, validate_job_id
 _COLUMNS = ("admission_seq,job_id,nonce,state_version,tool_id,kind,readonly,dry_run,"
             "state,admitted_ms,updated_ms,exit_code,outcome")
 _LABEL = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+_KINDS = frozenset({'task', 'service'})
+_STATES = frozenset({'admitted', 'claimed', 'running', 'uncertain', 'admission_expired',
+                     'refused', 'succeeded', 'failed', 'stopped', 'lost'})
 _EVENTS = frozenset({"admitted", "claimed", "running", "admission_expired", "refused",
                      "succeeded", "failed", "stopped", "lost", "uncertain", "operator_recheck",
-                     "archived", "archive_cleanup"})
+                     "archived", "archive_cleanup", "operator_stop", "acknowledged"})
 
 
 def _summary(row) -> dict:
@@ -24,8 +27,10 @@ def _summary(row) -> dict:
     return {"job_id": row["job_id"], "admission_seq": str(row["admission_seq"]),
             "nonce": row["nonce"], "state_version": row["state_version"],
             "tool_id": row["tool_id"] if _LABEL.fullmatch(row["tool_id"]) else "unknown",
-            "kind": row["kind"], "readonly": bool(row["readonly"]), "dry_run": bool(row["dry_run"]),
-            "state": row["state"], "admitted_ms": row["admitted_ms"], "updated_ms": row["updated_ms"],
+            "kind": row["kind"] if row["kind"] in _KINDS else "unknown",
+            "readonly": bool(row["readonly"]), "dry_run": bool(row["dry_run"]),
+            "state": row["state"] if row["state"] in _STATES else "unknown",
+            "admitted_ms": row["admitted_ms"], "updated_ms": row["updated_ms"],
             "exit_code": row["exit_code"],
             "outcome": row["outcome"] if row["outcome"] in {"succeeded", "failed", "stopped", "unknown"} else None}
 

@@ -168,6 +168,24 @@ class Supervisor:
         with self._operation():
             return JobViews(self.store).detail(job_id, after=after, limit=limit)
 
+    def stop_job(self, job_id, nonce, version, *, actor):
+        """Retain console lifetime around a fenced pre-tool stop request."""
+        from .actions import JobActions
+        with self._operation():
+            return JobActions(self.store).stop(job_id, nonce, version, actor=actor)
+
+    def recheck_job(self, job_id, nonce, version, *, actor, note):
+        """Retain ownership while recovery samples fresh proof and commits."""
+        from .actions import JobActions
+        with self._operation():
+            return JobActions(self.store).recheck(job_id, nonce, version, actor=actor, note=note)
+
+    def acknowledge_job(self, job_id, nonce, version, *, actor, note):
+        """Retain ownership while an attributed note is appended."""
+        from .actions import JobActions
+        with self._operation():
+            return JobActions(self.store).acknowledge(job_id, nonce, version, actor=actor, note=note)
+
     def start(self):
         """Reconcile synchronously before readiness, then start the sole scheduler."""
         with self._condition:

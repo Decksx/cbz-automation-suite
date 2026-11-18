@@ -98,6 +98,16 @@ def error_response(status: int, code: str, message: str, details: dict | None = 
 Handler = Callable[[Request], Response]
 
 
+def _unique_object(pairs):
+    """Reject ambiguous JSON before routing a state-changing request."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RequestRefused(400, 'BAD_JSON', 'Duplicate JSON fields are not allowed.')
+        result[key] = value
+    return result
+
+
 class ConsoleApp:
     """The WSGI callable. One instance per server run.
 
@@ -218,7 +228,7 @@ class ConsoleApp:
             return None
         raw = environ["wsgi.input"].read(length)
         try:
-            return json.loads(raw)
+            return json.loads(raw, object_pairs_hook=_unique_object)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RequestRefused(400, "BAD_JSON", "The body is not valid JSON.") from None
 

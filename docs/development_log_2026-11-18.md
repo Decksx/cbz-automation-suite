@@ -98,3 +98,43 @@ unchanged. This is not a full combined-suite claim. Full mitigation-suite and
 CI results belong in the PR receipts. Temporary comparison copies are removed
 after tests, inactive and unbound; both active implementation copies remain.
 No source or assertion in the Jobs implementation is changed by this branch.
+
+## M3d D2 protected operator actions
+
+From merged master bcc7ca7, add one direct service and protected POST dispatch
+for Stop, Recheck and Acknowledge. Actor is session-owned; nonce/version and
+bounded note validation also apply to direct callers. Admitted stop becomes
+terminal refused under the same admission exclusion as runner claim; current
+claimed/running policies remain wait-only. Recheck delegates to the existing
+fresh-proof path without nesting its lock. Acknowledge appends a private note
+without any job-field change, including for cold history. Responses use the
+redacted summary and supervisor operation-lifetime guard.
+
+The accepted contract requires duplicate JSON fields to refuse, so the common
+parser now rejects them before routing. Existing Host/session/Origin/CSRF/body
+and command-field gates stay first. Kind/state fixed-set checks and a blank-code
+401 witness close #206's two nonblocking notes. The old GET /stop 404 pin changes
+to 405 because the action route now exists and requires POST; safe methods still
+perform no mutation. Browser action buttons and production interruption remain
+separate. docs/web_console_job_actions.md describes the exact contract.
+
+New inventory: 86 action cases plus one security case, base 7,153 -> 7,240 total.
+The initial targeted run had 55 passes before a test-helper TypeError: the WSGI
+helper accepts bytes/strings/dictionaries, not a raw Python True. Serialising those
+test bodies as JSON corrected the harness. Targeted action/view/security suite
+then passed 182; the last canonical-ID and real wrong-session cases separately
+passed 10. Full four-worker/loadfile suite: **7,228 passed / 12 skipped**,
+**373.96 s**, **7,240** collected. Code/tests remained unchanged during that
+run; the documentation was added while it ran. Exact-head CI remains required.
+
+Twenty-nine process-local guard mutations are caught with no collection/setup
+errors and unchanged source hashes: canonical ID; nonce syntax; version type
+and range; actor; note; text length/encoding; nonce/version fences; admission
+ownership for stop and acknowledge; terminal/wait policy; fresh proof; note-only
+lifecycle; each action's DTO; exact fields/query; session attribution; duplicate
+JSON; kind/state; each supervisor lifetime; and transaction rollback. Stop SQL's
+conditional predicates and row-count check remain defence in depth under the
+admission-locked decision, not independently proven bypass guards.
+
+No live console, library, catalog, queue or model action. All tests use private
+fixtures and the existing pinned browser package; global Python stays unchanged.

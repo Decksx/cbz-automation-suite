@@ -92,6 +92,12 @@ def test_wrong_and_missing_codes_are_refused(app):
     assert call(app, "GET", "/login").status == 401
 
 
+def test_blank_code_refuses_without_consuming_an_outstanding_login(app):
+    code = call(app, 'POST', '/api/bootstrap', headers={'X-Launcher-Secret': app.secrets.launcher_secret}).json['code']
+    assert call(app, 'GET', '/login?code=').status == 401
+    assert call(app, 'GET', '/login?code='+code).status == 303
+
+
 def test_an_expired_code_is_refused(tmp_path):
     now = [1000.0]
     app = make_app(tmp_path, clock=lambda: now[0])
