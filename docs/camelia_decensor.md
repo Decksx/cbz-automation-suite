@@ -115,7 +115,8 @@ identifier, so the cursor does not skip events from a new database.
 
 Camelia can call this consumer after each completed book by setting
 `CAMELIA_COMIC_AUTOMATION_DATABASE` to the reviewed database path before
-starting its server. Its queue pauses if registration or handoff fails, and
+starting its server. Its queue pauses if registration or handoff fails (apart
+from the narrowly classified source refusal described below), and
 scheduled X: processing is blocked unless both are configured. The Camelia backlog
 keeps a local rollback copy during replacement, then calls
 `scripts.ai_decensor_backups --source-file ... --apply` to copy and SHA-256
@@ -126,3 +127,15 @@ the queue with the C: original retained. Camelia requires this offload
 integration for backlog processing; the default destination is
 `F:\ai-decensor-originals`, with `CAMELIA_BACKUP_ARCHIVE_ROOT` for another F:
 folder.
+
+The source-preparation CLI distinguishes one book-local catalog refusal:
+a source recorded as non-current exits **3**, writes a JSON object to stdout
+(`schema: camelia-source-refusal-v1`, `code: non_current_location`, and the
+resolved `path`), and keeps the human-readable error on stderr. It makes no
+registration or archive changes. A compatible Camelia consumer may mark only
+that book failed and continue after validating the schema, code and exact
+source path. Older consumers still pause safely on this nonzero exit.
+Other failures retain exit **1** and never emit that permission, including
+missing roots/databases, ambiguous hashes and completion handoff failures.
+Repair the catalog before explicitly retrying the refused book; the refusal
+does not authorize automatic catalog repair or archive quarantine.
