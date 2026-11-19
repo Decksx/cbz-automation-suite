@@ -501,3 +501,20 @@ def test_abnormal_worker_exit_closes_subscribers_even_when_exception_is_not_caug
         eventually(lambda: bool(cancelled))
         assert member.closed and member.reason == "LOG_UNAVAILABLE"
         assert value.stats()["slots"] == value.stats()["readers"] == 0
+
+
+@pytest.mark.parametrize("state", ["admission_expired", "refused"])
+def test_never_claimed_terminal_job_refuses_nonzero_cursor_without_retaining_a_slot(service, monkeypatch, state):
+    with service[1]._home(job_id=service[2]["job_id"]), service[1]._write() as db:
+        db.execute("UPDATE jobs SET state=? WHERE job_id=?", (state, service[2]["job_id"]))
+    monkeypatch.setattr(JobLogs, "read_page", lambda *a, **kw: pytest.fail("unobserved source read"))
+    with manager(service) as value:
+        before = ledger_rows(service[1])
+        with pytest.raises(streams.StreamRefused, match="INVALID_LOG_CURSOR"):
+            subscribe(value, service, cursor="1")
+        assert value.stats()["slots"] == value.stats()["readers"] == 0
+        valid = subscribe(value, service)
+        packet = valid.receive(5)
+        assert packet.cursor == packet.next_cursor == "0"
+        assert b'"log_status":"unobserved"' in packet.frames[-1]
+        assert ledger_rows(service[1]) == before
