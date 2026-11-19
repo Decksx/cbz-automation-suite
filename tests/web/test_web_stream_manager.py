@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from comic_automation.web.jobs import stream_manager as streams
+from comic_automation.database import dal
+from comic_automation.web.jobs.history import JobHistory
 from comic_automation.web.jobs.log_service import JobLogs
 from comic_automation.web.jobs.store import ProcessIdentity
 from test_web_job_observations import active, ledger_rows, ONE
-from test_web_log_service import service, written
+from test_web_log_service import service, written, rewrite_member
 
 
 def eventually(predicate, timeout=5):
@@ -656,3 +658,58 @@ def test_unobserved_fallback_never_hides_existing_broken_evidence(service, monke
             assert b"LOG_UNAVAILABLE" in next(member)
             snapshot = value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])
             assert snapshot["log_status"] == "unavailable" and not snapshot["eof"]
+
+
+@pytest.mark.parametrize("evidence", ["command_only", "partial_log", "legacy"])
+def test_archived_without_writer_requires_command_pins_and_no_log_pins(service, monkeypatch, evidence):
+    _, store, row, _ = service
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)):
+        with store._home(job_id=row["job_id"]), store._write() as db:
+            db.execute("UPDATE jobs SET state='failed' WHERE job_id=?", (row["job_id"],))
+    history = JobHistory(store)
+    history.initialize()
+    assert history.archive(keep=0, age_ms=0)
+    if evidence == "partial_log":
+        # Even a declared segment without its index prevents no-log synthesis.
+        with store._home(job_id=row["job_id"]), store._write() as db:
+            db.execute("INSERT INTO job_archive_members VALUES(?,?,?,?)",
+                       (row["job_id"], "log/seg-0000000000000000.log", 1, "0" * 64))
+    elif evidence == "legacy":
+        # Disposable fixture only: model the old archive format's absent pins,
+        # using the same setup as the existing legacy log-service witness.
+        with dal.connection_scope(store.database) as db, dal.transaction(db):
+            db.execute("DROP TRIGGER archive_members_no_delete")
+            db.execute("DELETE FROM job_archive_members")
+    with manager(service, monkeypatch) as value:
+        before = ledger_rows(store)
+        member = subscribe(value, service)
+        if evidence == "command_only":
+            packet = member.receive(5)
+            assert packet.frames[0].startswith(b"event: state\n")
+            assert b'"state":"failed"' in packet.frames[0]
+            assert b'"log_status":"unobserved"' in packet.frames[-1]
+            assert b'"eof":false' in packet.frames[-1]
+            assert packet.cursor == packet.next_cursor == "0"
+            assert value.observations.snapshot(row["job_id"], row["nonce"])["generation"] == 0
+            bad = subscribe(value, service, cursor="1")
+            eventually(lambda: bad.closed)
+            assert bad.reason == "INVALID_LOG_CURSOR" and not member.closed
+        else:
+            eventually(lambda: member.closed)
+            assert member.reason == "LOG_UNAVAILABLE"
+        assert ledger_rows(store) == before
+
+
+@pytest.mark.parametrize("failure", ["missing_batch", "corrupt_index"])
+def test_archived_declared_logs_never_become_unobserved(service, monkeypatch, failure):
+    batch = written(service)
+    if failure == "missing_batch":
+        batch.unlink()
+    else:
+        rewrite_member(batch, service[2]["job_id"] + "/log/index.json", lambda body: b"corrupt")
+    with manager(service, monkeypatch) as value:
+        member = subscribe(value, service)
+        eventually(lambda: member.closed)
+        assert member.reason == "LOG_UNAVAILABLE"
+        snapshot = value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])
+        assert snapshot["log_status"] == "unavailable" and not snapshot["eof"]
