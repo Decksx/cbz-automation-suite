@@ -611,6 +611,14 @@ def test_claimed_without_writer_delivers_state_and_later_logs_or_terminal_state(
                 disk = source.create_writer(claim)
                 disk.append(0, ONE)
                 packet = member.receive(5)
+                if packet.next_cursor == "0":
+                    # The worker may observe the valid empty index between
+                    # create_writer and append. That status frame is ordered
+                    # before the bytes, so consume it rather than assuming the
+                    # test thread wins that production race.
+                    assert b'"log_status":"live"' in packet.frames[-1]
+                    assert b'"eof":false' in packet.frames[-1]
+                    packet = member.receive(5)
                 assert packet.next_cursor == str(len(ONE))
                 assert packet.frames[0].startswith(b"event: log\n")
 
