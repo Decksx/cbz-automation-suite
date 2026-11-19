@@ -162,3 +162,18 @@ head review and both CI events are recorded on the PR. This is the service backe
 not all of D3: owned Response/WSGI closure, M2 binding, socket/request capacity,
 eight real streams plus a ninth JSON client, and D4 browser acceptance remain.
 No deployment or live job/library/catalog/queue/model action.
+
+### D3b review R1: never-claimed terminal cursors
+
+Connector inline 4623967616 found a valid P2 at c041922: admitted jobs refused
+nonzero cursors, but pre-claim refused/admission_expired jobs accepted one and
+then synthesized only cursor-zero pages forever. The new two-state regression
+fails twice on c041922 (DID NOT RAISE). Admission and synthesis now use the
+same unobserved-state predicate. Those two cases plus the admitted regression
+pass 3/3 in 2.83 s, without log reads, ledger mutation or retained invalid slots.
+
+Inventory is now 7,343 = base 7,285 + 58 (22 frame, 36 manager). Both earlier
+full runs are superseded by the code fix, even if green; their results are not
+final gates. The first finished 7,329/12 in 481.86 s. A fresh frozen-code/tests
+full Windows run uses eight loadfile workers; its result and the fresh guard
+rerun, review and CI are recorded on the PR. No production action.
