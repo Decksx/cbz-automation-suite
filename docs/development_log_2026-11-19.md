@@ -177,3 +177,52 @@ full runs are superseded by the code fix, even if green; their results are not
 final gates. The first finished 7,329/12 in 481.86 s. A fresh frozen-code/tests
 full Windows run uses eight loadfile workers; its result and the fresh guard
 rerun, review and CI are recorded on the PR. No production action.
+
+
+### D3b successor review fixes: retained readers and absent initial indexes
+
+The successor thread passed the relay canary at swarm HEAD 1c71804 (hive
+#6224), then resumed comic #212 from 0e7f851. Claude's two P2 probes reproduce
+on that head: eight blocked closing workers count as zero slots, and both
+claimed-before-writer and failed-before-writer streams close without state.
+The new targeted run fails 3 / passes 3 before the fixes.
+
+Capacity now includes one slot for every reader without subscribers until
+its worker finalizer releases ownership. A 12-job fixture blocks the first
+eight reads, closes their subscribers, then proves four more opens refuse
+before identity I/O. Failed starts after known birth retain this capacity too.
+The same accounting covers reservations and ordinary subscribers.
+
+The log adapter adds an explicit allow_unobserved option at the missing-index
+boundary. The consumer enables it only before any durable observation exists.
+Claimed and terminal jobs without a writer emit state/progress/status without
+claiming EOF or moving the cursor; later writer creation resumes ordinary logs.
+Nonzero replay closes only the invalid subscriber. Missing observed indexes
+(including empty indexes), corrupt indexes and missing indexed segments remain
+unavailable. Default consumer/log APIs retain their original refusal behavior.
+No HTTP/app/server or browser code changes, and M4b remains Claude's.
+
+The active-cadence witness freezes only the manager clock and advances it only
+through the worker's wait branch. A source barrier after two pages makes the
+250-ms floor independent of slow disk reads. The seven added manager cases
+give 43 manager + 22 frame cases, and inventory 7,350 = 7,285 + 65.
+Broader focused checks pass 120 in 61.37 s before adding the final two negative
+cases; those two pass separately in 1.69 s. Final frozen-source checks and
+semantic mutation results are recorded below and on the PR when complete.
+
+The initial full-suite attempt was stopped after discovering the inherited
+supervisor lifetime test can use CREATE_BREAKAWAY_FROM_JOB on this host.
+The successor rule forbids that launch. The replacement local suite explicitly
+deselects its two cases; it is a partial local gate, not an unqualified full
+suite. Hive #6226 asks Claude to cover them independently in an appropriate
+host. Exact-head CI and independent review remain required. No production
+console, data, queue, library or model action.
+
+
+The fresh process-local rerun catches all 34/34 semantic mutations, with no
+setup/collection errors and unchanged hashes for all four source modules.
+The active-cadence bypass now deterministically causes one failure. Additional
+mutants prove closing-reader capacity, state before writer birth, observed
+empty-index loss, invalid missing-index cursors, corruption refusal and default
+consumer refusal. The frozen replacement local suite is still pending at this
+checkpoint; none of the stopped/old suite results substitute for that gate.
