@@ -17,7 +17,7 @@ _NAME = re.compile(r"(?:index\.json|seg-[0-9a-f]{16}\.log)\Z")
 
 
 class _UnobservedIndex(Exception):
-    """Only an absent, unarchived index; never a missing indexed segment."""
+    """An absent index without declared logs; never a missing indexed segment."""
 
 
 class JobLogs:
@@ -70,7 +70,7 @@ class JobLogs:
         reader retains its original whole-batch verification contract.
 
         allow_unobserved is for a consumer that has never observed evidence.
-        Only a missing unarchived index becomes a zero-cursor state-only page;
+        Only a missing index with no declared archived logs becomes a state-only page;
         corrupt indexes, missing segments and pinned archive failures refuse.
         """
         with self.store._home(job_id=self.job_id), dal.connection_scope(self.store.database, readonly=True) as db:
@@ -105,6 +105,12 @@ class JobLogs:
                 if batch is not None:
                     pin = pins.get("log/" + name)
                     if pin is None:
+                        # A current command-only archive proves no logs were
+                        # retained. Empty legacy pin maps cannot establish that,
+                        # and even one declared log member requires its index.
+                        if (allow_unobserved and name == "index.json" and "command.json" in pins
+                                and not any(member.startswith("log/") for member in pins)):
+                            raise _UnobservedIndex()
                         raise logs.LogRefused("ARCHIVED_LOG_MEMBER_NOT_PINNED")
                     try:
                         cold = archives.read_pinned_member(batch, self.job_id, "log/" + name,
