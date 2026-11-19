@@ -53,13 +53,21 @@ def test_eight_subscribers_share_one_read_and_one_encoded_packet(service, monkey
             try:
                 members = [subscribe(value, service) for _ in range(8)]
                 assert entered.wait(5)
-                monkeypatch.setattr(value.store, "get", lambda *a: pytest.fail("ninth open did I/O"))
+                original_get, caller = value.store.get, threading.current_thread()
+                def guarded_get(*args):
+                    if threading.current_thread() is caller:
+                        pytest.fail("ninth open did I/O")
+                    return original_get(*args)
+                monkeypatch.setattr(value.store, "get", guarded_get)
                 with pytest.raises(streams.StreamRefused, match="STREAM_LIMIT"):
                     subscribe(value, service)
                 release.set()
                 packets = [member.receive(5) for member in members]
                 assert packets[0] is not None and all(packet is packets[0] for packet in packets)
-                assert len(calls) == 1 and value.stats()["readers"] == 1
+                # Later scheduled polls may run if the test thread is delayed;
+                # they must not repeat the page that produced this packet.
+                assert calls.count(dict(cursor="0", limit=1000)) == 1
+                assert len(calls) <= value.stats()["polls"] and value.stats()["readers"] == 1
                 assert packets[0].next_cursor == str(len(ONE))
                 # Delivery holds no admission scope or source handle.
                 with service[1]._home(job_id=service[2]["job_id"]):
