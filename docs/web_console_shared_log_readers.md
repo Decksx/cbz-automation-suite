@@ -83,7 +83,9 @@ Gap frames precede retained bytes, including reconnect from inside a gap.
 `state`, `progress`, `log_status`, errors and 15-second heartbeats have no ID.
 State/progress carry versions for browser-side deduplication. Unknown or
 unavailable tails cannot report EOF. A cursor beyond proven coverage closes
-only subscribers at that invalid cursor.
+only subscribers at that invalid cursor. Jobs still admitted, or refused/expired
+without a runner, have only the synthetic zero cursor; a nonzero subscription
+is refused before a worker or slot can remain attached.
 
 Source/storage/encoding failures close that job's subscribers with a fixed
 public error; details go to the private logger. No queued stale success frame
