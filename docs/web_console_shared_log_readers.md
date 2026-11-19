@@ -16,12 +16,16 @@ thread-safe, bounded in-memory session-validity predicate. The predicate must
 return exactly `True`; exceptions refuse it. The HTTP adapter must bind this
 predicate to its own session generation and expiry, never a client value.
 
-There are eight global slots per manager, counting both subscriptions and
-opens still doing their fixed identity/snapshot reads. Capacity is reserved
+There are eight global slots per manager, counting subscriptions, opens still
+doing their fixed identity/snapshot reads, and one slot for every reader whose
+last subscriber left while its source operation is still settling. A closing
+reader releases that slot only in its worker finalizer, so cycling job IDs
+cannot create more than eight retained workers. Capacity is reserved
 without waiting before those reads. Invalid identity/auth, failed opens and
 failed thread creation release their reservations. A subscription is itself
-the closeable byte iterator: `close()` releases it even before `next()` has
-ever run. A future Response adapter must own this close on every exit, including
+the closeable byte iterator: `close()` releases the subscriber even before
+`next()` has ever run; its settling reader can still retain a capacity slot.
+A future Response adapter must own this close on every exit, including
 HEAD/auth refusal, pre-header errors, disconnect and WSGI cancellation.
 
 Only one worker exists for each exact `(job_id, nonce)`. The last subscriber
@@ -86,6 +90,22 @@ unavailable tails cannot report EOF. A cursor beyond proven coverage closes
 only subscribers at that invalid cursor. Jobs still admitted, or refused/expired
 without a runner, have only the synthetic zero cursor; a nonzero subscription
 is refused before a worker or slot can remain attached.
+
+Claimed jobs waiting for create_writer, and terminal jobs whose reconstruction
+failed before creating a writer, also publish state-only pages when their
+unarchived index is absent. consume_page opts into this only while the durable
+observation generation is zero. The synthetic page leaves that generation at
+zero, carries no log event ID, and cannot report EOF. Later writer creation
+switches the same stream to normal observed pages. A nonzero replay cursor
+closes only that subscriber with INVALID_LOG_CURSOR. This classification is
+made at the index-read boundary under the existing admission scope; no separate
+filesystem probe or extra poll scope is introduced.
+
+An observed index disappearing, even after an empty zero-byte page, still
+produces LOG_UNAVAILABLE and the existing unavailable observation commit.
+Corrupt indexes, missing indexed segments and pinned cold-member failures
+remain errors even at generation zero. The default read_page and consume_page
+APIs retain their previous refusal semantics unless this option is selected.
 
 Source/storage/encoding failures close that job's subscribers with a fixed
 public error; details go to the private logger. No queued stale success frame
