@@ -713,3 +713,78 @@ def test_archived_declared_logs_never_become_unobserved(service, monkeypatch, fa
         assert member.reason == "LOG_UNAVAILABLE"
         snapshot = value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])
         assert snapshot["log_status"] == "unavailable" and not snapshot["eof"]
+
+
+@pytest.mark.parametrize("cursor", ["0", "6"])
+def test_runner_refused_job_keeps_prebirth_logs_and_accepts_resume(service, monkeypatch, cursor):
+    # A trusted runner can create/finish its log before positively refusing
+    # native birth. Terminal refused does not imply the job was never claimed.
+    _, store, row, source = service
+    body = b"first\nsecond\n"
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        disk = source.create_writer(claim)
+        disk.append(0, body)
+        disk.finish(len(body), complete=True)
+        refused = store.refuse_before_create(claim, 2, reason="STOP_REQUESTED_BEFORE_BIRTH")
+        assert refused["state"] == "refused" and refused["runner_pid"] == 1
+        with manager(service, monkeypatch) as value:
+            before = ledger_rows(store)
+            member = subscribe(value, service, cursor=cursor)
+            packet = member.receive(5)
+            assert packet.cursor == cursor and packet.next_cursor == str(len(body))
+            frames = b"".join(packet.frames)
+            assert packet.frames[0].startswith(b"event: log\n")
+            assert b'"text":"second\\n"' in frames and b'"state":"refused"' in frames
+            assert (b'"text":"first\\n"' in frames) == (cursor == "0")
+            assert b'"log_status":"complete"' in frames and not member.closed
+            assert ledger_rows(store) == before
+
+
+def test_historical_replay_of_lost_observed_index_closes_without_a_new_observation(service, monkeypatch):
+    # Hold the first cadence wait so replay joins while its zero cursor is
+    # still next in round-robin. Block any later producer consume separately:
+    # producer-side loss handling must not mask a broken replay-only guard.
+    initial_wait, replay_ready = threading.Event(), threading.Event()
+    release_producer = threading.Event()
+    producer_calls = []
+    with active(service) as (disk, _, _), manager(service, monkeypatch) as value:
+        disk.append(0, ONE)
+        original_wait = value.condition.wait
+        original_consume = value.observations.consume_page
+        def pause_first_wait(timeout=None):
+            if threading.current_thread().name.startswith("cbz-log-reader-") and not initial_wait.is_set():
+                initial_wait.set()
+                deadline = time.monotonic() + 10
+                while not replay_ready.is_set() and time.monotonic() < deadline:
+                    original_wait(.1)
+                assert replay_ready.is_set(), "replay admission barrier timed out"
+                return
+            return original_wait(timeout)
+        def block_later_producer(*args, **kwargs):
+            producer_calls.append(True)
+            if len(producer_calls) > 1:
+                assert release_producer.wait(10), "producer cleanup barrier timed out"
+            return original_consume(*args, **kwargs)
+        monkeypatch.setattr(value.condition, "wait", pause_first_wait)
+        monkeypatch.setattr(value.observations, "consume_page", block_later_producer)
+        try:
+            first = subscribe(value, service)
+            assert initial_wait.wait(5)
+            assert first.receive(5).next_cursor == str(len(ONE))
+            before = value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])
+            assert before["generation"] > 0 and before["cursor"] != "0"
+            (service[3].directory / "index.json").unlink()
+            replay = subscribe(value, service, cursor="0")
+            replay_ready.set()
+            with value.condition:
+                value.condition.notify_all()
+            with pytest.raises(streams.StreamClosed, match="LOG_UNAVAILABLE"):
+                replay.receive(5)
+            assert first.closed and first.reason == "LOG_UNAVAILABLE"
+            assert not replay.queue and len(producer_calls) == 1
+            assert value.observations.snapshot(service[2]["job_id"], service[2]["nonce"]) == before
+        finally:
+            replay_ready.set()
+            release_producer.set()
+            with value.condition:
+                value.condition.notify_all()
