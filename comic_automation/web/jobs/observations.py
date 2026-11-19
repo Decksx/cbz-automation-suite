@@ -1,11 +1,12 @@
 """Bounded, advisory log progress with a cursor independent of job lifecycle.
 
 This is the persistence/consumer part of D3, not an HTTP route or scheduler.
-Only the service consumer calls consume_once; GET/SSE readers use snapshot.
+Only the service consumer calls consume_once/consume_page; GET/SSE use snapshot.
 The additive schema leaves schema-v1 runners and their version fences alone.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 
 from ...database import dal
@@ -18,6 +19,18 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS job_observations (
     job_id TEXT NOT NULL REFERENCES jobs(job_id), nonce TEXT NOT NULL,
     generation INTEGER NOT NULL CHECK(generation > 0), snapshot_json TEXT NOT NULL,
     PRIMARY KEY(job_id,nonce))"""
+
+
+@dataclass(frozen=True)
+class ObservedPage:
+    """One materialized source page and its committed advisory snapshot.
+
+    The consumer owns these JSON objects. The envelope is frozen, but nested
+    records are not; a shared publisher should encode immutable bytes once
+    before handing data to subscribers. There are no open source handles here.
+    """
+    page: dict
+    observation: dict
 
 
 class JobObservations:
@@ -61,7 +74,11 @@ class JobObservations:
             return self._read(db, job_id, nonce)
 
     def consume_once(self, job_id: str, nonce: str, *, limit: int = 1000) -> dict:
-        """Read at most one bounded log page, then atomically advance its parse cursor.
+        """Return the committed snapshot, preserving the snapshot-only API."""
+        return self.consume_page(job_id, nonce, limit=limit).observation
+
+    def consume_page(self, job_id: str, nonce: str, *, limit: int = 1000) -> ObservedPage:
+        """Return one bounded page and snapshot after its cursor commit succeeds.
 
         No admission lock, SQLite transaction or segment handle spans the read
         and commit. A competing consumer or changed nonce refuses this page;
@@ -69,6 +86,8 @@ class JobObservations:
         Progress fragments are deliberately not assembled: parse_progress only
         accepts complete bounded records. A gap is retained as advisory loss,
         while lifecycle completion remains solely the runner's decision.
+        A service reader can publish this same page with its progress without
+        another source read. Errors never return a partially committed batch.
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise logs.LogRefused("INVALID_LOG_PAGE")
@@ -91,7 +110,8 @@ class JobObservations:
             progress = logs.parse_progress(record)
             if progress is not None:
                 after["progress"] = progress
-        return self._commit(job_id, nonce, before, after)
+        committed = self._commit(job_id, nonce, before, after)
+        return ObservedPage(page, committed)
 
     def _commit(self, job_id, nonce, before, after) -> dict:
         with self.store._home(job_id=job_id), self.store._write() as db:
