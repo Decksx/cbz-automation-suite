@@ -77,7 +77,7 @@ class JobObservations:
         """Return the committed snapshot, preserving the snapshot-only API."""
         return self.consume_page(job_id, nonce, limit=limit).observation
 
-    def consume_page(self, job_id: str, nonce: str, *, limit: int = 1000) -> ObservedPage:
+    def consume_page(self, job_id: str, nonce: str, *, limit: int = 1000, allow_unobserved=False) -> ObservedPage:
         """Return one bounded page and snapshot after its cursor commit succeeds.
 
         No admission lock, SQLite transaction or segment handle spans the read
@@ -88,12 +88,15 @@ class JobObservations:
         while lifecycle completion remains solely the runner's decision.
         A service reader can publish this same page with its progress without
         another source read. Errors never return a partially committed batch.
+        allow_unobserved permits a state-only page before any evidence was
+        observed; once generation advances, missing evidence still refuses.
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise logs.LogRefused("INVALID_LOG_PAGE")
         before = self.snapshot(job_id, nonce)
         try:
-            page = JobLogs(self.store, job_id).read_page(cursor=before["cursor"], limit=limit)
+            options = {"allow_unobserved": True} if allow_unobserved and before["generation"] == 0 else {}
+            page = JobLogs(self.store, job_id).read_page(cursor=before["cursor"], limit=limit, **options)
         except (logs.LogRefused, archives.ArchiveRefused):
             # Retain the last progress/cursor, but never leave an earlier EOF
             # looking current after mapped evidence becomes unreadable.
