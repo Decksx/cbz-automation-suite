@@ -104,3 +104,61 @@ the handoff semantics, not future fan-out/HTTP behaviour. A constructor-timing
 assertion was replaced before commit with an actual caller/commit barrier, and
 page equality permits a safe internal copy; no Python object-identity promise is
 part of the API. No production console/library/catalog/queue/model work.
+
+## D3b service backend: shared reader and encoded fan-out
+
+From merged #211 (0c0f1aa), add stream_manager and stream_frames, with no
+HTTP/app/server changes. One worker per job/nonce round-robins bounded progress
+and replay positions; one committed producer page is projected to safe DTOs,
+encoded once and shared as immutable byte tuples. Eight service-global slots
+include in-flight opens. Per-subscriber queues hold at most four 512-KiB
+packets plus the current delivery; a slow subscriber closes without blocking
+others, and reconnect uses its last delivered byte event ID. State/progress
+identities stay separate from that ID. Unknown tails never claim EOF.
+
+Session validity is checked before open, after its fixed reads, during waiting
+and before buffered delivery. Close works before first iteration. The last
+subscriber stops its worker; the registry retains it until source I/O unwinds.
+Shutdown also retains blocked open reservations. False close/wait results
+require retaining the home/console guard. An interrupted thread start of
+unknown lifetime fails closed. No force-release is added.
+
+The dedicated protocol is docs/web_console_shared_log_readers.md, including
+the historical-replay observation boundary and future HTTP owner obligations.
+No source handles or SQLite transactions cross delivery. At most one poll per
+250 ms for active output or one second cold/idle, independent of subscriber
+count. The real-ledger timed witness bounds admission work by four scopes per
+poll plus two fixed read scopes per subscribe (initialization measured outside
+that interval), with eight subscribers.
+
+There are 56 new fixture cases (22 frame and 34 manager), giving inventory
+7,341 = base 7,285 + 56. Focused final checks pass 56 in 33.05 s. They include
+shared packet identity/read count; real hot/cold/gap replay; cursor isolation;
+slow/fast consumers; source failure; session expiry during wait and buffered
+delivery; shutdown during source I/O and open reservations; thread-start
+failure before and after birth; restart buffers; active/idle cadence; and a
+real 15-second heartbeat. An abnormal worker cancellation initially left
+subscribers alive: the added test failed, then finally cleanup fixed it.
+
+All 27 final-code process-local guard mutations are caught, without collection
+or setup errors: cap/reservation/auth/expiry/queue/cleanup/lifetime/cadence,
+duplicate read/encode, nonce/cursor isolation, DTO redaction/escaping/budgets,
+gap ordering, truthful EOF and decimal precision. Twenty-six each cause one
+failure; the unknown-EOF mutation causes three. The final rerun patches only
+disposable child module namespaces, while full-suite workers read unchanged
+source bytes. Both source hashes stay unchanged across that rerun. The first
+26-case mutation pass used sequential byte restoration before the final
+cancellation fix; it is superseded by this 27-case rerun.
+
+The shared-packet witness was then refined to allow a legitimately scheduled
+later poll if the test thread is delayed, while still refusing a repeat read
+of the published page. Its final single-case run passes in 4.00 s. All three
+mutations using that witness (capacity, duplicate encode, duplicate source
+read) are re-proven against the revised harness. An intermediate full run was
+superseded by that test-only refinement; it is not the final gate.
+
+The full Windows gate uses frozen final source/tests; its exact result, fresh
+head review and both CI events are recorded on the PR. This is the service backend,
+not all of D3: owned Response/WSGI closure, M2 binding, socket/request capacity,
+eight real streams plus a ninth JSON client, and D4 browser acceptance remain.
+No deployment or live job/library/catalog/queue/model action.
