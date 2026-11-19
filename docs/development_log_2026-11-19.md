@@ -47,3 +47,30 @@ f7e2625. Store, receipts, runner, log disk/pump and recovery modules remain
 unchanged. The native compatibility fixture still tests the unchanged writer,
 live claim and receipt/finalization fence. Documentation now states this scope.
 No app/server/SSE wiring or production console/library/catalog/queue/model work.
+
+### Decoder boundary follow-up before merge
+
+The selected ZIP reader also leaked two expected decoder failures: zlib.error
+from invalid DEFLATE bytes, and EOFError from a truncated member stream. The
+3460b73 head is held and superseded. A real payload witness keeps ZIP metadata
+intact but changes the compressed index member's first block to the reserved
+DEFLATE type; it fails with bare zlib.error on that intermediate head. A second
+case injects EOFError at ZipExtFile.read after a real saved EOF. The pinned-member
+codec now normalizes those two expected failures to ArchiveRefused. No broad
+Exception catch is added, and source-I/O/private-home boundaries stay as above.
+
+Final inventory is 34 observation cases (24 original + 10 new), total 7,274.
+The intermediate 32-case full run finished 7,260 passed / 12 skipped, 614.93 s;
+it was superseded by the decoder additions while running and is not the final
+gate. The observation/log-service/receipt run through the DEFLATE addition
+passed 109 in 128.43 s; the final archive suite plus stream-EOF case separately
+passed 18 in 8.32 s. The final full-source run includes all 110 focused cases.
+
+All seven source-boundary mutations on the final implementation are caught:
+DEFLATE normalization (1), stream-EOF normalization (1), archive refusal
+handling (3), cold I/O mapping (2), hot I/O mapping (1), broad consumer OSError
+catch (2), private-check I/O mapping (1). No collection/setup errors and all
+three source hashes unchanged. The earlier 15 observer mutations exercised the
+same unchanged observation-module bytes; those plus these seven give 22 caught
+mutations, with the earlier cleanup warning retained above. Final full-suite,
+fresh review and both exact-head CI results belong on the PR. No deployment.
