@@ -50,7 +50,7 @@ class Subscription:
         self.closed, self.reason, self.error_sent = False, "", False
 
     def close(self):
-        """Idempotently release the slot and wake an unused reader."""
+        """Release the subscriber; a settling worker retains one capacity slot."""
         self.manager._detach(self, "CLIENT_CLOSED")
 
     def receive(self, timeout=HEARTBEAT_SECONDS) -> EncodedPage | None:
@@ -158,6 +158,12 @@ class SharedLogReaders:
         if not member.closed and not self._authorized(member.session_valid):
             self._detach(member, "SESSION_INVALID")
 
+    def _slots(self):
+        # Caller holds condition. Each reader without subscribers still owns
+        # one slot until its I/O unwinds, including failed/unknown thread starts.
+        return len(self.members) + len(self.reservations) + sum(
+            not reader.members for reader in self.readers.values())
+
     def subscribe(self, job_id, nonce, *, cursor="0", session_valid):
         """Reserve nonblocking before source work; release even failed opens."""
         if not callable(session_valid) or not self._authorized(session_valid):
@@ -168,7 +174,7 @@ class SharedLogReaders:
         with self.condition:
             if self.closed or not self.ready:
                 raise StreamRefused("STREAM_MANAGER_CLOSED" if self.closed else "STREAM_MANAGER_NOT_READY")
-            if len(self.members) + len(self.reservations) >= MAX_STREAMS:
+            if self._slots() >= MAX_STREAMS:
                 raise StreamRefused("STREAM_LIMIT")
             self.reservations.add(token)
         try:
@@ -264,13 +270,14 @@ class SharedLogReaders:
                     page = dict(cursor="0", next_cursor="0", records=[], proven_offset="0", eof=False,
                                 log_status="unobserved")
                 elif cursor == reader.latest["cursor"]:
-                    batch = self.observations.consume_page(job_id, nonce)
+                    batch = self.observations.consume_page(job_id, nonce, allow_unobserved=True)
                     page, reader.latest = batch.page, batch.observation
                 else:
                     # Historical replay is read-only. Its page may be behind
                     # current progress; never commit a rewound observation.
                     try:
-                        page = JobLogs(self.store, job_id).read_page(cursor=cursor)
+                        page = JobLogs(self.store, job_id).read_page(
+                            cursor=cursor, allow_unobserved=reader.latest["generation"] == 0)
                     except logs.LogRefused as error:
                         if str(error) == "INVALID_LOG_PAGE":
                             with self.condition:
@@ -310,7 +317,7 @@ class SharedLogReaders:
     def stats(self):
         """Bounded service diagnostics; polls count job attempts, not subscribers."""
         with self.condition:
-            return {"slots": len(self.members) + len(self.reservations), "readers": len(self.readers),
+            return {"slots": self._slots(), "readers": len(self.readers),
                     "reservations": len(self.reservations), "polls": self.polls}
 
     def close(self, timeout=2.0):
