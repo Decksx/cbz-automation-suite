@@ -226,3 +226,17 @@ mutants prove closing-reader capacity, state before writer birth, observed
 empty-index loss, invalid missing-index cursors, corruption refusal and default
 consumer refusal. The frozen replacement local suite is still pending at this
 checkpoint; none of the stopped/old suite results substitute for that gate.
+
+
+The first contained run finished 7,336 passed / 10 skipped / 2 failed,
+7,348 selected (two death/restart cases excluded), in 363.70 s. It is not a
+passing gate. One new assertion wrongly assumed append always wins the race
+after create_writer; a valid empty-live-index packet may arrive first. The
+witness now accepts that ordered EOF-false status before requiring all bytes.
+The other failure is the browser-driver default check: the same assertion
+fails on unmodified base 0c0f1aa with the global Python environment and installed
+Edge 157.0.4341.60. No browser or global Python settings were changed. The final
+contained rerun uses the existing isolated Playwright 1.65.1 environment at
+.codex/tmp/web207-playwright165; source and tests stay frozen. Only the revised
+claim/writer witness needs fresh mutant checks; both affected mutants are rerun.
+All earlier source guard results remain bound to identical source bytes.
