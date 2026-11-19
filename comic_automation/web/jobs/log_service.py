@@ -98,11 +98,17 @@ class JobLogs:
                     pin = pins.get("log/" + name)
                     if pin is None:
                         raise logs.LogRefused("ARCHIVED_LOG_MEMBER_NOT_PINNED")
-                    cold = archives.read_pinned_member(batch, self.job_id, "log/" + name,
-                        pin["size"], pin["sha256"], 0, pin["size"])
+                    try:
+                        cold = archives.read_pinned_member(batch, self.job_id, "log/" + name,
+                            pin["size"], pin["sha256"], 0, pin["size"])
+                    except OSError as exc:
+                        raise logs.LogRefused("LOG_SOURCE_IO_UNAVAILABLE") from exc
                 if os.path.lexists(path):
-                    with shared_read(path) as stream:
-                        hot = stream.read(pin["size"] + 1 if cold is not None else hot_sizes.get(name, logs.MAX_INDEX_BYTES + 1))
+                    try:
+                        with shared_read(path) as stream:
+                            hot = stream.read(pin["size"] + 1 if cold is not None else hot_sizes.get(name, logs.MAX_INDEX_BYTES + 1))
+                    except OSError as exc:
+                        raise logs.LogRefused("LOG_SOURCE_IO_UNAVAILABLE") from exc
                     if cold is not None and (len(hot) != pin["size"] or hashlib.sha256(hot).hexdigest() != pin["sha256"]):
                         raise logs.LogRefused("HOT_COLD_LOG_DISAGREEMENT")
                     if cold is None:
