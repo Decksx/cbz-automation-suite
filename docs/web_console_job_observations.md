@@ -39,12 +39,15 @@ clearing the last progress record. Restart resumes from the durable cursor;
 retention and dropped-byte gaps are recorded without guessing progress counts.
 Cold reads retain the existing member-verification boundary.
 
-A missing or unreadable mapped log raises `LogRefused`, and a successful
-observation commit records `log_status='unavailable'` and `eof=false`, preserving
+A refused selected log read raises `LogRefused` or `ArchiveRefused`, and a
+successful observation commit records `log_status='unavailable'` and `eof=false`, preserving
 the last progress and cursor. Repeated identical failures do not increment the
 generation. A later successful read restores the observed status. Unknown tails
-remain `unknown_tail`, not EOF. Private-home, database and commit failures still
-propagate; this table is observational evidence, not a replacement for either
+remain `unknown_tail`, not EOF. The log adapter converts `OSError` only around
+the selected archive-member read or hot-file open/read/close, preserving the
+original exception as its cause. Private-path checks and admission/home/database
+operations stay outside those catches. Private-home, database and commit failures
+still propagate; this table is observational evidence, not a replacement for either
 the log source or the runner's fresh native/receipt proof.
 
 ## Compatibility and validation
@@ -57,13 +60,18 @@ existing runner then publishes its receipt and finalizes with the original
 expected version. The observation survives finalization. This proves the
 additive/version-fence boundary; it is not a production rollout receipt.
 
-The runner-side modules are unchanged from pre-D3 `ee13ad91cae834163930845da1d722efcf3bacbc`:
+The runner's store and receipt modules are unchanged from pre-D3
+`ee13ad91cae834163930845da1d722efcf3bacbc`:
 
 | Module | Git blob |
 | --- | --- |
 | `jobs/store.py` | `0a6d6426515ac934d4e84bb00168fe7930a98c10` |
 | `jobs/receipts.py` | `269a0b1527b01c6e39dbc134f8e2e4d112045fd3` |
-| `jobs/log_service.py` | `e88e2d2214a7abe1e5465bb58c59e6041d1046c1` |
+
+The review fix changes only `read_page` in `jobs/log_service.py` to classify
+source-file I/O failures. Its `create_writer` method is unchanged, as are the
+runner, log-disk/pump, native-I/O and recovery modules. The compatibility fixture
+still exercises that unchanged writer/receipt/lifecycle path.
 
 The focused tests also cover read-only snapshots, bounded pages, exact 63-bit
 cursors, retained/cold logs, partial and fragmented records, missing evidence
