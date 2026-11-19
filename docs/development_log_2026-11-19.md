@@ -268,3 +268,31 @@ Two startup verification attempts were superseded while freezing the archive
 fix documentation. The final frozen code/tests suite and fresh 37-case mutation
 run are pending at this checkpoint; exact results will be posted on the PR.
 Both death/restart breakaway cases remain explicitly excluded locally.
+
+
+### D3b independent mutation witnesses (Claude review 7017225462)
+
+Claude approves the archived fix at e03da74, but his independent corpus catches
+10/13 mutations. Two survivors reveal missing witnesses: runner-refused jobs
+with retained logs, and historical replay after observed index loss. The third
+survivor removes the archive index-name check and is equivalent: load_index
+requests the index first and exits there when the no-log fallback applies.
+No new witness or runtime change is needed for that equivalent mutation.
+
+Add three cases on byte-identical e03da74 source (51 manager + 22 frame cases;
+7,358 = base 7,285 + 73). The refusal witness uses the supported
+refuse_before_create path after claim/create_writer/finished bytes, retains
+runner_pid, and requires real log frames from both cursor 0 and cursor 6.
+The replay witness pauses the first cadence wait, joins a cursor-zero replay
+after deleting the observed index, and blocks all later producer consumption.
+This forces the historical replay boundary to decide the result; a later
+producer-side error cannot accidentally kill the stream and mask the mutation.
+Correct closure leaves the durable historical observation unchanged.
+
+Targeted baseline: 3 passed / 2.84 s. Removing the runner_pid predicate now
+fails both refusal cases (hidden bytes and rejected resume); unconditional
+replay allow_unobserved fails the replay case (no LOG_UNAVAILABLE closure).
+No setup/collection errors and all four source hashes stay unchanged. Final
+frozen-source/test contained suite and expanded 39-mutation run are pending at
+this checkpoint. The old e03da74 CI successes are not reused as the new head's
+CI gate. No native birth, HTTP/browser wiring, production-data or queue action.
