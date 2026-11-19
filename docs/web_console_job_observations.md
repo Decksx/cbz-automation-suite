@@ -49,6 +49,9 @@ original exception as its cause. Private-path checks and admission/home/database
 operations stay outside those catches. Private-home, database and commit failures
 still propagate; this table is observational evidence, not a replacement for either
 the log source or the runner's fresh native/receipt proof.
+The pinned-member codec also normalizes invalid DEFLATE payloads (`zlib.error`)
+and truncated-stream `EOFError` to `ArchiveRefused`; these decoder failures
+cannot bypass this boundary.
 
 ## Compatibility and validation
 
