@@ -138,3 +138,50 @@ admission-locked decision, not independently proven bypass guards.
 
 No live console, library, catalog, queue or model action. All tests use private
 fixtures and the existing pinned browser package; global Python stays unchanged.
+
+## M3d D3a advisory observation storage
+
+From merged master ee13ad9, add explicit `JobObservations.initialize`, a read-only
+snapshot and one-page `consume_once`. The additive schema-v1 table is keyed by
+job ID and nonce and owns its generation/cursor. Neither initialization nor
+progress writes change jobs, lifecycle events, clock high-water or progress_json.
+Source reads happen outside the consumer's initial admission/DB scope; the
+existing log reader retains its own bounded lock. A commit rechecks nonce and
+observation generation. A stale page cannot rewind another consumer. Parse only
+complete records using the existing parser; retain gap spans and unknown tails.
+An unavailable source clears historical EOF without inventing missing bytes or
+clearing the last progress/cursor, and rethrows the source refusal.
+
+This is persistence/catch-up only, in new module/test/documentation files.
+No app/server/runner/scheduler wiring or SSE route is added. The future shared
+stream reader must reuse its source page for progress rather than multiply
+source polling by subscribers or add a separate progress reader.
+
+There are 24 new test IDs: base 7,240 -> 7,264 total. Initial focused observation,
+log-service and receipt checks passed 99 before the final unavailable-evidence
+case was added. Final observation cases plus the recovery comparison below:
+25 passed, 14.54 s (24 new cases and one unchanged recovery case). A native
+schema-v1 runner claim and completed child/pump predate additive initialization;
+its running row, audit and clock remain unchanged, and it publishes/finalizes
+with its original lifecycle version. The table/snapshot survives finalization.
+This is a private-fixture compatibility proof, not a production migration.
+
+Fifteen process-local mutations are caught, with no collection/setup errors and
+unchanged source hashes: page-bound early refusal (3 failures); unreadable-source
+status (2); nonce format (4); nonce binding (2); commit-time binding (1); stale
+generation (1); regressing log proof (1); parse cursor (5); gap count (3); gap
+evidence (2); progress update (6); false EOF (2); unchanged-poll generation (6);
+consecutive generation (6); generation exhaustion (1). No source copies are
+restored over the working tree.
+
+The first full four-worker/loadfile run was superseded by the added unavailable
+guard while it was running: 7,250 passed / 12 skipped / 1 failed, 389.66 s,
+7,263 collected. Its failure is the unchanged recovery fixture's before_receipt
+handshake: PermissionError reading the private `owner-ready` file after exists().
+No new observation call occurs on that path. The case passes once on the final
+candidate (included in the 25 above) and once on untouched ee13ad9 (18.97 s).
+The cause remains unclassified; those isolated passes do not prove a base flake
+or replace the failed full result. Final-source full results and exact-head CI
+will be recorded on the PR; neither this earlier run nor an isolated pass is a
+passing final gate. The existing private Playwright package is used, with no
+global Python/browser change. No live console/library/catalog/queue/model action.
