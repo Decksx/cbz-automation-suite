@@ -74,3 +74,33 @@ three source hashes unchanged. The earlier 15 observer mutations exercised the
 same unchanged observation-module bytes; those plus these seven give 22 caught
 mutations, with the earlier cleanup warning retained above. Final full-suite,
 fresh review and both exact-head CI results belong on the PR. No deployment.
+
+## D3b prerequisite: one-page producer handoff
+
+From merged 83dce07, add consume_page returning ObservedPage(page, observation).
+The existing consume_once delegates and keeps its snapshot-only result. The
+consumer returns the bounded source page it already parsed only after its
+observation commit succeeds. This lets the future shared producer fan out log
+data and progress without a second source read. It accepts no arbitrary replay
+cursor. The envelope contains caller-owned JSON objects; frozen fields do not
+freeze nested data, and the publisher must encode immutable bytes before sharing.
+
+The cursor/parser/error/CAS body is unchanged. This does not add the shared
+worker, subscriber queues, slots, scheduling, HTTP/SSE or browser integration.
+No schema or lifecycle change. Those remaining D3 gates stay mandatory.
+
+Eleven new cases cover single-read page fidelity, no open handle/admission scope
+after return, a controlled pending-commit barrier, restart/legacy compatibility,
+partial live lines, cold/gap pages, read/commit/stale failures and UTF-8 source-byte
+cursors. The focused observations/page/log-service/receipt run passes 121 in
+57.50 s; the last equality/import cleanup is covered by the final full run.
+Inventory: base 7,274 + 11 = 7,285. Full Windows suite is running; final results
+and fresh CI belong on the PR.
+
+Four process-local mutations fail: duplicate source read (1 failure), return an
+uncommitted batch (10), drop page records (7), return a page from the legacy API
+(1). No setup/collection errors and the source hash stays unchanged. These prove
+the handoff semantics, not future fan-out/HTTP behaviour. A constructor-timing
+assertion was replaced before commit with an actual caller/commit barrier, and
+page equality permits a safe internal copy; no Python object-identity promise is
+part of the API. No production console/library/catalog/queue/model work.
