@@ -93,7 +93,9 @@ is refused before a worker or slot can remain attached.
 
 Claimed jobs waiting for create_writer, and terminal jobs whose reconstruction
 failed before creating a writer, also publish state-only pages when their
-unarchived index is absent. consume_page opts into this only while the durable
+index is absent. A command-only archive takes the same path only when its
+member pins include command.json and no log/ members. Empty legacy pin maps
+or an archive declaring any log evidence cannot take this fallback. consume_page opts into this only while the durable
 observation generation is zero. The synthetic page leaves that generation at
 zero, carries no log event ID, and cannot report EOF. Later writer creation
 switches the same stream to normal observed pages. A nonzero replay cursor
