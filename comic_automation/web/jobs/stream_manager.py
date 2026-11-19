@@ -30,6 +30,12 @@ def _deadline(timeout):
     return None if timeout is None else time.monotonic() + timeout
 
 
+def _unobserved(row):
+    # Admission and synthesis must agree: these jobs never had a byte cursor
+    # beyond zero, including a pre-claim refusal or expired admission.
+    return row["state"] == "admitted" or row["state"] in {"refused", "admission_expired"} and row["runner_pid"] is None
+
+
 class StreamClosed(RuntimeError):
     """An owned subscription closed; its fixed reason is safe for the wire."""
 
@@ -170,7 +176,7 @@ class SharedLogReaders:
             if row["nonce"] != nonce:
                 raise StreamRefused("OBSERVATION_NONCE_MISMATCH")
             snapshot = self.observations.snapshot(job_id, nonce)
-            if row["state"] == "admitted" and cursor != "0":
+            if _unobserved(row) and cursor != "0":
                 raise StreamRefused("INVALID_LOG_CURSOR")
             if not self._authorized(session_valid):
                 raise StreamRefused("SESSION_INVALID")
@@ -254,7 +260,7 @@ class SharedLogReaders:
                 row = self.store.get(job_id)
                 if row["nonce"] != nonce:
                     raise StreamRefused("OBSERVATION_NONCE_MISMATCH")
-                if row["state"] == "admitted" or row["state"] in {"refused", "admission_expired"} and row["runner_pid"] is None:
+                if _unobserved(row):
                     page = dict(cursor="0", next_cursor="0", records=[], proven_offset="0", eof=False,
                                 log_status="unobserved")
                 elif cursor == reader.latest["cursor"]:
