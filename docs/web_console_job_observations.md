@@ -21,6 +21,21 @@ A competing consumer refuses with `STALE_OBSERVATION`; it cannot rewind a newer
 cursor. Retry from the durable snapshot on a later tick. A failed write leaves
 the old cursor available for retry.
 
+For the D3b shared producer, `consume_page(job_id, nonce, limit=1000)` returns an
+`ObservedPage` envelope containing that same bounded page and its committed
+observation. The existing `consume_once` delegates to it and still returns only
+the snapshot. There is no second source read. A batch is returned only after
+commit succeeds and admission/database/source ownership is released; read,
+write and generation failures never return a usable batch. The durable cursor
+still chooses the next page; this API does not accept arbitrary replay cursors.
+
+The envelope contains server-owned JSON objects, not a wire DTO or an iterator
+over open files. Its frozen fields do not freeze nested records. A shared
+publisher must encode immutable bytes once before fan-out and deduplicate
+unchanged observation generations/empty pages. Subscriber queues, slots,
+cadence, replay scheduling and HTTP ownership remain separate implementation
+work; this API only supplies the producer handoff without duplicate I/O.
+
 The snapshot contains:
 
 | Field | Meaning |
@@ -84,8 +99,8 @@ The development log records mutation and suite results for the candidate.
 ## Remaining D3 work
 
 The stream manager must own and share the per-job reader/consumer rather than
-create a consumer for each subscriber. Its integration must avoid a second
-independent source poll merely to publish progress. The remaining acceptance
+create a consumer for each subscriber. Its integration should use consume_page
+to avoid a second independent source poll merely to publish progress. The remaining acceptance
 gates include eight global stream slots with spare JSON request capacity,
 bounded subscriber queues, session revalidation, owned iterable closure,
 disconnect/shutdown cleanup, hot/cold cursor resumption and measured reader
