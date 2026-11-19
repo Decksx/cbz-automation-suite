@@ -14,6 +14,12 @@ lands. Revision 3 answers the re-review 7025222877 of revision 2 (`f9277c0`):
 - the aggregate backup guard and backup-visible control files (F4, sections 8 and 9);
 - explicit R1 precedence in the arrival classes (section 8).
 
+Revision 4 answers the re-review 7025305222 of revision 3 (`c47e72c`) on the one open F4
+point: the parent journal lives outside both trees, the X: child journal and control
+files are frozen before the F: phase, F: control-file replacements check the expected
+prior identity and save preimages, and promotions count journal growth (sections 8
+and 9).
+
 ## 1. Goal and operator rules
 
 David approved (2026-11-19) moving single-book "series" in `X:\Comix` into one Komga
@@ -445,8 +451,9 @@ never treated as a replacement.
   promotions stay below the threshold:
   - the watcher never forces or bypasses the guard, and never widens the backup's
     exclusions;
-  - each promotion journals its expected backup contribution (one book plus the two
-    control files), so a guard refusal can be explained;
+  - each promotion journals its expected backup contribution: one book, the two control
+    files, and the grown `_automation/relocations.jsonl` (revision 4), so a guard
+    refusal can be explained;
   - a guard refusal is reported for the operator to decide, as for any other cause.
 
   Fixture: several promotions plus unrelated replacements between two backup runs,
@@ -467,7 +474,18 @@ never treated as a replacement.
 - **Stop:** pause the watcher, Camelia, the "Comic Backup" scheduled task, any active
   Syncthing pair for Comix, and Komga scanning (record its scan interval to restore).
 - **[F4] One parent journal for both roots.** The cutover is one parent operation with
-  three receipted phases, each resumable and each reconciled before the next:
+  three receipted phases, each resumable and each reconciled before the next.
+
+  **Journal boundary (revision 4).** The parent journal lives **outside both trees**,
+  under `G:\ComicAutomation\oneshots-cutover\<operation_id>\`. It holds the phase
+  receipts, the F: step receipts and the saved preimages below. No F:-phase step writes
+  anything under `X:\Comix`, so nothing it records can change a file that has already
+  been copied to F:. The X: phase's own child journal (`_automation/relocations.jsonl`)
+  and every control file it changed are **frozen** before the F: phase starts: the
+  parent records their final SHA-256, and the watcher, Camelia and the apply tool stay
+  stopped, so none of them can append again until the parent completes.
+
+  The phases:
   1. X: moves and state stores, through `relocate`;
   2. F: phase, two kinds of step:
      - **book renames:** for each planned move, an F: intent record, a check that the F:
@@ -475,10 +493,17 @@ never treated as a replacement.
        per-file receipt;
      - **backup-visible control files (revision 3):** the X: phase changes files the
        backup copies (`_series_registry.json`, `_series_locations.json`, and anything
-       under `_automation` the script doesn't exclude). Each one the X: phase changed is
-       copied to F: as its own journalled step, verified by SHA-256 against X:, with a
-       receipt. The set is enumerated in the parent journal from the X: phase's own
-       receipts, not guessed;
+       under `_automation` the script doesn't exclude, including the frozen child
+       journal). Each one the X: phase changed is copied to F: as its own journalled
+       step. The set is enumerated in the parent journal from the X: phase's own
+       receipts, not guessed. Each copy step (revision 4):
+       - checks the existing F: file against its **expected prior identity**: the
+         SHA-256 the planner recorded for it, or "absent" for a file the X: phase
+         created. An unexpected F: occupant refuses; an expected one is replaced;
+       - saves that preimage under the parent journal before replacing it, so
+         conditional undo can restore the F: control file exactly;
+       - verifies the copied bytes against the frozen X: SHA-256 and records the
+         receipt in the parent journal (never under `X:\Comix`);
   3. verification: X: inventory equals the plan's targets, F: matches X: by SHA-256 for
      every moved book and every enumerated control file, and Camelia rows and paths
      reconcile.
