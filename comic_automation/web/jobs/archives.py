@@ -17,6 +17,7 @@ import stat
 import struct
 from typing import Mapping, Sequence
 import zipfile
+import zlib
 
 from .store import JobRefused, MAX_COMMAND_BYTES, validate_job_id
 
@@ -360,7 +361,7 @@ def read_pinned_member(path: Path, job_id: str, member: str, size: int, digest: 
                 if total != size or hashed.hexdigest() != digest:
                     raise ArchiveRefused("Pinned member digest mismatch")
                 return bytes(selected)
-    except (KeyError, TypeError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+    except (KeyError, TypeError, ValueError, zipfile.BadZipFile, RuntimeError, zlib.error, EOFError) as exc:
         if isinstance(exc, ArchiveRefused):
             raise
         raise ArchiveRefused(f"Invalid pinned member: {exc}") from None
