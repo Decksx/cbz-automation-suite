@@ -2,11 +2,13 @@
 from contextlib import contextmanager
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from comic_automation.web.jobs import stream_manager as streams
 from comic_automation.web.jobs.log_service import JobLogs
+from comic_automation.web.jobs.store import ProcessIdentity
 from test_web_job_observations import active, ledger_rows, ONE
 from test_web_log_service import service, written
 
@@ -66,7 +68,7 @@ def test_eight_subscribers_share_one_read_and_one_encoded_packet(service, monkey
                 assert packets[0] is not None and all(packet is packets[0] for packet in packets)
                 # Later scheduled polls may run if the test thread is delayed;
                 # they must not repeat the page that produced this packet.
-                assert calls.count(dict(cursor="0", limit=1000)) == 1
+                assert sum(call["cursor"] == "0" and call["limit"] == 1000 for call in calls) == 1
                 assert len(calls) <= value.stats()["polls"] and value.stats()["readers"] == 1
                 assert packets[0].next_cursor == str(len(ONE))
                 # Delivery holds no admission scope or source handle.
@@ -208,7 +210,7 @@ def test_shutdown_retains_reader_ownership_until_blocked_source_settles(service,
             member = subscribe(value, service)
             assert entered.wait(5)
             member.close()
-            assert value.stats()["slots"] == 0 and value.stats()["readers"] == 1
+            assert value.stats()["slots"] == value.stats()["readers"] == 1
             with pytest.raises(streams.StreamRefused, match="READER_CLOSING"):
                 subscribe(value, service)
             assert value.close(.01) is False
@@ -372,7 +374,7 @@ def test_started_thread_is_retained_if_start_raises_after_birth(service, monkeyp
         try:
             with pytest.raises(streams.StreamRefused, match="READER_START_FAILED"):
                 subscribe(value, service)
-            assert value.stats()["slots"] == 0 and value.stats()["readers"] == 1
+            assert value.stats()["slots"] == value.stats()["readers"] == 1
             assert value.close(.01) is False
         finally:
             release.set()
@@ -380,18 +382,42 @@ def test_started_thread_is_retained_if_start_raises_after_birth(service, monkeyp
 
 
 def test_active_cadence_has_one_quarter_second_floor(service, monkeypatch):
+    # Freeze only the manager's clock. Slow real disk reads cannot accidentally
+    # satisfy the cadence floor; every advance must come from its wait branch.
+    clock, reads, waits = [100.0], [], []
+    entered, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(streams, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     with active(service) as (disk, _, _):
         disk.append(0, b"a\n" * 2100)
-        reads, original = [], JobLogs.read_page
+        original = JobLogs.read_page
         def counted(source, **kw):
-            reads.append(time.monotonic())
+            reads.append(clock[0])
+            if len(reads) == 3:
+                entered.set()
+                assert release.wait(5)
             return original(source, **kw)
         monkeypatch.setattr(JobLogs, "read_page", counted)
         with manager(service) as value:
-            member = subscribe(value, service)
-            packets = [member.receive(5) for _ in range(3)]
-            assert [packet.next_cursor for packet in packets] == ["2000", "4000", "4200"]
-            assert all(b - a >= .24 for a, b in zip(reads, reads[1:]))
+            original_wait = value.condition.wait
+            def wait(timeout=None):
+                if threading.current_thread().name.startswith("cbz-log-reader-"):
+                    waits.append(timeout)
+                    clock[0] += timeout
+                    return
+                return original_wait(timeout)
+            monkeypatch.setattr(value.condition, "wait", wait)
+            try:
+                member = subscribe(value, service)
+                assert entered.wait(5)
+                assert reads == [100.0, 100.25, 100.5]
+                assert waits == [.25, .25]
+                packets = [member.receive(5) for _ in range(2)]
+                release.set()
+                packets.append(member.receive(5))
+                assert [packet.next_cursor for packet in packets] == ["2000", "4000", "4200"]
+            finally:
+                member.close()
+                release.set()
 
 
 def test_reconnect_inside_gap_emits_gap_before_bytes_and_progress_does_not_rewind(service, monkeypatch):
@@ -518,3 +544,107 @@ def test_never_claimed_terminal_job_refuses_nonzero_cursor_without_retaining_a_s
         assert packet.cursor == packet.next_cursor == "0"
         assert b'"log_status":"unobserved"' in packet.frames[-1]
         assert ledger_rows(service[1]) == before
+
+
+def test_closing_readers_keep_capacity_until_twelve_job_probe_settles(service, monkeypatch):
+    # Create independent terminal jobs, then hold every source read past close.
+    # The ninth attempt must refuse before doing any identity/snapshot I/O.
+    _, store, first, _ = service
+    rows = [first]
+    for number in range(12):
+        if number:
+            rows.append(store.admit({}))
+        with store._home(job_id=rows[-1]["job_id"]), store._write() as db:
+            db.execute("UPDATE jobs SET state='failed',runner_pid=1 WHERE job_id=?", (rows[-1]["job_id"],))
+    release, entered, threads = threading.Event(), threading.Event(), []
+    def blocked(source, **kw):
+        threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(10)
+        raise RuntimeError("private blocked source settled")
+    monkeypatch.setattr(JobLogs, "read_page", blocked)
+    with manager(service) as value:
+        try:
+            for row in rows[:8]:
+                entered.clear()
+                member = value.subscribe(row["job_id"], row["nonce"], session_valid=lambda: True)
+                assert entered.wait(5)
+                member.close()
+            assert value.stats()["readers"] == value.stats()["slots"] == 8
+            original = store.get
+            def denied_io(*args):
+                pytest.fail("capacity refusal did identity I/O")
+            monkeypatch.setattr(store, "get", denied_io)
+            for row in rows[8:]:
+                with pytest.raises(streams.StreamRefused, match="STREAM_LIMIT"):
+                    value.subscribe(row["job_id"], row["nonce"], session_valid=lambda: True)
+            assert len(threads) == 8 and all(thread.is_alive() for thread in threads)
+            assert value.close(.01) is False
+            monkeypatch.setattr(store, "get", original)
+        finally:
+            release.set()
+        assert value.wait_closed(5)
+        assert value.stats()["slots"] == value.stats()["readers"] == 0
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_claimed_without_writer_delivers_state_and_later_logs_or_terminal_state(service, monkeypatch, terminal):
+    _, store, row, source = service
+    with store.claim(row["job_id"], row["nonce"], ProcessIdentity(1, 123456, 1)) as claim:
+        if terminal:
+            with store._home(job_id=row["job_id"]), store._write() as db:
+                db.execute("UPDATE jobs SET state='failed' WHERE job_id=?", (row["job_id"],))
+        with manager(service, monkeypatch) as value:
+            before = ledger_rows(store)
+            member = subscribe(value, service)
+            packet = member.receive(5)
+            assert packet.frames[0].startswith(b"event: state\n")
+            assert (b'"state":"failed"' if terminal else b'"state":"claimed"') in packet.frames[0]
+            assert b'"log_status":"unobserved"' in packet.frames[-1]
+            assert packet.cursor == packet.next_cursor == "0"
+            assert value.observations.snapshot(row["job_id"], row["nonce"])["generation"] == 0
+            assert ledger_rows(store) == before
+            bad = subscribe(value, service, cursor="1")
+            eventually(lambda: bad.closed)
+            assert bad.reason == "INVALID_LOG_CURSOR" and not member.closed
+            if not terminal:
+                disk = source.create_writer(claim)
+                disk.append(0, ONE)
+                packet = member.receive(5)
+                assert packet.next_cursor == str(len(ONE))
+                assert packet.frames[0].startswith(b"event: log\n")
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_observed_hot_index_disappearing_is_unavailable_even_at_zero_cursor(service, monkeypatch, empty):
+    with active(service) as (disk, _, _), manager(service, monkeypatch) as value:
+        if not empty:
+            disk.append(0, ONE)
+        member = subscribe(value, service)
+        assert member.receive(5)
+        assert value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])["generation"] > 0
+        (service[3].directory / "index.json").unlink()
+        eventually(lambda: member.closed)
+        assert member.reason == "LOG_UNAVAILABLE"
+        snapshot = value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])
+        assert snapshot["log_status"] == "unavailable" and not snapshot["eof"]
+
+
+@pytest.mark.parametrize("failure", ["corrupt_index", "missing_segment"])
+def test_unobserved_fallback_never_hides_existing_broken_evidence(service, monkeypatch, failure):
+    # Generation zero alone is insufficient: index validation and segment
+    # reads still refuse even before the consumer has made its first snapshot.
+    with active(service) as (disk, _, _):
+        disk.append(0, ONE)
+        directory = service[3].directory
+        if failure == "corrupt_index":
+            (directory / "index.json").write_bytes(b"invalid index")
+        else:
+            (directory / "seg-0000000000000000.log").unlink()
+        with manager(service, monkeypatch) as value:
+            member = subscribe(value, service)
+            eventually(lambda: member.closed)
+            assert member.reason == "LOG_UNAVAILABLE"
+            assert b"LOG_UNAVAILABLE" in next(member)
+            snapshot = value.observations.snapshot(service[2]["job_id"], service[2]["nonce"])
+            assert snapshot["log_status"] == "unavailable" and not snapshot["eof"]
