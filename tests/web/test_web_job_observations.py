@@ -1,11 +1,13 @@
 """Disposable ledger/log witnesses for D3's additive progress consumer."""
 from contextlib import contextmanager
+import json
 import sqlite3
 
 import pytest
 
 from comic_automation.database import dal
-from comic_automation.web.jobs import logs as lg
+from comic_automation.web import state_dir as sd
+from comic_automation.web.jobs import archives as ar, log_service, logs as lg
 from comic_automation.web.jobs.log_service import JobLogs
 from comic_automation.web.jobs.observations import JobObservations
 from comic_automation.web.jobs.store import JobRefused, ProcessIdentity
@@ -295,7 +297,8 @@ def test_unreadable_evidence_clears_historical_eof_without_inventing_loss(servic
 
 def test_schema_v1_runner_keeps_its_version_fence_and_finalizes_after_additive_init(finished):
     # The claim and native child/pump predate the new table. store.py, receipts.py
-    # and log_service.py are unchanged from the pre-D3 ee13ad9 baseline.
+    # are unchanged from the pre-D3 ee13ad9 baseline. The log writer is unchanged;
+    # only read_page's source-I/O classification changes in the review fix.
     store, claim, running, child, pump = finished
     before = ledger_rows(store)
     obs = JobObservations(store)
@@ -310,3 +313,98 @@ def test_schema_v1_runner_keeps_its_version_fence_and_finalizes_after_additive_i
     assert obs.snapshot(claim.job_id, claim.nonce) == result
     with dal.connection_scope(store.database, readonly=True) as db:
         assert db.execute("SELECT value FROM console_meta WHERE key='schema_version'").fetchone()[0] == "1"
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "missing", "open_error"])
+def test_cold_source_failure_clears_saved_eof(service, monkeypatch, failure):
+    batch = written(service, body=ONE)
+    _, store, row, _ = service
+    obs = JobObservations(store)
+    obs.initialize()
+    before = obs.consume_once(row["job_id"], row["nonce"])
+    assert before["eof"] and before["progress"]["done"] == 1
+    if failure == "corrupt":
+        batch.write_bytes(b"not a ZIP archive")
+    elif failure == "missing":
+        batch.unlink()
+    else:
+        def denied(*args, **kwargs):
+            raise PermissionError("fixture cold source open")
+        monkeypatch.setattr(ar, "open", denied, raising=False)
+    expected = ar.ArchiveRefused if failure == "corrupt" else lg.LogRefused
+    with pytest.raises(expected):
+        obs.consume_once(row["job_id"], row["nonce"])
+    after = obs.snapshot(row["job_id"], row["nonce"])
+    assert after == dict(before, generation=before["generation"] + 1,
+                         log_status="unavailable", eof=False)
+
+
+def test_hot_segment_vanishing_at_open_clears_saved_eof(service, monkeypatch):
+    _, store, row, source = service
+    with active(service) as (disk, obs, consume):
+        disk.append(0, ONE)
+        disk.finish(len(ONE), complete=True)
+        before = consume()
+        assert before["eof"] and before["progress"]["done"] == 1
+        # Model replaced hot evidence after the saved EOF. Its new valid index
+        # maps bytes after that cursor, so a retry must open the mapped segment.
+        segment = source.directory / "seg-0000000000000000.log"
+        segment.write_bytes(ONE + TWO)
+        index = json.loads(disk.index_path.read_bytes())
+        index["offset"] = index["segments"][-1]["end"] = len(ONE + TWO)
+        disk.index_path.write_text(json.dumps(index), encoding="utf-8")
+        shared_read = log_service.shared_read
+        vanished = []
+        @contextmanager
+        def vanish(path):
+            if path == segment:
+                vanished.append(path)
+                path.unlink()  # after lexists, before the real native open
+            with shared_read(path) as stream:
+                yield stream
+        monkeypatch.setattr(log_service, "shared_read", vanish)
+        with pytest.raises(lg.LogRefused, match="LOG_SOURCE_IO_UNAVAILABLE") as error:
+            consume()
+        assert isinstance(error.value.__cause__, FileNotFoundError)
+        assert vanished == [segment]
+        assert obs.snapshot(row["job_id"], row["nonce"]) == dict(
+            before, generation=before["generation"] + 1, log_status="unavailable", eof=False)
+
+
+@pytest.mark.parametrize("failure", ["home_io", "private_io", "private", "database"])
+def test_non_source_failures_do_not_mutate_saved_observation(service, monkeypatch, failure):
+    _, store, row, _ = service
+    with active(service) as (disk, obs, consume):
+        disk.append(0, ONE)
+        disk.finish(len(ONE), complete=True)
+        before = consume()
+        assert before["eof"]
+        if failure == "home_io":
+            home, calls = store._home, []
+            @contextmanager
+            def unavailable_home(**kwargs):
+                calls.append(kwargs)
+                if len(calls) == 2:  # snapshot succeeds; page's admission open fails
+                    raise PermissionError("fixture home lock")
+                with home(**kwargs) as view:
+                    yield view
+            monkeypatch.setattr(store, "_home", unavailable_home)
+            expected, message = PermissionError, "fixture home lock"
+        elif failure == "private_io":
+            check_private = sd.check_private
+            def denied_private(root, paths):
+                selected = list(paths)
+                if any(path.name == "index.json" for path in selected):
+                    raise PermissionError("fixture private check I/O")
+                return check_private(root, selected)
+            monkeypatch.setattr(sd, "check_private", denied_private)
+            expected, message = PermissionError, "fixture private check I/O"
+        else:
+            expected = sd.StateDirRefused if failure == "private" else sqlite3.OperationalError
+            message = "fixture private home" if failure == "private" else "fixture database"
+            def refused(*args, **kwargs):
+                raise expected(message)
+            monkeypatch.setattr(JobLogs, "read_page", refused)
+        with pytest.raises(expected, match=message):
+            consume()
+        assert obs.snapshot(row["job_id"], row["nonce"]) == before
