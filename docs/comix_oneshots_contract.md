@@ -4,13 +4,18 @@ Status: draft for review by codex-lead. Docs only; nothing here is implemented y
 Base: comic `99a21d7`, autodecen `787463a`. Source facts below were read from those
 commits, not measured on the live library, unless marked *measured*.
 
+Revision 2 answers codex-lead's review 7024765340 of revision 1 (`7182414`). Each of the
+seven findings is closed by an explicit decision, marked **[F1]** to **[F7]** where it
+lands.
+
 ## 1. Goal and operator rules
 
 David approved (2026-11-19) moving single-book "series" in `X:\Comix` into one Komga
-oneshots folder, `X:\Comix\_oneshots\`. He created that folder (empty) and set it as the
-Comix library's `oneshotsDirectory` in Komga himself. *Measured* the same day: 19,237
-top-level folders; 15,925 hold exactly one book and no subfolder (83%), 2,701 hold more
-than one, 639 have subfolders, 4 are empty.
+oneshots folder, `X:\Comix\_oneshots\`. He reported creating that folder (empty) and
+setting it as the Comix library's `oneshotsDirectory` in Komga himself; neither has been
+independently checked yet. *Measured* the same day: 19,237 top-level folders; 15,925
+hold exactly one book and no subfolder (83%), 2,701 hold more than one, 639 have
+subfolders, 4 are empty.
 
 His rules (issue comment 7023971642), which bind every slice:
 
@@ -36,6 +41,13 @@ authorization to apply it; apply (slice 3) asks separately, citing the plan dige
 - So moving a book out of its folder deletes that series' identity on the next registry
   rebuild. Its next chapter would create a fresh folder, splitting the series and leaving
   the first book in `_oneshots`, which breaks R2.
+- The watcher imports from an intake directory that defaults to `C:\Temp\cbz_processing`,
+  a different volume from `X:`. Its existing move code deliberately handles that with a
+  protected partial copy, verification and commit rather than a rename into the visible
+  library.
+- `settle_file_conflict` recognises exact-byte duplicates; for any other collision it
+  keeps the larger file and quarantines the other. It says nothing about whether two
+  different files are the same book.
 - Camelia (`library_backlog.py`) keys `books` by `source_path` (UNIQUE) and
   `source_key`. It sets `series_path` to the parent directory at registration, and
   `claim_job` counts related books by `(root_path, series_path)` to defer series with
@@ -43,6 +55,9 @@ authorization to apply it; apply (slice 3) asks separately, citing the plan dige
   `prune_missing_books` (which deletes the row and detaches its events) plus re-crawl.
   So a plain move loses state and can requeue a book that was already decensored, and
   every oneshot would share `series_path = …\_oneshots`, forming one huge pseudo-series.
+- `_reuse_unchanged` reuses a crawled row only when its size and mtime match **and**
+  `eligibility_version >= QUEUE_PRIORITY_VERSION`; an older row is re-inspected, which
+  resets its queue state.
 - The crawl recurses into `_oneshots`: it is not in `EXCLUDED_DIRECTORY_NAMES` and has no
   `_quarantine_` prefix. R3's processing half already holds and must be pinned by a test.
 
@@ -70,29 +85,43 @@ just `.cbz`. Format:
 ```json
 {
   "version": 1,
+  "generation": 42,
   "oneshots": {
     "<canonical title>": {
       "relative_path": "_oneshots/<file>",
       "original_folder": "<folder name it came from, or null for a new import>",
       "aliases": ["…"],
-      "size": 123, "mtime_ns": 456,
+      "size": 123, "mtime_ns": 456, "sha256": "…",
       "operation_id": "<relocation op that last wrote this entry>"
     }
   }
 }
 ```
 
-It is written atomically (temp file plus replace, as `_atomic_json` does), and only by the
-relocation primitive (section 6). `build_registry` reads it and emits one series entry per
-record with `location.kind = "oneshot"`. If a record's file is missing, the entry is
-reported stale and left unresolved (no silent fallback), and the record is never deleted
-by a rebuild.
+If a record's file is missing, the entry is reported stale and left unresolved (no silent
+fallback), and the record is never deleted by a rebuild.
 
-**Registry v2.** `_series_registry.json` gains `version: 2` and a `location` object per
-series. `resolve_from_registry` returns `location` alongside `relative_path`; for folder
-series `relative_path` is unchanged, so v1 consumers keep working for folder series.
-`_resolve_import_target` (slice 2) accepts `kind == "oneshot"` and routes to promotion
-instead of rejecting a two-component path.
+**[F1] Shared metadata writes.** `_series_locations.json` and `_series_registry.json` are
+whole-file replacements shared by every series, so per-series serialization is not
+enough: two series updated concurrently could each replace the file and lose the other's
+change. Every read-modify-write of either file:
+
+- holds one **global metadata lock** (`_automation/metadata.lock`, the same advisory
+  lock primitive the library writer lock uses), and
+- is a **compare-and-swap on `generation`**: the writer reads `generation` under the
+  lock, writes the new content with `generation + 1` via temp file, fsync and replace,
+  and refuses if the on-disk generation changed in between.
+
+The registry records the locations generation it was built from. A loaded resolver
+(watcher, observer) compares that against the file's current generation before using a
+cached lookup and reloads when they differ, so a long-running watcher never routes from a
+stale view.
+
+**Registry v2.** `_series_registry.json` gains `version: 2`, its own `generation`, and a
+`location` object per series. `resolve_from_registry` returns `location` alongside
+`relative_path`; for folder series `relative_path` is unchanged, so v1 consumers keep
+working for folder series. `_resolve_import_target` (slice 2) accepts `kind == "oneshot"`
+and routes to promotion instead of rejecting a two-component path.
 
 ## 4. Classification (planner, slice 1)
 
@@ -100,19 +129,24 @@ Each top-level folder gets exactly one class:
 
 - **`oneshot`**, which moves. All of these must hold:
   - exactly one book (`.cbz .cbr .zip .pdf .epub`) and no subdirectory
-  - no other files except sidecars the plan explicitly carries (`series.json`; anything
-    else means `review`)
+  - **no other file at all** **[F5]**. In v1 every sidecar, including `series.json`, is
+    `review` with `extra_files`; no sidecar is ever moved. A later revision may define
+    namespaced sidecar ownership, metadata precedence and undo, but v1 does not guess.
   - no explicit number (R1) in the file name, the folder name, or the book's
     `ComicInfo.xml` `Number`/`Volume` fields
   - not a reparse point, readable, and the target path is safe and free
+  - its Camelia row, if any, is not active and not at an older eligibility version
+    (see section 7, **[F7]**)
 - **`numbered_single`**: one book, but numbered (R1). It stays in its folder; no move.
 - **`series`**: more than one book, or subfolders. It stays.
 - **`review`**, which never moves. Each item carries machine-readable `reasons`:
   - `ambiguous_number`: a bare trailing number that may be a title or year ("1984",
     "Mob Psycho 100"), or a number only in ComicInfo that disagrees with the file name
   - `extra_files`, `unreadable`, `reparse_point`, `target_collision`,
-    `metadata_conflict`, `unsafe_path`, `reserved_name`
+    `metadata_conflict`, `unsafe_path`, `reserved_name`, `duplicate_normalized_path`
   - `active_camelia_job`: the row is claimed or running
+  - `stale_camelia_version`: the row's `eligibility_version` is below
+    `QUEUE_PRIORITY_VERSION`
   - `unknown_reference`: the path is referenced by a state store the planner does not know
 
 **Number evidence (R1):** the token families are `part`/`pt`, `chapter`/`ch`,
@@ -121,22 +155,37 @@ and `Act N`. A match anywhere, including `1` and `01`, means numbered. A match t
 planner can't tell from part of a title goes to `review` with `ambiguous_number`, never to
 `oneshot`.
 
-**Target name:** `_oneshots/<original file name>`. If the stem is empty or not
+**Target name [F5]:** `_oneshots/<original file name>`. If the stem is empty or not
 descriptive (`.cbz`, `1.cbz`), or the name collides with another planned or existing
-file, the planner proposes `<canonical title>.cbz` and marks the item `renamed`. If that
+file, the planner proposes `<canonical title><original suffix>`, keeping the book's own
+format (`.cbr` stays `.cbr`, `.pdf` stays `.pdf`), and marks the item `renamed`. If that
 name also collides, the item goes to `review` with `target_collision`. Nothing is
 overwritten.
 
+**Unsafe paths:** absolute or `..` components, reparse points anywhere on the path,
+reserved Windows names, trailing dots or spaces, and two items whose normalized
+(NFC, casefolded) source or target collide all go to `review`.
+
 ## 5. Versioned plan report
 
-`comix-oneshots-plan/1`, written as JSON plus a human summary:
+`comix-oneshots-plan/2`, written as JSON plus a human summary.
+
+**[F6] What the digest binds.** `plan_digest` is the SHA-256 of the canonical JSON
+(UTF-8, `sort_keys`, separators `(",", ":")`, items sorted by NFC-casefolded `source`) of
+the whole **approved payload**, not just the items:
 
 ```json
 {
-  "schema": "comix-oneshots-plan/1",
+  "schema": "comix-oneshots-plan/2",
+  "policy_version": "r1-r3/2026-11-19",
   "generated_at": "…", "tool": "<name> <commit>",
-  "library_root": "X:\\Comix",
-  "inventory_digest": "sha256 over sorted (relative_path, size, mtime_ns) of every file",
+  "library_root": {"path": "X:\\Comix", "volume_serial": "…", "root_file_id": "…"},
+  "state_stores": {
+    "camelia": {"path": "…", "instance_uuid": "…", "data_version_observed": 0},
+    "registry_generation": 0, "locations_generation": 0
+  },
+  "inventory_digest": "sha256 over sorted (relative_path, size, mtime_ns, sha256) of every candidate book",
+  "expected_move_count": 0,
   "counts": {"oneshot": 0, "numbered_single": 0, "series": 0, "review": 0},
   "bytes": {"oneshot": 0},
   "review_reasons": {"ambiguous_number": 0, "...": 0},
@@ -144,128 +193,231 @@ overwritten.
     "series": "<canonical title>", "alias_key": "…",
     "class": "oneshot", "reasons": [], "renamed": false,
     "original_folder": "<name>", "source": "<rel path>", "target": "_oneshots/<file>",
-    "size": 0, "mtime_ns": 0, "number_evidence": null,
+    "size": 0, "mtime_ns": 0, "sha256": "…", "number_evidence": null,
     "state_changes": {
-      "camelia": [{"book_id": 1, "state": "completed", "source_path": "…"}],
+      "camelia": [{"book_id": 1, "state": "completed", "source_key": "…",
+                   "eligibility_version": 0}],
       "registry": "folder -> oneshot",
       "references": [{"store": "…", "field": "…", "count": 0}]
     }
   }],
-  "plan_digest": "sha256 of the canonical JSON of items"
+  "plan_digest": "sha256 of the canonical JSON of every field above except plan_digest"
 }
 ```
 
-The planner is read-only, including the Camelia DB, which it opens with `mode=ro` and
-the WAL-aware single-read pattern from CLAUDE.md. Apply takes `--plan`,
-`--expected-count` and `--plan-digest`. It refuses if any of the three differ, or if the
-live inventory no longer matches the plan's items (size, mtime, presence, empty targets).
+Changing the root, a store identity, the schema, the policy or any item changes the
+digest. The planner refuses to emit duplicate normalized sources or targets.
 
-## 6. Shared relocation primitive (used by slice 2 promotion and slice 3 apply)
+**Read-only.** The planner opens the Camelia DB with `mode=ro` and the WAL-aware
+single-read pattern from CLAUDE.md, and reads every candidate's bytes once to hash them.
 
-`relocate(operation_id, moves[])`, where each move is `(source, target, series, new_location)`.
-This is a recoverable multi-resource operation, not one transaction: X:, F:, JSON and
-SQLite cannot commit together.
+**[F6] Content evidence.** Size and mtime are diagnostics, not identity: a writer can
+replace a file with one of the same size and mtime. Every candidate carries its SHA-256,
+and apply, undo and backup parity all compare SHA-256. A mismatch refuses the affected
+item (and the plan, if the count or digest no longer holds).
 
-1. **Intent.** Append a journal record (operation id, moves, pre-state evidence: size,
-   mtime and Camelia row id/state) to `_automation/relocations.jsonl` before touching
-   anything. A repeated operation id resumes instead of re-running.
-2. **Fence.** Take the existing library writer lock. Ask Camelia to fence the source and
-   target paths (section 7): no claim, no registration, and refusal if a fenced book is
-   running.
-3. **Filesystem move.** Use a same-volume rename, so the bytes are unchanged. Verify the
-   target's size and mtime against the plan, and record a per-move receipt.
-4. **Camelia relocate** (section 7); record its receipt.
-5. **Location and registry.** Update `_series_locations.json` (add, remove or change the
-   entry), then regenerate the registry.
+**Apply** takes `--plan`, `--expected-count` and `--plan-digest`. It recomputes the full
+payload from live state and refuses unless the digest matches: same root and volume
+identity, same store identities and generations, the same Camelia row state, path and
+eligibility version per item, the same SHA-256 per source, and every target still free.
+
+## 6. Relocation and import primitives
+
+Two primitives, because moving inside the library and importing from intake are
+different operations **[F2]**:
+
+- **`relocate`** moves books that are already in the library, between library paths on
+  the same volume, by rename. Bytes never change.
+- **`publish_import`** brings a new book from intake into the library. It keeps the
+  watcher's existing cross-volume protocol unchanged (protected partial copy, verify,
+  commit, then source disposal under the existing claim, hold and disposal rules); this
+  contract only changes the target path and adds the location record. A new import has
+  **no Camelia row** and `publish_import` never creates one: Camelia registers the book
+  on its next crawl, deriving `series_key` with the shared function in section 7.
+
+A watcher promotion uses both under one parent operation: `relocate` for the existing
+oneshot, then `publish_import` for the new book.
+
+### 6.1 Journal and identities [F1]
+
+- Journal: `_automation/relocations.jsonl`, append-only, fsynced after each record.
+- **Operation:** `operation_id` plus `payload_sha256`, the digest of the operation's full
+  move list. Reusing an operation id with a different payload refuses.
+- **Move:** each move has its own `move_id = <operation_id>:<index>`, with the index fixed
+  by the sorted move list. Receipts and `relocate_book` key on `move_id`, so two books in
+  one promotion or one bulk batch never satisfy each other's idempotency check.
+
+### 6.2 Steps
+
+1. **Intent.** Append the intent record (operation id, payload digest, every move with
+   its `move_id`, and pre-state: size, mtime, SHA-256, Camelia row id, state and
+   eligibility version) before touching anything.
+2. **Lock and fence, in a fixed order.**
+   1. the library writer lock;
+   2. the Camelia fence (section 7): **every** normalized source and target key of the
+      operation, acquired atomically in one `BEGIN IMMEDIATE` transaction that refuses if
+      any key is already fenced, or any affected row is claimed or processing;
+   3. the global metadata lock (section 3), taken only around each metadata write.
+
+   Locks are always taken in this order and released in reverse, so promotion and bulk
+   apply cannot deadlock each other.
+3. **Filesystem move.** Rename source to target. Verify the target's size and SHA-256
+   against the intent, and append a per-move receipt.
+4. **Camelia relocate** (section 7), per move; append its receipt.
+5. **Location and registry.** Update `_series_locations.json`, then regenerate the
+   registry, each under the metadata lock with the generation CAS (section 3).
 6. **Other references.**
    - Append relocation mappings to stores that hold book paths: canonical-naming and
      quarantine journals, and the inspection catalog if it holds the path.
    - Never rewrite historical receipts; append `old → new` mappings that readers apply.
    - A store that isn't enumerated in the planner's `references` list blocks apply
      (`unknown_reference`).
-7. **Release** the fence and append the completion receipt.
+7. **Complete, then unfence.** Append the completion record and fsync it, commit the
+   Camelia fence release in the same transaction that records the operation as
+   completed, and only then release the library writer lock. A crash before this step
+   leaves the fences in place.
 
-**Restart or reconcile.** From the journal plus observation (file at source or target,
-Camelia row path, location entry), finish the forward path or report a conflict.
-Nothing is guessed. **Conditional undo** applies only when the target still matches its
-receipt (size, mtime), the Camelia row is unchanged since its receipt, and no later
-operation references the series. Otherwise undo refuses and says why. Once new imports
-have landed against a moved series, undo for that series is reported as impossible, not
-attempted.
+### 6.3 Restart, reconcile and undo [F1]
+
+- **Fences outlive crashes.** An operation without a completion record keeps its fences
+  and its paths stay unclaimable, unregistrable and unprunable until it is reconciled.
+- **Recovery ownership.** The tool that wrote the intent owns recovery: the watcher for
+  promotions, the apply tool for bulk. On start, each owner reconciles its incomplete
+  operations before doing new work. Reconcile reads the journal plus observation (file
+  at source or target and its SHA-256, Camelia row path, location entry) and either
+  finishes the forward path or stops with a conflict report. Nothing is guessed.
+- **Conditional undo** applies only when the target still matches its receipt (SHA-256),
+  the Camelia row is unchanged since its receipt, and no later operation references the
+  series. Otherwise undo refuses and says why. Once new imports have landed against a
+  moved series, undo for that series is reported as impossible, not attempted.
 
 ## 7. Camelia contract (autodecen repo)
 
-- **`series_key`, separate from `series_path`.** `series_key` is the logical grouping
-  used by `claim_job`'s related-book count. For books under `_oneshots`, `series_key` is
-  `oneshot:<source_key>`, so each oneshot is its own group. Otherwise it is the parent
-  directory, which keeps today's behaviour. The migration backfills
-  `series_key = series_path`. Registration, relocation, list/report and claim all use the
-  same function to derive it.
-- **`relocate_book(operation_id, old_path, new_path)`:**
-  - keeps `books.id`, `state`, attempts, retry, hold and queue fields, and `book_stages`
-    / `book_phases` rows
+- **One grouping function [F7].** `derive_series_key(root_path, source_path)` is the only
+  way `series_key` is computed:
+  - under `<root>/_oneshots/` it returns `oneshot:<source_key>`, so each oneshot is its
+    own group;
+  - otherwise it returns `<root identity>|<normalized parent directory>`, which keeps
+    today's grouping.
+
+  Registration, relocation, list/report, claim **and the migration backfill** all call
+  it. The backfill does not copy `series_path`: a pre-existing `_oneshots` row would
+  otherwise land in exactly the pseudo-series this function exists to prevent.
+- **Older eligibility versions [F7].** `_reuse_unchanged` re-inspects rows below
+  `QUEUE_PRIORITY_VERSION`, which would requeue a moved book. `relocate_book` refuses
+  such rows, and the planner marks them `review` with `stale_camelia_version`. They move
+  only after Camelia has re-verified them in place.
+- **`relocate_book(move_id, old_path, new_path)`:**
+  - keeps `books.id`, `state`, attempts, retry, hold and queue fields,
+    `eligibility_version`, and `book_stages` / `book_phases` rows
   - updates `source_path`, `source_key`, `series_path`, `series_key`, and `output_path`
     when it lies under the old location
   - appends a `relocated` event; old event text is not rewritten
-  - is idempotent by `operation_id`, and refuses if the row is claimed or running, or if
-    `new_path` already has a row
-- **Fencing.** A `relocation_fences` table (path, operation id) is checked by
-  `claim_job` and by `record_archive`. A fenced path is not claimed, and is not
-  registered as new, until the fence is released.
-- **Crawl after relocate** finds the row by its new `source_path`. Because size and
-  mtime are unchanged, it doesn't re-inspect or requeue; a completed book stays
-  completed.
+  - is idempotent by `move_id`, and refuses if the row is claimed or processing, if the
+    path is not fenced by this operation, or if `new_path` already has a row
+  - returns `no_row` (not an error) when the source has no backlog row
+- **Fences [F1].** A `relocation_fences` table holds `(normalized key, operation_id)`
+  with the key UNIQUE.
+  - Acquisition is atomic for the whole operation (section 6.2).
+  - `claim_job` checks fences **inside its write transaction**, so a claim can't slip in
+    between a check and the update.
+  - `record_archive` checks them in **both** of its write transactions (the
+    pre-inspection lookup and the final commit, since ZIP inspection happens between
+    them), so a path fenced mid-registration is not committed.
+  - `prune_missing_books` refuses fenced paths, so a book mid-move is never deleted as
+    missing.
+- **Crawl after relocate** finds the row by its new `source_path`. Because the bytes,
+  size and mtime are unchanged and the eligibility version is current, it reuses the row:
+  a completed book stays completed.
 - **Fixtures required**, each with a mutation check of its guard:
   - a completed book moved and then crawled is not requeued
-  - a queued book keeps its place
-  - a held book stays held
-  - a running book is refused
-  - a competing claim and a competing crawl during the fence
-  - a fault between the filesystem move and the DB receipt
-  - a target-row collision, and a repeated operation id
-  - conditional undo
-  - more than `DEFER_SERIES_BOOK_COUNT` unrelated oneshots alongside one real multi-book
-    series, so that grouping and priority are unchanged
+  - a queued book keeps its place; a held book stays held; a running book is refused
+  - a competing claim and a competing crawl during the fence, including a registration
+    whose ZIP inspection straddles fence acquisition
+  - prune during an in-flight relocation
+  - two series updating the locations file concurrently, with neither change lost
+  - two books in one operation, retried after a crash: each move applies exactly once
+  - a crash after the filesystem move but before the DB receipt, then restart: fences
+    retained until reconcile
+  - a target-row collision, a repeated operation id with the same payload (resumes) and
+    with a different payload (refused)
+  - conditional undo, including a same-size, same-mtime replacement detected by SHA-256
+  - an upgrade with more than `DEFER_SERIES_BOOK_COUNT` existing unrelated oneshots plus
+    one real multi-book series: backfill, registration, relocation, report and claim all
+    agree, and grouping and priority are unchanged
+  - an older-eligibility-version row is refused
   - `_oneshots` books are discovered and processed
 
 ## 8. Watcher (slice 2, codex-lead) obligations from this contract
 
-- **New series, unnumbered book:** route to `_oneshots/<file>` and write its location
-  record through `relocate` (an import is a move from intake).
+**[F3] Identity before collision policy.** When an arrival matches a series whose
+location is `oneshot`, the watcher first classifies the arrival against the existing
+book:
+
+| class | evidence | action |
+|---|---|---|
+| `exact_duplicate` | identical SHA-256 | existing duplicate disposal; no promotion |
+| `distinct` | the arrival is numbered (R1), whatever its file name | promotion |
+| `ambiguous` | anything else: different bytes, both unnumbered | hold for review; no promotion, no overwrite |
+
+v1 deliberately has no automatic "same book, better copy" replacement: two different
+unnumbered files with the same generic name are not evidence of one book.
+`settle_file_conflict` runs only **after** this classification, and only for a genuine
+same-name collision inside a series folder. R1 takes precedence: a numbered arrival is
+never treated as a replacement.
+
+- **New series, unnumbered book:** `publish_import` to `_oneshots/<file>` and write its
+  location record.
 - **New series, numbered book (R1):** create a series folder, as today.
-- **Match to a `oneshot` location, distinct new book:** promote. Create
-  `X:\Comix\<canonical>`, relocate the oneshot into it, then import the new book, all
-  under one operation id. The location becomes `folder`.
-- **Duplicate or replacement** of the oneshot (the same book per `settle_file_conflict`
-  evidence) is not a promotion.
+- **Promotion** (`distinct` against a `oneshot`): create `X:\Comix\<canonical>`,
+  `relocate` the oneshot into it, then `publish_import` the new book, all under one
+  parent operation. The location becomes `folder`.
 - **Two books for a new series in one batch** go straight to a folder.
-- **Concurrency:** arrivals for one series are serialized. Alias ambiguity or a target
-  collision holds the import for review, and never overwrites or loses the first book.
-- **Fixtures:** registry rebuild and restart, an interrupted promotion, and preservation
-  of aliases and state references.
+- **Concurrency:** arrivals for one series are serialized, and the locks follow
+  section 6.2's order. Alias ambiguity or a target collision holds the import for
+  review, and never overwrites or loses the first book.
+- **[F4] Backup during normal use.** A promotion moves exactly one existing book and
+  makes no F: change. The next "Comic Backup" mirror sees one deletion and one addition,
+  so the old copy goes to the 30-day `_holding` under the script's normal rules. That is
+  one file per promotion, far below the 10% guard. This is **not** claimed to be a
+  mirror no-op; slice 2 must confirm the behaviour against `Backup-Comics.ps1` in a
+  fixture before shipping.
+- **Fixtures:** cross-volume intake into `_oneshots` and into a promotion; a new import
+  with no Camelia row; same file name but different books (held); an exact duplicate
+  (not promoted); a numbered arrival with a generic name (promoted); registry rebuild and
+  restart; an interrupted promotion; preservation of aliases and state references.
 
 ## 9. Cutover (slice 3 apply and slice 4 Komga, claude-lead)
 
 - **Preconditions:**
-  - the first full F: backup has completed and `F:\comics-backup\Comix` matches `X:\Comix`
-    (size and mtime parity)
+  - the first full F: backup has completed, and `F:\comics-backup\Comix` matches
+    `X:\Comix` by SHA-256 for every planned source
   - David has reviewed the slice-1 report and separately authorized apply for a specific
     plan digest
 - **Stop:** pause the watcher, Camelia, the "Comic Backup" scheduled task, any active
   Syncthing pair for Comix, and Komga scanning (record its scan interval to restore).
-- **Apply** the plan through `relocate`. Then apply the identical relative renames to
-  `F:\comics-backup\Comix`, so that the next mirror is a no-op and the backup's
-  10%-to-holding guard is never bypassed.
-- **Verify** before resuming anything: the source inventory equals the plan's target
-  inventory, F: matches X:, and Camelia rows and paths reconcile. The backup script's dry
-  listing must show zero changes.
+- **[F4] One parent journal for both roots.** The cutover is one parent operation with
+  three receipted phases, each resumable and each reconciled before the next:
+  1. X: moves and state stores, through `relocate`;
+  2. F: moves: for each planned move, an F: intent record, a check that the F: source
+     exists with the planned SHA-256 and the F: target is free, a rename, and a per-file
+     receipt;
+  3. verification: X: inventory equals the plan's targets, F: matches X: by SHA-256, and
+     Camelia rows and paths reconcile.
+
+  The parent is **not complete**, and the backup task stays disabled, until all three
+  phases reconcile. Recovery resumes a partial F: phase from its receipts. A missing F:
+  source or an occupied F: target stops the operation with a report; it is never
+  overwritten or skipped silently. Conditional undo works per root with the same
+  SHA-256 receipts. The backup script's dry listing must show zero changes before the
+  backup is re-enabled.
 - **Komga:**
-  - record the version, the Comix library ID, the current `oneshotsDirectory` (already
-    `_oneshots`, set by David), `hashFiles`, and baseline book and series counts
+  - record the version, the Comix library ID, the current `oneshotsDirectory` (reported
+    as `_oneshots`), `hashFiles`, and baseline book and series counts
   - rescan, then reconcile book counts and old→new paths, and check for duplicates,
     orphaned empty series from vacated folders, and representative read progress and
     metadata
-  - **rollback:** restore the prior setting and undo the plan if needed (section 6
+  - **rollback:** restore the prior setting and undo the plan if needed (section 6.3
     limits apply)
 - **Resume** in reverse order only after every inventory reconciles.
 
@@ -274,9 +426,12 @@ attempted.
 - **Manga and Graphic Novels** are not touched.
 - **Multi-book series are never collapsed** into `_oneshots`, and `_oneshots` books are
   never renamed beyond the collision rule in section 4.
+- **Sidecars (v1):** any folder with a sidecar is review-only and stays where it is.
 - **Interim:** until slice 2 lands, a registry rebuild indexes `_oneshots` as a series
   named `_oneshots`. The folder is empty and no title normalizes to `oneshots` that we
   know of, but the reservation in section 3 is the fix.
 - **Komga read progress** for moved books depends on Komga matching moved files; David
   accepted progress resets (2026-10-22). The checks in section 9 look for duplicates and
   orphans, not lost progress.
+- **Watcher promotions leave one old copy per promotion in the backup's `_holding`**
+  until it expires (section 8).
