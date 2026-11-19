@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from ...database import dal
-from . import logs
+from . import archives, logs
 from .log_service import JobLogs
 from .store import JobRefused, _NONCE, _json, validate_job_id
 
@@ -75,7 +75,7 @@ class JobObservations:
         before = self.snapshot(job_id, nonce)
         try:
             page = JobLogs(self.store, job_id).read_page(cursor=before["cursor"], limit=limit)
-        except logs.LogRefused:
+        except (logs.LogRefused, archives.ArchiveRefused):
             # Retain the last progress/cursor, but never leave an earlier EOF
             # looking current after mapped evidence becomes unreadable.
             self._commit(job_id, nonce, before, dict(before, log_status="unavailable", eof=False))
