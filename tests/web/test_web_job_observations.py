@@ -2,6 +2,8 @@
 from contextlib import contextmanager
 import json
 import sqlite3
+import struct
+import zipfile
 
 import pytest
 
@@ -315,7 +317,7 @@ def test_schema_v1_runner_keeps_its_version_fence_and_finalizes_after_additive_i
         assert db.execute("SELECT value FROM console_meta WHERE key='schema_version'").fetchone()[0] == "1"
 
 
-@pytest.mark.parametrize("failure", ["corrupt", "missing", "open_error"])
+@pytest.mark.parametrize("failure", ["corrupt", "deflate", "stream_eof", "missing", "open_error"])
 def test_cold_source_failure_clears_saved_eof(service, monkeypatch, failure):
     batch = written(service, body=ONE)
     _, store, row, _ = service
@@ -325,13 +327,25 @@ def test_cold_source_failure_clears_saved_eof(service, monkeypatch, failure):
     assert before["eof"] and before["progress"]["done"] == 1
     if failure == "corrupt":
         batch.write_bytes(b"not a ZIP archive")
+    elif failure == "deflate":
+        with zipfile.ZipFile(batch) as archive:
+            member = archive.getinfo(row["job_id"] + "/log/index.json")
+        payload = bytearray(batch.read_bytes())
+        name_size, extra_size = struct.unpack_from("<HH", payload, member.header_offset + 26)
+        start = member.header_offset + 30 + name_size + extra_size
+        payload[start] |= 0b110  # reserved DEFLATE block type; ZIP metadata stays intact
+        batch.write_bytes(payload)
+    elif failure == "stream_eof":
+        def truncated(*args, **kwargs):
+            raise EOFError("fixture truncated compressed stream")
+        monkeypatch.setattr(zipfile.ZipExtFile, "read", truncated)
     elif failure == "missing":
         batch.unlink()
     else:
         def denied(*args, **kwargs):
             raise PermissionError("fixture cold source open")
         monkeypatch.setattr(ar, "open", denied, raising=False)
-    expected = ar.ArchiveRefused if failure == "corrupt" else lg.LogRefused
+    expected = ar.ArchiveRefused if failure in ("corrupt", "deflate", "stream_eof") else lg.LogRefused
     with pytest.raises(expected):
         obs.consume_once(row["job_id"], row["nonce"])
     after = obs.snapshot(row["job_id"], row["nonce"])
