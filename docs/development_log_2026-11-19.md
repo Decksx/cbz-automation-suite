@@ -240,3 +240,31 @@ contained rerun uses the existing isolated Playwright 1.65.1 environment at
 .codex/tmp/web207-playwright165; source and tests stay frozen. Only the revised
 claim/writer witness needs fresh mutant checks; both affected mutants are rerun.
 All earlier source guard results remain bound to identical source bytes.
+
+
+### D3b archived jobs without writers (Claude re-review)
+
+Claude's review 7016698924 confirms the cap, pre-writer claimed state and
+connector cursor fixes, and finds the archived form of the no-writer case.
+A current command-only archive lacked a log index pin and still closed before
+publishing state. The new five-case witness fails once / passes four before
+the fix, then passes all five in 3.61 s. It covers the archived state-only
+path, nonzero-cursor isolation, a partial declared log map, absent legacy pins,
+and missing/corrupt archives that declare log evidence.
+
+The adapter now permits the same initial state-only page for an archive only
+when command.json is pinned and no log/ member is declared. Any declared log
+member requires its pinned index, and the unchanged generation-zero condition
+still prevents hiding loss after an observation. This is the only source
+change after 8160195; no runner/supervisor/HTTP/browser change.
+Inventory is now 7,355 = 7,285 + 70 (48 manager, 22 frame cases).
+
+The isolated-interpreter full attempt on 8160195 showed failures/errors and
+was stopped at 98%; it is not a gate and its errors are not relabelled as a
+successful environment check. The final contained suite uses canonical
+C:/Python311/python.exe with the existing private Playwright 1.65.1 site-packages
+on process-local PYTHONPATH. Global Python/browser settings stay untouched.
+Two startup verification attempts were superseded while freezing the archive
+fix documentation. The final frozen code/tests suite and fresh 37-case mutation
+run are pending at this checkpoint; exact results will be posted on the PR.
+Both death/restart breakaway cases remain explicitly excluded locally.
