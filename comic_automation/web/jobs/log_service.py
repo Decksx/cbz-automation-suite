@@ -16,6 +16,10 @@ from .log_io import shared_read
 _NAME = re.compile(r"(?:index\.json|seg-[0-9a-f]{16}\.log)\Z")
 
 
+class _UnobservedIndex(Exception):
+    """An absent index without declared logs; never a missing indexed segment."""
+
+
 class JobLogs:
     """A selected job's bounded log access under existing state/private guards."""
     def __init__(self, store, job_id: str):
@@ -57,13 +61,17 @@ class JobLogs:
         return logs.LogDisk(self.directory, self.job_id, row["nonce"], service=row["kind"] == "service",
                             validate=validate, **options)
 
-    def read_page(self, *, cursor="0", limit=1000) -> dict:
+    def read_page(self, *, cursor="0", limit=1000, allow_unobserved=False) -> dict:
         """Read hot or independently ledger-pinned cold members, refuse disagreement.
 
         Admission protects the hot/archive handover for one bounded page. Cold
         data hashes only selected <=8MiB members, never the entire batch. Legacy
         archives lacking per-member pins refuse this new fast path; their command
         reader retains its original whole-batch verification contract.
+
+        allow_unobserved is for a consumer that has never observed evidence.
+        Only a missing index with no declared archived logs becomes a state-only page;
+        corrupt indexes, missing segments and pinned archive failures refuse.
         """
         with self.store._home(job_id=self.job_id), dal.connection_scope(self.store.database, readonly=True) as db:
             row = db.execute("SELECT * FROM jobs WHERE job_id=?", (self.job_id,)).fetchone()
@@ -97,6 +105,12 @@ class JobLogs:
                 if batch is not None:
                     pin = pins.get("log/" + name)
                     if pin is None:
+                        # A current command-only archive proves no logs were
+                        # retained. Empty legacy pin maps cannot establish that,
+                        # and even one declared log member requires its index.
+                        if (allow_unobserved and name == "index.json" and "command.json" in pins
+                                and not any(member.startswith("log/") for member in pins)):
+                            raise _UnobservedIndex()
                         raise logs.LogRefused("ARCHIVED_LOG_MEMBER_NOT_PINNED")
                     try:
                         cold = archives.read_pinned_member(batch, self.job_id, "log/" + name,
@@ -117,8 +131,16 @@ class JobLogs:
                 if cold is not None:
                     remember(name, cold)  # two adjacent <=8MiB members per page
                     return cold[offset:offset + count]
+                if allow_unobserved and name == "index.json":
+                    raise _UnobservedIndex()
                 raise logs.LogRefused("LOG_EVIDENCE_UNAVAILABLE")
-            index = logs.load_index(read, self.job_id, row["nonce"])
+            try:
+                index = logs.load_index(read, self.job_id, row["nonce"])
+            except _UnobservedIndex:
+                if cursor != "0" or type(limit) is not int or not 1 <= limit <= 1000:
+                    raise logs.LogRefused("INVALID_LOG_PAGE") from None
+                return dict(cursor="0", next_cursor="0", records=[], proven_offset="0",
+                            eof=False, log_status="unobserved")
             hot_sizes.update({logs._segment(s["start"]): s["end"] - s["start"] for s in index["segments"]})
             return logs.page(index, read, cursor=cursor, limit=limit,
                              live=row["state"] in ("claimed", "running"))
