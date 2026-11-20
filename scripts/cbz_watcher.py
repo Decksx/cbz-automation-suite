@@ -33,6 +33,7 @@ from watchdog.events import FileSystemEventHandler
 from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from comic_automation.series_resolver import (
     SeriesResolver,
+    ReservedSeriesName,
     digest,
     is_reserved_series_name,
     normalize_apostrophes,
@@ -2283,7 +2284,7 @@ def _resolve_import_target(
     """
     # The container is never an ordinary series, including with resolver mode off.
     if is_reserved_series_name(title):
-        raise ValueError("The oneshots container is not an import series")
+        raise ReservedSeriesName("The oneshots container is not an import series")
     source_resolver = _series_resolvers.get(category)
     if not _series_resolvers:
         return title, legacy_dest, {"match_type": "resolver_disabled"}, None
@@ -3432,10 +3433,20 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
             base, reboot_year = split_series_year(comic_dir.name)
             if reboot_year is not None:
                 clean_dir_name = f"{clean_directory_name(base) or base} ({reboot_year})"
-        preliminary_title = clean_dir_name or comic_dir.name
-        _, dest_folder, _, active_resolver = (
-            _resolve_import_target(route_category, preliminary_title, legacy_dest)
-        )
+        # Cleaning may remove the leading underscore; reserve the arrival first.
+        preliminary_title = (comic_dir.name if is_reserved_series_name(comic_dir.name)
+                             else clean_dir_name or comic_dir.name)
+        try:
+            _, dest_folder, _, active_resolver = (
+                _resolve_import_target(route_category, preliminary_title, legacy_dest)
+            )
+        except ReservedSeriesName as exc:
+            # Persist the hold before moving; a failed placement is resumable.
+            planned = {path: ("review", str(exc)) for path in cbz_files if path.exists()}
+            _dispose(claim, planned, "_oneshots", set())
+            total_skipped += len(cbz_files)
+            progress.step(len(cbz_files))
+            continue
         conflict_quarantine_root = (
             active_resolver.quarantine_root if active_resolver is not None else None
         )
@@ -3855,6 +3866,12 @@ def _process_work(items, *, progress, shadow_results, shadow_handoffs) -> tuple[
                     log.warning(f"    AI original kept on C: for '{archive.name}': {backup}")
             ai_backups = [(a, b) for a, b in ai_backups if a not in disposed]
             archive_completed_ai_backups(_routed_ai_backups(ai_backups, landed), landed)
+        except ReservedSeriesName as exc:
+            # Metadata may reveal a reserved identity only after archive parsing.
+            planned = {path: ("review", str(exc)) for path in parsed_by_path if path.exists()}
+            _dispose(claim, planned, "_oneshots", set())
+            total_skipped += len(parsed_by_path)
+            continue
         except UnstableSeriesIdentityError as e:
             # The destination kept moving under us. Deferring is correct:
             # nothing was mutated, the arrival is still in the watch folder,
