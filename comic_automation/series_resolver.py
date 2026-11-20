@@ -42,6 +42,10 @@ NORMALIZATION_EXCLUDED_DIRECTORIES = (
 )
 
 
+class ReservedSeriesName(ValueError):
+    """A container name or old container alias needs per-arrival review."""
+
+
 def normalize_apostrophes(value: str) -> str:
     """Return *value* with apostrophe-like Unicode characters made ASCII."""
     return value.translate(APOSTROPHE_TRANSLATION)
@@ -558,7 +562,7 @@ def resolve_from_registry(
     and never turn a reserved query into a suggested new series directory.
     """
     if is_reserved_series_name(title):
-        raise ValueError("The oneshots container is not a series name")
+        raise ReservedSeriesName("The oneshots container is not a series name")
     _require_v1_registry(registry)
     key = alias_key(title)
     aliases = registry.get("aliases_by_normalized_key", {})
@@ -571,7 +575,7 @@ def resolve_from_registry(
             raise ValueError("Invalid series registry: ambiguous candidates must be a list")
         candidates = [item for item in candidates if not _container_target(item)]
         if not candidates:
-            raise ValueError("Registry alias refers only to the reserved oneshots container")
+            raise ReservedSeriesName("Registry alias refers only to the reserved oneshots container")
         return {
             "matched": False,
             "match_type": "ambiguous_exact",
@@ -580,7 +584,7 @@ def resolve_from_registry(
         }
     if key in aliases:
         if _container_target(aliases[key]):
-            raise ValueError("Registry alias refers to the reserved oneshots container")
+            raise ReservedSeriesName("Registry alias refers to the reserved oneshots container")
         return {
             "matched": True,
             "match_type": "exact_alias",
@@ -693,7 +697,7 @@ class SeriesResolver:
         """Persist a newly landed canonical folder and its observed aliases."""
         canonical = safe_name(canonical)
         if is_reserved_series_name(canonical):
-            raise ValueError("The oneshots container cannot be registered as a series")
+            raise ReservedSeriesName("The oneshots container cannot be registered as a series")
         values = {canonical}
         values.update(alias.strip() for alias in aliases or set() if alias.strip())
         with self._guard:
