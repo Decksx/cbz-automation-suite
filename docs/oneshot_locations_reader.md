@@ -48,6 +48,15 @@ inspection and open is also an error so the caller can retry from a fresh read.
 - Missing books remain in the snapshot. Staleness belongs in the resolver's
   result; a rebuild must not delete their durable identity records.
 
+Stored path casing is retained, with NFC/casefold equality as the contract
+requires; integrating writers must not switch to case-sensitive comparisons.
+`original_folder` is historical provenance, not an ownership key. The canonical
+title and current target are the unique keys; this reader does not invent a new
+uniqueness constraint on an old folder name. The reader currently has no byte-size
+cap for its trusted control file; a bounded-read interface can be added separately
+if the deployment needs one. None of these rules makes a control file safe to
+accept from an untrusted uploader.
+
 ## Concurrency boundary
 
 The caller must bind and validate its library root before calling the loader.
