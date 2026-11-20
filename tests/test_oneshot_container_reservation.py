@@ -2,6 +2,7 @@
 
 import copy
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -194,3 +195,72 @@ def test_watcher_refuses_container_series_even_when_resolver_mode_is_off(tmp_pat
     with pytest.raises(ValueError, match="not an import series"):
         watcher._resolve_import_target("Comix", name, str(tmp_path))
     assert not (tmp_path / "_oneshots").exists()
+
+
+@pytest.mark.parametrize("metadata_only", [False, True])
+@pytest.mark.parametrize("defer_review", [False, True])
+def test_reserved_arrival_is_a_durable_hold_while_sibling_lands_and_resume_is_safe(
+    tmp_path, monkeypatch, metadata_only, defer_review,
+):
+    from scripts import cbz_core
+    incoming = tmp_path / "incoming"
+    library = tmp_path / "library"
+    batch = incoming / "drop"
+    bad_name = "Ordinary Bad" if metadata_only else "_oneshots"
+    expected = {}
+    for name in (bad_name, "Good"):
+        archive = batch / name / f"{name}.cbz"
+        archive.parent.mkdir(parents=True)
+        with zipfile.ZipFile(archive, "w") as stream:
+            stream.writestr("page1.jpg", name.encode())
+        expected[name] = archive.read_bytes()
+    library.mkdir()
+    monkeypatch.setattr(watcher, "WATCH_FOLDER", str(incoming))
+    monkeypatch.setattr(watcher, "_routing_rules", [])
+    monkeypatch.setattr(watcher, "_routing_default", str(library))
+    monkeypatch.setattr(watcher, "_number_style_registry", None)
+    monkeypatch.setattr(watcher, "_router", None)
+    monkeypatch.setattr(watcher, "AI_DECENSOR_ENABLED", False)
+    monkeypatch.setattr(watcher, "POLL_INTERVAL", 0)
+    monkeypatch.setattr(watcher, "wait_for_file_stable", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cbz_core, "translate_metadata_text", lambda text: (text, None))
+    monkeypatch.setattr(watcher, "_series_resolvers", {"comix": sr.SeriesResolver(library)} if metadata_only else {})
+    if metadata_only:
+        monkeypatch.setattr(watcher, "_consistent_comicinfo_series", lambda paths:
+                            "_oneshots" if any(p.parent.name == bad_name for p in paths) else None)
+    original_process = watcher.process_cbz_file
+    processed = []
+
+    def process(path, **kwargs):
+        if not metadata_only:
+            assert path.parent.name != bad_name, "Reserved arrival must be held before rewriting"
+        processed.append(path.parent.name)
+        return original_process(path, **kwargs)
+
+    monkeypatch.setattr(watcher, "process_cbz_file", process)
+    original_place = watcher._claims.place
+    injected = []
+
+    def place(path, root, series):
+        if defer_review and root == watcher.REVIEW_ROOT and not injected:
+            injected.append(path.name)
+            raise OSError("fixture: review temporarily unavailable")
+        return original_place(path, root, series)
+
+    monkeypatch.setattr(watcher._claims, "place", place)
+    watcher.process_and_move_directory(batch)
+    assert list(library.rglob("*.cbz")) and "Good" in processed
+    assert not (library / "_oneshots").exists()
+    if defer_review:
+        assert injected
+        records = list(watcher.PROCESSING_ROOT.rglob(watcher._claims.RECORD_NAME))
+        assert any(json.loads(p.read_text()).get("dispositions") for p in records)
+    watcher._resume_claims()
+    held = list(watcher.REVIEW_ROOT.rglob("*.cbz"))
+    assert len(held) == 1
+    if not metadata_only:
+        assert held[0].read_bytes() == expected[bad_name]
+    assert not list(watcher.PROCESSING_ROOT.rglob("*.cbz"))
+    assert len(list(library.rglob("*.cbz"))) == 1
+    with zipfile.ZipFile(held[0]) as stream:
+        assert stream.read("page1.jpg") == bad_name.encode()
