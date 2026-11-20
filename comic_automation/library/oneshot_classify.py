@@ -47,8 +47,14 @@ _NUMBERED = [
     ("volume", re.compile(r"(\d+)\s*巻")),
 ]
 # A bare number at the end of the stem ("Mob Psycho 100", "1984", "Title 02")
-# may be a title, a year or a chapter. R1 can't decide, so it is review.
+# may be a title, a year or a chapter. R1 can't decide, so it is review. Trailing
+# parenthesized or bracketed annotations are stripped first, so "Title 2
+# (Complete)" is still caught, while "Title (2019)" alone has no bare number.
 _BARE_TRAILING = re.compile(r"(?:^|[\s_\-])(\d+)\s*$")
+_TRAILING_ANNOTATION = re.compile(r"\s*[\(\[][^\(\)\[\]]*[\)\]]\s*$")
+# "v 1" / "v. 2" / "v-3": probably a volume, but a lone "v" can be part of a
+# title, so a separated marker is ambiguous rather than explicit (review).
+_SPACED_V = re.compile(r"(?<![a-z])v[\s._\-]+(\d+)", re.I)
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,14 @@ class FolderFacts:
 
 @dataclass(frozen=True)
 class Classification:
+    """The planner's decision for one folder.
+
+    ``kind`` is one of ``oneshot``, ``numbered_single``, ``series`` or ``review``.
+    ``reasons`` is empty except for ``review``. ``target`` and ``renamed`` are set
+    only for ``oneshot``. ``number_evidence`` is the R1 match that made a book
+    numbered; ``ambiguous`` holds numbers that couldn't be classified safely.
+    """
+
     folder: str
     kind: str
     reasons: tuple[str, ...] = ()
@@ -118,25 +132,42 @@ def number_evidence(text: str, source: str) -> tuple[NumberEvidence | None, Numb
         match = pattern.search(folded)
         if match:
             return NumberEvidence(kind, int(match.group(1)), source, match.group(0)), None
-    bare = _BARE_TRAILING.search(folded)
+    spaced = _SPACED_V.search(folded)
+    if spaced:
+        return None, NumberEvidence("volume_separated", int(spaced.group(1)), source, spaced.group(0))
+    stripped = folded
+    while True:
+        shorter = _TRAILING_ANNOTATION.sub("", stripped)
+        if shorter == stripped:
+            break
+        stripped = shorter
+    bare = _BARE_TRAILING.search(stripped)
     if bare:
         return None, NumberEvidence("bare", int(bare.group(1)), source, bare.group(1))
     return None, None
 
 
-def _comicinfo_evidence(info: dict[str, str]) -> tuple[NumberEvidence | None, NumberEvidence | None]:
-    """Read ComicInfo ``Number``/``Volume``. The caller decides what the number means:
-    alone it is only ambiguous, and it is a conflict when it disagrees with the name."""
+def _comicinfo_evidence(info: dict[str, str]) -> tuple[list[NumberEvidence], list[NumberEvidence]]:
+    """Read **every** populated ComicInfo ``Number``/``Volume``.
+
+    Returns ``(numeric, unclear)``. All fields are examined, so a first value that
+    agrees with the name can't hide a later one that conflicts. The caller decides
+    what the numbers mean: alone they are only ambiguous, and any one that
+    disagrees with a numbered name is a conflict.
+    """
+    numeric: list[NumberEvidence] = []
+    unclear: list[NumberEvidence] = []
     for field_name, kind in (("Number", "issue"), ("Volume", "volume")):
         value = (info.get(field_name) or "").strip()
         if not value:
             continue
         digits = re.search(r"\d+", _fold(value))
         if digits:
-            return NumberEvidence(kind, int(digits.group(0)), "comicinfo", value), None
-        # A non-numeric Number ("Special", "½") can't be classified safely.
-        return None, NumberEvidence("bare", -1, "comicinfo", value)
-    return None, None
+            numeric.append(NumberEvidence(kind, int(digits.group(0)), "comicinfo", value))
+        else:
+            # A non-numeric value ("Special", "½") can't be classified safely.
+            unclear.append(NumberEvidence("bare", -1, "comicinfo", value))
+    return numeric, unclear
 
 
 def unsafe_component(name: str) -> bool:
@@ -152,8 +183,12 @@ def unsafe_component(name: str) -> bool:
 
 
 def _descriptive(stem: str) -> bool:
-    """A stem that says nothing about the book can't be its _oneshots file name."""
-    stripped = re.sub(r"[\s_\-.]+", "", _fold(stem))
+    """A stem that says nothing about the book can't be its _oneshots file name.
+
+    Only letters and digits count, so ``""``, ``"--"`` and ``"()"`` are all
+    non-descriptive, and so is a stem of digits alone.
+    """
+    stripped = re.sub(r"[\W_]+", "", _fold(stem))
     return bool(stripped) and not stripped.isdigit()
 
 
@@ -214,20 +249,22 @@ def classify_folder(facts: FolderFacts, taken: set[str]) -> Classification:
         numbered = numbered or hit
         if unclear:
             ambiguous.append(unclear)
-    if facts.comicinfo is not None:
-        hit, unclear = _comicinfo_evidence(facts.comicinfo)
-        if unclear:
-            ambiguous.append(unclear)
-        elif hit is not None:
-            if numbered is None:
-                # Contract section 4: a number only in ComicInfo is review, not R1.
-                # Taggers often set Number=1 on true oneshots, so this alone
-                # can't decide the class either way.
-                ambiguous.append(hit)
-            elif hit.value != numbered.value:
-                reasons.append("metadata_conflict")
-    elif facts.comicinfo_unreadable:
+    # Checked on its own: partial facts (an empty ComicInfo plus an unreadable
+    # flag) must still keep the folder in review.
+    if facts.comicinfo_unreadable:
         reasons.append("unreadable")
+    if facts.comicinfo is not None:
+        numeric, unclear = _comicinfo_evidence(facts.comicinfo)
+        ambiguous.extend(unclear)
+        if numbered is None:
+            # Contract section 4: a number only in ComicInfo is review, not R1.
+            # Taggers often set Number=1 on true oneshots, so this alone can't
+            # decide the class either way.
+            ambiguous.extend(numeric)
+        elif unclear or any(hit.value != numbered.value for hit in numeric):
+            # Any field that disagrees with the numbered name, or can't be read
+            # as a number at all, is a contradiction the report must expose.
+            reasons.append("metadata_conflict")
 
     if numbered is not None and not reasons:
         # R1: numbered books stay in (or get) a series folder, including 1.
