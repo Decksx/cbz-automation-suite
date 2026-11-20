@@ -64,6 +64,24 @@ def test_a_bare_trailing_number_is_ambiguous_and_never_moves(name):
     assert (result.kind, result.reasons) == (REVIEW, ("ambiguous_number",))
 
 
+@pytest.mark.parametrize("name", [
+    "Title v 1 (Complete)", "Title v. 2 [Digital]", "Title V-3 (Complete Edition)", "Title v 1",
+    "Title 2 (Complete)", "Title 1 [Digital] (2019)", "Title 01 (Complete)",
+    # A separated marker followed by a plain word: only the spaced-v rule sees it.
+    "Title v 1 Deluxe", "Title v.2 Omnibus",
+])
+def test_separated_volume_or_annotated_number_is_never_a_oneshot(name):
+    """Codex review 7028373230 / connector 4637665101: a separated "v N" marker or a
+    number followed by an edition annotation must not fall through to a move."""
+    result = classify(name, [f"{name}.cbz"])
+    assert (result.kind, result.reasons) == (REVIEW, ("ambiguous_number",))
+
+
+@pytest.mark.parametrize("name", ["Title (2019)", "Title [Digital]", "Title (Complete) [2020]"])
+def test_annotations_alone_add_no_number(name):
+    assert classify(name, [f"{name}.cbz"]).kind == ONESHOT
+
+
 def test_a_year_in_parentheses_is_not_a_number():
     assert classify("Title (2019)", ["Title (2019).cbz"]).kind == ONESHOT
 
@@ -82,6 +100,30 @@ def test_comicinfo_agreeing_with_the_name_stays_numbered():
 def test_comicinfo_disagreeing_with_the_name_is_a_metadata_conflict():
     result = classify("Title Vol 2", ["Title Vol 2.cbz"], comicinfo={"Number": "5"})
     assert (result.kind, result.reasons) == (REVIEW, ("metadata_conflict",))
+
+
+@pytest.mark.parametrize("info", [{"Number": "2", "Volume": "3"}, {"Number": "3", "Volume": "2"},
+                                  {"Number": "2", "Volume": "Special"}])
+def test_every_comicinfo_field_is_checked_against_the_name(info):
+    """Codex review 7028373230 / connector 4637665108: a first agreeing field must not
+    hide a later conflicting or non-numeric one."""
+    result = classify("Title Vol 2", ["Title Vol 2.cbz"], comicinfo=info)
+    assert (result.kind, result.reasons) == (REVIEW, ("metadata_conflict",))
+
+
+def test_both_comicinfo_fields_agreeing_stay_numbered():
+    result = classify("Title Vol 2", ["Title Vol 2.cbz"], comicinfo={"Number": "2", "Volume": "2"})
+    assert result.kind == NUMBERED_SINGLE
+
+
+def test_comicinfo_numbers_on_an_unnumbered_name_are_ambiguous():
+    result = classify("Title", ["Title.cbz"], comicinfo={"Number": "1", "Volume": "2"})
+    assert (result.kind, result.reasons) == (REVIEW, ("ambiguous_number",))
+
+
+def test_unreadable_comicinfo_is_honoured_even_with_partial_empty_facts():
+    result = classify("Title", ["Title.cbz"], comicinfo={}, comicinfo_unreadable=True)
+    assert (result.kind, result.reasons) == (REVIEW, ("unreadable",))
 
 
 def test_a_non_numeric_comicinfo_number_is_ambiguous():
@@ -130,7 +172,8 @@ def test_an_unsafe_book_name_is_review():
 
 
 @pytest.mark.parametrize("book,expected", [(".cbz", "_oneshots/Title.cbz"), (".cbr", "_oneshots/Title.cbr"),
-                                           ("--.pdf", "_oneshots/Title.pdf")])
+                                           ("--.pdf", "_oneshots/Title.pdf"), ("().cbz", "_oneshots/Title.cbz"),
+                                           ("[_].epub", "_oneshots/Title.epub")])
 def test_a_non_descriptive_name_takes_the_series_title_and_keeps_its_suffix(book, expected):
     result = classify("Title", [book])
     assert (result.kind, result.target, result.renamed) == (ONESHOT, expected, True)
