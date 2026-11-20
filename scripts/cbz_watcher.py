@@ -34,6 +34,7 @@ from logging.handlers import RotatingFileHandler as _RotatingFileHandler
 from comic_automation.series_resolver import (
     SeriesResolver,
     digest,
+    is_reserved_series_name,
     normalize_apostrophes,
     safe_name,
     settle_file_conflict,
@@ -2280,6 +2281,9 @@ def _resolve_import_target(
     stale registry path is ignored, except when the same folder can be found
     under another configured root after a manual move.
     """
+    # The container is never an ordinary series, including with resolver mode off.
+    if is_reserved_series_name(title):
+        raise ValueError("The oneshots container is not an import series")
     source_resolver = _series_resolvers.get(category)
     if not _series_resolvers:
         return title, legacy_dest, {"match_type": "resolver_disabled"}, None
