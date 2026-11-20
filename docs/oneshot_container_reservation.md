@@ -12,6 +12,13 @@ mode is disabled. A reserved query or registration raises `ValueError` instead
 of becoming a suggested series directory or a new alias target. Titles such as
 `Oneshots` and `_oneshots anthology` remain distinct permitted series names.
 
+The watcher catches `ReservedSeriesName` for each arrival, including a reserved
+identity discovered later from metadata. It writes the existing claim's review
+disposition before placing the archive in review; other arrivals keep processing.
+A failed placement stays recorded for resume. The raw arrival name is checked
+before cleanup can remove its leading underscore. The standalone resolver API
+still raises the `ValueError` subclass for callers to handle at their boundary.
+
 `build_registry` skips the container while preserving ordinary series folders.
 Alias seeds cannot make the excluded container a canonical target.
 
