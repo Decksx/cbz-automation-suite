@@ -97,6 +97,7 @@ def test_container_and_unsafe_canonical_names_refuse(canonical):
 
 
 @pytest.mark.parametrize("relative", ["../Book.cbz", "_oneshots/../Book.cbz",
+    "_oneshots/a/b.cbz", "_oneshots/a/",
     "_oneshots/", "_oneshots//Book.cbz", "_oneshots\\Book.cbz", "Other/Book.cbz",
     "C:/Book.cbz", "/_oneshots/Book.cbz", "_oneshots/COM1.cbz", "_oneshots/CON .cbz",
     "_oneshots/a.cbz:stream",
@@ -120,6 +121,17 @@ def test_two_series_cannot_own_the_same_normalized_target(second):
 def test_unicode_equivalent_targets_are_a_collision():
     with pytest.raises(LocationsError, match="Duplicate normalized target"):
         _parse(_document({"One": _record("Café.cbz"), "Two": _record("CAFE\u0301.cbz")}))
+
+
+def test_snapshot_order_is_nfc_casefolded_not_insertion_or_raw_case_order():
+    snapshot = _parse(_document({
+        "zeta": _record("Last.cbz"),
+        "e\u0301clair": _record("Accent.cbz"),
+        "Banana": _record("Upper.cbz"),
+        "apple": _record("Lower.cbz"),
+    }))
+    assert [row.canonical_title for row in snapshot.oneshots] == [
+        "apple", "Banana", "zeta", "e\u0301clair"]
 
 
 @pytest.mark.parametrize("changes", [
