@@ -28,6 +28,7 @@ from comic_automation.library.exclusions import (
     DEFAULT_EXCLUDED_DIRECTORIES,
     iter_files_excluding_directories,
 )
+from comic_automation.library.oneshot_locations import ONESHOTS_DIRECTORY
 
 
 REGISTRY_NAME = "_series_registry.json"
@@ -37,7 +38,7 @@ APOSTROPHE_TRANSLATION = str.maketrans({
     "ʻ": "'", "ʼ": "'", "＇": "'", "ꞌ": "'", "՚": "'", "´": "'",
 })
 NORMALIZATION_EXCLUDED_DIRECTORIES = (
-    DEFAULT_EXCLUDED_DIRECTORIES | {"_automation"}
+    DEFAULT_EXCLUDED_DIRECTORIES | {"_automation", ONESHOTS_DIRECTORY}
 )
 
 
@@ -70,6 +71,30 @@ def safe_name(value: str) -> str:
     value = re.sub(r'[<>:"/\\|?*]', " ", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
     return value or "Untitled Series"
+
+
+def is_reserved_series_name(value: str) -> bool:
+    """Recognize the shared container after Windows-safe name normalization.
+
+    This is a series-identity restriction, not a file-inventory exclusion. Books
+    inside the container must remain visible to Camelia and library observers.
+    """
+    return safe_name(value).casefold() == ONESHOTS_DIRECTORY
+
+
+def _container_target(value: object) -> bool:
+    if isinstance(value, dict):
+        value = value.get("relative_path")
+    return isinstance(value, str) and is_reserved_series_name(
+        value.replace("\\", "/").split("/", 1)[0]
+    )
+
+
+def _require_v1_registry(registry: dict[str, object]) -> None:
+    # Do not silently strip valid v2 locations before that protocol is integrated.
+    version = registry.get("version", 1)
+    if type(version) is not int or version != 1:
+        raise ValueError("Unsupported series registry version; v2 integration is not active")
 
 
 def unique_path(path: Path) -> Path:
@@ -105,6 +130,8 @@ def normalize_apostrophe_names(
     the larger file and quarantine the smaller one outside the library.
     """
     root = root.resolve()
+    if any(is_reserved_series_name(part) for part in root.parts):
+        raise ValueError("Oneshots require state-aware relocation, not apostrophe repair")
     quarantine_root = quarantine_root.resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Library root not found: {root}")
@@ -353,6 +380,7 @@ def build_registry(root: Path) -> dict[str, object]:
             for path in root.iterdir()
             if path.is_dir()
             and not path.name.startswith("_quarantine_")
+            and not is_reserved_series_name(path.name)
             and path.name not in {".stfolder", ".stversions", "_automation"}
         ),
         key=lambda path: path.name.casefold(),
@@ -476,30 +504,83 @@ def write_registry(root: Path, registry: dict[str, object]) -> Path:
 
 
 def load_registry(root: Path) -> dict[str, object]:
-    """Load an existing registry for *root*."""
+    """Load a registry, removing legacy container identities only in memory.
+
+    Old snapshots may have indexed the once-empty shared folder as a series.
+    Do not perpetuate those entries on a later registration, or rewrite the
+    operator's file merely by reading it. Durable book locations are separate
+    and are not inferred from the container's name or contents here.
+    """
     path = root / REGISTRY_NAME
     if not path.is_file():
         raise FileNotFoundError(f"Registry not found: {path}")
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    registry = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(registry, dict):
+        raise ValueError("Invalid series registry: expected an object")
+    _require_v1_registry(registry)
+    series = registry.get("series")
+    if isinstance(series, list):
+        registry["series"] = [
+            item for item in series
+            if not isinstance(item, dict) or not (
+                _container_target(item.get("relative_path"))
+                or _container_target(item.get("canonical_title"))
+            )
+        ]
+        registry["series_count"] = len(registry["series"])
+    aliases = registry.get("aliases_by_normalized_key")
+    if isinstance(aliases, dict):
+        registry["aliases_by_normalized_key"] = {
+            key: target for key, target in aliases.items() if not _container_target(target)
+        }
+        registry["alias_count"] = len(registry["aliases_by_normalized_key"])
+    ambiguous = registry.get("ambiguous_aliases")
+    if isinstance(ambiguous, dict):
+        # Keep surviving ambiguity conservative; a rebuild can reclassify it.
+        cleaned = {}
+        for key, candidates in ambiguous.items():
+            if isinstance(candidates, list):
+                candidates = [item for item in candidates if not _container_target(item)]
+                if not candidates:
+                    continue
+            cleaned[key] = candidates
+        registry["ambiguous_aliases"] = cleaned
+    return registry
 
 
 def resolve_from_registry(
     registry: dict[str, object], title: str, threshold: float = 0.95
 ) -> dict[str, object]:
-    """Resolve *title* against an already-loaded registry."""
+    """Resolve a title without treating the oneshots container as a series.
+
+    Direct callers may supply a pre-migration snapshot instead of using the
+    loader. Reject its reserved exact targets, filter ambiguous/fuzzy targets,
+    and never turn a reserved query into a suggested new series directory.
+    """
+    if is_reserved_series_name(title):
+        raise ValueError("The oneshots container is not a series name")
+    _require_v1_registry(registry)
     key = alias_key(title)
     aliases = registry.get("aliases_by_normalized_key", {})
     ambiguous = registry.get("ambiguous_aliases", {})
     if not isinstance(aliases, dict) or not isinstance(ambiguous, dict):
         raise ValueError("Invalid series registry: alias maps are missing")
     if key in ambiguous:
+        candidates = ambiguous[key]
+        if not isinstance(candidates, list):
+            raise ValueError("Invalid series registry: ambiguous candidates must be a list")
+        candidates = [item for item in candidates if not _container_target(item)]
+        if not candidates:
+            raise ValueError("Registry alias refers only to the reserved oneshots container")
         return {
             "matched": False,
             "match_type": "ambiguous_exact",
             "title": title,
-            "candidates": ambiguous[key],
+            "candidates": candidates,
         }
     if key in aliases:
+        if _container_target(aliases[key]):
+            raise ValueError("Registry alias refers to the reserved oneshots container")
         return {
             "matched": True,
             "match_type": "exact_alias",
@@ -517,6 +598,8 @@ def resolve_from_registry(
     scored: list[tuple[float, str, str]] = []
     for candidate_key, relative in aliases.items():
         if not isinstance(candidate_key, str) or not isinstance(relative, str):
+            continue
+        if _container_target(relative):
             continue
         if len(candidate_key) < 10:
             continue
@@ -609,6 +692,8 @@ class SeriesResolver:
     def register(self, canonical: str, aliases: set[str] | None = None) -> None:
         """Persist a newly landed canonical folder and its observed aliases."""
         canonical = safe_name(canonical)
+        if is_reserved_series_name(canonical):
+            raise ValueError("The oneshots container cannot be registered as a series")
         values = {canonical}
         values.update(alias.strip() for alias in aliases or set() if alias.strip())
         with self._guard:
